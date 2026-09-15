@@ -759,7 +759,7 @@ mod tests {
 
         let snapshot = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
         assert_eq!(snapshot.life_id, LIFE_ID);
-        assert_eq!(snapshot.capabilities.len(), 4);
+        assert_eq!(snapshot.capabilities.len(), 5);
 
         let entry = snapshot
             .capabilities
@@ -802,7 +802,12 @@ mod tests {
     fn snapshot_exposes_trusted_descriptor_metadata_not_frontend_values() {
         let fixture = Fixture::new();
         let snapshot = build_snapshot(&fixture.storage, &fixture.registry).expect("snapshot");
-        let descriptor = &snapshot.capabilities[0].descriptor;
+        let descriptor = &snapshot
+            .capabilities
+            .iter()
+            .find(|entry| entry.descriptor.capability_id == PRODUCTION_CAPABILITY_ID)
+            .expect("frozen Git capability descriptor")
+            .descriptor;
         assert_eq!(descriptor.risk_class, "CRITICAL");
         assert_eq!(descriptor.approval_floor, "EXPLICIT_PER_ACTION");
         assert_eq!(descriptor.scope_requirement, "WORKSPACE_REQUIRED");
@@ -1605,16 +1610,16 @@ mod tests {
             );
         }
 
-        // D31-C keeps the frozen Git-status/read routes and adds only the
-        // exact bounded replacement route plus its Host-only recovery
-        // descriptor. D30-A still changes only authorization reachability;
-        // no generic side-effect surface is admitted.
+        // D32-A keeps the frozen Git-status/read/replacement/recovery routes
+        // and adds only the exact sandboxed Cargo-check route. D30-A still
+        // changes only authorization reachability; no generic side-effect
+        // surface is admitted.
         let registry = CapabilityRegistry::production().expect("production registry");
         let entries: Vec<&CapabilityDescriptor> = registry.entries().collect();
         assert_eq!(
             entries.len(),
-            4,
-            "D31-C keeps exactly four trusted capability descriptors"
+            5,
+            "D32-A keeps exactly five trusted capability descriptors"
         );
         let entry_ids = entries
             .iter()
@@ -1627,6 +1632,7 @@ mod tests {
                 "vita.workspace.read_file",
                 "vita.workspace.replace_file",
                 "vita.workspace.recover_replace",
+                "vita.process.workspace.cargo_check",
             ])
         );
         for entry in entries {
@@ -1648,6 +1654,10 @@ mod tests {
                 "vita.workspace.recover_replace" => {
                     assert!(!entry.is_read_only());
                     assert!(entry.tool_name().is_none());
+                }
+                "vita.process.workspace.cargo_check" => {
+                    assert!(!entry.is_read_only());
+                    assert_eq!(entry.tool_name(), Some("vita_workspace_cargo_check"));
                 }
                 _ => unreachable!("registry ID set was checked above"),
             }

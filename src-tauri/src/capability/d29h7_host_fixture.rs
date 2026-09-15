@@ -843,10 +843,10 @@ mod tests {
         )
         .expect("H7 fixture initialize");
         assert_eq!(response.authorization_revision, Some(2));
-        // D31-C keeps the accepted H7/read descriptors and adds the exact
-        // replace and Host-only recovery descriptors; this fixture still
-        // exercises only Git status.
-        assert_eq!(session.production_registry.len(), 4);
+        // D32-A keeps the accepted H7/read/replace descriptors, Host-only
+        // recovery, and adds only the fixed sandboxed Cargo-check route; this
+        // fixture still exercises only Git status.
+        assert_eq!(session.production_registry.len(), 5);
         let descriptor = session
             .production_registry
             .descriptor(&CapabilityId::try_from(GIT_STATUS_CAPABILITY_ID).unwrap())

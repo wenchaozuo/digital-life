@@ -14,6 +14,9 @@ pub(crate) const PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME: &str = "vita_workspace_
 pub(crate) const PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID: &str =
     "vita.workspace.recover_replace";
 pub(crate) const PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID: &str = "d31.workspace.recover_replace.v1";
+pub(crate) const PRODUCTION_CARGO_CHECK_CAPABILITY_ID: &str = "vita.process.workspace.cargo_check";
+pub(crate) const PRODUCTION_CARGO_CHECK_PROFILE_ID: &str = "d32.workspace.cargo_check.v1";
+pub(crate) const PRODUCTION_CARGO_CHECK_TOOL_NAME: &str = "vita_workspace_cargo_check";
 
 /// A capability identity is an opaque, exact, lower-case ASCII identifier.
 /// No normalization, aliasing, or case folding is performed.
@@ -336,11 +339,26 @@ impl CapabilityRegistry {
         )
         .expect("the production workspace recovery descriptor is valid")
         .with_host_only_mutating_route(PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID);
+        let cargo_capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
+            .expect("the production Cargo check capability ID is a valid static identifier");
+        let cargo_descriptor = CapabilityDescriptor::new(
+            cargo_capability_id,
+            "Governed sandboxed workspace cargo check",
+            RiskClass::Critical,
+            ApprovalFloor::ExplicitPerAction,
+            ScopeRequirement::WorkspaceRequired,
+        )
+        .expect("the production Cargo check descriptor is valid")
+        .with_mutating_execution_route(
+            PRODUCTION_CARGO_CHECK_PROFILE_ID,
+            PRODUCTION_CARGO_CHECK_TOOL_NAME,
+        );
         Self::from_trusted_descriptors([
             git_descriptor,
             read_descriptor,
             replace_descriptor,
             recover_descriptor,
+            cargo_descriptor,
         ])
     }
 
@@ -446,7 +464,7 @@ mod tests {
             CapabilityRegistryError::DuplicateCapabilityId(_)
         ));
         let registry = CapabilityRegistry::production().unwrap();
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 5);
         let git_status = CapabilityId::try_from(PRODUCTION_GIT_STATUS_CAPABILITY_ID).unwrap();
         let descriptor = registry.descriptor(&git_status).unwrap();
         assert_eq!(descriptor.risk_class(), RiskClass::Critical);
@@ -491,6 +509,25 @@ mod tests {
         assert!(
             registry.descriptor(&patch_facade).is_none(),
             "the exact-literal patch façade must reuse replace authority"
+        );
+        let cargo = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID).unwrap();
+        let cargo_descriptor = registry.descriptor(&cargo).unwrap();
+        assert_eq!(cargo_descriptor.risk_class(), RiskClass::Critical);
+        assert_eq!(
+            cargo_descriptor.approval_floor(),
+            ApprovalFloor::ExplicitPerAction
+        );
+        assert_eq!(
+            cargo_descriptor.scope_requirement(),
+            ScopeRequirement::WorkspaceRequired
+        );
+        assert_eq!(
+            cargo_descriptor.execution_profile(),
+            Some(PRODUCTION_CARGO_CHECK_PROFILE_ID)
+        );
+        assert_eq!(
+            cargo_descriptor.tool_name(),
+            Some(PRODUCTION_CARGO_CHECK_TOOL_NAME)
         );
         for excluded in [
             "vita.process.run",

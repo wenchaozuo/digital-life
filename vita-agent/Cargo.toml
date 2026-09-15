@@ -7,6 +7,7 @@ publish = false
 [features]
 d29-h7-test-helper = []
 d29-h9-test-helper = []
+d32-a-test-helper = []
 
 [lib]
 name = "vita_agent"
@@ -24,6 +25,11 @@ path = "src/bin/d29h7-process-fixture.rs"
 name = "d29h7-git-helper-fixture"
 path = "src/bin/d29h7-git-helper-fixture.rs"
 required-features = ["d29-h7-test-helper"]
+
+[[bin]]
+name = "d32a-sandbox-fixture"
+path = "src/bin/d32a-sandbox-fixture.rs"
+required-features = ["d32-a-test-helper"]
 
 [dependencies]
 digital-life-vita-agent-protocol = { path = "../vita-agent-protocol" }
@@ -56,6 +62,7 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_Security_Isolation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",

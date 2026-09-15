@@ -186,12 +186,13 @@ mod windows {
         CapabilityAuthorizationRepository, CapabilityEvaluationErrorCode, RequestedCapabilityScope,
     };
     use crate::capability::descriptor::{
-        CapabilityId, ScopeRequirement, PRODUCTION_GIT_STATUS_CAPABILITY_ID,
-        PRODUCTION_GIT_STATUS_PROFILE_ID, PRODUCTION_GIT_STATUS_TOOL_NAME,
-        PRODUCTION_WORKSPACE_READ_CAPABILITY_ID, PRODUCTION_WORKSPACE_READ_TOOL_NAME,
-        PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID, PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID,
-        PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID, PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID,
-        PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME,
+        CapabilityId, ScopeRequirement, PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
+        PRODUCTION_CARGO_CHECK_PROFILE_ID, PRODUCTION_CARGO_CHECK_TOOL_NAME,
+        PRODUCTION_GIT_STATUS_CAPABILITY_ID, PRODUCTION_GIT_STATUS_PROFILE_ID,
+        PRODUCTION_GIT_STATUS_TOOL_NAME, PRODUCTION_WORKSPACE_READ_CAPABILITY_ID,
+        PRODUCTION_WORKSPACE_READ_TOOL_NAME, PRODUCTION_WORKSPACE_RECOVER_CAPABILITY_ID,
+        PRODUCTION_WORKSPACE_RECOVER_PROFILE_ID, PRODUCTION_WORKSPACE_REPLACE_CAPABILITY_ID,
+        PRODUCTION_WORKSPACE_REPLACE_PROFILE_ID, PRODUCTION_WORKSPACE_REPLACE_TOOL_NAME,
     };
     use crate::execution_enclave::{CodexRuntimeError, VitaSidecarProcess};
     use protocol::{
@@ -229,6 +230,12 @@ mod windows {
     // generic H7 fixture program id is deliberately not accepted on this
     // production capability lane.
     const PROGRAM_ID: &str = PRODUCTION_GIT_STATUS_PROFILE_ID;
+    const CARGO_PROGRAM_ID: &str = "cargo-check-v1";
+    const CARGO_NO_GIT_METADATA_FENCE: &str = "d32-no-git-fence-v1";
+    const CARGO_ENVIRONMENT_POLICY_HASH: &str =
+        "f45206b70dabb5c144d0ba95b966e97da91a1f284b2449a8e4bc96fade55ba3a";
+    const CARGO_ARGV_HASH: &str =
+        "51f73634568f17211b3f8305649cfd9391a1dd52c05b2469add4317fbc8603c8";
     const GRANT_LIFETIME_MS: u64 = 30_000;
     const HOST_CONFIRMATION_TTL_MS: u64 = 30_000;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -4226,7 +4233,8 @@ mod windows {
         if request.session_id != session.session_id
             || request.life_id != session.life_id
             || request.task_id != session.task_id
-            || request.capability_id != PRODUCTION_GIT_STATUS_CAPABILITY_ID
+            || (request.capability_id != PRODUCTION_GIT_STATUS_CAPABILITY_ID
+                && request.capability_id != PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
             || request.binding.validate().is_err()
         {
             return Err("Vita confirmation binding was not exact".to_string());
@@ -4522,6 +4530,25 @@ mod windows {
         validate_binding(session, binding)?;
         let capability_id = CapabilityId::try_from(binding.capability_id.as_str())
             .map_err(|_| "invalid capability identity".to_string())?;
+        let descriptor = registry
+            .descriptor(&capability_id)
+            .ok_or_else(|| "CAPABILITY_AUTHORIZATION_REQUIRED".to_string())?;
+        let expected_profile = if binding.capability_id == PRODUCTION_GIT_STATUS_CAPABILITY_ID {
+            PRODUCTION_GIT_STATUS_PROFILE_ID
+        } else {
+            PRODUCTION_CARGO_CHECK_PROFILE_ID
+        };
+        let expected_tool = if binding.capability_id == PRODUCTION_GIT_STATUS_CAPABILITY_ID {
+            PRODUCTION_GIT_STATUS_TOOL_NAME
+        } else {
+            PRODUCTION_CARGO_CHECK_TOOL_NAME
+        };
+        if descriptor.execution_profile() != Some(expected_profile)
+            || descriptor.tool_name() != Some(expected_tool)
+            || descriptor.scope_requirement() != ScopeRequirement::WorkspaceRequired
+        {
+            return Err("CAPABILITY_AUTHORIZATION_UNAVAILABLE".to_string());
+        }
         let decision = evaluate_capability_authorization_in_scope(
             authority,
             registry,
@@ -4557,15 +4584,31 @@ mod windows {
         if binding.session_id != session.session_id
             || binding.life_id != session.life_id
             || binding.task_id != session.task_id
-            || binding.capability_id != PRODUCTION_GIT_STATUS_CAPABILITY_ID
-            || binding.program_id != PROGRAM_ID
-            || binding.profile_id != PRODUCTION_GIT_STATUS_PROFILE_ID
+            || !((binding.capability_id == PRODUCTION_GIT_STATUS_CAPABILITY_ID
+                && binding.program_id == PROGRAM_ID
+                && binding.profile_id == PRODUCTION_GIT_STATUS_PROFILE_ID
+                && binding.git_metadata_fence_hash.len() == 64
+                && binding
+                    .git_metadata_fence_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+                || (binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+                    && binding.program_id == CARGO_PROGRAM_ID
+                    && binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+                    && binding.argv_count == 2
+                    && binding.argv_hash == CARGO_ARGV_HASH
+                    && binding.working_directory_identity == session.workspace_identity
+                    && binding.stdout_bound == 65_536
+                    && binding.stderr_bound == 65_536
+                    && binding.timeout_ms == 120_000
+                    && binding.environment_policy_hash == CARGO_ENVIRONMENT_POLICY_HASH
+                    && binding.executable_sha256.len() == 64
+                    && binding
+                        .executable_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    && binding.git_metadata_fence_hash == CARGO_NO_GIT_METADATA_FENCE))
             || binding.workspace_root_identity != session.workspace_identity
-            || binding.git_metadata_fence_hash.len() != 64
-            || !binding
-                .git_metadata_fence_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             return Err("Vita process binding was not exact".to_string());
         }
@@ -9911,6 +9954,34 @@ mod windows {
         }
 
         #[test]
+        fn d32_cargo_binding_requires_the_fixed_non_git_marker() {
+            let (session, _receiver) = test_session();
+            let mut binding = test_binding(&session.session_id);
+            binding.capability_id = PRODUCTION_CARGO_CHECK_CAPABILITY_ID.to_string();
+            binding.program_id = CARGO_PROGRAM_ID.to_string();
+            binding.profile_id = PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string();
+            binding.argv_hash = CARGO_ARGV_HASH.to_string();
+            binding.argv_count = 2;
+            binding.working_directory_identity = session.workspace_identity.clone();
+            binding.workspace_root_identity = session.workspace_identity.clone();
+            binding.stdout_bound = 65_536;
+            binding.stderr_bound = 65_536;
+            binding.timeout_ms = 120_000;
+            binding.environment_policy_hash = CARGO_ENVIRONMENT_POLICY_HASH.to_string();
+            binding.git_metadata_fence_hash = CARGO_NO_GIT_METADATA_FENCE.to_string();
+            assert!(validate_binding(&session, &binding).is_ok());
+
+            binding.git_metadata_fence_hash = "0".repeat(64);
+            assert!(validate_binding(&session, &binding).is_err());
+            binding.git_metadata_fence_hash = CARGO_NO_GIT_METADATA_FENCE.to_string();
+            binding.argv_count = 1;
+            assert!(validate_binding(&session, &binding).is_err());
+            binding.argv_count = 2;
+            binding.environment_policy_hash = "0".repeat(64);
+            assert!(validate_binding(&session, &binding).is_err());
+        }
+
+        #[test]
         fn host_confirmation_ttl_is_an_upper_bound() {
             assert_eq!(effective_confirmation_expiry(1_000, 90_000), Some(31_000));
             assert_eq!(effective_confirmation_expiry(1_000, 20_000), Some(20_000));
@@ -11582,10 +11653,19 @@ mod windows {
             }
             assert!(completed, "D31-C canary did not complete a real turn");
             if is_patch_conflict {
-                assert!(!authority_evaluate_seen, "D31-D conflict must not reach authority");
-                assert!(!confirmation_seen, "D31-D conflict must not request confirmation");
+                assert!(
+                    !authority_evaluate_seen,
+                    "D31-D conflict must not reach authority"
+                );
+                assert!(
+                    !confirmation_seen,
+                    "D31-D conflict must not request confirmation"
+                );
                 assert!(!grant_issue_seen, "D31-D conflict must not issue a grant");
-                assert!(!revalidation_seen, "D31-D conflict must not revalidate a grant");
+                assert!(
+                    !revalidation_seen,
+                    "D31-D conflict must not revalidate a grant"
+                );
             } else {
                 assert!(
                     authority_evaluate_seen,

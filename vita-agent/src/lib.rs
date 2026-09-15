@@ -30,6 +30,8 @@ mod d29h5c;
 mod d29h6;
 #[cfg(windows)]
 mod d29h7;
+#[cfg(windows)]
+mod d32a;
 mod provider_gateway;
 pub mod recovery_journal;
 mod runtime_composition;
@@ -90,6 +92,12 @@ pub use d29h7::{
     VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,
     VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_PROFILE_ID,
     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
+};
+
+#[cfg(windows)]
+pub(crate) use d32a::{
+    VitaCargoCheckProduction, VitaCargoCheckToolContributor, D32_CARGO_CAPABILITY_ID,
+    D32_CARGO_NO_GIT_METADATA_FENCE, D32_CARGO_PROFILE_ID, D32_CARGO_TOOL_NAME,
 };
 
 #[cfg(windows)]

@@ -45,12 +45,14 @@ use crate::{
     H4ReplaceOperation, H4ScopeRequirement, H5RecoveryExecutor, H7ProcessBinding, H7ProcessGrant,
     HostExplicitActionConfirmationEvidence, PreparedWorkspaceTargetKind, RecoveryActionRequest,
     RecoveryAuthorityPort, RecoveryDenyReason, RecoveryGrantEvidence, TrustedWorkspaceRoot,
-    VitaAgentEntrypoint, VitaAgentRuntime, VitaAgentRuntimeProfile, VitaExecutionContext,
-    VitaGitStatusAuthority, VitaGitStatusPendingConfirmation, VitaGitStatusProduction,
-    VitaGitStatusToolContributor, VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort,
-    VitaH3DisclosureFuture, VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort,
+    VitaAgentEntrypoint, VitaAgentRuntime, VitaAgentRuntimeProfile, VitaCargoCheckProduction,
+    VitaCargoCheckToolContributor, VitaExecutionContext, VitaGitStatusAuthority,
+    VitaGitStatusPendingConfirmation, VitaGitStatusProduction, VitaGitStatusToolContributor,
+    VitaH3AuthorityError, VitaH3AuthorityFuture, VitaH3AuthorityPort, VitaH3DisclosureFuture,
+    VitaH4AuthorityError, VitaH4AuthorityFuture, VitaH4AuthorityPort,
     VitaWorkspacePatchToolContributor, VitaWorkspaceReadBroker, VitaWorkspaceReadToolContributor,
-    VitaWorkspaceReplaceBroker, VitaWorkspaceReplaceH5ToolContributor,
+    VitaWorkspaceReplaceBroker, VitaWorkspaceReplaceH5ToolContributor, D32_CARGO_CAPABILITY_ID,
+    D32_CARGO_NO_GIT_METADATA_FENCE, D32_CARGO_PROFILE_ID, D32_CARGO_TOOL_NAME,
     H5_RECOVER_REPLACE_CAPABILITY_ID, VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID,
     VITA_WORKSPACE_GIT_STATUS_PROFILE_ID, VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
     VITA_WORKSPACE_READ_CAPABILITY_ID, VITA_WORKSPACE_READ_TOOL_NAME,
@@ -399,12 +401,16 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     })
                     .collect::<Vec<_>>();
                 names.sort_unstable();
-                let expected_names = vec![
+                let mut expected_names = vec![
                     VITA_WORKSPACE_GIT_STATUS_TOOL_NAME,
                     VITA_WORKSPACE_PATCH_TOOL_NAME,
                     VITA_WORKSPACE_READ_TOOL_NAME,
                     VITA_WORKSPACE_REPLACE_TOOL_NAME,
                 ];
+                if names.len() == 5 {
+                    expected_names.push(D32_CARGO_TOOL_NAME);
+                    expected_names.sort_unstable();
+                }
                 if names != expected_names {
                     return Err(crate::VitaAgentError::GatewayProtocol(
                         "H9 canary first request advertised an unexpected tool set".to_string(),
@@ -1180,6 +1186,7 @@ fn parse_gateway_responses_request(
                     && name != VITA_WORKSPACE_READ_TOOL_NAME
                     && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
                     && name != VITA_WORKSPACE_PATCH_TOOL_NAME
+                    && name != D32_CARGO_TOOL_NAME
                 {
                     return Err("unknown tool call".to_string());
                 }
@@ -1240,6 +1247,7 @@ fn parse_gateway_responses_request(
                 && name != VITA_WORKSPACE_READ_TOOL_NAME
                 && name != VITA_WORKSPACE_REPLACE_TOOL_NAME
                 && name != VITA_WORKSPACE_PATCH_TOOL_NAME
+                && name != D32_CARGO_TOOL_NAME
             {
                 return Err("unknown advertised tool".to_string());
             }
@@ -1662,6 +1670,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     // Codex turn.
     let recovery_root = workspace.clone();
     let patch_context = context.clone();
+    let cargo_context = context.clone();
+    let cargo_workspace = workspace.clone();
+    let cargo_path = resolve_cargo_path().ok();
     let production = Arc::new(
         VitaGitStatusProduction::new(
             context,
@@ -1671,6 +1682,22 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         )
         .map_err(|error| format!("Vita H7-C production setup failed: {error}"))?,
     );
+    let cargo_production = Arc::new(VitaCargoCheckProduction::new(
+        cargo_context,
+        cargo_workspace,
+        cargo_path.unwrap_or_else(|| PathBuf::from(r"C:\__digital_life_missing_cargo__.exe")),
+        Arc::clone(&authority) as Arc<dyn VitaGitStatusAuthority>,
+    ));
+    if std::env::var("D32_A_REQUIRE_REAL_CANARY").ok().as_deref() == Some("1")
+        && !cargo_production.is_available()
+    {
+        return Err(format!(
+            "D32-A mandatory real canary prerequisites unavailable: {}",
+            cargo_production
+                .unavailable_reason()
+                .unwrap_or("unknown blocker")
+        ));
+    }
     let contributor = VitaProductionContributors {
         git: production.contributor(),
         read: VitaWorkspaceReadToolContributor::new(Arc::clone(&read_broker)),
@@ -1684,6 +1711,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             patch_context,
             recovery_store.clone(),
         ),
+        cargo: cargo_production.contributor(),
     };
     let (entrypoint, mut gateway_server) = if let Some(provider_config) = init.provider.as_ref() {
         provider_config.validate().map_err(protocol_error)?;
@@ -1821,6 +1849,9 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
     let receiver = production
         .take_confirmation_receiver()
         .ok_or_else(|| "Vita confirmation receiver was already consumed".to_string())?;
+    let cargo_receiver = cargo_production
+        .take_confirmation_receiver()
+        .ok_or_else(|| "D32 Cargo confirmation receiver was already consumed".to_string())?;
     router.send(&VitaMessage::Ready(protocol::Ready {
         request_id: next_request_id("vita-ready"),
         session_id: init.session_id.clone(),
@@ -1839,6 +1870,14 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
         init.clone(),
         receiver,
         Arc::clone(&active_identity),
+        VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID,
+    );
+    spawn_confirmation_loop(
+        router.clone(),
+        init.clone(),
+        cargo_receiver,
+        Arc::clone(&active_identity),
+        D32_CARGO_CAPABILITY_ID,
     );
 
     // Keep command reception alive while an H5 recovery is running.  A
@@ -1873,6 +1912,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             result.map_err(|_| "Vita sidecar command reader task failed".to_string())??;
         let Some(command) = command else {
             production.cancel();
+            cargo_production.cancel();
             read_broker.cancel();
             replace_broker.cancel();
             recovery_executor.cancel();
@@ -1891,6 +1931,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                 // start a later turn after the exact Cancelled acknowledgement;
                 // session-terminal teardown uses `production.cancel()` below.
                 production.cancel_turn();
+                cargo_production.cancel_turn();
                 read_broker.cancel_turn();
                 replace_broker.cancel_turn();
                 recovery_executor.cancel();
@@ -1926,6 +1967,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     init.provider.as_ref(),
                     Arc::clone(&runtime),
                     Arc::clone(&production),
+                    Arc::clone(&cargo_production),
                     Arc::clone(&read_broker),
                     Arc::clone(&read_authority),
                     Arc::clone(&replace_broker),
@@ -1942,6 +1984,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     &init,
                     Arc::clone(&runtime),
                     Arc::clone(&production),
+                    Arc::clone(&cargo_production),
                     Arc::clone(&read_broker),
                     Arc::clone(&replace_broker),
                     router.clone(),
@@ -1953,6 +1996,7 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
             }
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
+                cargo_production.cancel();
                 read_broker.cancel();
                 replace_broker.cancel();
                 recovery_executor.cancel();
@@ -2133,6 +2177,7 @@ fn handle_start_turn(
     provider_config: Option<&ProviderConfiguration>,
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
+    cargo_production: Arc<VitaCargoCheckProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
     read_authority: Arc<SidecarWorkspaceReadAuthority>,
     replace_broker: Arc<VitaWorkspaceReplaceBroker>,
@@ -2201,6 +2246,7 @@ fn handle_start_turn(
         }
     };
     production.begin_turn();
+    cargo_production.begin_turn();
     read_authority.begin_turn();
     read_broker.begin_turn();
     replace_authority.begin_turn();
@@ -2320,6 +2366,7 @@ async fn handle_cancel_turn(
     init: &InitializeSession,
     runtime: Arc<VitaAgentRuntime>,
     production: Arc<VitaGitStatusProduction>,
+    cargo_production: Arc<VitaCargoCheckProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
     replace_broker: Arc<VitaWorkspaceReplaceBroker>,
     router: SidecarRouter,
@@ -2343,6 +2390,7 @@ async fn handle_cancel_turn(
         active.take();
     }
     production.cancel_turn();
+    cargo_production.cancel_turn();
     read_broker.cancel_turn();
     replace_broker.cancel_turn();
     let Some(task) = turn_owner.take(&identity) else {
@@ -2378,6 +2426,7 @@ fn spawn_confirmation_loop(
     init: InitializeSession,
     mut receiver: tokio::sync::mpsc::Receiver<VitaGitStatusPendingConfirmation>,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    capability_id: &'static str,
 ) {
     tokio::spawn(async move {
         while let Some(action) = receiver.recv().await {
@@ -2407,7 +2456,7 @@ fn spawn_confirmation_loop(
                     host_turn_id: host_turn_id.clone(),
                     life_id: init.life_id.clone(),
                     task_id: init.task_id.clone(),
-                    capability_id: VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID.to_string(),
+                    capability_id: capability_id.to_string(),
                     workspace_summary: workspace_summary(&init.workspace_path),
                     expires_at_unix_ms: unix_millis().saturating_add(30_000),
                     binding: wire_binding,
@@ -3579,7 +3628,7 @@ impl RecoveryAuthorityPort for SidecarRecoveryAuthority {
     }
 }
 
-/// The production Codex extension registry is closed over these four exact
+/// The production Codex extension registry is closed over these five exact
 /// contributors.  Keeping the composition in one concrete contributor means
 /// the pinned runtime never receives a generic plugin or filesystem surface.
 struct VitaProductionContributors {
@@ -3587,6 +3636,7 @@ struct VitaProductionContributors {
     read: VitaWorkspaceReadToolContributor,
     replace: VitaWorkspaceReplaceH5ToolContributor,
     patch: VitaWorkspacePatchToolContributor,
+    cargo: VitaCargoCheckToolContributor,
 }
 
 impl ToolContributor for VitaProductionContributors {
@@ -3601,6 +3651,7 @@ impl ToolContributor for VitaProductionContributors {
         tools.extend(self.read.tools(session_store, thread_store));
         tools.extend(self.replace.tools(session_store, thread_store));
         tools.extend(self.patch.tools(session_store, thread_store));
+        tools.extend(self.cargo.tools(session_store, thread_store));
         tools
     }
 }
@@ -3630,7 +3681,13 @@ fn binding_to_wire(session_id: &str, binding: &H7ProcessBinding) -> ProcessBindi
         profile_id: binding.profile_id().unwrap_or_default().to_string(),
         git_metadata_fence_hash: binding
             .git_metadata_fence_hash()
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                if binding.capability_id() == D32_CARGO_CAPABILITY_ID {
+                    D32_CARGO_NO_GIT_METADATA_FENCE
+                } else {
+                    ""
+                }
+            })
             .to_string(),
     }
 }
@@ -3679,10 +3736,14 @@ fn h7_grant_from_wire(
     require_used: bool,
 ) -> Result<H7ProcessGrant, String> {
     grant.validate().map_err(protocol_error)?;
+    let is_git = grant.binding.capability_id == VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID
+        && grant.binding.profile_id == VITA_WORKSPACE_GIT_STATUS_PROFILE_ID;
+    let is_cargo = grant.binding.capability_id == D32_CARGO_CAPABILITY_ID
+        && grant.binding.profile_id == D32_CARGO_PROFILE_ID
+        && grant.binding.program_id == "cargo-check-v1";
     if grant.session_id != session_id
         || grant.binding != *expected_binding
-        || grant.binding.capability_id != VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID
-        || grant.binding.profile_id != VITA_WORKSPACE_GIT_STATUS_PROFILE_ID
+        || (!is_git && !is_cargo)
         || grant.authorization_revision <= 0
         || (require_used && !grant.used)
         || (!require_used && grant.used)
@@ -3707,6 +3768,24 @@ fn workspace_summary(path: &str) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "selected workspace".to_string())
+}
+
+fn resolve_cargo_path() -> Result<PathBuf, String> {
+    // Absolute, fixed install locations only.  This is intentionally not a
+    // PATH lookup and never accepts a model/provider supplied executable.
+    let mut candidates = vec![
+        PathBuf::from(r"C:\Program Files\Rust\bin\cargo.exe"),
+        PathBuf::from(r"C:\Program Files\Cargo\bin\cargo.exe"),
+        PathBuf::from(r"E:\Program Files\Rust\bin\cargo.exe"),
+    ];
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        candidates.push(PathBuf::from(user_profile).join(r".cargo\bin\cargo.exe"));
+    }
+    candidates
+        .into_iter()
+        .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "No trusted absolute Cargo image is installed".to_string())
 }
 
 fn unix_millis() -> u64 {

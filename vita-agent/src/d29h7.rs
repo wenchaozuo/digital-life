@@ -44,17 +44,21 @@ use windows_sys::Wdk::Storage::FileSystem::{
 #[cfg(test)]
 use windows_sys::Win32::Foundation::GetHandleInformation;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, SetHandleInformation, DUPLICATE_SAME_ACCESS,
-    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND,
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetHandleInformation,
+    DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
+    ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
+    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
+    OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
+use windows_sys::Win32::Security::Isolation::{
+    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::{PSID, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -82,7 +86,8 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResetEvent, ResumeThread,
     TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 use windows_sys::Win32::System::IO::{
@@ -92,6 +97,20 @@ use windows_sys::Win32::System::IO::{
 use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity};
 
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
+pub(crate) const VITA_WORKSPACE_CARGO_CHECK_TOOL_NAME: &str = "vita_workspace_cargo_check";
+pub(crate) const VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID: &str =
+    "vita.process.workspace.cargo_check";
+pub(crate) const VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID: &str = "d32.workspace.cargo_check.v1";
+// ProcessBinding is frozen and its legacy Git-fence field is required to be a
+// non-empty identifier on the wire.  Cargo carries this explicit, non-Git
+// marker so the Host can distinguish the fixed profile without weakening the
+// protocol validator or treating an empty value as evidence.
+pub(crate) const D32_CARGO_NO_GIT_METADATA_FENCE: &str = "d32-no-git-fence-v1";
+// The values of CARGO_HOME/CARGO_TARGET_DIR are per-instance scratch paths,
+// so the binding carries this static policy identity rather than a path hash.
+// The paths themselves are created and retained only by the fixed catalog.
+pub(crate) const D32_CARGO_ENVIRONMENT_POLICY_HASH: &str =
+    "f45206b70dabb5c144d0ba95b966e97da91a1f284b2449a8e4bc96fade55ba3a";
 const H7_CAPABILITY_ID: &str = "vita.process.run";
 const H7B_CAPABILITY_ID: &str = "vita.process.workspace.run";
 pub const VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID: &str = "vita.process.workspace.git_status";
@@ -139,7 +158,7 @@ struct H7ProcessArguments {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H7ProcessRequest {
+pub(crate) struct H7ProcessRequest {
     tool_call_id: String,
     turn_id: String,
     program: String,
@@ -190,11 +209,25 @@ impl H7ProcessRequest {
         })
     }
 
-    fn synthetic(call_id: &str, turn_id: &str, args: &[&str]) -> Self {
+    pub(crate) fn synthetic(call_id: &str, turn_id: &str, args: &[&str]) -> Self {
         Self {
             tool_call_id: call_id.to_string(),
             turn_id: turn_id.to_string(),
             program: H7_PROGRAM_ID.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+
+    pub(crate) fn synthetic_fixed(
+        call_id: &str,
+        turn_id: &str,
+        program: &str,
+        args: &[&str],
+    ) -> Self {
+        Self {
+            tool_call_id: call_id.to_string(),
+            turn_id: turn_id.to_string(),
+            program: program.to_string(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
         }
     }
@@ -709,6 +742,36 @@ fn hash_file(file: &File) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
+fn d32_trusted_toolchain_paths(cargo_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let user_profile = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .ok_or_else(|| "D32 toolchain root was unavailable".to_string())?;
+    let toolchains = user_profile.join(".rustup").join("toolchains");
+    let mut candidates = fs::read_dir(&toolchains)
+        .map_err(|_| "D32 Rust toolchain directory was unavailable".to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.reverse();
+    for root in candidates {
+        let bin = root.join("bin");
+        let rustc = bin.join("rustc.exe");
+        let rustdoc = bin.join("rustdoc.exe");
+        if rustc.is_file() && rustdoc.is_file() {
+            let cargo_parent = cargo_path
+                .parent()
+                .ok_or_else(|| "D32 cargo image had no parent directory".to_string())?;
+            if !cargo_parent.is_dir() {
+                return Err("D32 cargo image parent was not a directory".to_string());
+            }
+            return Ok((rustc, rustdoc, bin));
+        }
+    }
+    Err("D32 trusted Rust toolchain was unavailable".to_string())
+}
+
 struct H7CatalogEntry {
     program_id: String,
     image_path: PathBuf,
@@ -722,14 +785,15 @@ struct H7CatalogEntry {
     timeout: Duration,
     stdout_bound: usize,
     stderr_bound: usize,
+    _owned_scratch: Option<Arc<TempDir>>,
 }
 
-struct H7ExecutableCatalog {
+pub(crate) struct H7ExecutableCatalog {
     entry: H7CatalogEntry,
 }
 
 impl H7ExecutableCatalog {
-    fn fixture(image_path: PathBuf, working_directory: PathBuf) -> Result<Self, String> {
+    pub(crate) fn fixture(image_path: PathBuf, working_directory: PathBuf) -> Result<Self, String> {
         if !image_path.is_absolute() || !working_directory.is_absolute() {
             return Err("H7 catalog paths must be absolute".to_string());
         }
@@ -743,7 +807,7 @@ impl H7ExecutableCatalog {
             H7_ENV_ALLOWLIST_KEY.to_string(),
             H7_ENV_ALLOWLIST_VALUE.to_string(),
         )]);
-        let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
+        let environment_policy_hash = D32_CARGO_ENVIRONMENT_POLICY_HASH.to_string();
         image
             .reverify(expected_image_identity, &expected_image_sha256)
             .map_err(|error| format!("H7 catalog image proof failed: {error}"))?;
@@ -761,6 +825,81 @@ impl H7ExecutableCatalog {
                 timeout: H7_TIMEOUT,
                 stdout_bound: H7_STDOUT_BOUND,
                 stderr_bound: H7_STDERR_BOUND,
+                _owned_scratch: None,
+            },
+        })
+    }
+
+    /// Builds the one static D32 production profile.  The caller supplies the
+    /// already Host-selected absolute cargo image; argv and all environment
+    /// values remain fixed here and cannot be selected by the model.
+    pub(crate) fn cargo_check(
+        cargo_path: PathBuf,
+        workspace_path: PathBuf,
+    ) -> Result<Self, String> {
+        if !cargo_path.is_absolute() || !workspace_path.is_absolute() {
+            return Err("D32 cargo profile paths must be absolute".to_string());
+        }
+        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&workspace_path)?);
+        let mut image = PreparedExecutableImage::prepare(&cargo_path)?;
+        let expected_image_identity = image.identity;
+        let expected_image_namespace = image.namespace.identity();
+        let expected_image_sha256 = image.sha256.clone();
+        let scratch = Arc::new(
+            tempfile::tempdir()
+                .map_err(|_| "D32 cargo scratch root could not be created".to_string())?,
+        );
+        let target = scratch.path().join("target");
+        let cargo_home = scratch.path().join("cargo-home");
+        fs::create_dir_all(&target)
+            .map_err(|_| "D32 cargo target scratch could not be created".to_string())?;
+        fs::create_dir_all(&cargo_home)
+            .map_err(|_| "D32 cargo home scratch could not be created".to_string())?;
+        let (rustc, rustdoc, toolchain_bin) = d32_trusted_toolchain_paths(&cargo_path)?;
+        let cargo_bin = cargo_path
+            .parent()
+            .ok_or_else(|| "D32 cargo image had no parent directory".to_string())?;
+        let path = format!(
+            "{};{}",
+            toolchain_bin.to_string_lossy(),
+            cargo_bin.to_string_lossy()
+        );
+        let environment = BTreeMap::from([
+            (
+                "CARGO_HOME".to_string(),
+                cargo_home.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target.to_string_lossy().into_owned(),
+            ),
+            ("CARGO_TERM_COLOR".to_string(), "never".to_string()),
+            ("PATH".to_string(), path),
+            ("RUSTC".to_string(), rustc.to_string_lossy().into_owned()),
+            (
+                "RUSTDOC".to_string(),
+                rustdoc.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
+        let working_directory_identity = working_directory.0.identity().wire();
+        image.reverify(expected_image_identity, &expected_image_sha256)?;
+        Ok(Self {
+            entry: H7CatalogEntry {
+                program_id: "cargo-check-v1".to_string(),
+                image_path: cargo_path,
+                expected_image_identity,
+                expected_image_namespace,
+                expected_image_sha256,
+                working_directory_identity,
+                working_directory,
+                environment,
+                environment_policy_hash,
+                timeout: Duration::from_secs(120),
+                stdout_bound: 64 * 1024,
+                stderr_bound: 64 * 1024,
+                _owned_scratch: Some(scratch),
             },
         })
     }
@@ -805,8 +944,58 @@ impl H7ExecutableCatalog {
         capability_id: &str,
         workspace_root: Option<TrustedWorkspaceRoot>,
     ) -> Result<Arc<PreparedProcessAction>, String> {
+        self.prepare_action_with_profile(
+            context,
+            request,
+            capability_id,
+            None,
+            workspace_root,
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_fixed_workspace_action(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+        capability_id: &str,
+        profile_id: &str,
+        workspace_root: TrustedWorkspaceRoot,
+        sandbox: Arc<H7SandboxProfile>,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
+        self.prepare_action_with_profile(
+            context,
+            request,
+            capability_id,
+            Some(profile_id),
+            Some(workspace_root),
+            Some(sandbox),
+        )
+    }
+
+    fn prepare_action_with_profile(
+        &self,
+        context: VitaExecutionContext,
+        request: H7ProcessRequest,
+        capability_id: &str,
+        profile_id: Option<&str>,
+        workspace_root: Option<TrustedWorkspaceRoot>,
+        sandbox: Option<Arc<H7SandboxProfile>>,
+    ) -> Result<Arc<PreparedProcessAction>, String> {
         if request.program != self.entry.program_id {
             return Err("H7 program was not in the Host-owned catalog".to_string());
+        }
+        if capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+            if profile_id != Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
+                || request.args.len() != 2
+                || request.args.first().map(String::as_str) != Some("check")
+                || request.args.get(1).map(String::as_str) != Some("--locked")
+                || sandbox.is_none()
+            {
+                return Err("D32 Cargo profile was not the fixed sandboxed action".to_string());
+            }
+        } else if sandbox.is_some() {
+            return Err("sandbox identity was attached to a non-D32 action".to_string());
         }
         let image = PreparedExecutableImage::prepare(&self.entry.image_path)?;
         if image.identity != self.entry.expected_image_identity
@@ -843,14 +1032,16 @@ impl H7ExecutableCatalog {
             stderr_bound: self.entry.stderr_bound,
             workspace_root,
             workspace_root_identity,
-            profile_id: None,
+            profile_id: profile_id.map(str::to_owned),
             git_metadata_fence: None,
-            git_metadata_fence_hash: None,
+            git_metadata_fence_hash: (capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID)
+                .then(|| D32_CARGO_NO_GIT_METADATA_FENCE.to_string()),
+            sandbox,
         }))
     }
 }
 
-struct PreparedProcessAction {
+pub(crate) struct PreparedProcessAction {
     context: VitaExecutionContext,
     tool_call_id: String,
     turn_id: String,
@@ -873,6 +1064,7 @@ struct PreparedProcessAction {
     profile_id: Option<String>,
     git_metadata_fence: Option<Arc<H7CGitMetadataFence>>,
     git_metadata_fence_hash: Option<String>,
+    sandbox: Option<Arc<H7SandboxProfile>>,
 }
 
 impl PreparedProcessAction {
@@ -907,7 +1099,7 @@ impl PreparedProcessAction {
 fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), String> {
     let workspace_capability = matches!(
         action.capability_id.as_str(),
-        H7B_CAPABILITY_ID | H7C_CAPABILITY_ID
+        H7B_CAPABILITY_ID | H7C_CAPABILITY_ID | VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
     );
     if !workspace_capability {
         if action.workspace_root.is_some() || action.workspace_root_identity.is_some() {
@@ -923,10 +1115,18 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
         .as_ref()
         .ok_or_else(|| "H7-B workspace scope was not Host-owned".to_string())?;
     let root_identity = root.identity();
-    if action.workspace_root_identity != Some(root_identity)
-        || !h7_workspace_paths_equal(action.working_directory.path(), root.final_path())
-    {
+    if action.workspace_root_identity != Some(root_identity) {
         return Err("H7-B workspace root and cwd binding did not match".to_string());
+    }
+    // D32 keeps the governed workspace as the fixed, read-only working
+    // directory and sends all Cargo output to the app-owned scratch paths in
+    // the static environment.  The AppContainer must be able to read this
+    // root; otherwise CreateProcess/child I/O fails closed rather than
+    // widening the user's ambient filesystem authority.
+    if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+        && !h7_workspace_paths_equal(action.working_directory.path(), root.final_path())
+    {
+        return Err("H7 workspace root and cwd binding did not match".to_string());
     }
     root.verify_named_path_current()
         .map_err(|_| "H7-B workspace root named path changed".to_string())
@@ -934,6 +1134,15 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
 
 fn h7c_revalidate_metadata_fence(action: &PreparedProcessAction) -> Result<(), String> {
     if action.capability_id != H7C_CAPABILITY_ID {
+        if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+            if action.git_metadata_fence.is_some()
+                || action.git_metadata_fence_hash.as_deref()
+                    != Some(D32_CARGO_NO_GIT_METADATA_FENCE)
+            {
+                return Err("D32 Cargo metadata marker was not exact".to_string());
+            }
+            return Ok(());
+        }
         if action.git_metadata_fence.is_some() || action.git_metadata_fence_hash.is_some() {
             return Err("H7 Git metadata evidence appeared on a non-Git action".to_string());
         }
@@ -1197,9 +1406,84 @@ impl Drop for H7Handle {
 unsafe impl Send for H7Handle {}
 unsafe impl Sync for H7Handle {}
 
+/// A process-local Windows AppContainer identity for the fixed D32 Cargo
+/// profile.  The profile deliberately has no capability SIDs, therefore no
+/// network capability is present.  The identity is retained for the complete
+/// suspended-create/final-fence interval and is never serialized.
+pub(crate) struct H7SandboxProfile {
+    name: Vec<u16>,
+    sid: PSID,
+    capabilities: Box<SECURITY_CAPABILITIES>,
+}
+
+impl H7SandboxProfile {
+    pub(crate) fn new() -> Result<Arc<Self>, String> {
+        let name = wide_null(OsStr::new("DigitalLife.D32.CargoCheck"));
+        let display = wide_null(OsStr::new("Digital Life Cargo Check"));
+        let description = wide_null(OsStr::new(
+            "Default-deny process identity for the governed cargo check profile",
+        ));
+        let mut sid = std::ptr::null_mut();
+        let created = unsafe {
+            CreateAppContainerProfile(
+                name.as_ptr(),
+                display.as_ptr(),
+                description.as_ptr(),
+                std::ptr::null(),
+                0,
+                &mut sid,
+            )
+        };
+        if created != 0 || sid.is_null() {
+            // The profile is intentionally stable across launches.  Windows
+            // reports an already-existing profile as an error and requires a
+            // separate SID derivation call for that case.
+            sid = std::ptr::null_mut();
+            let derived =
+                unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+            if derived != 0 || sid.is_null() {
+                return Err(format!(
+                    "D32 AppContainer profile could not be established: create={created:#x} derive={derived:#x}"
+                ));
+            }
+        }
+        let capabilities = Box::new(SECURITY_CAPABILITIES {
+            AppContainerSid: sid,
+            Capabilities: std::ptr::null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        });
+        Ok(Arc::new(Self {
+            name,
+            sid,
+            capabilities,
+        }))
+    }
+
+    fn security_capabilities(&self) -> *const SECURITY_CAPABILITIES {
+        self.capabilities.as_ref()
+    }
+}
+
+impl Drop for H7SandboxProfile {
+    fn drop(&mut self) {
+        if !self.sid.is_null() {
+            unsafe {
+                let _ = LocalFree(self.sid as HLOCAL);
+            }
+            self.sid = std::ptr::null_mut();
+        }
+    }
+}
+
+// The SID is an owned immutable kernel object retained by the Arc above.
+unsafe impl Send for H7SandboxProfile {}
+unsafe impl Sync for H7SandboxProfile {}
+
 struct H7ProcThreadAttributes {
     buffer: Vec<u8>,
     handles: Vec<HANDLE>,
+    sandbox: Option<Arc<H7SandboxProfile>>,
 }
 
 impl H7ProcThreadAttributes {
@@ -1232,6 +1516,7 @@ impl H7ProcThreadAttributes {
         Ok(Self {
             buffer,
             handles: Vec::new(),
+            sandbox: None,
         })
     }
 
@@ -1258,6 +1543,28 @@ impl H7ProcThreadAttributes {
                 unsafe { GetLastError() }
             ));
         }
+        Ok(())
+    }
+
+    fn set_security_capabilities(&mut self, sandbox: Arc<H7SandboxProfile>) -> Result<(), String> {
+        let result = unsafe {
+            UpdateProcThreadAttribute(
+                self.pointer().cast(),
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                sandbox.security_capabilities().cast(),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if result == 0 {
+            return Err(format!(
+                "D32 AppContainer security-capabilities attribute failed: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        self.sandbox = Some(sandbox);
         Ok(())
     }
 }
@@ -2804,7 +3111,11 @@ impl H7LaunchPreparation {
             return Err("H7 working-directory binding was not host-owned".to_string());
         }
         verify_workspace_root_binding(action)?;
-        let job = create_job_object()?;
+        // The historical H7 fixture remains single-process.  D32's fixed
+        // sandbox profile permits a small, bounded descendant set so the
+        // adversarial fixture can prove grandchild containment without ever
+        // allowing an unbounded process tree.
+        let job = create_job_object(if action.sandbox.is_some() { 4 } else { 1 })?;
         let (stdin_read, stdin_write) = create_stdin_pipe()?;
         let stdout_capture = H7OverlappedOutputCapture::new(action.stdout_bound, "stdout")?;
         let stdout_capture = match output_terminality_gate.as_ref() {
@@ -2816,12 +3127,16 @@ impl H7LaunchPreparation {
             Some(gate) => stderr_capture.with_terminality_gate(gate),
             None => stderr_capture,
         };
-        let mut attributes = H7ProcThreadAttributes::new(1)?;
+        let mut attributes =
+            H7ProcThreadAttributes::new(if action.sandbox.is_some() { 2 } else { 1 })?;
         attributes.set_handle_list(vec![
             stdin_read.raw(),
             stdout_capture.child_handle(),
             stderr_capture.child_handle(),
         ])?;
+        if let Some(sandbox) = action.sandbox.as_ref() {
+            attributes.set_security_capabilities(Arc::clone(sandbox))?;
+        }
         if let Some(raw) = unlisted_inheritable_handle {
             unsafe {
                 if SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
@@ -3188,6 +3503,14 @@ fn supervise_native_inner(
     resources.job_assigned = true;
     options.metrics.job_assigned.fetch_add(1, Ordering::AcqRel);
     phase.store(H7LaunchPhase::AssignedJob as u8, Ordering::Release);
+    // The child remains suspended until this last cancellation observation.
+    // If a turn/session cancellation wins after CreateProcessW but before the
+    // resume syscall, terminate the contained job and report a pre-start
+    // denial; user code must never run in that race.
+    if options.cancellation.load(Ordering::Acquire) {
+        let _ = resources.terminate_assigned_job();
+        return launch_failed(true, false, Some(&cleanup)).with_kind(H7NativeOutcomeKind::Denied);
+    }
     let resumed = unsafe { ResumeThread(resources.thread.raw()) } != u32::MAX;
     if !resumed {
         let _ = resources.terminate_for_cleanup();
@@ -3510,14 +3833,14 @@ fn launch_failed(
     }
 }
 
-fn create_job_object() -> Result<H7Handle, String> {
+fn create_job_object(active_process_limit: u32) -> Result<H7Handle, String> {
     let job =
         unsafe { CreateJobObjectW(std::ptr::null::<SECURITY_ATTRIBUTES>(), std::ptr::null()) };
     let job = H7Handle::new(job)?;
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
         BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
             LimitFlags: JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            ActiveProcessLimit: 1,
+            ActiveProcessLimit: active_process_limit,
             ..Default::default()
         },
         ..Default::default()
@@ -4051,7 +4374,7 @@ pub trait VitaGitStatusAuthority: Send + Sync {
     ) -> Result<(), String>;
 }
 
-trait H7AuthorityPort: Send + Sync {
+pub(crate) trait H7AuthorityPort: Send + Sync {
     fn evaluate_workspace_scope(&self, action: &PreparedProcessAction) -> Result<i64, String>;
     fn issue_process_grant(
         &self,
@@ -4065,8 +4388,14 @@ trait H7AuthorityPort: Send + Sync {
     ) -> Result<(), String>;
 }
 
-struct VitaGitStatusAuthorityAdapter {
+pub(crate) struct VitaGitStatusAuthorityAdapter {
     authority: Arc<dyn VitaGitStatusAuthority>,
+}
+
+impl VitaGitStatusAuthorityAdapter {
+    pub(crate) fn new(authority: Arc<dyn VitaGitStatusAuthority>) -> Self {
+        Self { authority }
+    }
 }
 
 impl H7AuthorityPort for VitaGitStatusAuthorityAdapter {
@@ -4583,7 +4912,7 @@ fn validate_h7_canonical(
     // D31-C's closed production catalog contains the frozen H7 Git-status and
     // bounded workspace-read routes plus the exact replace/recovery entries.
     if canonical.canonical_evaluations != 1
-        || canonical.production_registry_size != 4
+        || canonical.production_registry_size != 5
         || canonical.test_registry_size != 1
         || canonical.authorization_row_reads != 1
         || canonical.life_id != binding.life_id
@@ -4658,7 +4987,7 @@ impl H7PendingConfirmationBridge {
         Self::new_with_timeout(H7_CONFIRMATION_TIMEOUT)
     }
 
-    fn new_with_timeout(
+    pub(crate) fn new_with_timeout(
         timeout: Duration,
     ) -> (
         Arc<Self>,
@@ -4684,10 +5013,12 @@ impl H7PendingConfirmationBridge {
     }
 
     fn begin_turn(&self) {
+        self.cancelled.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn cancel_turn(&self) {
+        self.cancelled.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.cancelled_notify.notify_waiters();
     }
@@ -4849,9 +5180,10 @@ impl H7FinalFenceGate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct H7ToolResult {
+pub(crate) struct H7ToolResult {
     status: &'static str,
     process_created: bool,
+    user_code_started: bool,
     side_effect_count: usize,
     exit_code: Option<u32>,
     stdout: String,
@@ -4877,6 +5209,7 @@ impl H7ToolResult {
         Self {
             status: "denied",
             process_created: false,
+            user_code_started: false,
             side_effect_count: 0,
             exit_code: None,
             stdout: String::new(),
@@ -4898,6 +5231,12 @@ impl H7ToolResult {
         }
     }
 
+    fn cancelled_before_start() -> Self {
+        let mut result = Self::denied();
+        result.cancelled = true;
+        result
+    }
+
     fn from_native(native: H7NativeResult) -> Self {
         let status = match native.kind {
             H7NativeOutcomeKind::LaunchFailed => "launch_failed",
@@ -4911,6 +5250,7 @@ impl H7ToolResult {
         Self {
             status,
             process_created: native.process_created,
+            user_code_started: native.user_code_started,
             side_effect_count: usize::from(native.process_created),
             exit_code: native.exit_code,
             stdout: String::from_utf8_lossy(&native.stdout).into_owned(),
@@ -4942,6 +5282,30 @@ impl H7ToolResult {
             "stderr": self.stderr,
             "timed_out": self.timed_out,
             "cancelled": self.cancelled,
+        })
+    }
+
+    pub(crate) fn cargo_value(&self) -> Value {
+        let status = match self.status {
+            "started_and_exited" if self.exit_code == Some(0) => "completed",
+            "started_and_exited" => "failed",
+            "started_and_timed_out" => "timed_out",
+            "started_and_cancelled" if self.user_code_started => "cancelled_after_start",
+            "started_and_cancelled" => "cancelled_before_start",
+            "started_and_output_limited" => "failed",
+            "started_outcome_unknown" => "failed",
+            "denied" if self.cancelled && !self.user_code_started => "cancelled_before_start",
+            "launch_failed" | "denied" => "denied",
+            _ => "failed",
+        };
+        json!({
+            "status": status,
+            "exit_code": self.exit_code,
+            "timed_out": self.timed_out,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "stdout_truncated": self.status == "started_and_output_limited",
+            "stderr_truncated": self.status == "started_and_output_limited",
         })
     }
 }
@@ -5052,7 +5416,7 @@ impl Drop for H7ActionCancellationGuard {
     }
 }
 
-struct H7ProcessBroker {
+pub(crate) struct H7ProcessBroker {
     context: VitaExecutionContext,
     catalog: Arc<H7ExecutableCatalog>,
     authority: Arc<dyn H7AuthorityPort>,
@@ -5069,7 +5433,7 @@ struct H7ProcessBroker {
 }
 
 impl H7ProcessBroker {
-    fn new(
+    pub(crate) fn new(
         context: VitaExecutionContext,
         catalog: Arc<H7ExecutableCatalog>,
         authority: Arc<dyn H7AuthorityPort>,
@@ -5136,7 +5500,7 @@ impl H7ProcessBroker {
         self
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         if let Some(active) = self
             .active_cancellation
             .lock()
@@ -5149,11 +5513,31 @@ impl H7ProcessBroker {
         self.bridge.cancel();
     }
 
+    pub(crate) fn begin_turn(&self) {
+        self.bridge.begin_turn();
+    }
+
+    pub(crate) fn cancel_turn(&self) {
+        if let Some(active) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            active.token.store(true, Ordering::Release);
+            active.notify.notify_waiters();
+        }
+        self.bridge.cancel_turn();
+    }
+
     fn metrics(&self) -> Arc<H7SupervisorMetrics> {
         Arc::clone(&self.metrics)
     }
 
-    async fn execute(self: &Arc<Self>, action: Arc<PreparedProcessAction>) -> H7ToolResult {
+    pub(crate) async fn execute(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+    ) -> H7ToolResult {
         self.execute_tool_action(action).await
     }
 
@@ -5196,10 +5580,16 @@ impl H7ProcessBroker {
             .await
         {
             Ok(revision) => revision,
-            Err(_) => return H7ToolResult::denied(),
+            Err(_) => {
+                return if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                }
+            }
         };
         if cancellation.load(Ordering::Acquire) {
-            return H7ToolResult::denied();
+            return H7ToolResult::cancelled_before_start();
         }
         let authority = Arc::clone(&self.authority);
         let action_for_grant = Arc::clone(&action);
@@ -5211,7 +5601,13 @@ impl H7ProcessBroker {
         .await
         {
             Ok(Ok(grant)) => grant,
-            _ => return H7ToolResult::denied(),
+            _ => {
+                return if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                }
+            }
         };
         let preparation_action = Arc::clone(&action);
         let unlisted_inheritable_handle = self.unlisted_inheritable_handle;
@@ -5228,7 +5624,13 @@ impl H7ProcessBroker {
         .await
         {
             Ok(Ok(preparation)) => preparation,
-            _ => return H7ToolResult::denied(),
+            _ => {
+                return if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                }
+            }
         };
         if let Some(gate) = &self.final_fence_gate {
             gate.wait_if_armed().await;
@@ -5243,23 +5645,28 @@ impl H7ProcessBroker {
         let output_terminality_gate = self.output_terminality_gate.clone();
         let worker_metrics = Arc::clone(&metrics);
         let worker_admission = admission.clone();
+        let worker_cancellation = Arc::clone(&cancellation);
         match tokio::task::spawn_blocking(move || {
             let _admission = worker_admission;
             let _worker = H7NativeWorkerGuard::new(worker_metrics);
-            if cancellation.load(Ordering::Acquire) {
-                return H7ToolResult::denied();
+            if worker_cancellation.load(Ordering::Acquire) {
+                return H7ToolResult::cancelled_before_start();
             }
             let mut grant = grant;
             if authority
                 .revalidate_process_grant(&action_for_launch, &mut grant)
                 .is_err()
             {
-                return H7ToolResult::denied();
+                return if worker_cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                };
             }
-            H7ToolResult::from_native(supervise_native_prepared(
+            let native = supervise_native_prepared(
                 &action_for_launch,
                 H7NativeOptions {
-                    cancellation,
+                    cancellation: Arc::clone(&worker_cancellation),
                     metrics,
                     fault,
                     unlisted_inheritable_handle,
@@ -5269,12 +5676,31 @@ impl H7ProcessBroker {
                 },
                 preparation,
                 Some(grant),
-            ))
+            );
+            if native.kind == H7NativeOutcomeKind::Denied
+                && worker_cancellation.load(Ordering::Acquire)
+            {
+                if native.process_created {
+                    H7ToolResult::from_native(
+                        native.with_kind(H7NativeOutcomeKind::StartedAndCancelled),
+                    )
+                } else {
+                    H7ToolResult::cancelled_before_start()
+                }
+            } else {
+                H7ToolResult::from_native(native)
+            }
         })
         .await
         {
             Ok(result) => result,
-            Err(_) => H7ToolResult::denied(),
+            Err(_) => {
+                if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                }
+            }
         }
     }
 }
@@ -6112,6 +6538,7 @@ impl H7CGitStatusProfile {
             profile_id: Some(self.profile_id.clone()),
             git_metadata_fence: Some(Arc::clone(&self.git_metadata_fence)),
             git_metadata_fence_hash: Some(self.git_metadata_fence_hash.clone()),
+            sandbox: None,
         }))
     }
 

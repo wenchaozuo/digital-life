@@ -25,9 +25,7 @@ fn run() -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
-    };
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetProcessHandleCount, CREATE_BREAKAWAY_FROM_JOB,
     };
@@ -49,18 +47,42 @@ fn run() -> Result<(), String> {
     let user_profile = absolute_path(arguments.next(), "user profile fixture")?;
     let authority = absolute_path(arguments.next(), "Host authority fixture")?;
     let recovery = absolute_path(arguments.next(), "recovery fixture")?;
+    let credential = absolute_path(arguments.next(), "credential fixture")?;
     let network_target = arguments
         .next()
         .ok_or_else(|| "network target is required".to_string())?
         .to_string_lossy()
         .parse::<SocketAddr>()
         .map_err(|_| "network target is invalid".to_string())?;
-    let forbidden_handle = arguments
+    let external_network_target = arguments
         .next()
-        .ok_or_else(|| "known inheritable sentinel handle is required".to_string())?
+        .ok_or_else(|| "external network target is required".to_string())?
+        .to_string_lossy()
+        .parse::<SocketAddr>()
+        .map_err(|_| "external network target is invalid".to_string())?;
+    let credential_handle = arguments
+        .next()
+        .ok_or_else(|| "known credential handle is required".to_string())?
         .to_string_lossy()
         .parse::<usize>()
-        .map_err(|_| "known inheritable sentinel handle was invalid".to_string())?;
+        .map_err(|_| "known credential handle was invalid".to_string())?;
+    let authority_handle = arguments
+        .next()
+        .ok_or_else(|| "known authority handle is required".to_string())?
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|_| "known authority handle was invalid".to_string())?;
+    let sentinel_handle = arguments
+        .next()
+        .ok_or_else(|| "known sentinel handle is required".to_string())?
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|_| "known sentinel handle was invalid".to_string())?;
+    if credential_handle == 0 || authority_handle == 0 || sentinel_handle == 0 {
+        return Err(
+            "known authority, credential, and sentinel handles must be nonzero".to_string(),
+        );
+    }
 
     let allowed_read = bounded_read(&allowed).is_ok();
     fs::create_dir_all(&scratch).map_err(|_| "sandbox scratch root unavailable".to_string())?;
@@ -78,6 +100,7 @@ fn run() -> Result<(), String> {
     let profile_read_denied = bounded_read(&user_profile).is_err();
     let authority_read_denied = bounded_read(&authority).is_err();
     let recovery_read_denied = bounded_read(&recovery).is_err();
+    let credential_read_denied = bounded_read(&credential).is_err();
 
     // The harness owns a live listener at network_target.  Connection refused
     // is reported separately and is never folded into the sandbox-denied
@@ -98,6 +121,28 @@ fn run() -> Result<(), String> {
                 && socket
                     .recv_from(&mut response)
                     .is_ok_and(|(length, _)| &response[..length] == b"d32a-ack");
+            !echoed
+        }
+    };
+    let external_tcp_probe =
+        TcpStream::connect_timeout(&external_network_target, Duration::from_millis(250));
+    let external_tcp_refused = external_tcp_probe
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.kind() == ErrorKind::ConnectionRefused);
+    let external_tcp_denied = external_tcp_probe.is_err() && !external_tcp_refused;
+    let external_udp_denied = match UdpSocket::bind("0.0.0.0:0") {
+        Err(_) => true,
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+            let sent = socket
+                .send_to(b"d32a-external", external_network_target)
+                .is_ok();
+            let mut response = [0_u8; 32];
+            let echoed = sent
+                && socket
+                    .recv_from(&mut response)
+                    .is_ok_and(|(length, _)| &response[..length] == b"d32a-external-ack");
             !echoed
         }
     };
@@ -140,25 +185,9 @@ fn run() -> Result<(), String> {
     let mut handle_count = 0_u32;
     let handle_count_ok =
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut handle_count) } != 0;
-    let forbidden_handle_probe_denied = {
-        let handle = forbidden_handle as HANDLE;
-        let mut duplicated = std::ptr::null_mut();
-        let duplicated_ok = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                handle,
-                GetCurrentProcess(),
-                &mut duplicated,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } != 0;
-        if duplicated_ok && !duplicated.is_null() {
-            unsafe { CloseHandle(duplicated) };
-        }
-        !duplicated_ok
-    };
+    let credential_handle_probe_denied = forbidden_handle_probe_denied(credential_handle as HANDLE);
+    let authority_handle_probe_denied = forbidden_handle_probe_denied(authority_handle as HANDLE);
+    let forbidden_handle_probe_denied = forbidden_handle_probe_denied(sentinel_handle as HANDLE);
     println!(
         "{}",
         json!({
@@ -169,9 +198,13 @@ fn run() -> Result<(), String> {
             "user_profile_read_denied": profile_read_denied,
             "host_authority_read_denied": authority_read_denied,
             "recovery_read_denied": recovery_read_denied,
+            "credential_read_denied": credential_read_denied,
             "tcp_denied": tcp_denied,
             "tcp_refused": tcp_refused,
             "udp_denied": udp_denied,
+            "external_tcp_denied": external_tcp_denied,
+            "external_tcp_refused": external_tcp_refused,
+            "external_udp_denied": external_udp_denied,
             "tcp_listener_denied": tcp_listener_denied,
             "udp_listener_denied": udp_listener_denied,
             "grandchild_spawned": grandchild_spawned,
@@ -179,10 +212,37 @@ fn run() -> Result<(), String> {
             "breakaway_denied": breakaway_denied,
             "handle_count_observed": handle_count_ok,
             "handle_count": handle_count,
+            "credential_handle_probe_denied": credential_handle_probe_denied,
+            "authority_handle_probe_denied": authority_handle_probe_denied,
             "forbidden_handle_probe_denied": forbidden_handle_probe_denied,
+            "all_forbidden_handle_probes_denied": credential_handle_probe_denied
+                && authority_handle_probe_denied
+                && forbidden_handle_probe_denied,
         })
     );
     Ok(())
+}
+
+#[cfg(windows)]
+fn forbidden_handle_probe_denied(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS};
+
+    let mut duplicated = std::ptr::null_mut();
+    let duplicated_ok = unsafe {
+        DuplicateHandle(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            handle,
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            &mut duplicated,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } != 0;
+    if duplicated_ok && !duplicated.is_null() {
+        unsafe { CloseHandle(duplicated) };
+    }
+    !duplicated_ok
 }
 
 #[cfg(windows)]

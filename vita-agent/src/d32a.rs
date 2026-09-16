@@ -17,7 +17,7 @@ use sha2::Digest;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(windows)]
@@ -191,10 +191,105 @@ pub(crate) struct D32ExecutionProjection {
     pub(crate) rustc_path: PathBuf,
     pub(crate) rustdoc_path: PathBuf,
     pub(crate) toolchain_manifest_hash: String,
+    rollback: Arc<D32ProjectionRollbackState>,
+}
+
+/// Owns the app-created run root until the projection has either been handed
+/// to the H7 action or explicitly cleaned up.  This guard is intentionally
+/// independent of the async tool path: an early `?`, a panic, or a failed
+/// copy must not leave a partial app-owned projection behind.
+#[derive(Debug)]
+struct D32ProjectionRollbackState {
+    root: PathBuf,
+    armed: AtomicBool,
+    cleanup_failed: AtomicBool,
+    cleanup_failure: Mutex<Option<String>>,
+}
+
+impl D32ProjectionRollbackState {
+    fn new(root: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            armed: AtomicBool::new(true),
+            cleanup_failed: AtomicBool::new(false),
+            cleanup_failure: Mutex::new(None),
+        })
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    fn mark_cleanup_failed(&self, error: impl Into<String>) {
+        let error = error.into();
+        self.cleanup_failed.store(true, Ordering::Release);
+        if let Ok(mut failure) = self.cleanup_failure.lock() {
+            if failure.is_none() {
+                *failure = Some(error.clone());
+            }
+        }
+        eprintln!(
+            "D32 projection cleanup failed (fail-closed): root={} error={error}",
+            self.root.display(),
+        );
+    }
+}
+
+impl Drop for D32ProjectionRollbackState {
+    fn drop(&mut self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        // A reparse point or an uninspectable tree is deliberately left in
+        // place.  Removing an unsafe path during panic cleanup would turn a
+        // containment failure into an arbitrary deletion primitive.
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) if !is_reparse(&metadata) => {
+                if let Err(error) = validate_existing_tree_without_reparse(&self.root) {
+                    self.mark_cleanup_failed(error);
+                } else if let Err(error) = fs::remove_dir_all(&self.root) {
+                    self.mark_cleanup_failed(format!(
+                        "D32 run root could not be removed during rollback: {error}"
+                    ));
+                }
+            }
+            Ok(_) => self.mark_cleanup_failed("D32 run root became a reparse point"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.disarm();
+            }
+            Err(error) => self.mark_cleanup_failed(format!(
+                "D32 run root metadata was unavailable during rollback: {error}"
+            )),
+        }
+    }
 }
 
 impl D32ExecutionProjection {
     pub(crate) fn prepare(
+        app_data_root: PathBuf,
+        workspace_root: &TrustedWorkspaceRoot,
+        toolchain: Arc<D32ToolchainMirror>,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Arc<Self>, String> {
+        let projection = Self::prepare_layout(
+            app_data_root,
+            workspace_root,
+            toolchain,
+            session_id,
+            turn_id,
+            tool_call_id,
+        )?;
+        projection.populate(workspace_root)?;
+        projection.rollback.disarm();
+        Ok(projection)
+    }
+
+    /// Reserve an app-owned run layout without reading the governed
+    /// workspace.  D32's Host authority must complete its fresh D28 scope
+    /// evaluation before [`Self::populate`] snapshots any workspace bytes.
+    pub(crate) fn prepare_layout(
         app_data_root: PathBuf,
         workspace_root: &TrustedWorkspaceRoot,
         toolchain: Arc<D32ToolchainMirror>,
@@ -237,6 +332,7 @@ impl D32ExecutionProjection {
         let toolchain_root = toolchain.root.clone();
         let cargo_home = root.join(D32_CARGO_HOME_DIR_NAME);
         let target = root.join(D32_TARGET_DIR_NAME);
+        let rollback = D32ProjectionRollbackState::new(root.clone());
         for path in [&source_root, &cargo_home, &target] {
             fs::create_dir_all(path).map_err(|_| {
                 format!(
@@ -246,24 +342,6 @@ impl D32ExecutionProjection {
             })?;
         }
 
-        let mut source_limits = CopyLimits::new(D32_MAX_SOURCE_FILES, D32_MAX_SOURCE_BYTES);
-        snapshot_workspace(
-            workspace_root,
-            workspace_root.final_path(),
-            &source_root,
-            PathBuf::new(),
-            &mut source_limits,
-        )?;
-
-        if !toolchain_root.is_absolute()
-            || !toolchain_root.is_dir()
-            || !toolchain.cargo_path.is_file()
-            || !toolchain.rustc_path.is_file()
-            || !toolchain.rustdoc_path.is_file()
-        {
-            return Err("D32 app-owned toolchain mirror was incomplete".to_string());
-        }
-        let manifest_hash = toolchain.manifest_hash.clone();
         Ok(Arc::new(Self {
             root,
             source_root,
@@ -273,24 +351,73 @@ impl D32ExecutionProjection {
             cargo_path: toolchain.cargo_path.clone(),
             rustc_path: toolchain.rustc_path.clone(),
             rustdoc_path: toolchain.rustdoc_path.clone(),
-            toolchain_manifest_hash: manifest_hash,
+            toolchain_manifest_hash: toolchain.manifest_hash.clone(),
+            rollback,
         }))
+    }
+
+    /// Snapshot the currently governed workspace into the reserved app-owned
+    /// source root.  The caller invokes this only after Host D28 scope
+    /// evaluation has completed, then proceeds to confirmation and grant.
+    pub(crate) fn populate(&self, workspace_root: &TrustedWorkspaceRoot) -> Result<(), String> {
+        workspace_root
+            .verify_named_path_current()
+            .map_err(|_| "D32 governed workspace changed before staging".to_string())?;
+
+        let mut source_limits = CopyLimits::new(D32_MAX_SOURCE_FILES, D32_MAX_SOURCE_BYTES);
+        snapshot_workspace(
+            workspace_root,
+            workspace_root.final_path(),
+            &self.source_root,
+            PathBuf::new(),
+            &mut source_limits,
+        )?;
+
+        if !self.toolchain_root.is_absolute()
+            || !self.toolchain_root.is_dir()
+            || !self.cargo_path.is_file()
+            || !self.rustc_path.is_file()
+            || !self.rustdoc_path.is_file()
+        {
+            return Err("D32 app-owned toolchain mirror was incomplete".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn cleanup(&self) -> Result<(), String> {
         match fs::symlink_metadata(&self.root) {
             Ok(metadata) => {
                 if is_reparse(&metadata) {
-                    return Err("D32 run root became a reparse point".to_string());
+                    let error = "D32 run root became a reparse point".to_string();
+                    self.rollback.mark_cleanup_failed(error.clone());
+                    return Err(error);
                 }
-                validate_existing_tree_without_reparse(&self.root)?;
-                fs::remove_dir_all(&self.root)
-                    .map_err(|_| "D32 run root could not be cleaned".to_string())?;
+                if let Err(error) = validate_existing_tree_without_reparse(&self.root) {
+                    self.rollback.mark_cleanup_failed(error.clone());
+                    return Err(error);
+                }
+                if let Err(error) = fs::remove_dir_all(&self.root) {
+                    let error = format!("D32 run root could not be cleaned: {error}");
+                    self.rollback.mark_cleanup_failed(error.clone());
+                    return Err(error);
+                }
+                self.rollback.disarm();
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("D32 run root metadata was unavailable".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.rollback.disarm();
+            }
+            Err(error) => {
+                let error = format!("D32 run root metadata was unavailable: {error}");
+                self.rollback.mark_cleanup_failed(error.clone());
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn cleanup_failed(&self) -> bool {
+        self.rollback.cleanup_failed.load(Ordering::Acquire)
     }
 }
 
@@ -853,7 +980,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     .and_then(|raw| serde_json::from_str::<CargoCheckArguments>(raw).ok()),
             ) {
                 (Some(inner), true, Some(call_id), Some(turn_id), Some(_)) => {
-                    let projection = D32ExecutionProjection::prepare(
+                    // Reserve only app-owned directories first.  The governed
+                    // workspace remains unread until Host has performed its
+                    // canonical D28 scope evaluation below.
+                    let projection = D32ExecutionProjection::prepare_layout(
                         inner.app_data_root.clone(),
                         &inner.workspace_root,
                         Arc::clone(&inner.toolchain),
@@ -880,7 +1010,9 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     ) {
                         Ok(catalog) => Arc::new(catalog),
                         Err(_error) => {
-                            let _ = projection.cleanup();
+                            if let Err(error) = projection.cleanup() {
+                                eprintln!("D32 catalog cleanup denied: {error}");
+                            }
                             return Ok(Box::new(JsonToolOutput::with_success(
                                 denied_value(),
                                 Some(false),
@@ -892,7 +1024,9 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         .grant_execution_root(&projection.root, &projection.toolchain_root)
                         .is_err()
                     {
-                        let _ = projection.cleanup();
+                        if let Err(error) = projection.cleanup() {
+                            eprintln!("D32 sandbox cleanup denied: {error}");
+                        }
                         return Ok(Box::new(JsonToolOutput::with_success(
                             denied_value(),
                             Some(false),
@@ -919,21 +1053,30 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         Arc::clone(&inner.sandbox),
                     ) {
                         Ok(action) => {
-                            if let Ok(mut active) = inner.active_broker.lock() {
-                                *active = Some(Arc::clone(&broker));
-                            }
-                            let result = broker.execute(action).await;
-                            if let Ok(mut active) = inner.active_broker.lock() {
-                                if active
-                                    .as_ref()
-                                    .is_some_and(|current| Arc::ptr_eq(current, &broker))
-                                {
-                                    *active = None;
+                            // D28 scope evaluation is the first Host-owned
+                            // operation.  Only after it completes may the
+                            // projection read the governed workspace.
+                            if inner.authority.evaluate_workspace_scope(&action).is_err()
+                                || projection.populate(&inner.workspace_root).is_err()
+                            {
+                                denied_value()
+                            } else {
+                                if let Ok(mut active) = inner.active_broker.lock() {
+                                    *active = Some(Arc::clone(&broker));
                                 }
+                                let result = broker.execute(action).await;
+                                if let Ok(mut active) = inner.active_broker.lock() {
+                                    if active
+                                        .as_ref()
+                                        .is_some_and(|current| Arc::ptr_eq(current, &broker))
+                                    {
+                                        *active = None;
+                                    }
+                                }
+                                #[cfg(feature = "d32-a-test-helper")]
+                                record_internal_evidence(result.internal_process_evidence());
+                                result.cargo_value()
                             }
-                            #[cfg(feature = "d32-a-test-helper")]
-                            record_internal_evidence(result.internal_process_evidence());
-                            result.cargo_value()
                         }
                         Err(_error) => denied_value(),
                     };
@@ -944,10 +1087,11 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     // child Job has reached terminal state.
                     drop(broker);
                     drop(catalog);
-                    if projection.cleanup().is_err() {
+                    if let Err(error) = projection.cleanup() {
                         // A terminal run must not be reported as a successful
                         // Cargo result while its app-owned run root is still
                         // present or has become unsafe to remove.
+                        eprintln!("D32 terminal cleanup denied: {error}");
                         denied_value()
                     } else {
                         result
@@ -1027,5 +1171,46 @@ mod tests {
                 "telemetry leaked: {forbidden}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn projection_copy_failure_rolls_back_partial_run_root() {
+        let app_data = tempfile::tempdir().expect("D32 projection app data");
+        let workspace = tempfile::tempdir().expect("D32 projection workspace");
+        fs::write(workspace.path().join("Cargo.toml"), b"[package]\n").expect("manifest");
+        let trusted = TrustedWorkspaceRoot::acquire(workspace.path()).expect("trusted root");
+        let toolchain = tempfile::tempdir().expect("D32 projection toolchain");
+        fs::create_dir_all(toolchain.path().join("bin")).expect("toolchain bin");
+        let cargo = toolchain.path().join("bin/cargo.exe");
+        let rustc = toolchain.path().join("bin/rustc.exe");
+        let rustdoc = toolchain.path().join("bin/rustdoc.exe");
+        for path in [&cargo, &rustc, &rustdoc] {
+            fs::write(path, b"fixture").expect("toolchain image");
+        }
+        let mirror = Arc::new(D32ToolchainMirror {
+            root: toolchain.path().to_path_buf(),
+            cargo_path: cargo.clone(),
+            rustc_path: rustc,
+            rustdoc_path: rustdoc,
+            manifest_hash: "0".repeat(64),
+        });
+        let projection = D32ExecutionProjection::prepare_layout(
+            app_data.path().to_path_buf(),
+            &trusted,
+            mirror,
+            "d32-test-session",
+            "d32-test-turn",
+            "d32-test-call",
+        )
+        .expect("projection layout");
+        let run_root = projection.root.clone();
+        fs::remove_file(cargo).expect("remove toolchain image for deterministic failure");
+        assert!(projection.populate(&trusted).is_err());
+        drop(projection);
+        assert!(
+            !run_root.exists(),
+            "partial D32 projection root survived a copy failure"
+        );
     }
 }

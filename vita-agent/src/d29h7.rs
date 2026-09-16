@@ -2121,8 +2121,12 @@ struct H7NativeResult {
     exit_code: Option<u32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    real_sandbox_evidence_checked: bool,
+    real_sandbox_evidence_failed: bool,
+    job_termination_attempted: bool,
     job_terminated: bool,
     process_tree_observed: bool,
+    process_tree_observer_failed: bool,
     process_tree_remaining: usize,
     automatic_retry: bool,
     direct_termination_attempted: bool,
@@ -3302,6 +3306,7 @@ struct H7CleanupEvidence {
     job_termination_proven: AtomicBool,
     process_exit_verified: AtomicBool,
     process_tree_observed: AtomicBool,
+    process_tree_observer_failed: AtomicBool,
     process_tree_remaining: AtomicUsize,
     stdout_reader_joined: AtomicBool,
     stderr_reader_joined: AtomicBool,
@@ -3317,6 +3322,8 @@ struct H7NativeResources {
     cleanup: Arc<H7CleanupEvidence>,
     job_assigned: bool,
     job_terminated: bool,
+    #[cfg(test)]
+    force_process_tree_observer_failure: bool,
 }
 
 impl H7NativeResources {
@@ -3349,6 +3356,17 @@ impl H7NativeResources {
     }
 
     fn observe_process_tree(&self) -> Option<usize> {
+        #[cfg(test)]
+        if self.force_process_tree_observer_failure {
+            // Test-only fault injection models QueryInformationJobObject
+            // failing after a real process has been launched.  The caller
+            // must treat the containment observation as unproven and fail
+            // closed; it must never synthesize a zero-process result.
+            self.cleanup
+                .process_tree_observer_failed
+                .store(true, Ordering::Release);
+            return None;
+        }
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         let mut returned_length = 0_u32;
         let ok = unsafe {
@@ -3361,6 +3379,9 @@ impl H7NativeResources {
             )
         } != 0;
         if !ok {
+            self.cleanup
+                .process_tree_observer_failed
+                .store(true, Ordering::Release);
             return None;
         }
         let remaining = accounting.ActiveProcesses as usize;
@@ -3637,7 +3658,7 @@ impl H7LaunchPreparation {
     fn final_local_fence(
         &mut self,
         action: &PreparedProcessAction,
-        grant: &H7ProcessGrant,
+        grant: &mut H7ProcessGrant,
         cancellation: &AtomicBool,
         mutation: H7PostHostMutation,
     ) -> Result<(), String> {
@@ -3663,10 +3684,16 @@ impl H7LaunchPreparation {
             || grant.binding != current_binding
             || grant.authorization_revision <= 0
             || !grant.used
+            || grant.launch_consumed
         {
             return Err("H7 local final binding fence rejected the ProcessGrant".to_string());
         }
-        self.final_native_fence(action, cancellation, mutation)
+        self.final_native_fence(action, cancellation, mutation)?;
+        // The Host's single-use consumption authorizes exactly one native
+        // launch.  Mark it consumed before any later gate or CreateProcessW
+        // edge so a replay cannot reach the process boundary.
+        grant.launch_consumed = true;
+        Ok(())
     }
 
     fn final_native_fence(
@@ -3737,6 +3764,10 @@ struct H7NativeOptions {
     post_host_mutation: H7PostHostMutation,
     pre_create_process_gate: Option<Arc<H7PostHostFenceGate>>,
     output_terminality_gate: Option<Arc<H7TerminalityGate>>,
+    #[cfg(test)]
+    post_create_resume_gate: Option<Arc<H7PostCreateResumeFenceGate>>,
+    #[cfg(test)]
+    force_process_tree_observer_failure: bool,
 }
 
 fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) -> H7NativeResult {
@@ -3753,11 +3784,87 @@ fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) ->
     supervise_native_prepared(action, options, preparation, None)
 }
 
+/// The freeze canary drives the real D32 Host -> Vita -> Cargo chain with a
+/// build-script workload that invokes the adversarial fixture.  Keep the
+/// fixture's bounded JSON out of the public tool result, but validate every
+/// containment assertion at the native process boundary.  A missing,
+/// malformed, or negative observation is therefore a denial rather than a
+/// successful Cargo completion.
+fn validate_d32_real_sandbox_evidence(
+    action: &PreparedProcessAction,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<bool, String> {
+    if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1")
+        || action.profile_id.as_deref() != Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
+    {
+        return Ok(false);
+    }
+    let mut combined = String::from_utf8_lossy(stdout).into_owned();
+    combined.push('\n');
+    combined.push_str(&String::from_utf8_lossy(stderr));
+    let marker = "D32A_SANDBOX_OBSERVATION=";
+    let line = combined
+        .lines()
+        .rev()
+        .find_map(|line| line.split_once(marker).map(|(_, value)| value.trim()))
+        .ok_or_else(|| "Cargo output omitted D32A_SANDBOX_OBSERVATION".to_string())?;
+    let observation: Value = serde_json::from_str(line)
+        .map_err(|error| format!("D32A sandbox observation was not JSON: {error}"))?;
+    for (field, expected) in [
+        ("allowed_read", true),
+        ("scratch_write", true),
+        ("outside_read_denied", true),
+        ("outside_write_denied", true),
+        ("user_profile_read_denied", true),
+        ("host_authority_read_denied", true),
+        ("recovery_read_denied", true),
+        ("credential_read_denied", true),
+        ("tcp_denied", true),
+        ("tcp_refused", false),
+        ("udp_denied", true),
+        ("external_tcp_denied", true),
+        ("external_tcp_refused", false),
+        ("external_udp_denied", true),
+        ("tcp_listener_denied", true),
+        ("udp_listener_denied", true),
+        ("grandchild_spawned", true),
+        ("grandchild_alive_after_probe", true),
+        ("breakaway_denied", true),
+        ("handle_count_observed", true),
+        ("credential_handle_probe_denied", true),
+        ("authority_handle_probe_denied", true),
+        ("forbidden_handle_probe_denied", true),
+        ("all_forbidden_handle_probes_denied", true),
+    ] {
+        if observation.get(field).and_then(Value::as_bool) != Some(expected) {
+            return Err(format!(
+                "D32A sandbox assertion {field} expected {expected}, observation={observation}"
+            ));
+        }
+    }
+    let handle_count = observation
+        .get("handle_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "D32A sandbox observation omitted handle_count".to_string())?;
+    if handle_count > 32 {
+        return Err(format!(
+            "D32A sandbox inherited handle count exceeded bound: {handle_count}"
+        ));
+    }
+    Ok(true)
+}
+
+fn d32_real_canary_replay_required(action: &PreparedProcessAction) -> bool {
+    std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
+        && action.profile_id.as_deref() == Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
+}
+
 fn supervise_native_prepared(
     action: &PreparedProcessAction,
     options: H7NativeOptions,
     preparation: H7LaunchPreparation,
-    grant: Option<H7ProcessGrant>,
+    mut grant: Option<H7ProcessGrant>,
 ) -> H7NativeResult {
     let phase = Arc::new(AtomicU8::new(H7LaunchPhase::NotStarted as u8));
     let cleanup = Arc::new(H7CleanupEvidence::default());
@@ -3768,7 +3875,7 @@ fn supervise_native_prepared(
             Arc::clone(&phase),
             Arc::clone(&cleanup),
             preparation,
-            grant.as_ref(),
+            grant.as_mut(),
         )
     }));
     match result {
@@ -3784,7 +3891,13 @@ fn supervise_native_prepared(
             exit_code: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            real_sandbox_evidence_checked: false,
+            real_sandbox_evidence_failed: false,
+            job_termination_attempted: cleanup.job_termination_attempted.load(Ordering::Acquire),
             job_terminated: cleanup.job_termination_proven.load(Ordering::Acquire),
+            process_tree_observer_failed: cleanup
+                .process_tree_observer_failed
+                .load(Ordering::Acquire),
             process_tree_remaining: if cleanup.process_tree_observed.load(Ordering::Acquire) {
                 cleanup.process_tree_remaining.load(Ordering::Acquire)
             } else if phase_at_least(&phase, H7LaunchPhase::CreatedSuspended) {
@@ -3818,7 +3931,7 @@ fn supervise_native_inner(
     phase: Arc<AtomicU8>,
     cleanup: Arc<H7CleanupEvidence>,
     mut preparation: H7LaunchPreparation,
-    grant: Option<&H7ProcessGrant>,
+    grant: Option<&mut H7ProcessGrant>,
 ) -> H7NativeResult {
     if options.cancellation.load(Ordering::Acquire) {
         return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
@@ -3975,6 +4088,8 @@ fn supervise_native_inner(
         cleanup: Arc::clone(&cleanup),
         job_assigned: false,
         job_terminated: false,
+        #[cfg(test)]
+        force_process_tree_observer_failure: options.force_process_tree_observer_failure,
     };
     cleanup.stdout_reader_joined.store(true, Ordering::Release);
     cleanup.stderr_reader_joined.store(true, Ordering::Release);
@@ -4008,6 +4123,13 @@ fn supervise_native_inner(
     resources.job_assigned = true;
     options.metrics.job_assigned.fetch_add(1, Ordering::AcqRel);
     phase.store(H7LaunchPhase::AssignedJob as u8, Ordering::Release);
+    #[cfg(test)]
+    if let Some(gate) = options.post_create_resume_gate.as_ref() {
+        // Test-only synchronization point for the exact
+        // CreateProcessW -> cancellation-load -> ResumeThread interval.
+        // Production never installs this gate.
+        gate.wait_if_armed_blocking();
+    }
     // The child remains suspended until this last cancellation observation.
     // If a turn/session cancellation wins after CreateProcessW but before the
     // resume syscall, terminate the contained job and report a pre-start
@@ -4219,6 +4341,17 @@ fn supervise_native_inner(
     {
         let _ = resources.terminate_assigned_job();
     }
+    // QueryInformationJobObject can fail after the primary process has
+    // already signalled.  Exited is therefore not a cleanup exemption: the
+    // assigned Job must still receive an explicit bounded termination call so
+    // descendants cannot outlive the supervisor merely because the observer
+    // lost its evidence path.
+    if cleanup.process_tree_observer_failed.load(Ordering::Acquire)
+        && resources.job_assigned
+        && !cleanup.job_termination_attempted.load(Ordering::Acquire)
+    {
+        let _ = resources.terminate_assigned_job();
+    }
     let exit_code = if process_exit_verified {
         let mut code = 0_u32;
         (unsafe { GetExitCodeProcess(resources.process.raw(), &mut code) } != 0).then_some(code)
@@ -4243,14 +4376,32 @@ fn supervise_native_inner(
     let stderr_retained_bytes = stderr_capture.retained_len();
     let stdout = std::mem::take(&mut stdout_capture.bytes);
     let stderr = std::mem::take(&mut stderr_capture.bytes);
+    let (real_sandbox_evidence_checked, real_sandbox_evidence_failed) =
+        match validate_d32_real_sandbox_evidence(action, &stdout, &stderr) {
+            Ok(checked) => (checked, false),
+            Err(error) => {
+                eprintln!("D32 real sandbox evidence failed closed: {error}");
+                diagnostics.final_local_fence_error_category = Some("sandbox_evidence".to_string());
+                (true, true)
+            }
+        };
     drop(stdout_capture);
     drop(stderr_capture);
     drop(_output_handle_guard);
     let termination_unproven = ((cancelled || timed_out || (output_limited && !process_signaled))
         && !resources.job_terminated)
         || output_failure
-        || !output_cleanup_bounded;
-    let kind = if termination_unproven {
+        || !output_cleanup_bounded
+        || cleanup.process_tree_observer_failed.load(Ordering::Acquire)
+        || real_sandbox_evidence_failed;
+    let kind = if cleanup.process_tree_observer_failed.load(Ordering::Acquire) {
+        // A failed QueryInformationJobObject observation is never an
+        // "unknown but usable" outcome.  The supervisor must report denial
+        // and retain fail-closed cleanup evidence.
+        H7NativeOutcomeKind::Denied
+    } else if real_sandbox_evidence_failed {
+        H7NativeOutcomeKind::Denied
+    } else if termination_unproven {
         H7NativeOutcomeKind::StartedOutcomeUnknown
     } else if output_limited {
         H7NativeOutcomeKind::StartedAndOutputLimited
@@ -4270,8 +4421,12 @@ fn supervise_native_inner(
         exit_code,
         stdout,
         stderr,
+        real_sandbox_evidence_checked,
+        real_sandbox_evidence_failed,
+        job_termination_attempted: cleanup.job_termination_attempted.load(Ordering::Acquire),
         job_terminated: resources.job_terminated,
         process_tree_observed: cleanup.process_tree_observed.load(Ordering::Acquire),
+        process_tree_observer_failed: cleanup.process_tree_observer_failed.load(Ordering::Acquire),
         process_tree_remaining,
         automatic_retry: false,
         direct_termination_attempted: cleanup.direct_termination_attempted.load(Ordering::Acquire),
@@ -4335,6 +4490,7 @@ fn launch_failed(
     let (
         job_terminated,
         process_tree_observed,
+        process_tree_observer_failed,
         process_tree_remaining,
         direct_termination_attempted,
         direct_termination_verified,
@@ -4342,11 +4498,12 @@ fn launch_failed(
         stdout_reader_joined,
         stderr_reader_joined,
     ) = cleanup.map_or(
-        (false, false, 0, false, false, false, true, true),
+        (false, false, false, 0, false, false, false, true, true),
         |cleanup| {
             (
                 cleanup.job_termination_proven.load(Ordering::Acquire),
                 cleanup.process_tree_observed.load(Ordering::Acquire),
+                cleanup.process_tree_observer_failed.load(Ordering::Acquire),
                 if cleanup.process_tree_observed.load(Ordering::Acquire) {
                     cleanup.process_tree_remaining.load(Ordering::Acquire)
                 } else if process_created {
@@ -4369,8 +4526,14 @@ fn launch_failed(
         exit_code: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
+        real_sandbox_evidence_checked: false,
+        real_sandbox_evidence_failed: false,
+        job_termination_attempted: cleanup
+            .map(|cleanup| cleanup.job_termination_attempted.load(Ordering::Acquire))
+            .unwrap_or(false),
         job_terminated,
         process_tree_observed,
+        process_tree_observer_failed,
         process_tree_remaining,
         automatic_retry: false,
         direct_termination_attempted,
@@ -4856,27 +5019,14 @@ fn d32_sandbox_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
     if executable.is_file() && executable_is_fresh {
         return Ok(executable);
     }
-    let status = Command::new("cargo")
-        .current_dir(repo_root)
-        .args(["build", "--quiet", "--locked", "--manifest-path"])
-        .arg(repo_root.join("vita-agent").join("Cargo.toml"))
-        .args([
-            "--bin",
-            "d32a-sandbox-fixture",
-            "--features",
-            "d32-a-test-helper",
-        ])
-        .env("CARGO_BUILD_JOBS", "1")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_TERM_COLOR", "never")
-        .status()
-        .map_err(|error| format!("build D32-A sandbox fixture: {error}"))?;
-    if !status.success() || !executable.is_file() {
-        return Err("D32-A sandbox fixture executable was not produced".to_string());
-    }
-    Ok(executable)
+    Err(format!(
+        "D32-A sandbox fixture is missing or stale: {}; prebuild with `cargo build --locked --manifest-path {} --bin d32a-sandbox-fixture --features d32-a-test-helper`",
+        executable.display(),
+        repo_root.join("vita-agent").join("Cargo.toml").display()
+    ))
 }
 
+#[derive(Clone)]
 pub struct H7ProcessGrant {
     grant_id: String,
     confirmation_id: String,
@@ -4886,6 +5036,7 @@ pub struct H7ProcessGrant {
     expires_at_unix_ms: u64,
     single_use: bool,
     used: bool,
+    launch_consumed: bool,
 }
 
 impl H7ProcessGrant {
@@ -4911,6 +5062,7 @@ impl H7ProcessGrant {
             expires_at_unix_ms,
             single_use,
             used,
+            launch_consumed: false,
         }
     }
 
@@ -5360,6 +5512,7 @@ impl H7Authority {
             expires_at_unix_ms: grant.expires_at_unix_ms,
             single_use: grant.single_use,
             used: grant.used,
+            launch_consumed: false,
         })
     }
 
@@ -5703,6 +5856,52 @@ struct H7PostHostFenceGate {
     entered_notify: Notify,
 }
 
+#[cfg(test)]
+struct H7PostCreateResumeFenceGate {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_notify: Notify,
+}
+
+#[cfg(test)]
+impl H7PostCreateResumeFenceGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+        })
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_entered(&self) {
+        if self.entered.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered_notify.notified().await;
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    fn wait_if_armed_blocking(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
+}
+
 impl H7PostHostFenceGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -5790,8 +5989,18 @@ pub(crate) struct H7ToolResult {
     stderr: String,
     timed_out: bool,
     cancelled: bool,
+    real_sandbox_evidence_checked: bool,
+    real_sandbox_evidence_failed: bool,
+    d32_replay_checked: bool,
+    d32_replay_denied: bool,
+    d32_replay_process_created_before: usize,
+    d32_replay_thread_resumed_before: usize,
+    d32_replay_process_created_after: usize,
+    d32_replay_thread_resumed_after: usize,
+    job_termination_attempted: bool,
     job_terminated: bool,
     process_tree_observed: bool,
+    process_tree_observer_failed: bool,
     process_tree_remaining: usize,
     direct_termination_attempted: bool,
     direct_termination_verified: bool,
@@ -5820,8 +6029,18 @@ impl H7ToolResult {
             stderr: String::new(),
             timed_out: false,
             cancelled: false,
+            real_sandbox_evidence_checked: false,
+            real_sandbox_evidence_failed: false,
+            d32_replay_checked: false,
+            d32_replay_denied: false,
+            d32_replay_process_created_before: 0,
+            d32_replay_thread_resumed_before: 0,
+            d32_replay_process_created_after: 0,
+            d32_replay_thread_resumed_after: 0,
+            job_termination_attempted: false,
             job_terminated: false,
             process_tree_observed: false,
+            process_tree_observer_failed: false,
             process_tree_remaining: 0,
             direct_termination_attempted: false,
             direct_termination_verified: false,
@@ -5862,8 +6081,18 @@ impl H7ToolResult {
             stderr: String::from_utf8_lossy(&native.stderr).into_owned(),
             timed_out: native.kind == H7NativeOutcomeKind::StartedAndTimedOut,
             cancelled: native.kind == H7NativeOutcomeKind::StartedAndCancelled,
+            real_sandbox_evidence_checked: native.real_sandbox_evidence_checked,
+            real_sandbox_evidence_failed: native.real_sandbox_evidence_failed,
+            d32_replay_checked: false,
+            d32_replay_denied: false,
+            d32_replay_process_created_before: 0,
+            d32_replay_thread_resumed_before: 0,
+            d32_replay_process_created_after: 0,
+            d32_replay_thread_resumed_after: 0,
+            job_termination_attempted: native.job_termination_attempted,
             job_terminated: native.job_terminated,
             process_tree_observed: native.process_tree_observed,
+            process_tree_observer_failed: native.process_tree_observer_failed,
             process_tree_remaining: native.process_tree_remaining,
             direct_termination_attempted: native.direct_termination_attempted,
             direct_termination_verified: native.direct_termination_verified,
@@ -5921,8 +6150,18 @@ impl H7ToolResult {
             "process_created": self.process_created,
             "user_code_started": self.user_code_started,
             "process_tree_remaining": self.process_tree_remaining,
+            "real_sandbox_evidence_checked": self.real_sandbox_evidence_checked,
+            "real_sandbox_evidence_failed": self.real_sandbox_evidence_failed,
+            "d32_replay_checked": self.d32_replay_checked,
+            "d32_replay_denied": self.d32_replay_denied,
+            "d32_replay_process_created_before": self.d32_replay_process_created_before,
+            "d32_replay_thread_resumed_before": self.d32_replay_thread_resumed_before,
+            "d32_replay_process_created_after": self.d32_replay_process_created_after,
+            "d32_replay_thread_resumed_after": self.d32_replay_thread_resumed_after,
+            "job_termination_attempted": self.job_termination_attempted,
             "job_terminated": self.job_terminated,
             "process_tree_observed": self.process_tree_observed,
+            "process_tree_observer_failed": self.process_tree_observer_failed,
             "process_exit_verified": self.process_exit_verified,
             "thread_resumed": self.process_created && self.user_code_started,
             "final_local_fence_error_category": self
@@ -6055,6 +6294,8 @@ pub(crate) struct H7ProcessBroker {
     metrics: Arc<H7SupervisorMetrics>,
     final_fence_gate: Option<Arc<H7FinalFenceGate>>,
     post_host_gate: Option<Arc<H7PostHostFenceGate>>,
+    #[cfg(test)]
+    post_create_resume_gate: Option<Arc<H7PostCreateResumeFenceGate>>,
     native_fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
@@ -6078,6 +6319,8 @@ impl H7ProcessBroker {
             metrics: Arc::new(H7SupervisorMetrics::default()),
             final_fence_gate: None,
             post_host_gate: None,
+            #[cfg(test)]
+            post_create_resume_gate: None,
             native_fault: H7NativeLaunchFault::None,
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
@@ -6103,6 +6346,17 @@ impl H7ProcessBroker {
         Arc::get_mut(&mut self)
             .expect("H7 post-Host gate must be installed before sharing broker")
             .post_host_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_post_create_resume_gate(
+        mut self: Arc<Self>,
+        gate: Arc<H7PostCreateResumeFenceGate>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("H7 post-create resume gate must be installed before sharing broker")
+            .post_create_resume_gate = Some(gate);
         self
     }
 
@@ -6295,6 +6549,8 @@ impl H7ProcessBroker {
         let pre_create_process_gate = self.post_host_gate.clone();
         let post_host_mutation = self.post_host_mutation;
         let output_terminality_gate = self.output_terminality_gate.clone();
+        #[cfg(test)]
+        let post_create_resume_gate = self.post_create_resume_gate.clone();
         let worker_metrics = Arc::clone(&metrics);
         let worker_admission = admission.clone();
         let worker_cancellation = Arc::clone(&cancellation);
@@ -6313,6 +6569,35 @@ impl H7ProcessBroker {
                     H7ToolResult::denied()
                 };
             }
+            let mut d32_replay_checked = false;
+            let mut d32_replay_denied = false;
+            let mut d32_replay_process_created_before = 0usize;
+            let mut d32_replay_thread_resumed_before = 0usize;
+            let mut d32_replay_process_created_after = 0usize;
+            let mut d32_replay_thread_resumed_after = 0usize;
+            if d32_real_canary_replay_required(&action_for_launch) {
+                d32_replay_checked = true;
+                let mut replay_grant = grant.clone();
+                d32_replay_process_created_before = metrics.process_created.load(Ordering::Acquire);
+                d32_replay_thread_resumed_before = metrics.thread_resumed.load(Ordering::Acquire);
+                if d32_replay_process_created_before != 0 || d32_replay_thread_resumed_before != 0 {
+                    return H7ToolResult::denied();
+                }
+                let replay_result =
+                    authority.revalidate_process_grant(&action_for_launch, &mut replay_grant);
+                d32_replay_process_created_after = metrics.process_created.load(Ordering::Acquire);
+                d32_replay_thread_resumed_after = metrics.thread_resumed.load(Ordering::Acquire);
+                if d32_replay_process_created_after != d32_replay_process_created_before
+                    || d32_replay_thread_resumed_after != d32_replay_thread_resumed_before
+                {
+                    return H7ToolResult::denied();
+                }
+                if replay_result.is_err() {
+                    d32_replay_denied = true;
+                } else {
+                    return H7ToolResult::denied();
+                }
+            }
             let native = supervise_native_prepared(
                 &action_for_launch,
                 H7NativeOptions {
@@ -6323,11 +6608,15 @@ impl H7ProcessBroker {
                     post_host_mutation,
                     pre_create_process_gate,
                     output_terminality_gate,
+                    #[cfg(test)]
+                    post_create_resume_gate,
+                    #[cfg(test)]
+                    force_process_tree_observer_failure: false,
                 },
                 preparation,
                 Some(grant),
             );
-            if native.kind == H7NativeOutcomeKind::Denied
+            let mut tool_result = if native.kind == H7NativeOutcomeKind::Denied
                 && worker_cancellation.load(Ordering::Acquire)
             {
                 if native.process_created {
@@ -6339,7 +6628,14 @@ impl H7ProcessBroker {
                 }
             } else {
                 H7ToolResult::from_native(native)
-            }
+            };
+            tool_result.d32_replay_checked = d32_replay_checked;
+            tool_result.d32_replay_denied = d32_replay_denied;
+            tool_result.d32_replay_process_created_before = d32_replay_process_created_before;
+            tool_result.d32_replay_thread_resumed_before = d32_replay_thread_resumed_before;
+            tool_result.d32_replay_process_created_after = d32_replay_process_created_after;
+            tool_result.d32_replay_thread_resumed_after = d32_replay_thread_resumed_after;
+            tool_result
         })
         .await
         {
@@ -6741,6 +7037,10 @@ impl H7BWorkspaceProcessBroker {
                     post_host_mutation: H7PostHostMutation::None,
                     pre_create_process_gate: None,
                     output_terminality_gate: None,
+                    #[cfg(test)]
+                    post_create_resume_gate: None,
+                    #[cfg(test)]
+                    force_process_tree_observer_failure: false,
                 },
                 preparation,
                 Some(grant),
@@ -7759,6 +8059,10 @@ impl H7CGitStatusBroker {
                     post_host_mutation: H7PostHostMutation::None,
                     pre_create_process_gate: None,
                     output_terminality_gate: None,
+                    #[cfg(test)]
+                    post_create_resume_gate: None,
+                    #[cfg(test)]
+                    force_process_tree_observer_failure: false,
                 },
                 preparation,
                 Some(grant),
@@ -8100,6 +8404,20 @@ mod tests {
                 Arc::clone(&self.bridge),
             )
             .with_post_host_gate(gate)
+        }
+
+        #[cfg(test)]
+        fn broker_with_post_create_resume_gate(
+            &self,
+            gate: Arc<H7PostCreateResumeFenceGate>,
+        ) -> Arc<H7ProcessBroker> {
+            H7ProcessBroker::new(
+                self.broker.context.clone(),
+                Arc::clone(&self.catalog),
+                self.authority.clone(),
+                Arc::clone(&self.bridge),
+            )
+            .with_post_create_resume_gate(gate)
         }
 
         fn broker_with_post_host_mutation(
@@ -10270,6 +10588,8 @@ mod tests {
             post_host_mutation: H7PostHostMutation::None,
             pre_create_process_gate: None,
             output_terminality_gate: None,
+            post_create_resume_gate: None,
+            force_process_tree_observer_failure: false,
         }
     }
 
@@ -10502,7 +10822,21 @@ mod tests {
         let toolchain = execution_root.path().join("toolchain");
         fs::create_dir_all(&toolchain).expect("D32-A fixture toolchain root");
         let staged_fixture = toolchain.join("d32a-sandbox-fixture.exe");
-        fs::copy(&fixture, &staged_fixture).expect("D32-A stage sandbox fixture image");
+        let fixture_size = fs::metadata(&fixture)
+            .expect("D32-A sandbox fixture metadata")
+            .len();
+        let fixture_hash = hash_d32_toolchain_file(&fixture).expect("D32-A sandbox fixture hash");
+        let staged_size =
+            fs::copy(&fixture, &staged_fixture).expect("D32-A stage sandbox fixture image");
+        assert_eq!(
+            staged_size, fixture_size,
+            "D32-A staged fixture was truncated"
+        );
+        assert_eq!(
+            hash_d32_toolchain_file(&staged_fixture).expect("D32-A staged fixture hash"),
+            fixture_hash,
+            "D32-A staged fixture changed before execution"
+        );
         let allowed = execution_root.path().join("source");
         let scratch = execution_root.path().join("target");
         fs::create_dir_all(&allowed).expect("D32-A fixture source root");
@@ -10514,8 +10848,30 @@ mod tests {
         let user_profile = tempdir().expect("D32-A fixture user profile");
         let authority = tempdir().expect("D32-A fixture authority root");
         let recovery = tempdir().expect("D32-A fixture recovery root");
+        let credential = tempdir().expect("D32-A fixture credential root");
+        let credential_path = credential.path().join("credential.bin");
+        fs::write(&credential_path, b"credential").expect("D32-A fixture credential");
+        let authority_path = authority.path().join("authority.txt");
+        fs::write(&authority_path, b"authority").expect("D32-A fixture authority");
         let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("D32-A TCP listener");
         let network_target = tcp_listener.local_addr().expect("D32-A TCP address");
+        // The external-network lane must target a live, controlled endpoint.
+        // An unroutable documentation address would conflate policy denial
+        // with ordinary timeout/refusal and cannot be freeze evidence.
+        let route_probe = UdpSocket::bind("0.0.0.0:0").expect("D32-A route probe");
+        route_probe
+            .connect(("192.0.2.1", 9))
+            .expect("D32-A route probe connect");
+        let external_ip = route_probe
+            .local_addr()
+            .expect("D32-A route probe address")
+            .ip();
+        assert!(!external_ip.is_loopback() && !external_ip.is_unspecified());
+        let external_tcp_listener =
+            TcpListener::bind((external_ip, 0)).expect("D32-A external TCP listener");
+        let external_network_target: SocketAddr = external_tcp_listener
+            .local_addr()
+            .expect("D32-A external TCP address");
         let udp_receiver = UdpSocket::bind(network_target).expect("D32-A UDP receiver");
         let udp_echo = udp_receiver.try_clone().expect("D32-A UDP receiver clone");
         udp_echo
@@ -10526,6 +10882,24 @@ mod tests {
             match udp_echo.recv_from(&mut buffer) {
                 Ok((length, peer)) if &buffer[..length] == b"d32a" => {
                     let _ = udp_echo.send_to(b"d32a-ack", peer);
+                    true
+                }
+                _ => false,
+            }
+        });
+        let external_udp_receiver =
+            UdpSocket::bind(external_network_target).expect("D32-A external UDP receiver");
+        let external_udp_echo = external_udp_receiver
+            .try_clone()
+            .expect("D32-A external UDP receiver clone");
+        external_udp_echo
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("D32-A external UDP receiver timeout");
+        let external_udp_echo_task = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 64];
+            match external_udp_echo.recv_from(&mut buffer) {
+                Ok((length, peer)) if &buffer[..length] == b"d32a-external" => {
+                    let _ = external_udp_echo.send_to(b"d32a-external-ack", peer);
                     true
                 }
                 _ => false,
@@ -10544,6 +10918,19 @@ mod tests {
             },
             0
         );
+        let credential_handle_file = File::open(&credential_path).expect("D32-A credential handle");
+        let authority_handle_file = File::open(&authority_path).expect("D32-A authority handle");
+        let credential_raw = credential_handle_file.as_raw_handle() as usize;
+        let authority_raw = authority_handle_file.as_raw_handle() as usize;
+        for (raw, label) in [(credential_raw, "credential"), (authority_raw, "authority")] {
+            assert_ne!(
+                unsafe {
+                    SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                },
+                0,
+                "D32-A {label} handle inherit setup"
+            );
+        }
 
         let catalog = Arc::new(
             H7ExecutableCatalog::fixture(staged_fixture, execution_root.path().to_path_buf())
@@ -10572,7 +10959,15 @@ mod tests {
             user_profile.path().to_string_lossy().into_owned(),
             authority.path().to_string_lossy().into_owned(),
             recovery.path().to_string_lossy().into_owned(),
+            credential
+                .path()
+                .join("credential.bin")
+                .to_string_lossy()
+                .into_owned(),
             network_target.to_string(),
+            external_network_target.to_string(),
+            credential_raw.to_string(),
+            authority_raw.to_string(),
             sentinel_raw.to_string(),
         ];
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -10590,6 +10985,11 @@ mod tests {
         Arc::get_mut(&mut action)
             .expect("D32-A fixture action remains uniquely owned")
             .timeout = Duration::from_secs(5);
+        assert_eq!(
+            action.binding().timeout_ms,
+            5_000,
+            "D32-A fixture action timeout and Host binding diverged"
+        );
         let metrics = broker.metrics();
         let mut task = tokio::spawn({
             let broker = Arc::clone(&broker);
@@ -10672,17 +11072,29 @@ mod tests {
         assert_eq!(observation["user_profile_read_denied"], true);
         assert_eq!(observation["host_authority_read_denied"], true);
         assert_eq!(observation["recovery_read_denied"], true);
+        assert_eq!(observation["credential_read_denied"], true);
         assert_eq!(observation["tcp_refused"], false);
         assert_eq!(observation["tcp_denied"], true);
         assert_eq!(observation["udp_denied"], true);
+        assert_eq!(observation["external_tcp_refused"], false);
+        assert_eq!(observation["external_tcp_denied"], true);
+        assert_eq!(observation["external_udp_denied"], true);
         assert!(!udp_echo_task.join().expect("D32-A UDP echo probe thread"));
+        assert!(!external_udp_echo_task
+            .join()
+            .expect("D32-A external UDP echo probe thread"));
         assert_eq!(observation["breakaway_denied"], true);
+        assert_eq!(observation["credential_handle_probe_denied"], true);
+        assert_eq!(observation["authority_handle_probe_denied"], true);
         assert_eq!(observation["forbidden_handle_probe_denied"], true);
+        assert_eq!(observation["all_forbidden_handle_probes_denied"], true);
         assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
         assert!(metrics.jobs_terminated.load(Ordering::Acquire) >= 1);
         assert!(authority_port.shutdown());
         drop(udp_receiver);
         drop(tcp_listener);
+        drop(external_udp_receiver);
+        drop(external_tcp_listener);
         drop(sentinel);
     }
 
@@ -10729,6 +11141,37 @@ mod tests {
             .authority
             .revalidate_process_grant(&action, &mut grant)
             .is_err());
+        // Reuse the exact consumed grant at the native final fence as well.
+        // This is the process boundary proof: a successful Host consumption
+        // cannot be replayed into CreateProcessW or user code, even if the
+        // caller bypasses the normal broker sequence.
+        let mut first_preparation = H7LaunchPreparation::prepare(&action, None, None)
+            .expect("D29-H7 replay launch preparation");
+        first_preparation
+            .final_local_fence(
+                &action,
+                &mut grant,
+                &AtomicBool::new(false),
+                H7PostHostMutation::None,
+            )
+            .expect("D29-H7 first native launch fence");
+        let preparation = H7LaunchPreparation::prepare(&action, None, None)
+            .expect("D29-H7 replay launch preparation after first fence");
+        let metrics = Arc::new(H7SupervisorMetrics::default());
+        let native = supervise_native_prepared(
+            &action,
+            native_options(Arc::clone(&metrics), H7NativeLaunchFault::None),
+            preparation,
+            Some(grant),
+        );
+        assert_eq!(native.kind, H7NativeOutcomeKind::Denied);
+        assert!(!native.process_created);
+        assert!(!native.user_code_started);
+        assert_eq!(
+            metrics.process_created.load(Ordering::Acquire),
+            0,
+            "replayed consumed grant reached process creation"
+        );
         assert_eq!(
             harness
                 .authority
@@ -11051,6 +11494,30 @@ mod tests {
         assert!(result.stderr_reader_joined);
         assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
         assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert!(harness.authority.shutdown());
+    }
+
+    #[test]
+    fn h7_query_information_job_object_failure_fails_closed() {
+        let _lock = lock_h7_tests();
+        let harness = H7DirectHarness::new();
+        let mut options = native_options(
+            Arc::new(H7SupervisorMetrics::default()),
+            H7NativeLaunchFault::None,
+        );
+        options.force_process_tree_observer_failure = true;
+        let result = supervise_native(&harness.action(&["echo-argv", "observer-fault"]), options);
+
+        // QueryInformationJobObject is the only source of the process-tree
+        // containment observation.  A fault must never be represented as a
+        // synthetic zero or an otherwise usable completion.
+        assert_eq!(result.kind, H7NativeOutcomeKind::Denied);
+        assert!(result.process_created);
+        assert!(result.process_exit_verified);
+        assert!(result.job_termination_attempted);
+        assert!(result.process_tree_observer_failed);
+        assert!(!result.process_tree_observed);
+        assert_eq!(result.process_tree_remaining, usize::MAX);
         assert!(harness.authority.shutdown());
     }
 
@@ -12559,6 +13026,49 @@ mod tests {
                 .load(Ordering::Acquire),
             1
         );
+        assert!(harness.authority.shutdown());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h7_cancel_after_create_before_resume_never_starts_user_code() {
+        let _lock = lock_h7_tests();
+        let mut harness = H7DirectHarness::new();
+        let gate = H7PostCreateResumeFenceGate::new();
+        gate.arm();
+        let broker = harness.broker_with_post_create_resume_gate(Arc::clone(&gate));
+        let action = harness.action(&["echo-argv", "post-create-cancel"]);
+        let mut receiver = harness.receiver.take().unwrap();
+        let metrics = broker.metrics();
+        let task = tokio::spawn({
+            let broker = Arc::clone(&broker);
+            async move { broker.execute(action).await }
+        });
+        let pending = receiver
+            .recv()
+            .await
+            .expect("D29-H7 post-create cancellation confirmation");
+        let revision = harness
+            .authority
+            .provision_confirmation(&pending.action)
+            .expect("D29-H7 post-create cancellation confirmation");
+        pending.response.send(revision).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("D29-H7 post-create resume fence entry");
+        assert_eq!(metrics.process_created.load(Ordering::Acquire), 1);
+
+        // Cancellation wins while the primary thread is still suspended.  A
+        // deterministic release lets the native worker perform its normal
+        // fail-closed cleanup; no timing sleep participates in the proof.
+        broker.cancel();
+        gate.release();
+        let result = task.await.unwrap();
+        assert_eq!(result.status, "started_and_cancelled");
+        assert!(result.process_created);
+        assert!(!result.user_code_started);
+        assert_eq!(metrics.thread_resumed.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);
+        assert!(result.job_terminated);
         assert!(harness.authority.shutdown());
     }
 

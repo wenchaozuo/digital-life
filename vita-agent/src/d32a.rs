@@ -431,7 +431,7 @@ fn snapshot_workspace(
             }
             limits.file(size)?;
             let bytes = prepared
-                .read_existing_file_raw_bounded(D32_MAX_SOURCE_FILE_BYTES)
+                .read_existing_file_raw_bounded_with_limit(D32_MAX_SOURCE_FILE_BYTES)
                 .map_err(|_| "D32 workspace snapshot read failed".to_string())?;
             if bytes.len() as u64 != size {
                 return Err("D32 workspace snapshot changed during read".to_string());
@@ -879,7 +879,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         projection.rustdoc_path.clone(),
                     ) {
                         Ok(catalog) => Arc::new(catalog),
-                        Err(_) => {
+                        Err(_error) => {
                             let _ = projection.cleanup();
                             return Ok(Box::new(JsonToolOutput::with_success(
                                 denied_value(),
@@ -935,8 +935,15 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                             record_internal_evidence(result.internal_process_evidence());
                             result.cargo_value()
                         }
-                        Err(_) => denied_value(),
+                        Err(_error) => denied_value(),
                     };
+                    // The catalog retains the prepared source-directory handle
+                    // used by the H7 binding.  Release the broker/catalog before
+                    // removing this per-action projection; otherwise Windows
+                    // correctly reports ERROR_SHARING_VIOLATION even after the
+                    // child Job has reached terminal state.
+                    drop(broker);
+                    drop(catalog);
                     if projection.cleanup().is_err() {
                         // A terminal run must not be reported as a successful
                         // Cargo result while its app-owned run root is still

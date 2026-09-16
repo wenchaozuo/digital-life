@@ -957,6 +957,28 @@ impl PreparedWorkspaceTarget {
         }
     }
 
+    /// Reads an app-owned projection source through the same retained-root
+    /// and handle-relative identity fence as the D31 raw reader, with the
+    /// larger bounded source-file ceiling required by D32 staging.  This is
+    /// crate-internal and never exposed through the model-facing workspace
+    /// read tool.
+    pub(crate) fn read_existing_file_raw_bounded_with_limit(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, WorkspaceReadError> {
+        #[cfg(windows)]
+        {
+            return platform::read_existing_file_raw_bounded_with_limit(self, max_bytes);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = max_bytes;
+            Err(WorkspaceReadError::Kernel(VitaAgentError::KernelInvariant(
+                "workspace raw read is unavailable on this platform",
+            )))
+        }
+    }
+
     /// Restores an existing regular file from exact raw bytes using one
     /// exclusive handle acquired relative to the retained H2 parent handle.
     /// This is crate-internal H5-B infrastructure; it is not a model-facing
@@ -2407,10 +2429,32 @@ mod platform {
         prepared: &PreparedWorkspaceTarget,
         max_bytes: usize,
     ) -> Result<Vec<u8>, WorkspaceReadError> {
-        if max_bytes == 0 || max_bytes > WORKSPACE_REPLACE_HARD_MAX_BYTES {
-            return Err(WorkspaceReadError::TooLarge {
-                limit: WORKSPACE_REPLACE_HARD_MAX_BYTES,
-            });
+        read_existing_file_raw_bounded_with_limit_impl(
+            prepared,
+            max_bytes,
+            WORKSPACE_REPLACE_HARD_MAX_BYTES,
+        )
+    }
+
+    pub(super) fn read_existing_file_raw_bounded_with_limit(
+        prepared: &PreparedWorkspaceTarget,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, WorkspaceReadError> {
+        const D32_SOURCE_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
+        read_existing_file_raw_bounded_with_limit_impl(
+            prepared,
+            max_bytes,
+            D32_SOURCE_HARD_MAX_BYTES,
+        )
+    }
+
+    fn read_existing_file_raw_bounded_with_limit_impl(
+        prepared: &PreparedWorkspaceTarget,
+        max_bytes: usize,
+        hard_limit: usize,
+    ) -> Result<Vec<u8>, WorkspaceReadError> {
+        if max_bytes == 0 || max_bytes > hard_limit {
+            return Err(WorkspaceReadError::TooLarge { limit: hard_limit });
         }
         if prepared.kind != PreparedWorkspaceTargetKind::ExistingFile {
             return Err(WorkspaceReadError::InvalidTarget(
@@ -2477,7 +2521,7 @@ mod platform {
                 io::Error::last_os_error(),
             )));
         }
-        match read_raw_recovery_bounded(&handle) {
+        match read_raw_recovery_bounded_with_limit(&handle, hard_limit) {
             Ok(bytes) if bytes.len() <= max_bytes => Ok(bytes),
             Ok(_) => Err(WorkspaceReadError::TooLarge { limit: max_bytes }),
             Err(RecoveryReadError::TooLarge) => {
@@ -2805,10 +2849,17 @@ mod platform {
     }
 
     fn read_raw_recovery_bounded(handle: &OwnedHandle) -> Result<Vec<u8>, RecoveryReadError> {
-        let mut bytes = Vec::with_capacity(WORKSPACE_REPLACE_HARD_MAX_BYTES + 1);
+        read_raw_recovery_bounded_with_limit(handle, WORKSPACE_REPLACE_HARD_MAX_BYTES)
+    }
+
+    fn read_raw_recovery_bounded_with_limit(
+        handle: &OwnedHandle,
+        hard_limit: usize,
+    ) -> Result<Vec<u8>, RecoveryReadError> {
+        let mut bytes = Vec::with_capacity(hard_limit.saturating_add(1));
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let remaining = WORKSPACE_REPLACE_HARD_MAX_BYTES + 1 - bytes.len();
+            let remaining = hard_limit + 1 - bytes.len();
             if remaining == 0 {
                 return Err(RecoveryReadError::TooLarge);
             }
@@ -2830,7 +2881,7 @@ mod platform {
                 break;
             }
             bytes.extend_from_slice(&buffer[..read as usize]);
-            if bytes.len() > WORKSPACE_REPLACE_HARD_MAX_BYTES {
+            if bytes.len() > hard_limit {
                 return Err(RecoveryReadError::TooLarge);
             }
         }

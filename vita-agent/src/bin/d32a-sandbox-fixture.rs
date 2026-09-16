@@ -25,7 +25,9 @@ fn run() -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
-    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+    };
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetProcessHandleCount, CREATE_BREAKAWAY_FROM_JOB,
     };
@@ -86,9 +88,19 @@ fn run() -> Result<(), String> {
         .err()
         .is_some_and(|error| error.kind() == ErrorKind::ConnectionRefused);
     let tcp_denied = tcp_probe.is_err() && !tcp_refused;
-    let udp_probe =
-        UdpSocket::bind("0.0.0.0:0").and_then(|socket| socket.send_to(b"d32a", network_target));
-    let udp_denied = udp_probe.is_err();
+    let udp_denied = match UdpSocket::bind("0.0.0.0:0") {
+        Err(_) => true,
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+            let sent = socket.send_to(b"d32a", network_target).is_ok();
+            let mut response = [0_u8; 16];
+            let echoed = sent
+                && socket
+                    .recv_from(&mut response)
+                    .is_ok_and(|(length, _)| &response[..length] == b"d32a-ack");
+            !echoed
+        }
+    };
     let tcp_listener_denied = TcpListener::bind("127.0.0.1:0").is_err();
     let udp_listener_denied = UdpSocket::bind("127.0.0.1:0").is_err();
 
@@ -130,12 +142,23 @@ fn run() -> Result<(), String> {
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut handle_count) } != 0;
     let forbidden_handle_probe_denied = {
         let handle = forbidden_handle as HANDLE;
-        let file_type = unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(handle) };
-        let error = unsafe { GetLastError() };
-        handle.is_null()
-            || file_type == windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN && error != 0
+        let mut duplicated = std::ptr::null_mut();
+        let duplicated_ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } != 0;
+        if duplicated_ok && !duplicated.is_null() {
+            unsafe { CloseHandle(duplicated) };
+        }
+        !duplicated_ok
     };
-
     println!(
         "{}",
         json!({

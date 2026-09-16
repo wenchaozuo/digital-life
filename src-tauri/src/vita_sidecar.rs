@@ -255,7 +255,11 @@ mod windows {
     const D32_TOOLCHAIN_MAX_FILES: usize = 131_072;
     const D32_IMAGE_HASH_MAX_BYTES: u64 = 256 * 1024 * 1024;
     const GRANT_LIFETIME_MS: u64 = 30_000;
-    const HOST_CONFIRMATION_TTL_MS: u64 = 30_000;
+    // Cargo authority validation rechecks the app-owned toolchain mirror by
+    // streaming its bounded manifest.  Keep confirmation expiry bounded, but
+    // allow the fixed production Cargo lane enough time to complete that
+    // Host-owned evidence check on a cold machine.
+    const HOST_CONFIRMATION_TTL_MS: u64 = 120_000;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const READY_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_PENDING: usize = 1;
@@ -292,13 +296,22 @@ mod windows {
     /// The executable image is selected by the Host before Vita starts.  The
     /// marker is app-owned state, not user/provider input; Vita may only
     /// consume the exact path and digest that the Host published here.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
     struct HostCargoSelection {
         path: String,
         sha256: String,
         toolchain_path: String,
         toolchain_manifest_sha256: String,
+    }
+
+    /// Host-owned authority retained across Vita startup.  The serialized
+    /// selection marker is only a locator for Vita; it is never the source of
+    /// the Host's expected executable evidence.
+    #[derive(Clone, Debug)]
+    struct HostPublishedCargoProfile {
+        selection: HostCargoSelection,
+        expected_profile_evidence: HostCargoCheckProfileEvidence,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -735,7 +748,6 @@ mod windows {
             })
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates.reverse();
         let toolchain_path = candidates
             .into_iter()
             .find(|path| {
@@ -762,19 +774,23 @@ mod windows {
         app_data_root.join(D32_CARGO_SELECTION_FILE_NAME)
     }
 
-    fn host_publish_cargo_selection(app_data_root: &Path) -> Result<(), String> {
+    fn host_publish_cargo_selection(
+        app_data_root: &Path,
+    ) -> Result<HostPublishedCargoProfile, String> {
         if !app_data_root.is_absolute() {
             return Err("D32 Host app-data root was not absolute".to_string());
         }
         let app_data_root = fs::canonicalize(app_data_root)
             .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
         validate_private_app_data_root(&app_data_root)?;
-        if let Ok(selection) = host_read_cargo_selection_marker(&app_data_root) {
-            if host_prepare_toolchain_mirror(&app_data_root, &selection).is_ok() {
-                return Ok(());
-            }
-        }
+        // Select and verify the source toolchain independently on every Host
+        // startup.  A marker left in app data by an earlier session is a Vita
+        // locator, not durable authority, so it must never redefine the
+        // expected executable evidence for this session.
         let selection = host_select_cargo_image()?;
+        host_prepare_toolchain_mirror(&app_data_root, &selection)?;
+        let expected_profile_evidence =
+            host_cargo_profile_evidence_for_selection(&app_data_root, &selection)?;
         let marker = host_cargo_selection_path(&app_data_root);
         match fs::symlink_metadata(&marker) {
             Ok(_) => host_verify_no_reparse_path(&app_data_root, &marker)?,
@@ -786,8 +802,10 @@ mod windows {
         fs::write(&marker, payload)
             .map_err(|_| "D32 Host Cargo selection could not be published".to_string())?;
         host_verify_no_reparse_path(&app_data_root, &marker)?;
-        host_prepare_toolchain_mirror(&app_data_root, &selection)?;
-        Ok(())
+        Ok(HostPublishedCargoProfile {
+            selection,
+            expected_profile_evidence,
+        })
     }
 
     fn host_clear_cargo_selection(app_data_root: &Path) -> Result<(), String> {
@@ -840,8 +858,9 @@ mod windows {
         Ok(selection)
     }
 
-    fn host_cargo_profile_evidence(
+    fn host_cargo_profile_evidence_for_selection(
         app_data_root: &Path,
+        selection: &HostCargoSelection,
     ) -> Result<HostCargoCheckProfileEvidence, String> {
         if !app_data_root.is_absolute() {
             return Err("D32 Host app-data root was not absolute".to_string());
@@ -851,7 +870,6 @@ mod windows {
         // Every action is bound to the immutable app-owned mirror.  Do not
         // reread/hash the user-profile toolchain on the AuthorityEvaluate
         // path; Host publication already established this source evidence.
-        let selection = host_read_cargo_selection_marker(&app_data_root)?;
         let toolchain = app_data_root
             .join(D32_TOOLCHAIN_MIRROR_ROOT_NAME)
             .join(&selection.toolchain_manifest_sha256);
@@ -892,6 +910,33 @@ mod windows {
         })
     }
 
+    fn host_cargo_profile_evidence(
+        app_data_root: &Path,
+    ) -> Result<HostCargoCheckProfileEvidence, String> {
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        let selection = host_read_cargo_selection_marker(&app_data_root)?;
+        host_cargo_profile_evidence_for_selection(&app_data_root, &selection)
+    }
+
+    fn host_finalize_published_cargo_profile(
+        app_data_root: &Path,
+        published: &HostPublishedCargoProfile,
+    ) -> Result<HostCargoCheckProfileEvidence, String> {
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        let current_selection = host_read_cargo_selection_marker(&app_data_root)?;
+        if current_selection != published.selection {
+            return Err("D32 Host Cargo selection changed during Vita startup".to_string());
+        }
+        let current =
+            host_cargo_profile_evidence_for_selection(&app_data_root, &current_selection)?;
+        if current != published.expected_profile_evidence {
+            return Err("D32 Host Cargo profile evidence changed during Vita startup".to_string());
+        }
+        Ok(published.expected_profile_evidence.clone())
+    }
+
     fn d32_run_id(session_id: &str, turn_id: &str, tool_call_id: &str) -> String {
         format!(
             "{:x}",
@@ -908,8 +953,9 @@ mod windows {
         app_data_root: &Path,
         binding: &ProcessBinding,
     ) -> Result<String, String> {
-        let root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?
+        let app_data_root = fs::canonicalize(app_data_root)
+            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        let root = app_data_root
             .join(D32_EXECUTION_ROOT_NAME)
             .join(D32_RUNS_DIR_NAME)
             .join(d32_run_id(
@@ -918,7 +964,7 @@ mod windows {
                 &binding.tool_call_id,
             ));
         let source = root.join(D32_SOURCE_DIR_NAME);
-        host_verify_no_reparse_path(app_data_root, &source)?;
+        host_verify_no_reparse_path(&app_data_root, &source)?;
         Ok(host_file_identity(&source, true)?.namespace_wire())
     }
 
@@ -3221,7 +3267,8 @@ mod windows {
             // private app-data namespace before Vita is started.  A missing
             // or changed installation clears stale state, leaving D32
             // unavailable rather than allowing Vita to choose an image.
-            if host_publish_cargo_selection(&app_data_root).is_err() {
+            let published_cargo_profile = host_publish_cargo_selection(&app_data_root).ok();
+            if published_cargo_profile.is_none() {
                 let _ = host_clear_cargo_selection(&app_data_root);
             }
             let sidecar_app_data_root = normalize_sidecar_local_path(&app_data_root)?;
@@ -3304,7 +3351,12 @@ mod windows {
             // the app-owned Cargo projection is unavailable; the Cargo lane
             // then stays fail-closed because validate_binding() requires this
             // Host-owned evidence before it can issue or revalidate a grant.
-            let cargo_profile = host_cargo_profile_evidence(&app_data_root).ok();
+            let cargo_profile = published_cargo_profile.as_ref().and_then(|published| {
+                host_finalize_published_cargo_profile(&app_data_root, published).ok()
+            });
+            if cargo_profile.is_none() && published_cargo_profile.is_some() {
+                let _ = host_clear_cargo_selection(&app_data_root);
+            }
             let cargo_profile_app_data_root = cargo_profile.as_ref().map(|_| app_data_root.clone());
             let session = Arc::new(HostSessionState {
                 session_id: session_id.clone(),
@@ -5296,8 +5348,10 @@ mod windows {
                 None => expected.clone(),
             };
             let fresh_source_exact = match session.cargo_profile_app_data_root.as_deref() {
-                Some(root) => host_cargo_run_source_identity(root, binding)
-                    .is_ok_and(|identity| identity == binding.working_directory_identity),
+                Some(root) => match host_cargo_run_source_identity(root, binding) {
+                    Ok(identity) => identity == binding.working_directory_identity,
+                    Err(_) => false,
+                },
                 None => {
                     binding.working_directory_identity == expected.staged_working_directory_identity
                 }
@@ -6939,6 +6993,195 @@ mod windows {
                 environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
                 profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
             }
+        }
+
+        fn synthetic_published_cargo_profile(
+            app_data_root: &Path,
+            label: &str,
+            cargo_bytes: &[u8],
+        ) -> HostPublishedCargoProfile {
+            let mirror_parent = app_data_root.join(D32_TOOLCHAIN_MIRROR_ROOT_NAME);
+            fs::create_dir_all(&mirror_parent).expect("D32 startup tamper mirror parent");
+            let staging = mirror_parent.join(format!("staging-{label}"));
+            fs::create_dir_all(staging.join("bin")).expect("D32 startup tamper bin");
+            fs::write(staging.join("bin/cargo.exe"), cargo_bytes)
+                .expect("D32 startup tamper cargo");
+            fs::write(staging.join("bin/rustc.exe"), b"rustc-image")
+                .expect("D32 startup tamper rustc");
+            fs::write(staging.join("bin/rustdoc.exe"), b"rustdoc-image")
+                .expect("D32 startup tamper rustdoc");
+            let manifest =
+                host_toolchain_manifest_hash(&staging).expect("D32 startup tamper manifest");
+            let mirror = mirror_parent.join(&manifest);
+            fs::rename(&staging, &mirror).expect("D32 startup tamper mirror finalize");
+            let cargo = mirror.join("bin/cargo.exe");
+            let selection = HostCargoSelection {
+                path: cargo.to_string_lossy().into_owned(),
+                sha256: host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)
+                    .expect("D32 startup tamper cargo hash"),
+                toolchain_path: mirror.to_string_lossy().into_owned(),
+                toolchain_manifest_sha256: manifest,
+            };
+            let expected_profile_evidence =
+                host_cargo_profile_evidence_for_selection(app_data_root, &selection)
+                    .expect("D32 startup tamper expected evidence");
+            HostPublishedCargoProfile {
+                selection,
+                expected_profile_evidence,
+            }
+        }
+
+        fn write_cargo_selection_marker(app_data_root: &Path, selection: &HostCargoSelection) {
+            fs::write(
+                host_cargo_selection_path(app_data_root),
+                serde_json::to_vec(selection).expect("D32 startup tamper marker encoding"),
+            )
+            .expect("D32 startup tamper marker write");
+        }
+
+        #[test]
+        fn d32_host_startup_tamper_cannot_redefine_expected_profile() {
+            let app_data = tempfile::tempdir().expect("D32 startup tamper app data");
+            let published = synthetic_published_cargo_profile(app_data.path(), "e1", b"cargo-e1");
+            let replacement = synthetic_published_cargo_profile(app_data.path(), "e2", b"cargo-e2");
+            write_cargo_selection_marker(app_data.path(), &published.selection);
+            assert!(host_finalize_published_cargo_profile(app_data.path(), &published).is_ok());
+
+            // A valid-looking marker digest cannot replace the in-memory E1
+            // authority, even when it points at a real mirror generation.
+            let mut marker_sha_tamper = published.selection.clone();
+            marker_sha_tamper.sha256 = "a".repeat(64);
+            write_cargo_selection_marker(app_data.path(), &marker_sha_tamper);
+            assert!(host_finalize_published_cargo_profile(app_data.path(), &published).is_err());
+
+            // A complete, valid-looking E2 marker/mirror pair is still not
+            // accepted as the expected profile for this startup.
+            write_cargo_selection_marker(app_data.path(), &replacement.selection);
+            assert!(host_finalize_published_cargo_profile(app_data.path(), &published).is_err());
+
+            // Restoring E1's marker and changing the mirror image itself is
+            // also detected by the post-Ready exact comparison.
+            write_cargo_selection_marker(app_data.path(), &published.selection);
+            fs::write(
+                app_data
+                    .path()
+                    .join(D32_TOOLCHAIN_MIRROR_ROOT_NAME)
+                    .join(&published.selection.toolchain_manifest_sha256)
+                    .join("bin/cargo.exe"),
+                b"cargo-e1-tampered",
+            )
+            .expect("D32 startup tamper cargo replacement");
+            assert!(host_finalize_published_cargo_profile(app_data.path(), &published).is_err());
+        }
+
+        #[test]
+        fn d32_host_toolchain_prepare_reuses_verified_mirror() {
+            let app_data = tempfile::tempdir().expect("D32 mirror reuse app data");
+            let source = tempfile::tempdir().expect("D32 mirror reuse source");
+            let source_bin = source.path().join("bin");
+            fs::create_dir_all(&source_bin).expect("D32 mirror reuse source bin");
+            let source_cargo = source_bin.join("cargo.exe");
+            fs::write(&source_cargo, b"cargo-source").expect("D32 mirror reuse cargo");
+            fs::write(source_bin.join("rustc.exe"), b"rustc-source")
+                .expect("D32 mirror reuse rustc");
+            fs::write(source_bin.join("rustdoc.exe"), b"rustdoc-source")
+                .expect("D32 mirror reuse rustdoc");
+            let selection = HostCargoSelection {
+                path: source_cargo.to_string_lossy().into_owned(),
+                sha256: host_hash_file(&source_cargo, D32_IMAGE_HASH_MAX_BYTES)
+                    .expect("D32 mirror reuse cargo hash"),
+                toolchain_path: source.path().to_string_lossy().into_owned(),
+                toolchain_manifest_sha256: host_toolchain_manifest_hash(source.path())
+                    .expect("D32 mirror reuse manifest"),
+            };
+
+            let first = host_prepare_toolchain_mirror(app_data.path(), &selection)
+                .expect("D32 mirror first prepare");
+            assert!(first.join("bin/cargo.exe").is_file());
+
+            // A valid cache hit must not reread or recopy the source tree.  Make
+            // the selected source path a directory after the first prepare:
+            // canonicalization still succeeds, but any attempted copy would
+            // fail, while the verified app-owned mirror remains usable.
+            fs::remove_file(&source_cargo).expect("D32 mirror source cargo removal");
+            fs::create_dir(&source_cargo).expect("D32 mirror source cargo sentinel");
+            let second = host_prepare_toolchain_mirror(app_data.path(), &selection)
+                .expect("D32 mirror cached prepare");
+            assert_eq!(second, first);
+            assert_eq!(
+                fs::read(first.join("bin/cargo.exe")).unwrap(),
+                b"cargo-source"
+            );
+        }
+
+        #[test]
+        fn d32_a_same_valid_host_grant_replay_is_denied() {
+            let provider = test_provider();
+            let (session, receiver) = test_session_with_provider(provider.clone());
+            let (_root, storage, registry, revision) = authority_fixture(&session);
+            let host_turn_id = "turn".to_string();
+            let provider_binding =
+                protocol::ProviderBinding::derive(&session.session_id, &host_turn_id, &provider)
+                    .expect("D32 replay provider binding");
+            session
+                .begin_turn(host_turn_id.clone(), provider, provider_binding)
+                .expect("D32 replay Host turn");
+            let binding = test_binding(&session.session_id);
+            handle_authority_evaluate(
+                &session,
+                &storage,
+                &registry,
+                AuthorityEvaluate {
+                    request_id: "d32-replay-authority".to_string(),
+                    session_id: session.session_id.clone(),
+                    host_turn_id: host_turn_id.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("D32 replay authority evaluation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("D32 replay authority reply"),
+                HostMessage::AuthorityScopeReply(AuthorityScopeReply { allowed: true, .. })
+            ));
+            let mut grant = test_grant(&session.session_id, "d32-valid-replay", binding.clone());
+            grant.authorization_revision = revision;
+            session
+                .grants
+                .lock()
+                .expect("D32 replay grant lock")
+                .insert(
+                    grant.grant_id.clone(),
+                    HostStoredGrant {
+                        host_turn_id: host_turn_id.clone(),
+                        grant: grant.clone(),
+                    },
+                );
+            let request = RevalidateGrant {
+                request_id: "d32-replay-first".to_string(),
+                session_id: session.session_id.clone(),
+                host_turn_id: host_turn_id.clone(),
+                binding: binding.clone(),
+                grant: grant.clone(),
+            };
+            handle_revalidate_grant(&session, &storage, &registry, request.clone())
+                .expect("D32 first valid grant revalidation");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("D32 first replay reply"),
+                HostMessage::GrantRevalidated(GrantRevalidated { allowed: true, .. })
+            ));
+            handle_revalidate_grant(&session, &storage, &registry, request)
+                .expect("D32 replay denial response");
+            assert!(matches!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("D32 replay denial"),
+                HostMessage::GrantRevalidated(GrantRevalidated { allowed: false, .. })
+            ));
+            session.retire();
         }
 
         fn test_grant(session_id: &str, grant_id: &str, binding: ProcessBinding) -> ProcessGrant {
@@ -10758,7 +11001,7 @@ mod windows {
             CancelBeforeRevalidation,
             LifeBeforeRevalidation,
             MigrationBeforeRevalidation,
-            GrantReplay,
+            GrantIdTamper,
             ExecutableIdentityTamper,
             EnvironmentProfileTamper,
         }
@@ -10826,7 +11069,7 @@ mod windows {
                 );
                 return;
             }
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::GrantReplay);
+            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::GrantIdTamper);
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::ExecutableIdentityTamper);
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::EnvironmentProfileTamper);
         }
@@ -10894,7 +11137,7 @@ mod windows {
                 b"runtime_id=vita-agent\nlayout=v1\n",
             )
             .expect("D32-A Vita ownership marker");
-            host_publish_cargo_selection(app_data.path())
+            let published_cargo_profile = host_publish_cargo_selection(app_data.path())
                 .expect("D32-A Host Cargo selection authority");
             let process_root = tempfile::tempdir().expect("D32-A canary process root");
             let canary_resource = tempfile::tempdir().expect("D32-A canary resource root");
@@ -10917,7 +11160,12 @@ mod windows {
                 HANDSHAKE_TIMEOUT,
                 "D32-A canary handshake",
             )
-            .expect("D32-A canary handshake");
+            .unwrap_or_else(|error| {
+                let _ = process.shutdown();
+                let mut diagnostics = String::new();
+                let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+                panic!("D32-A canary handshake failed: {error}; sidecar stderr: {diagnostics}");
+            });
             let handshake = match message {
                 VitaMessage::Handshake(value) => value,
                 other => panic!("unexpected D32-A canary first frame: {other:?}"),
@@ -11038,7 +11286,8 @@ mod windows {
             assert_eq!(enabled_revision.revision, 2);
 
             let cargo_profile =
-                host_cargo_profile_evidence(app_data.path()).expect("D32-A Host Cargo evidence");
+                host_finalize_published_cargo_profile(app_data.path(), &published_cargo_profile)
+                    .expect("D32-A Host Cargo evidence");
             let provider_binding =
                 protocol::ProviderBinding::derive(&session_id, &host_turn_id, &provider)
                     .expect("D32-A provider binding");
@@ -11200,7 +11449,7 @@ mod windows {
                                 );
                                 assert!(migration.restart_required);
                             }
-                            D32CargoCanaryMode::GrantReplay => {
+                            D32CargoCanaryMode::GrantIdTamper => {
                                 request.grant.grant_id = "d32-a-replayed-grant".to_string();
                             }
                             D32CargoCanaryMode::ExecutableIdentityTamper => {
@@ -11314,7 +11563,7 @@ mod windows {
 
         #[test]
         fn host_confirmation_ttl_is_an_upper_bound() {
-            assert_eq!(effective_confirmation_expiry(1_000, 90_000), Some(31_000));
+            assert_eq!(effective_confirmation_expiry(1_000, 90_000), Some(90_000));
             assert_eq!(effective_confirmation_expiry(1_000, 20_000), Some(20_000));
             assert_eq!(effective_confirmation_expiry(1_000, 1_000), None);
         }

@@ -1816,7 +1816,11 @@ pub async fn serve_ipc(test_canary: bool) -> Result<(), String> {
                     &provider_config.base_url,
                     provider_config.model.clone(),
                     Some(credential),
-                    Duration::from_secs(30),
+                    // The real Cargo canary performs Host-side exact mirror
+                    // revalidation before confirmation/grant consumption;
+                    // keep the deterministic fixture bounded but long enough
+                    // for that cold-machine evidence pass.
+                    Duration::from_secs(180),
                     crate::ProviderRetryPolicy::default(),
                     crate::ProviderCapabilities {
                         streaming: true,
@@ -2544,7 +2548,13 @@ fn spawn_confirmation_loop(
                     task_id: init.task_id.clone(),
                     capability_id: capability_id.to_string(),
                     workspace_summary: workspace_summary(&init.workspace_path),
-                    expires_at_unix_ms: unix_millis().saturating_add(30_000),
+                    expires_at_unix_ms: unix_millis().saturating_add(
+                        if capability_id == D32_CARGO_CAPABILITY_ID {
+                            120_000
+                        } else {
+                            30_000
+                        },
+                    ),
                     binding: wire_binding,
                 });
                 move || router.request(message)

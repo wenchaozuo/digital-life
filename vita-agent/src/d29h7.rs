@@ -92,6 +92,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResetEvent, ResumeThread,
@@ -359,13 +360,14 @@ impl H7PreparedNamespace {
         directory: bool,
         leaf_share_access: u32,
     ) -> Result<Self, String> {
-        if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
+        if !path.is_absolute() {
             return Err("H7 namespace path was not an absolute local path".to_string());
         }
         let mut normal_components = Vec::new();
         for component in path.components() {
             match component {
-                Component::Prefix(prefix) if matches!(prefix.kind(), Prefix::Disk(_)) => {}
+                Component::Prefix(prefix)
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
                 Component::RootDir => {}
                 Component::Normal(value) => normal_components.push(value.to_os_string()),
                 _ => return Err("H7 namespace path contained an unsafe component".to_string()),
@@ -373,7 +375,7 @@ impl H7PreparedNamespace {
         }
         let drive_letter = match path.components().next() {
             Some(Component::Prefix(prefix)) => match prefix.kind() {
-                Prefix::Disk(letter) => letter,
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
                 _ => return Err("H7 namespace path had no local drive anchor".to_string()),
             },
             _ => return Err("H7 namespace path had no explicit local drive anchor".to_string()),
@@ -1295,6 +1297,67 @@ fn environment_block(environment: &BTreeMap<String, String>) -> Vec<u16> {
     block
 }
 
+// A caller-supplied environment block needs a small amount of OS launch
+// plumbing in addition to the fixed action policy.  Keep these launch-only
+// values out of the policy map/hash so they cannot become model-controlled
+// environment authority.
+fn launch_environment_block(
+    environment: &BTreeMap<String, String>,
+    current_directory: &Path,
+) -> Vec<u16> {
+    let mut entries = BTreeMap::new();
+    // The AppContainer loader requires the system root to resolve its base
+    // system image set when a caller supplies a private environment block.
+    // Derive it from the OS API, never from a user/profile environment value.
+    let mut windows_root = [0_u16; 260];
+    let windows_root_len =
+        unsafe { GetWindowsDirectoryW(windows_root.as_mut_ptr(), windows_root.len() as u32) }
+            as usize;
+    if windows_root_len != 0 && windows_root_len < windows_root.len() {
+        if let Ok(windows_root) = String::from_utf16(&windows_root[..windows_root_len]) {
+            let system_drive = windows_root
+                .chars()
+                .next()
+                .map(|letter| format!("{letter}:"));
+            entries.insert(
+                "ComSpec".to_string(),
+                format!(r"{windows_root}\System32\cmd.exe"),
+            );
+            entries.insert("windir".to_string(), windows_root.clone());
+            if let Some(system_drive) = system_drive {
+                entries.insert("SystemDrive".to_string(), system_drive);
+            }
+            entries.insert("SystemRoot".to_string(), windows_root);
+        }
+    }
+    // Give D32's cargo child a writable, already-projected temporary
+    // namespace.  A caller-supplied environment otherwise leaves TEMP/TMP
+    // absent, and AppContainer startup can fail while initializing the
+    // process environment.  Generic H7 fixtures have no such namespace and
+    // therefore retain the intentionally minimal environment.
+    let scratch = current_directory.join("target");
+    let scratch = if scratch.is_dir() {
+        Some(scratch)
+    } else {
+        current_directory
+            .parent()
+            .map(|root| root.join("target"))
+            .filter(|path| path.is_dir())
+    };
+    if let Some(scratch) = scratch {
+        let scratch = scratch.to_string_lossy().into_owned();
+        entries.insert("LOCALAPPDATA".to_string(), scratch.clone());
+        entries.insert("TEMP".to_string(), scratch.clone());
+        entries.insert("TMP".to_string(), scratch);
+    }
+    entries.extend(
+        environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    environment_block(&entries)
+}
+
 fn environment_policy_bytes(environment: &BTreeMap<String, String>) -> Vec<u8> {
     environment_block(environment)
         .into_iter()
@@ -1727,7 +1790,10 @@ impl H7SandboxProfile {
         // The projection root and immutable source/toolchain trees are read
         // only.  Cargo's two scratch namespaces receive the minimum extra
         // rights needed for incremental artifacts and registry/cache writes.
-        apply_appcontainer_acl(self.sid, root, FILE_GENERIC_READ)?;
+        // The root itself is not executable user code; the execute bit here
+        // is the bounded directory-traverse right required to reach the
+        // explicitly projected source/toolchain/scratch children.
+        apply_appcontainer_acl(self.sid, root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
         apply_appcontainer_acl(self.sid, &root.join("source"), FILE_GENERIC_READ)?;
         apply_appcontainer_acl(
             self.sid,
@@ -2023,6 +2089,31 @@ enum H7NativeOutcomeKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct H7NativeLaunchDiagnostics {
+    final_local_fence_error_category: Option<String>,
+    create_process_succeeded: bool,
+    create_process_error: Option<u32>,
+    assign_process_to_job_succeeded: Option<bool>,
+    assign_process_to_job_error: Option<u32>,
+    resume_thread_succeeded: Option<bool>,
+    resume_thread_error: Option<u32>,
+}
+
+impl Default for H7NativeLaunchDiagnostics {
+    fn default() -> Self {
+        Self {
+            final_local_fence_error_category: None,
+            create_process_succeeded: false,
+            create_process_error: None,
+            assign_process_to_job_succeeded: None,
+            assign_process_to_job_error: None,
+            resume_thread_succeeded: None,
+            resume_thread_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct H7NativeResult {
     kind: H7NativeOutcomeKind,
     process_created: bool,
@@ -2043,6 +2134,10 @@ struct H7NativeResult {
     pending_stderr_reads: usize,
     stdout_retained_bytes: usize,
     stderr_retained_bytes: usize,
+    // Native launch diagnostics are retained out-of-band.  They are exposed
+    // only by the d32-a-test-helper evidence channel and never by the
+    // production model result.
+    diagnostics: H7NativeLaunchDiagnostics,
 }
 
 const H7_OUTPUT_SCRATCH_BYTES: usize = 8 * 1024;
@@ -3526,7 +3621,10 @@ impl H7LaunchPreparation {
             application_name,
             command_line: argv_to_command_line(&action.argv),
             current_directory: wide_null(action.working_directory.path().as_os_str()),
-            environment: environment_block(&action.environment),
+            environment: launch_environment_block(
+                &action.environment,
+                action.working_directory.path(),
+            ),
             executable_probe,
             working_directory_probe,
             binding,
@@ -3648,7 +3746,9 @@ fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) ->
         options.output_terminality_gate.clone(),
     ) {
         Ok(preparation) => preparation,
-        Err(_) => return launch_failed(false, false, None),
+        Err(_) => {
+            return launch_failed(false, false, None).with_final_local_fence_error("preparation")
+        }
     };
     supervise_native_prepared(action, options, preparation, None)
 }
@@ -3707,6 +3807,7 @@ fn supervise_native_prepared(
             pending_stderr_reads: 0,
             stdout_retained_bytes: 0,
             stderr_retained_bytes: 0,
+            diagnostics: H7NativeLaunchDiagnostics::default(),
         },
     }
 }
@@ -3739,8 +3840,10 @@ fn supervise_native_inner(
             H7PostHostMutation::None,
         )
     };
-    if final_fence.is_err() {
-        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+    if let Err(error) = final_fence {
+        return launch_failed(false, false, None)
+            .with_final_local_fence_error(&error)
+            .with_kind(H7NativeOutcomeKind::Denied);
     }
     let H7LaunchPreparation {
         job,
@@ -3776,22 +3879,28 @@ fn supervise_native_inner(
     // ProcessW edge so an exemption added during the retained fence fails
     // closed instead of being mistaken for a capability-free launch.
     if let Some(sandbox) = attributes.sandbox.as_ref() {
-        if sandbox.verify_no_loopback_exemption().is_err() {
-            return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+        if let Err(error) = sandbox.verify_no_loopback_exemption() {
+            return launch_failed(false, false, None)
+                .with_final_local_fence_error(&error)
+                .with_kind(H7NativeOutcomeKind::Denied);
         }
     }
     // A Git-status action owns a retained local metadata fence.  Recheck it
     // after any final gate and immediately before the last cancellation load
     // and CreateProcessW call so confirmation cannot authorize changed Git
     // metadata.
-    if h7c_revalidate_metadata_fence(action).is_err() {
-        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+    if let Err(error) = h7c_revalidate_metadata_fence(action) {
+        return launch_failed(false, false, None)
+            .with_final_local_fence_error(&error)
+            .with_kind(H7NativeOutcomeKind::Denied);
     }
     // This is the final cancellation load.  Keep it immediately adjacent to
     // CreateProcessW: no hash, IPC, allocation, wait, or other meaningful
     // work may occur between the load and the syscall.
     if options.cancellation.load(Ordering::Acquire) {
-        return launch_failed(false, false, None).with_kind(H7NativeOutcomeKind::Denied);
+        return launch_failed(false, false, None)
+            .with_final_local_fence_error("cancellation")
+            .with_kind(H7NativeOutcomeKind::Denied);
     }
     let created = unsafe {
         CreateProcessW(
@@ -3810,9 +3919,21 @@ fn supervise_native_inner(
             &mut process_information,
         )
     };
+    let create_process_error = if created == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
     if created == 0 {
-        return launch_failed(false, false, None);
+        let mut result = launch_failed(false, false, None);
+        result.diagnostics.create_process_error = create_process_error;
+        return result;
     }
+    let mut diagnostics = H7NativeLaunchDiagnostics {
+        create_process_succeeded: true,
+        create_process_error,
+        ..H7NativeLaunchDiagnostics::default()
+    };
     phase.store(H7LaunchPhase::CreatedSuspended as u8, Ordering::Release);
     options
         .metrics
@@ -3826,7 +3947,7 @@ fn supervise_native_inner(
     let process = match H7Handle::new(process_information.hProcess) {
         Ok(handle) => handle,
         Err(_) => {
-            return launch_failed(true, false, None);
+            return launch_failed(true, false, None).with_diagnostics(diagnostics);
         }
     };
     let thread = match if options.fault == H7NativeLaunchFault::ForceThreadHandleFailure {
@@ -3842,7 +3963,7 @@ fn supervise_native_inner(
                 &options.metrics,
                 &cleanup,
             );
-            return launch_failed(true, false, Some(&cleanup));
+            return launch_failed(true, false, Some(&cleanup)).with_diagnostics(diagnostics);
         }
     };
     let mut resources = H7NativeResources {
@@ -3860,11 +3981,20 @@ fn supervise_native_inner(
     if options.fault == H7NativeLaunchFault::PanicAfterCreateProcess {
         panic!("D29-H7 injected panic after CreateProcessW");
     }
-    let assignment_ok = options.fault != H7NativeLaunchFault::ForceAssignmentFailure
-        && unsafe { AssignProcessToJobObject(resources.job.raw(), resources.process.raw()) != 0 };
+    let (assignment_ok, assignment_error) = if options.fault
+        == H7NativeLaunchFault::ForceAssignmentFailure
+    {
+        (false, None)
+    } else {
+        let ok =
+            unsafe { AssignProcessToJobObject(resources.job.raw(), resources.process.raw()) != 0 };
+        (ok, (!ok).then(|| unsafe { GetLastError() }))
+    };
+    diagnostics.assign_process_to_job_succeeded = Some(assignment_ok);
+    diagnostics.assign_process_to_job_error = assignment_error;
     if !assignment_ok {
         let _ = resources.terminate_for_cleanup();
-        return launch_failed(true, false, Some(&cleanup));
+        return launch_failed(true, false, Some(&cleanup)).with_diagnostics(diagnostics);
     }
     let mut in_job = FALSE;
     let verified = unsafe {
@@ -3873,7 +4003,7 @@ fn supervise_native_inner(
     };
     if !verified {
         let _ = resources.terminate_for_cleanup();
-        return launch_failed(true, false, Some(&cleanup));
+        return launch_failed(true, false, Some(&cleanup)).with_diagnostics(diagnostics);
     }
     resources.job_assigned = true;
     options.metrics.job_assigned.fetch_add(1, Ordering::AcqRel);
@@ -3884,12 +4014,17 @@ fn supervise_native_inner(
     // denial; user code must never run in that race.
     if options.cancellation.load(Ordering::Acquire) {
         let _ = resources.terminate_assigned_job();
-        return launch_failed(true, false, Some(&cleanup)).with_kind(H7NativeOutcomeKind::Denied);
+        return launch_failed(true, false, Some(&cleanup))
+            .with_diagnostics(diagnostics)
+            .with_kind(H7NativeOutcomeKind::Denied);
     }
-    let resumed = unsafe { ResumeThread(resources.thread.raw()) } != u32::MAX;
+    let resume_result = unsafe { ResumeThread(resources.thread.raw()) };
+    let resumed = resume_result != u32::MAX;
+    diagnostics.resume_thread_succeeded = Some(resumed);
+    diagnostics.resume_thread_error = (!resumed).then(|| unsafe { GetLastError() });
     if !resumed {
         let _ = resources.terminate_for_cleanup();
-        return launch_failed(true, false, Some(&cleanup));
+        return launch_failed(true, false, Some(&cleanup)).with_diagnostics(diagnostics);
     }
     options
         .metrics
@@ -4072,6 +4207,18 @@ fn supervise_native_inner(
         let _ = resources.observe_process_exit(0);
         process_exit_verified = cleanup.process_exit_verified.load(Ordering::Acquire);
     }
+    // A primary process may exit while a descendant remains in the assigned
+    // Job.  Do not return a successful terminal result with a live tree: the
+    // production supervisor owns the complete process lifetime and closes
+    // the residual Job before releasing its handles.
+    if phase_at_least(&phase, H7LaunchPhase::Exited)
+        && !resources.job_terminated
+        && resources
+            .observe_process_tree()
+            .is_some_and(|remaining| remaining != 0)
+    {
+        let _ = resources.terminate_assigned_job();
+    }
     let exit_code = if process_exit_verified {
         let mut code = 0_u32;
         (unsafe { GetExitCodeProcess(resources.process.raw(), &mut code) } != 0).then_some(code)
@@ -4136,16 +4283,46 @@ fn supervise_native_inner(
         pending_stderr_reads,
         stdout_retained_bytes,
         stderr_retained_bytes,
+        diagnostics,
     }
 }
 
 trait H7NativeResultExt {
     fn with_kind(self, kind: H7NativeOutcomeKind) -> Self;
+    fn with_diagnostics(self, diagnostics: H7NativeLaunchDiagnostics) -> Self;
+    fn with_final_local_fence_error(self, error: &str) -> Self;
 }
 
 impl H7NativeResultExt for H7NativeResult {
     fn with_kind(mut self, kind: H7NativeOutcomeKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    fn with_diagnostics(mut self, diagnostics: H7NativeLaunchDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    fn with_final_local_fence_error(mut self, error: &str) -> Self {
+        self.diagnostics.final_local_fence_error_category = Some(
+            if error.contains("ProcessGrant") {
+                "grant_binding"
+            } else if error.contains("Cargo environment") {
+                "d32_environment"
+            } else if error.contains("workspace") {
+                "workspace_binding"
+            } else if error.contains("metadata") {
+                "metadata_fence"
+            } else if error.contains("cancellation") {
+                "cancellation"
+            } else if error == "preparation" {
+                "preparation"
+            } else {
+                "final_local_fence"
+            }
+            .to_string(),
+        );
         self
     }
 }
@@ -4205,6 +4382,7 @@ fn launch_failed(
         pending_stderr_reads: 0,
         stdout_retained_bytes: 0,
         stderr_retained_bytes: 0,
+        diagnostics: H7NativeLaunchDiagnostics::default(),
     }
 }
 
@@ -4682,7 +4860,12 @@ fn d32_sandbox_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
         .current_dir(repo_root)
         .args(["build", "--quiet", "--locked", "--manifest-path"])
         .arg(repo_root.join("vita-agent").join("Cargo.toml"))
-        .args(["--bin", "d32a-sandbox-fixture"])
+        .args([
+            "--bin",
+            "d32a-sandbox-fixture",
+            "--features",
+            "d32-a-test-helper",
+        ])
         .env("CARGO_BUILD_JOBS", "1")
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TERM_COLOR", "never")
@@ -5619,6 +5802,10 @@ pub(crate) struct H7ToolResult {
     pending_stderr_reads: usize,
     stdout_retained_bytes: usize,
     stderr_retained_bytes: usize,
+    // Kept out-of-band from all production result serializers.  The
+    // d32-a-test-helper channel may inspect native launch diagnostics when a
+    // real process fixture fails, but model-visible JSON never includes them.
+    diagnostics: H7NativeLaunchDiagnostics,
 }
 
 impl H7ToolResult {
@@ -5645,6 +5832,7 @@ impl H7ToolResult {
             pending_stderr_reads: 0,
             stdout_retained_bytes: 0,
             stderr_retained_bytes: 0,
+            diagnostics: H7NativeLaunchDiagnostics::default(),
         }
     }
 
@@ -5686,6 +5874,7 @@ impl H7ToolResult {
             pending_stderr_reads: native.pending_stderr_reads,
             stdout_retained_bytes: native.stdout_retained_bytes,
             stderr_retained_bytes: native.stderr_retained_bytes,
+            diagnostics: native.diagnostics,
         }
     }
 
@@ -5736,6 +5925,16 @@ impl H7ToolResult {
             "process_tree_observed": self.process_tree_observed,
             "process_exit_verified": self.process_exit_verified,
             "thread_resumed": self.process_created && self.user_code_started,
+            "final_local_fence_error_category": self
+                .diagnostics
+                .final_local_fence_error_category
+                .clone(),
+            "create_process_succeeded": self.diagnostics.create_process_succeeded,
+            "create_process_error": self.diagnostics.create_process_error,
+            "assign_process_to_job_succeeded": self.diagnostics.assign_process_to_job_succeeded,
+            "assign_process_to_job_error": self.diagnostics.assign_process_to_job_error,
+            "resume_thread_succeeded": self.diagnostics.resume_thread_succeeded,
+            "resume_thread_error": self.diagnostics.resume_thread_error,
         })
     }
 }
@@ -6008,11 +6207,13 @@ impl H7ProcessBroker {
         cancellation_notify: Arc<Notify>,
         admission: H7ProcessAdmissionLease,
     ) -> H7ToolResult {
-        if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
-            && (action.workspace_root.is_none()
-                || self.authority.evaluate_workspace_scope(&action).is_err())
-        {
-            return H7ToolResult::denied();
+        if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+            if action.workspace_root.is_none() {
+                return H7ToolResult::denied();
+            }
+            if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
+                return H7ToolResult::denied();
+            }
         }
         let authorization_revision = match self
             .bridge
@@ -6045,6 +6246,13 @@ impl H7ProcessBroker {
         .await
         {
             Ok(Ok(grant)) => grant,
+            Ok(Err(_error)) => {
+                return if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                };
+            }
             _ => {
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
@@ -6097,9 +6305,7 @@ impl H7ProcessBroker {
                 return H7ToolResult::cancelled_before_start();
             }
             let mut grant = grant;
-            if authority
-                .revalidate_process_grant(&action_for_launch, &mut grant)
-                .is_err()
+            if let Err(_error) = authority.revalidate_process_grant(&action_for_launch, &mut grant)
             {
                 return if worker_cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
@@ -10286,7 +10492,13 @@ mod tests {
             .to_path_buf();
         let fixture = d32_sandbox_fixture_executable(&repository_root)
             .expect("D32-A sandbox fixture executable");
-        let execution_root = tempdir().expect("D32-A fixture execution root");
+        // Keep the adversarial projection under the OS app-data temp parent;
+        // it is not the live repository workspace and avoids granting the
+        // AppContainer SID any traversal rights on the source checkout.
+        let execution_root = Builder::new()
+            .prefix("d32a-sandbox-")
+            .tempdir_in(Path::new(r"C:\Windows\Temp"))
+            .expect("D32-A fixture execution root");
         let toolchain = execution_root.path().join("toolchain");
         fs::create_dir_all(&toolchain).expect("D32-A fixture toolchain root");
         let staged_fixture = toolchain.join("d32a-sandbox-fixture.exe");
@@ -10305,6 +10517,20 @@ mod tests {
         let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("D32-A TCP listener");
         let network_target = tcp_listener.local_addr().expect("D32-A TCP address");
         let udp_receiver = UdpSocket::bind(network_target).expect("D32-A UDP receiver");
+        let udp_echo = udp_receiver.try_clone().expect("D32-A UDP receiver clone");
+        udp_echo
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("D32-A UDP receiver timeout");
+        let udp_echo_task = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 32];
+            match udp_echo.recv_from(&mut buffer) {
+                Ok((length, peer)) if &buffer[..length] == b"d32a" => {
+                    let _ = udp_echo.send_to(b"d32a-ack", peer);
+                    true
+                }
+                _ => false,
+            }
+        });
         let sentinel = File::create(execution_root.path().join("sentinel.txt"))
             .expect("D32-A sentinel handle");
         let sentinel_raw = sentinel.as_raw_handle() as usize;
@@ -10340,7 +10566,7 @@ mod tests {
         .with_unlisted_inheritable_handle(sentinel_raw);
         let args = vec![
             "d32-sandbox-canary".to_string(),
-            allowed.to_string_lossy().into_owned(),
+            allowed.join("canary.txt").to_string_lossy().into_owned(),
             scratch.to_string_lossy().into_owned(),
             outside.path().to_string_lossy().into_owned(),
             user_profile.path().to_string_lossy().into_owned(),
@@ -10350,15 +10576,22 @@ mod tests {
             sentinel_raw.to_string(),
         ];
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let action = catalog
+        let mut action = catalog
             .prepare_sandbox_fixture_action(
                 context,
                 H7ProcessRequest::synthetic("d32-a-fixture-call", "d32-a-fixture-turn", &arg_refs),
                 Arc::clone(&sandbox),
             )
             .expect("D32-A fixture action");
+        // The adversarial fixture performs bounded filesystem, network, and
+        // descendant probes; keep the production supervisor but give this
+        // test-only catalog action a bounded multi-second lane rather than
+        // the 500 ms generic history-fixture profile.
+        Arc::get_mut(&mut action)
+            .expect("D32-A fixture action remains uniquely owned")
+            .timeout = Duration::from_secs(5);
         let metrics = broker.metrics();
-        let task = tokio::spawn({
+        let mut task = tokio::spawn({
             let broker = Arc::clone(&broker);
             async move { broker.execute(action).await }
         });
@@ -10373,27 +10606,65 @@ mod tests {
             .response
             .send(revision)
             .expect("D32-A fixture confirmation response");
+        let mut terminal_result = None;
         if metrics.process_created.load(Ordering::Acquire) == 0 {
-            tokio::time::timeout(H7_TURN_TIMEOUT, metrics.created_notify.notified())
-                .await
-                .expect("D32-A fixture process creation");
+            tokio::select! {
+                _ = tokio::time::sleep(H7_TURN_TIMEOUT) => {
+                    panic!("D32-A fixture process creation timed out without a terminal broker result")
+                }
+                terminal = &mut task => {
+                    let result = terminal.expect("D32-A fixture broker task before process creation");
+                    if result.process_created {
+                        terminal_result = Some(result);
+                    } else {
+                        #[cfg(feature = "d32-a-test-helper")]
+                        let evidence = result.internal_process_evidence();
+                        #[cfg(not(feature = "d32-a-test-helper"))]
+                        let evidence = Value::Null;
+                        panic!(
+                            "D32-A fixture launch terminated before CreateProcessW: result={result:?}; evidence={evidence}"
+                        );
+                    }
+                }
+            }
         }
         // The fixture's parent exits after emitting its bounded observations;
         // the grandchild remains in the Job.  Wait for that process-terminal
         // event, then exercise the same outer cancellation supervisor that
         // production Cargo uses to close the complete tree.
-        if metrics.process_exited.load(Ordering::Acquire) == 0 {
-            tokio::time::timeout(H7_TURN_TIMEOUT, metrics.process_exited_notify.notified())
-                .await
-                .expect("D32-A fixture parent terminal event");
+        if terminal_result.is_none() && metrics.process_exited.load(Ordering::Acquire) == 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(H7_TURN_TIMEOUT) => {
+                    panic!("D32-A fixture parent terminal timed out without a terminal broker result")
+                }
+                terminal = &mut task => {
+                    let result = terminal.expect("D32-A fixture broker task before parent terminal");
+                    if result.process_created {
+                        terminal_result = Some(result);
+                    } else {
+                        #[cfg(feature = "d32-a-test-helper")]
+                        let evidence = result.internal_process_evidence();
+                        #[cfg(not(feature = "d32-a-test-helper"))]
+                        let evidence = Value::Null;
+                        panic!(
+                            "D32-A fixture launch terminated before parent terminal: result={result:?}; evidence={evidence}"
+                        );
+                    }
+                }
+            }
         }
-        broker.cancel();
-        let result = tokio::time::timeout(H7_TURN_TIMEOUT, task)
-            .await
-            .expect("D32-A fixture outer cancellation")
-            .expect("D32-A fixture broker task");
-        let observation = serde_json::from_str::<Value>(&result.stdout)
-            .expect("D32-A fixture bounded JSON observation");
+        let result = if let Some(result) = terminal_result {
+            result
+        } else {
+            broker.cancel();
+            tokio::time::timeout(H7_TURN_TIMEOUT, task)
+                .await
+                .expect("D32-A fixture outer cancellation")
+                .expect("D32-A fixture broker task")
+        };
+        let observation = serde_json::from_str::<Value>(&result.stdout).unwrap_or_else(|error| {
+            panic!("D32-A fixture bounded JSON observation unavailable: {error}; result={result:?}")
+        });
         assert_eq!(observation["allowed_read"], true);
         assert_eq!(observation["scratch_write"], true);
         assert_eq!(observation["outside_read_denied"], true);
@@ -10404,6 +10675,7 @@ mod tests {
         assert_eq!(observation["tcp_refused"], false);
         assert_eq!(observation["tcp_denied"], true);
         assert_eq!(observation["udp_denied"], true);
+        assert!(!udp_echo_task.join().expect("D32-A UDP echo probe thread"));
         assert_eq!(observation["breakaway_denied"], true);
         assert_eq!(observation["forbidden_handle_probe_denied"], true);
         assert_eq!(metrics.process_tree_remaining.load(Ordering::Acquire), 0);

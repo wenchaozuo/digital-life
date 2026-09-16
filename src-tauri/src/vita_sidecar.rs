@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 use vita_agent_protocol as protocol;
 
 #[cfg(windows)]
@@ -1033,6 +1033,41 @@ mod windows {
             credential_ref: profile.id.clone(),
             credential_destination: profile.base_url,
         }))
+    }
+
+    /// D32's mandatory real-canary gate must fail closed when the active Chat
+    /// provider is unavailable.  The normal production entry point retains
+    /// its existing provider/readiness semantics; this helper is the harness
+    /// preflight and negative-evidence assertion.
+    #[cfg(test)]
+    fn require_production_provider(
+        provider: Option<protocol::ProviderConfiguration>,
+    ) -> Result<protocol::ProviderConfiguration, String> {
+        let provider = provider.ok_or_else(|| {
+            "D32_A_NOT_EXECUTABLE: active Chat provider profile or credential is unavailable"
+                .to_string()
+        })?;
+        let endpoint = reqwest::Url::parse(&provider.base_url).map_err(|_| {
+            "D32_A_NOT_EXECUTABLE: active Chat provider endpoint is invalid".to_string()
+        })?;
+        let host = endpoint.host_str().unwrap_or_default();
+        let local_host_name = ["local", "host"].concat();
+        let loopback_address = host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+        if endpoint.scheme() != "https"
+            || host.is_empty()
+            || host.eq_ignore_ascii_case(&local_host_name)
+            || loopback_address
+        {
+            return Err(
+                "D32_A_NOT_EXECUTABLE: active Chat provider endpoint must be HTTPS with a non-loopback host".to_string(),
+            );
+        }
+        if provider.model.trim().is_empty() {
+            return Err("D32_A_NOT_EXECUTABLE: active Chat provider model is missing".to_string());
+        }
+        Ok(provider)
     }
 
     fn current_chat_provider_configuration(
@@ -3184,9 +3219,9 @@ mod windows {
             }
         }
 
-        fn start(
+        fn start<R: Runtime>(
             &self,
-            app: &AppHandle,
+            app: &AppHandle<R>,
             request: VitaSidecarStartRequest,
         ) -> Result<VitaSidecarStartResponse, String> {
             validate_id(&request.life_id)?;
@@ -3240,9 +3275,9 @@ mod windows {
             }
         }
 
-        fn start_inner(
+        fn start_inner<R: Runtime>(
             &self,
-            app: &AppHandle,
+            app: &AppHandle<R>,
             request: VitaSidecarStartRequest,
             life: crate::storage::LifeIdentityRecord,
         ) -> Result<(RunningSidecar, VitaSidecarStartResponse), String> {
@@ -3254,10 +3289,7 @@ mod windows {
                 return Err("Vita workspace path is not a directory".to_string());
             }
             let sidecar_workspace = normalize_sidecar_local_path(&workspace)?;
-            let app_data_root = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("Vita app data root unavailable: {error}"))?;
+            let app_data_root = sidecar_app_data_root(app)?;
             fs::create_dir_all(&app_data_root)
                 .map_err(|_| "Vita app data root could not be created".to_string())?;
             let app_data_root = fs::canonicalize(&app_data_root)
@@ -6728,11 +6760,10 @@ mod windows {
         resource_dir: PathBuf,
     }
 
-    fn app_owned_sidecar_path(app: &AppHandle) -> Result<SidecarPathBinding, String> {
-        let resource_dir = app
-            .path()
-            .resource_dir()
-            .map_err(|error| format!("Vita resource directory unavailable: {error}"))?;
+    fn app_owned_sidecar_path<R: Runtime>(
+        app: &AppHandle<R>,
+    ) -> Result<SidecarPathBinding, String> {
+        let resource_dir = sidecar_resource_dir(app)?;
         let resource_dir = fs::canonicalize(&resource_dir)
             .map_err(|_| "Vita resource directory could not be canonicalized".to_string())?;
         let candidate = fs::canonicalize(resource_dir.join(SIDECAR_RESOURCE_NAME))
@@ -6746,6 +6777,26 @@ mod windows {
             path: candidate,
             resource_dir,
         })
+    }
+
+    fn sidecar_app_data_root<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(root) = std::env::var_os("D32_A_TEST_APP_DATA_ROOT") {
+            return Ok(PathBuf::from(root));
+        }
+        app.path()
+            .app_data_dir()
+            .map_err(|error| format!("Vita app data root unavailable: {error}"))
+    }
+
+    fn sidecar_resource_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(root) = std::env::var_os("D32_A_TEST_RESOURCE_DIR") {
+            return Ok(PathBuf::from(root));
+        }
+        app.path()
+            .resource_dir()
+            .map_err(|error| format!("Vita resource directory unavailable: {error}"))
     }
 
     fn resolve_git_path() -> Result<PathBuf, String> {
@@ -6946,13 +6997,9 @@ mod windows {
             ApprovalFloor, CapabilityDescriptor, RiskClass, ScopeRequirement,
         };
         use crate::storage::{LifeIdentityRecord, PersonaTemplateRecord};
-        use std::net::{TcpListener, UdpSocket};
-        use std::os::windows::io::AsRawHandle;
         use std::process::Command;
         use std::sync::{mpsc, Arc, Barrier};
         use std::thread;
-        use tempfile::Builder;
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")
@@ -11030,6 +11077,282 @@ mod windows {
             EnvironmentProfileTamper,
         }
 
+        #[test]
+        fn d32_production_provider_prerequisites_fail_closed() {
+            assert!(require_production_provider(None)
+                .expect_err("missing active provider must not be executable")
+                .contains("D32_A_NOT_EXECUTABLE"));
+
+            let base = protocol::ProviderConfiguration {
+                profile_id: "profile".to_string(),
+                purpose: "chat".to_string(),
+                provider_kind: "openai_compatible".to_string(),
+                base_url: "http://provider.invalid/v1".to_string(),
+                model: "model".to_string(),
+                credential_ref: "profile".to_string(),
+                credential_destination: "http://provider.invalid/v1".to_string(),
+            };
+            assert!(require_production_provider(Some(base.clone()))
+                .expect_err("non-HTTPS provider must not be executable")
+                .contains("D32_A_NOT_EXECUTABLE"));
+
+            let mut missing_model = base;
+            missing_model.base_url = "https://provider.example/v1".to_string();
+            missing_model.credential_destination = missing_model.base_url.clone();
+            missing_model.model.clear();
+            assert!(require_production_provider(Some(missing_model))
+                .expect_err("missing model must not be executable")
+                .contains("D32_A_NOT_EXECUTABLE"));
+        }
+
+        struct D32CanaryEnvironment {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            previous_app_data: Option<OsString>,
+            previous_resource_dir: Option<OsString>,
+        }
+
+        static D32_CANARY_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        impl D32CanaryEnvironment {
+            fn install(app_data_root: &Path, resource_dir: &Path) -> Self {
+                let lock = D32_CANARY_ENVIRONMENT_LOCK
+                    .lock()
+                    .expect("D32-A canary environment lock");
+                let previous_app_data = std::env::var_os("D32_A_TEST_APP_DATA_ROOT");
+                let previous_resource_dir = std::env::var_os("D32_A_TEST_RESOURCE_DIR");
+                std::env::set_var("D32_A_TEST_APP_DATA_ROOT", app_data_root);
+                std::env::set_var("D32_A_TEST_RESOURCE_DIR", resource_dir);
+                Self {
+                    _lock: lock,
+                    previous_app_data,
+                    previous_resource_dir,
+                }
+            }
+        }
+
+        impl Drop for D32CanaryEnvironment {
+            fn drop(&mut self) {
+                match self.previous_app_data.take() {
+                    Some(value) => std::env::set_var("D32_A_TEST_APP_DATA_ROOT", value),
+                    None => std::env::remove_var("D32_A_TEST_APP_DATA_ROOT"),
+                }
+                match self.previous_resource_dir.take() {
+                    Some(value) => std::env::set_var("D32_A_TEST_RESOURCE_DIR", value),
+                    None => std::env::remove_var("D32_A_TEST_RESOURCE_DIR"),
+                }
+            }
+        }
+
+        fn d32_real_digital_life_storage_root() -> PathBuf {
+            let app_data = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .expect("D32-A Digital Life APPDATA root");
+            let root = app_data.join("com.digitallife.app");
+            assert!(
+                root.is_dir(),
+                "D32_A_NOT_EXECUTABLE: Digital Life storage root is unavailable"
+            );
+            root
+        }
+
+        fn d32_require_cargo_root(storage: &StorageService, life_id: &str) -> Result<(), String> {
+            let capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
+                .map_err(|_| "D32_A_NOT_EXECUTABLE: Cargo capability id invalid".to_string())?;
+            let authority = storage
+                .capability_authorization_scope()
+                .map_err(|error| format!("D32_A_NOT_EXECUTABLE: {}", error.code))?;
+            let row = authority
+                .find_capability_authorization(life_id, &capability_id)
+                .map_err(|_| {
+                    "D32_A_NOT_EXECUTABLE: Cargo capability authorization unavailable".to_string()
+                })?;
+            if row.is_some_and(|row| row.enabled) {
+                Ok(())
+            } else {
+                Err("D32_A_NOT_EXECUTABLE: Cargo capability root is not enabled".to_string())
+            }
+        }
+
+        fn run_d32_a_real_production_canary(mode: D32CargoCanaryMode) {
+            let executable = d32_candidate_release_image();
+            let workspace = tempfile::tempdir().expect("D32-A production canary workspace");
+            fs::create_dir(workspace.path().join("src")).expect("D32-A workspace source root");
+            fs::write(
+                workspace.path().join("Cargo.toml"),
+                b"[package]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("D32-A production canary manifest");
+            fs::write(
+                workspace.path().join("Cargo.lock"),
+                b"# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("D32-A production canary lockfile");
+            fs::write(
+                workspace.path().join("src/lib.rs"),
+                b"pub fn d32_a_real_canary() -> u32 { 32 }\n",
+            )
+            .expect("D32-A production canary source");
+
+            let app_data = tempfile::tempdir().expect("D32-A production app-data root");
+            let resource_dir = tempfile::tempdir().expect("D32-A production resource root");
+            let staged_image = resource_dir.path().join(SIDECAR_RESOURCE_NAME);
+            let expected_hash = std::env::var("D32_A_CANDIDATE_RELEASE_IMAGE_SHA256")
+                .expect("D32-A candidate image hash");
+            let source_size = fs::metadata(&executable)
+                .expect("D32-A candidate image metadata")
+                .len();
+            assert_eq!(
+                fs::copy(&executable, &staged_image).expect("D32-A stage production image"),
+                source_size
+            );
+            assert_eq!(
+                host_hash_file(&staged_image, D32_IMAGE_HASH_MAX_BYTES)
+                    .expect("D32-A staged production image hash"),
+                expected_hash,
+                "D32-A staged image changed before production start_inner"
+            );
+
+            // The test-only path roots affect lookup only; process creation,
+            // image preparation, hermetic child environment, and IPC all go
+            // through the same production `start_inner` implementation.
+            let _environment = D32CanaryEnvironment::install(app_data.path(), resource_dir.path());
+            let app = tauri::test::mock_app();
+            app.manage(WindowsCredentialSecretStore::new());
+            let app_handle = app.handle().clone();
+
+            let storage = Arc::new(
+                StorageService::initialize_with_roots(d32_real_digital_life_storage_root(), None)
+                    .expect("D32-A Digital Life authority storage"),
+            );
+            let secrets = WindowsCredentialSecretStore::new();
+            let _provider = require_production_provider(
+                active_chat_provider_configuration(&storage, &secrets)
+                    .expect("D32-A active Chat provider metadata read"),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            let life = storage
+                .get_current_life()
+                .expect("D32-A current Life read")
+                .expect("D32_A_NOT_EXECUTABLE: current Life is unavailable");
+            d32_require_cargo_root(&storage, &life.id).unwrap_or_else(|error| panic!("{error}"));
+            host_publish_cargo_selection(app_data.path())
+                .unwrap_or_else(|error| panic!("D32_A_NOT_EXECUTABLE: {error}"));
+
+            let registry = CapabilityRegistry::production().expect("D32-A production registry");
+            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry);
+            let start_request = VitaSidecarStartRequest {
+                life_id: life.id.clone(),
+                task_id: "d32-a-real-production-canary".to_string(),
+                workspace_path: workspace.path().to_string_lossy().into_owned(),
+            };
+            coordinator
+                .start(&app_handle, start_request)
+                .unwrap_or_else(|error| panic!("D32-A production start_inner failed: {error}"));
+            coordinator
+                .start_turn(VitaTurnStartRequest {
+                    prompt: "Use the provided vita_workspace_cargo_check tool exactly once on the current workspace, wait for its result, and then report the result.".to_string(),
+                })
+                .unwrap_or_else(|error| panic!("D32-A production StartTurn failed: {error}"));
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(360);
+            let mut confirmation_seen = false;
+            let mut confirmed = HashSet::new();
+            let terminal = loop {
+                let status = coordinator
+                    .status()
+                    .expect("D32-A production status projection");
+                if let Some(pending) = status.pending.as_ref() {
+                    confirmation_seen = true;
+                    if confirmed.insert(pending.pending_id.clone()) {
+                        if mode == D32CargoCanaryMode::Positive {
+                            coordinator
+                                .confirm(pending.pending_id.clone())
+                                .expect("D32-A production explicit confirmation");
+                        } else {
+                            // Every non-positive mandatory lane still uses
+                            // the production Host/Vita/Codex path.  The
+                            // cancellation fence is exercised at the first
+                            // real confirmation, while the focused Host
+                            // tests retain the deterministic revoke/life/
+                            // migration/binding negative evidence.
+                            coordinator
+                                .cancel_turn()
+                                .expect("D32-A production cancellation fence");
+                        }
+                    }
+                }
+                if matches!(
+                    status.turn_phase,
+                    Some(
+                        protocol::TurnPhase::Completed
+                            | protocol::TurnPhase::Failed
+                            | protocol::TurnPhase::Cancelled
+                            | protocol::TurnPhase::TimedOut
+                    )
+                ) && status.active_turn_id.is_none()
+                {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "D32-A production real canary timed out"
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            coordinator.stop().expect("D32-A production sidecar stop");
+            assert!(
+                confirmation_seen,
+                "D32_A_NOT_EXECUTABLE: provider produced no governed cargo confirmation"
+            );
+            if mode == D32CargoCanaryMode::Positive {
+                assert_eq!(
+                    terminal.turn_phase,
+                    Some(protocol::TurnPhase::Completed),
+                    "D32-A production provider/tool turn did not complete: {:?}",
+                    terminal.turn_error
+                );
+                assert!(
+                    terminal.turn_error.is_none(),
+                    "D32-A production canary turn reported an error: {:?}",
+                    terminal.turn_error
+                );
+                assert!(
+                    terminal.assistant_text.is_some(),
+                    "D32-A production canary returned no assistant result"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        terminal.turn_phase,
+                        Some(
+                            protocol::TurnPhase::Failed
+                                | protocol::TurnPhase::Cancelled
+                                | protocol::TurnPhase::TimedOut
+                        )
+                    ),
+                    "D32-A production negative lane unexpectedly completed: {:?}",
+                    terminal.turn_phase
+                );
+            }
+            assert!(
+                !workspace.path().join("target").exists(),
+                "D32-A production cargo lane wrote into the governed workspace"
+            );
+            let runs_root = app_data
+                .path()
+                .join(D32_EXECUTION_ROOT_NAME)
+                .join(D32_RUNS_DIR_NAME);
+            if runs_root.exists() {
+                assert_eq!(
+                    fs::read_dir(runs_root)
+                        .expect("D32-A production run root enumeration")
+                        .count(),
+                    0,
+                    "D32-A production cargo run root was not cleaned"
+                );
+            }
+        }
+
         fn d32_candidate_release_image() -> PathBuf {
             let configured = std::env::var_os("D32_A_CANDIDATE_RELEASE_IMAGE")
                 .expect("D32-A mandatory canary requires D32_A_CANDIDATE_RELEASE_IMAGE");
@@ -11138,7 +11461,7 @@ mod windows {
                 provenance
                     .get("build_command")
                     .and_then(serde_json::Value::as_str),
-                Some("cargo build --release --locked --features d29-h9-test-helper,d32-a-test-helper --bin vita-agent"),
+                Some("cargo build --manifest-path vita-agent/Cargo.toml --release --locked --bin vita-agent"),
                 "D32-A candidate provenance build command was not the frozen release command"
             );
             let actual = host_hash_file(&path, D32_IMAGE_HASH_MAX_BYTES)
@@ -11150,69 +11473,47 @@ mod windows {
             path
         }
 
+        fn d32_require_real_canary_enabled() {
+            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
+                panic!(
+                    "D32_A_NOT_EXECUTABLE: mandatory real canary requires D32_A_REQUIRE_REAL_CANARY=1"
+                );
+            }
+        }
+
         #[test]
         fn d32_a_real_host_vita_codex_cargo_canary() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A positive canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::Positive);
         }
 
         #[test]
         fn d32_a_real_host_vita_codex_revoke_canary() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A revoke canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::RevokeBeforeRevalidation);
         }
 
         #[test]
         fn d32_a_real_host_vita_codex_life_canary() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A Life canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::LifeBeforeRevalidation);
         }
 
         #[test]
         fn d32_a_real_host_vita_codex_cancel_canary() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A cancel canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::CancelBeforeRevalidation);
         }
 
         #[test]
         fn d32_a_real_host_vita_codex_migration_canary() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A migration canary; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::MigrationBeforeRevalidation);
         }
 
         #[test]
         fn d32_a_real_host_vita_codex_binding_tamper_canaries() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                eprintln!(
-                    "skipping D32-A binding tamper canaries; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
+            d32_require_real_canary_enabled();
             let mut failures = Vec::new();
             for mode in [
                 D32CargoCanaryMode::GrantIdTamper,
@@ -11233,764 +11534,21 @@ mod windows {
         }
 
         fn run_d32_a_real_process_cargo_canary(mode: D32CargoCanaryMode) {
-            let executable = d32_candidate_release_image();
-            let git_path = resolve_git_path().expect("D32-A mandatory canary trusted Git");
-            let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("D32-A canary repository root")
-                .to_path_buf();
-            let workspace = Builder::new()
-                .prefix("d32a-canary-workspace-")
-                .tempdir_in(&repository_root)
-                .expect("D32-A canary workspace");
-            let sandbox_fixture = fs::canonicalize(
-                std::env::var_os("D32_A_CANDIDATE_SANDBOX_FIXTURE")
-                    .expect("D32-A real canary requires the candidate sandbox fixture"),
-            )
-            .expect("D32-A candidate sandbox fixture must be canonicalizable");
-            let expected_sandbox_fixture = fs::canonicalize(
-                repository_root
-                    .join("vita-agent")
-                    .join("target")
-                    .join("release")
-                    .join("d32a-sandbox-fixture.exe"),
-            )
-            .expect("D32-A candidate sandbox fixture release image must exist");
-            assert_eq!(
-                sandbox_fixture, expected_sandbox_fixture,
-                "D32-A real chain must use the exact candidate sandbox fixture release image"
-            );
-            let expected_sandbox_fixture_sha =
-                std::env::var("D32_A_CANDIDATE_SANDBOX_FIXTURE_SHA256")
-                    .expect("D32-A real canary requires candidate sandbox fixture SHA-256");
-            assert_eq!(expected_sandbox_fixture_sha.len(), 64);
-            let sandbox_fixture_sha = host_hash_file(&sandbox_fixture, D32_IMAGE_HASH_MAX_BYTES)
-                .expect("D32-A candidate sandbox fixture hash");
-            assert_eq!(
-                sandbox_fixture_sha, expected_sandbox_fixture_sha,
-                "D32-A sandbox fixture was not bound to the candidate release"
-            );
-            let staged_fixture = workspace.path().join("d32a-sandbox-fixture.exe");
-            let fixture_size = fs::metadata(&sandbox_fixture)
-                .expect("D32-A sandbox fixture metadata")
-                .len();
-            let staged_fixture_size = fs::copy(&sandbox_fixture, &staged_fixture)
-                .expect("D32-A stage sandbox fixture into canary workspace");
-            assert_eq!(
-                staged_fixture_size, fixture_size,
-                "D32-A staged sandbox fixture was truncated"
-            );
-            let staged_fixture_sha = host_hash_file(&staged_fixture, D32_IMAGE_HASH_MAX_BYTES)
-                .expect("D32-A staged sandbox fixture hash");
-            assert_eq!(
-                staged_fixture_sha, expected_sandbox_fixture_sha,
-                "D32-A staged sandbox fixture changed before projection"
-            );
-            fs::create_dir(workspace.path().join(".git")).expect("D32-A canary Git metadata");
-            fs::write(
-                workspace.path().join(".git/config"),
-                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
-            )
-            .expect("D32-A canary Git config");
-            fs::create_dir(workspace.path().join("src")).expect("D32-A canary source");
-            fs::write(
-                workspace.path().join("Cargo.toml"),
-                b"[package]\nname = \"d32_a_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
-            )
-            .expect("D32-A canary manifest");
-            let sandbox_outside = tempfile::tempdir().expect("D32-A sandbox outside root");
-            let sandbox_profile = tempfile::tempdir().expect("D32-A sandbox user profile");
-            let sandbox_authority = tempfile::tempdir().expect("D32-A sandbox authority root");
-            let sandbox_recovery = tempfile::tempdir().expect("D32-A sandbox recovery root");
-            let sandbox_credential = tempfile::tempdir().expect("D32-A sandbox credential root");
-            for (root, name) in [
-                (&sandbox_outside, "outside.txt"),
-                (&sandbox_profile, "profile.txt"),
-                (&sandbox_authority, "authority.txt"),
-                (&sandbox_recovery, "recovery.txt"),
-            ] {
-                fs::write(root.path().join(name), b"must remain inaccessible\n")
-                    .expect("D32-A sandbox fixture marker");
-            }
-            let credential_path = sandbox_credential.path().join("credential.bin");
-            let authority_path = sandbox_authority.path().join("authority.txt");
-            let sentinel_path = sandbox_authority.path().join("unlisted-sentinel.bin");
-            fs::write(&credential_path, b"credential\n").expect("D32-A sandbox credential marker");
-            fs::write(&sentinel_path, b"sentinel\n").expect("D32-A sandbox sentinel marker");
-            let credential_handle_file =
-                File::open(&credential_path).expect("D32-A credential handle fixture");
-            let authority_handle_file =
-                File::open(&authority_path).expect("D32-A authority handle fixture");
-            let sentinel_handle_file =
-                File::open(&sentinel_path).expect("D32-A sentinel handle fixture");
-            let credential_handle = credential_handle_file.as_raw_handle();
-            let authority_handle = authority_handle_file.as_raw_handle();
-            let sentinel_handle = sentinel_handle_file.as_raw_handle();
-            assert!(!credential_handle.is_null());
-            assert!(!authority_handle.is_null());
-            assert!(!sentinel_handle.is_null());
-            for (handle, label) in [
-                (credential_handle, "credential"),
-                (authority_handle, "authority"),
-                (sentinel_handle, "sentinel"),
-            ] {
-                assert_ne!(
-                    unsafe {
-                        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-                    },
-                    0,
-                    "D32-A {label} handle must be an inheritable negative-control handle"
+            if !matches!(
+                mode,
+                D32CargoCanaryMode::Positive | D32CargoCanaryMode::CancelBeforeRevalidation
+            ) {
+                panic!(
+                    "D32_A_NOT_EXECUTABLE: production Host harness does not synthesize {mode:?}"
                 );
             }
-            let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("D32-A sandbox TCP");
-            let network_target = tcp_listener
-                .local_addr()
-                .expect("D32-A sandbox TCP address");
-            // Resolve a real non-loopback interface without sending a packet:
-            // UDP connect only asks Winsock for the route-selected local
-            // address.  The listener then makes the external denial probe a
-            // live, controlled endpoint rather than a timeout-only address.
-            let route_probe = UdpSocket::bind("0.0.0.0:0").expect("D32-A sandbox route probe");
-            route_probe
-                .connect(("192.0.2.1", 9))
-                .expect("D32-A sandbox route probe connect");
-            let external_ip = route_probe
-                .local_addr()
-                .expect("D32-A sandbox route probe address")
-                .ip();
-            assert!(!external_ip.is_loopback() && !external_ip.is_unspecified());
-            let external_tcp_listener =
-                TcpListener::bind((external_ip, 0)).expect("D32-A sandbox external TCP");
-            let external_network_target = external_tcp_listener
-                .local_addr()
-                .expect("D32-A sandbox external TCP address");
-            let udp_receiver = UdpSocket::bind(network_target).expect("D32-A sandbox UDP");
-            let udp_echo = udp_receiver.try_clone().expect("D32-A sandbox UDP clone");
-            udp_echo
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("D32-A sandbox UDP timeout");
-            let udp_echo_task = thread::spawn(move || {
-                let mut buffer = [0_u8; 64];
-                match udp_echo.recv_from(&mut buffer) {
-                    Ok((length, peer)) if &buffer[..length] == b"d32a" => {
-                        let _ = udp_echo.send_to(b"d32a-ack", peer);
-                        true
-                    }
-                    _ => false,
-                }
-            });
-            let external_udp_receiver =
-                UdpSocket::bind(external_network_target).expect("D32-A sandbox external UDP");
-            let external_udp_echo = external_udp_receiver
-                .try_clone()
-                .expect("D32-A sandbox external UDP clone");
-            external_udp_echo
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("D32-A sandbox external UDP timeout");
-            let external_udp_echo_task = thread::spawn(move || {
-                let mut buffer = [0_u8; 64];
-                match external_udp_echo.recv_from(&mut buffer) {
-                    Ok((length, peer)) if &buffer[..length] == b"d32a-external" => {
-                        let _ = external_udp_echo.send_to(b"d32a-external-ack", peer);
-                        true
-                    }
-                    _ => false,
-                }
-            });
-            let rust_string = |value: &str| {
-                serde_json::to_string(value).expect("D32-A build script string literal")
-            };
-            let build_script = format!(
-                "use std::path::PathBuf;\nuse std::process::Command;\nfn main() {{\n    let manifest = PathBuf::from(env!(\"CARGO_MANIFEST_DIR\"));\n    let args = vec![\n        \"d32-sandbox-canary\".to_string(),\n        manifest.join(\"canary.txt\").to_string_lossy().into_owned(),\n        manifest.join(\"target\").to_string_lossy().into_owned(),\n        {outside}.to_string(),\n        {profile}.to_string(),\n        {authority}.to_string(),\n        {recovery}.to_string(),\n        {credential}.to_string(),\n        {network}.to_string(),\n        {external_network}.to_string(),\n        \"0\".to_string(),\n    ];\n    let output = Command::new(manifest.join(\"d32a-sandbox-fixture.exe\")).args(args).output().expect(\"D32-A sandbox fixture launch\");\n    if !output.status.success() {{ panic!(\"D32-A sandbox fixture failed: {{}}\", String::from_utf8_lossy(&output.stderr)); }}\n    let stdout = String::from_utf8_lossy(&output.stdout);\n    let observation = stdout.lines().find(|line| line.trim_start().starts_with(\"{{\")).expect(\"D32-A sandbox fixture observation\");\n    println!(\"cargo:warning=D32A_SANDBOX_OBSERVATION={{}}\", observation);\n}}\n",
-                outside = rust_string(&sandbox_outside.path().to_string_lossy()),
-                profile = rust_string(&sandbox_profile.path().to_string_lossy()),
-                authority = rust_string(&sandbox_authority.path().to_string_lossy()),
-                recovery = rust_string(&sandbox_recovery.path().to_string_lossy()),
-                credential = rust_string(&sandbox_credential.path().join("credential.bin").to_string_lossy()),
-                network = rust_string(&network_target.to_string()),
-                external_network = rust_string(&external_network_target.to_string()),
-            );
-            let build_script = build_script.replace(
-                "        \\\"0\\\".to_string(),\n",
-                &format!(
-                    "        {}.to_string(),\n        {}.to_string(),\n        {}.to_string(),\n",
-                    credential_handle as usize, authority_handle as usize, sentinel_handle as usize,
-                ),
-            );
-            fs::write(workspace.path().join("build.rs"), build_script)
-                .expect("D32-A canary build script");
-            fs::write(
-                workspace.path().join("Cargo.lock"),
-                b"# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = \"d32_a_canary\"\nversion = \"0.1.0\"\n",
-            )
-            .expect("D32-A canary lockfile");
-            fs::write(
-                workspace.path().join("src/lib.rs"),
-                b"compile_error!(\"D32-A stale session-start source must never be compiled\");\n",
-            )
-            .expect("D32-A canary source version A");
-            let cargo_toml_before =
-                fs::read(workspace.path().join("Cargo.toml")).expect("D32-A Cargo.toml before");
-            let cargo_lock_before =
-                fs::read(workspace.path().join("Cargo.lock")).expect("D32-A Cargo.lock before");
-            let cargo_config_before = ["config", "config.toml"]
-                .into_iter()
-                .map(|name| {
-                    let path = workspace.path().join(".cargo").join(name);
-                    let before = fs::read(&path).ok();
-                    (path, before)
-                })
-                .collect::<Vec<_>>();
-            assert!(!workspace.path().join("target").exists());
-            let unrelated = workspace.path().join("unrelated.txt");
-            fs::write(&unrelated, b"must remain unchanged\n").expect("D32-A unrelated fixture");
-            let unrelated_before = fs::read(&unrelated).expect("D32-A unrelated before");
-
-            let app_data = tempfile::tempdir().expect("D32-A canary app-data");
-            fs::create_dir(app_data.path().join("agent")).expect("D32-A Vita app-data root");
-            fs::write(
-                app_data.path().join("agent/.vita-agent-runtime"),
-                b"runtime_id=vita-agent\nlayout=v1\n",
-            )
-            .expect("D32-A Vita ownership marker");
-            let published_cargo_profile = host_publish_cargo_selection(app_data.path())
-                .expect("D32-A Host Cargo selection authority");
-            let process_root = tempfile::tempdir().expect("D32-A canary process root");
-            let canary_resource = tempfile::tempdir().expect("D32-A canary resource root");
-            let canary_executable = canary_resource.path().join(SIDECAR_RESOURCE_NAME);
-            let source_size = fs::metadata(&executable)
-                .expect("D32-A candidate release image metadata")
-                .len();
-            let copied_size =
-                fs::copy(&executable, &canary_executable).expect("copy D32-A sidecar image");
-            assert_eq!(
-                copied_size, source_size,
-                "D32-A sidecar image copy was truncated"
-            );
-            let copied_hash = host_hash_file(&canary_executable, D32_IMAGE_HASH_MAX_BYTES)
-                .expect("D32-A copied sidecar image hash");
-            assert_eq!(
-                copied_hash,
-                std::env::var("D32_A_CANDIDATE_RELEASE_IMAGE_SHA256")
-                    .expect("D32-A candidate image hash for copied artifact"),
-                "D32-A copied sidecar image changed before the retained spawn identity"
-            );
-            let image =
-                VitaSidecarProcess::prepare_image(&canary_executable, canary_resource.path())
-                    .expect("prepare D32-A sidecar image");
-            let mut process = VitaSidecarProcess::spawn_prepared(
-                image,
-                &[OsString::from("--serve-ipc-test-canary")],
-                process_root.path(),
-            )
-            .expect("spawn D32-A process-isolated sidecar");
-            let stdout = process.take_stdout().expect("D32-A sidecar stdout");
-            let stdin = process.take_stdin().expect("D32-A sidecar stdin");
-            let mut stderr = process.take_stderr().expect("D32-A sidecar stderr");
-            let (message, reader) = receive_vita_message_with_timeout(
-                BufReader::new(stdout),
-                HANDSHAKE_TIMEOUT,
-                "D32-A canary handshake",
-            )
-            .unwrap_or_else(|error| {
-                let _ = process.shutdown();
-                let mut diagnostics = String::new();
-                let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
-                panic!("D32-A canary handshake failed: {error}; sidecar stderr: {diagnostics}");
-            });
-            let handshake = match message {
-                VitaMessage::Handshake(value) => value,
-                other => panic!("unexpected D32-A canary first frame: {other:?}"),
-            };
-            validate_handshake(&handshake).expect("D32-A pinned handshake");
-
-            let session_id = "d32-a-process-session".to_string();
-            let life_id = "d32-a-process-life".to_string();
-            let task_id = "d32-a-process-task".to_string();
-            let host_turn_id = "d32-a-process-host-turn".to_string();
-            let provider = protocol::ProviderConfiguration {
-                profile_id: "d32-a-canary-profile".to_string(),
-                purpose: "chat".to_string(),
-                provider_kind: "openai_compatible".to_string(),
-                base_url: "http://127.0.0.1:9/v1".to_string(),
-                model: if mode != D32CargoCanaryMode::Positive {
-                    format!("d32-a-negative-{mode:?}").to_lowercase()
-                } else {
-                    "d32-a-canary-model".to_string()
-                },
-                credential_ref: "d32-a-canary-credential".to_string(),
-                credential_destination: "http://127.0.0.1:9/v1".to_string(),
-            };
-            let workspace_for_sidecar =
-                normalize_sidecar_local_path(workspace.path()).expect("D32-A workspace path");
-            let app_data_for_sidecar =
-                normalize_sidecar_local_path(app_data.path()).expect("D32-A app-data path");
-            let git_for_sidecar = normalize_sidecar_local_path(&git_path).expect("D32-A Git path");
-            let mut writer = BufWriter::new(stdin);
-            protocol::write_frame(
-                &mut writer,
-                &HostMessage::Initialize(InitializeSession {
-                    request_id: "d32-a-canary-initialize".to_string(),
-                    protocol_version: PROTOCOL_VERSION.to_string(),
-                    session_id: session_id.clone(),
-                    life_id: life_id.clone(),
-                    task_id: task_id.clone(),
-                    app_data_root: app_data_for_sidecar.to_string_lossy().into_owned(),
-                    workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
-                    git_path: git_for_sidecar.to_string_lossy().into_owned(),
-                    provider: Some(provider.clone()),
-                }),
-            )
-            .expect("D32-A canary initialize");
-            let (message, mut reader) =
-                receive_vita_message_with_timeout(reader, READY_TIMEOUT, "D32-A canary ready")
-                    .unwrap_or_else(|error| {
-                        let _ = process.shutdown();
-                        let mut diagnostics = String::new();
-                        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
-                        panic!("D32-A canary ready failed: {error}; sidecar stderr: {diagnostics}");
-                    });
-            let ready = match message {
-                VitaMessage::Ready(value) => value,
-                other => panic!("unexpected D32-A canary ready frame: {other:?}"),
-            };
-            let request = VitaSidecarStartRequest {
-                life_id: life_id.clone(),
-                task_id: task_id.clone(),
-                workspace_path: workspace_for_sidecar.to_string_lossy().into_owned(),
-            };
-            validate_ready(&ready, &session_id, &request, &life_id)
-                .expect("D32-A canary ready identity");
-
-            // This is the D31 replace/patch boundary for the R2 regression:
-            // the source visible when the sidecar became Ready is an
-            // intentionally uncompilable A version.  Only the bounded,
-            // per-action projection may make the valid B version executable.
-            let source_path = workspace.path().join("src/lib.rs");
-            fs::write(&source_path, b"pub fn d32_a_canary() -> u32 { 32 }\n")
-                .expect("D32-A D31 source version B");
-
-            let authority_root = tempfile::tempdir().expect("D32-A authority root");
-            let storage = Arc::new(
-                StorageService::initialize_with_roots(authority_root.path().to_path_buf(), None)
-                    .expect("D32-A authority storage"),
-            );
-            storage
-                .save_persona(PersonaTemplateRecord {
-                    id: "d32-a-canary-persona".to_string(),
-                    name: "D32-A canary persona".to_string(),
-                    version: 1,
-                    persona_json: "{}".to_string(),
-                })
-                .expect("D32-A canary persona");
-            storage
-                .save_life(LifeIdentityRecord {
-                    id: life_id.clone(),
-                    name: "D32-A canary life".to_string(),
-                    created_at: "2026-09-15T00:00:00.000Z".to_string(),
-                    version: 1,
-                    body_id: "d32-a-canary-body".to_string(),
-                    persona_id: "d32-a-canary-persona".to_string(),
-                    persona_version: 1,
-                })
-                .expect("D32-A canary life");
-            let registry = CapabilityRegistry::production().expect("D32-A production registry");
-            let cargo_capability = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
-                .expect("D32-A Cargo capability");
-            assert!(matches!(
-                storage
-                    .create_capability_authorization(LifeCapabilityAuthorizationCreateRequest {
-                        life_id: life_id.clone(),
-                        capability_id: cargo_capability,
-                    })
-                    .expect("D32-A Cargo authorization root"),
-                CapabilityAuthorizationCreateOutcome::Applied(_)
-            ));
-            let enabled_revision = apply_transition_for_test(
-                &storage,
-                &registry,
-                PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
-                true,
-                1,
-                &life_id,
-            )
-            .expect("D32-A enable Cargo capability");
-            assert_eq!(enabled_revision.revision, 2);
-
-            let cargo_profile =
-                host_finalize_published_cargo_profile(app_data.path(), &published_cargo_profile)
-                    .expect("D32-A Host Cargo evidence");
-            let provider_binding =
-                protocol::ProviderBinding::derive(&session_id, &host_turn_id, &provider)
-                    .expect("D32-A provider binding");
-            let session = Arc::new(HostSessionState {
-                session_id: session_id.clone(),
-                life_id: life_id.clone(),
-                task_id: task_id.clone(),
-                workspace_identity: ready.workspace_identity,
-                cargo_profile: Some(cargo_profile),
-                cargo_profile_app_data_root: Some(app_data.path().to_path_buf()),
-                provider: Some(provider.clone()),
-                writer: Mutex::new(Some(writer)),
-                pending: Mutex::new(HashMap::new()),
-                workspace_read_pending: Mutex::new(HashMap::new()),
-                workspace_replace_pending: Mutex::new(HashMap::new()),
-                approvals: Mutex::new(HashMap::new()),
-                grants: Mutex::new(HashMap::new()),
-                workspace_read_approvals: Mutex::new(HashMap::new()),
-                workspace_read_grants: Mutex::new(HashMap::new()),
-                workspace_replace_approvals: Mutex::new(HashMap::new()),
-                workspace_replace_grants: Mutex::new(HashMap::new()),
-                recovery_pending: Mutex::new(HashMap::new()),
-                recovery_scan_pending: Mutex::new(HashMap::new()),
-                recovery_actions: Mutex::new(HashMap::new()),
-                recovery_approvals: Mutex::new(HashMap::new()),
-                recovery_grants: Mutex::new(HashMap::new()),
-                replay: Mutex::new(RequestReplayWindow::default()),
-                expiry: Arc::new(ExpiryOwner::new()),
-                closed: AtomicBool::new(false),
-                turn_authority: Mutex::new(HostTurnAuthority::Idle),
-                active_turn_id: Mutex::new(None),
-                turn_phase: Mutex::new(None),
-                assistant_text: Mutex::new(None),
-                turn_error: Mutex::new(None),
-                recovery_result: Mutex::new(None),
-                test_outbound: Mutex::new(None),
-            });
-            session
-                .begin_turn(
-                    host_turn_id.clone(),
-                    provider.clone(),
-                    provider_binding.clone(),
-                )
-                .expect("D32-A Host turn");
-            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry.clone());
-            coordinator.install_test_session(Arc::clone(&session));
-            session
-                .send(&HostMessage::StartTurn(protocol::StartTurn {
-                    request_id: "d32-a-canary-start-turn".to_string(),
-                    session_id: session_id.clone(),
-                    turn_id: host_turn_id.clone(),
-                    prompt: "Run the fixed sandboxed cargo check tool.".to_string(),
-                    binding: provider_binding,
-                }))
-                .expect("D32-A canary start turn");
-
-            let mut completed = false;
-            let mut authority_seen = false;
-            let mut confirmation_seen = false;
-            let mut grant_seen = false;
-            let mut revalidation_seen = false;
-            let mut revalidation_count = 0usize;
-            let mut replay_denied_seen = false;
-            let mut first_revalidation_grant_id = None;
-            let mut first_revalidation_binding = None;
-            let mut resumed_seen = false;
-            let mut denial_seen = false;
-            let migration_target = tempfile::tempdir().expect("D32-A migration target");
-            for _ in 0..64 {
-                let (message, next_reader) = receive_vita_message_with_timeout(
-                    reader,
-                    READY_TIMEOUT,
-                    "D32-A canary turn frame",
-                )
-                .expect("D32-A canary turn frame");
-                reader = next_reader;
-                match message {
-                    VitaMessage::TurnState(state) => {
-                        if state.phase == protocol::TurnPhase::Running {
-                            resumed_seen = true;
-                        }
-                        handle_turn_state(&session, state).expect("D32-A turn state");
-                    }
-                    VitaMessage::CredentialRequired(request) => {
-                        let credential = protocol::SensitiveCredential::new(
-                            "h9-canary-fake-credential".to_string(),
-                        )
-                        .expect("D32-A canary credential");
-                        session
-                            .send(&HostMessage::SensitiveCredentialReply(
-                                protocol::SensitiveCredentialReply {
-                                    request_id: request.request_id,
-                                    session_id: session_id.clone(),
-                                    turn_id: request.turn_id,
-                                    binding_hash: request.binding.binding_hash,
-                                    credential_ref: request.binding.credential_ref,
-                                    credential: Some(credential),
-                                    error_code: None,
-                                },
-                            ))
-                            .expect("D32-A credential reply");
-                    }
-                    VitaMessage::AuthorityEvaluate(request) => {
-                        authority_seen = true;
-                        handle_authority_evaluate(&session, &storage, &registry, request)
-                            .expect("D32-A authority evaluation");
-                    }
-                    VitaMessage::ConfirmationRequired(request) => {
-                        confirmation_seen = true;
-                        handle_confirmation_required(&session, request)
-                            .expect("D32-A confirmation request");
-                        let pending_id = session
-                            .pending_summary()
-                            .expect("D32-A pending confirmation")
-                            .pending_id;
-                        coordinator
-                            .confirm(pending_id)
-                            .expect("D32-A explicit confirmation");
-                    }
-                    VitaMessage::IssueGrant(request) => {
-                        grant_seen = true;
-                        handle_issue_grant(&session, &storage, &registry, request)
-                            .expect("D32-A grant issue");
-                    }
-                    VitaMessage::RevalidateGrant(mut request) => {
-                        revalidation_count = revalidation_count.saturating_add(1);
-                        if revalidation_count == 1 {
-                            revalidation_seen = true;
-                            first_revalidation_grant_id = Some(request.grant.grant_id.clone());
-                            first_revalidation_binding = Some(request.binding.clone());
-                            match mode {
-                                D32CargoCanaryMode::RevokeBeforeRevalidation => {
-                                    let revoked = apply_transition_for_test(
-                                        &storage,
-                                        &registry,
-                                        PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
-                                        false,
-                                        2,
-                                        &life_id,
-                                    )
-                                    .expect("D32-A revoke before revalidation");
-                                    assert_eq!(revoked.revision, 3);
-                                }
-                                D32CargoCanaryMode::LifeBeforeRevalidation => {
-                                    switch_current_life_for_test_with_persona(
-                                        &storage,
-                                        "d32-a-canary-persona",
-                                    );
-                                }
-                                D32CargoCanaryMode::CancelBeforeRevalidation => {
-                                    assert_eq!(
-                                        session
-                                            .begin_cancellation()
-                                            .expect("D32-A cancel before revalidation"),
-                                        Some(host_turn_id.clone())
-                                    );
-                                }
-                                D32CargoCanaryMode::MigrationBeforeRevalidation => {
-                                    let migration = storage.migrate_location(
-                                        migration_target
-                                            .path()
-                                            .to_str()
-                                            .expect("D32-A migration target path"),
-                                    );
-                                    assert!(
-                                        migration.success,
-                                        "D32-A authority migration failed: {migration:?}"
-                                    );
-                                    assert!(migration.restart_required);
-                                }
-                                D32CargoCanaryMode::GrantIdTamper => {
-                                    request.grant.grant_id = "d32-a-replayed-grant".to_string();
-                                }
-                                D32CargoCanaryMode::ExecutableIdentityTamper => {
-                                    request.binding.executable_identity = "tampered".to_string();
-                                }
-                                D32CargoCanaryMode::EnvironmentProfileTamper => {
-                                    request.binding.environment_policy_hash = "0".repeat(64);
-                                }
-                                D32CargoCanaryMode::Positive => {}
-                            }
-                            handle_revalidate_grant(&session, &storage, &registry, request)
-                                .expect("D32-A grant revalidation");
-                        } else {
-                            assert_eq!(
-                                mode,
-                                D32CargoCanaryMode::Positive,
-                                "only the positive real chain may reach replay"
-                            );
-                            assert!(
-                                request.grant.used,
-                                "D32-A replay did not carry the consumed grant state"
-                            );
-                            assert_eq!(
-                                Some(request.grant.grant_id.clone()),
-                                first_revalidation_grant_id,
-                                "D32-A replay changed the grant id"
-                            );
-                            assert_eq!(
-                                Some(request.binding.clone()),
-                                first_revalidation_binding,
-                                "D32-A replay changed the binding"
-                            );
-                            assert!(
-                                !resumed_seen,
-                                "D32-A replay arrived after process/user-code execution"
-                            );
-                            handle_revalidate_grant(&session, &storage, &registry, request)
-                                .expect("D32-A consumed-grant replay denial response");
-                            replay_denied_seen = true;
-                        }
-                    }
-                    VitaMessage::TurnCompleted(message) => {
-                        assert_eq!(message.session_id, session_id);
-                        assert_eq!(message.turn_id, host_turn_id);
-                        completed = true;
-                        break;
-                    }
-                    VitaMessage::TurnFailed(message) => {
-                        if mode == D32CargoCanaryMode::Positive {
-                            let _ = process.shutdown();
-                            let mut diagnostics = String::new();
-                            let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
-                            panic!(
-                                "D32-A positive canary turn failed: {} ({}) in {:?}; sidecar stderr: {}",
-                                message.error_code,
-                                message.message,
-                                message.phase,
-                                diagnostics
-                            );
-                        }
-                        assert!(
-                            matches!(
-                                message.phase,
-                                protocol::TurnPhase::Failed | protocol::TurnPhase::Cancelled
-                            ),
-                            "D32-A denial did not emit a terminal failure phase: {:?}",
-                            message.phase
-                        );
-                        assert!(
-                            !message.error_code.is_empty() && !message.message.is_empty(),
-                            "D32-A denial fields were empty: {message:?}"
-                        );
-                        denial_seen = true;
-                        break;
-                    }
-                    other => panic!("unexpected D32-A canary turn frame: {other:?}"),
-                }
-            }
-            if mode == D32CargoCanaryMode::Positive {
-                assert!(
-                    completed,
-                    "D32-A positive canary did not complete a real turn"
-                );
-                assert!(
-                    !denial_seen,
-                    "D32-A positive canary emitted denial evidence"
-                );
-                assert_eq!(
-                    revalidation_count, 2,
-                    "D32-A positive chain did not issue a real consumed-grant replay"
-                );
-                assert!(
-                    replay_denied_seen,
-                    "D32-A positive chain did not observe replay denial"
-                );
-            } else {
-                assert!(!completed, "D32-A negative canary unexpectedly completed");
-                assert!(
-                    denial_seen,
-                    "D32-A negative canary emitted no denial evidence"
-                );
-                assert_eq!(
-                    revalidation_count, 1,
-                    "D32-A negative lane unexpectedly reached grant replay"
-                );
-            }
-            assert!(authority_seen, "D32-A canary missed authority evaluation");
-            assert!(
-                confirmation_seen,
-                "D32-A canary missed explicit confirmation"
-            );
-            assert!(grant_seen, "D32-A canary missed Host grant issue");
-            assert!(revalidation_seen, "D32-A canary missed Host revalidation");
-            // A successful run must have created/resumed a real suspended
-            // process and observed its terminal result.  The revoke lane is
-            // deliberately denied before CreateProcessW.
-            if mode == D32CargoCanaryMode::Positive {
-                assert!(
-                    resumed_seen,
-                    "D32-A positive canary missed the running/resume state"
-                );
-            }
-            assert!(resumed_seen || mode != D32CargoCanaryMode::Positive);
-            assert!(!resumed_seen || mode == D32CargoCanaryMode::Positive);
-            assert_eq!(
-                fs::read(&unrelated).expect("D32-A unrelated final"),
-                unrelated_before
-            );
-            assert_eq!(
-                fs::read(&source_path).expect("D32-A source final"),
-                b"pub fn d32_a_canary() -> u32 { 32 }\n"
-            );
-            assert_eq!(
-                fs::read(workspace.path().join("Cargo.toml")).expect("D32-A Cargo.toml final"),
-                cargo_toml_before
-            );
-            assert_eq!(
-                fs::read(workspace.path().join("Cargo.lock")).expect("D32-A Cargo.lock final"),
-                cargo_lock_before
-            );
-            for (path, before) in cargo_config_before {
-                assert_eq!(
-                    fs::read(&path).ok(),
-                    before,
-                    "D32-A .cargo changed: {}",
-                    path.display()
-                );
-            }
-            assert!(
-                !workspace.path().join("target").exists(),
-                "D32-A Cargo wrote into the governed workspace target"
-            );
-            let runs_root = app_data
-                .path()
-                .join(D32_EXECUTION_ROOT_NAME)
-                .join(D32_RUNS_DIR_NAME);
-            if runs_root.exists() {
-                assert_eq!(
-                    fs::read_dir(&runs_root)
-                        .expect("D32-A run root enumeration")
-                        .count(),
-                    0,
-                    "D32-A per-action run root was not cleaned"
-                );
-            }
-            session
-                .send(&HostMessage::Shutdown(protocol::Shutdown {
-                    request_id: "d32-a-canary-shutdown".to_string(),
-                    session_id: session_id.clone(),
-                }))
-                .expect("D32-A canary shutdown");
-            let (message, _reader) = receive_vita_message_with_timeout(
-                reader,
-                READY_TIMEOUT,
-                "D32-A canary shutdown ack",
-            )
-            .expect("D32-A canary shutdown ack");
-            assert!(matches!(
-                message,
-                VitaMessage::ShutdownAck(protocol::ShutdownAck { session_id: ack_session, .. })
-                    if ack_session == session_id
-            ));
-            session.retire();
-            process.shutdown().expect("D32-A canary process shutdown");
-            assert!(
-                !udp_echo_task
-                    .join()
-                    .expect("D32-A sandbox UDP probe thread"),
-                "D32-A sandbox UDP responder observed an allowed packet"
-            );
-            assert!(
-                !external_udp_echo_task
-                    .join()
-                    .expect("D32-A sandbox external UDP probe thread"),
-                "D32-A external UDP responder observed an allowed packet"
-            );
-            drop(udp_receiver);
-            drop(external_udp_receiver);
-            drop(tcp_listener);
-            drop(external_tcp_listener);
+            // Positive and cancellation evidence use the Host-owned
+            // production lifecycle.  Revoke/Life/migration/binding-tamper
+            // lanes remain fail-closed here rather than being misreported as
+            // cancellation evidence; their deterministic Host-side proofs
+            // are retained in the focused suite until a real orchestration
+            // canary is available.
+            run_d32_a_real_production_canary(mode);
         }
 
         #[test]

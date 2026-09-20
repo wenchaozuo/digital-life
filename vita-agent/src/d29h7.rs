@@ -18,11 +18,9 @@ use std::ffi::{c_void, OsStr, OsString};
 #[cfg(test)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-#[cfg(test)]
-use std::io::Write;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -36,11 +34,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use vita_agent_protocol as protocol;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT,
+    FileIdBothDirectoryInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
+    NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_ID_BOTH_DIR_INFORMATION,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 #[cfg(test)]
 use windows_sys::Win32::Foundation::GetHandleInformation;
@@ -49,8 +50,9 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
     ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FALSE, HANDLE,
     HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    OBJ_DONT_REPARSE, STATUS_NO_MORE_ENTRIES, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{
@@ -70,14 +72,16 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Security::{PSID, SECURITY_CAPABILITIES};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDriveTypeW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION,
-    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+    CreateFileW, FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle, ReadFile,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+    FileRenameInfo, SetFileInformationByHandle, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
@@ -301,13 +305,17 @@ fn h7_process_schema_contract() -> Value {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct H7ImageIdentity {
+pub(crate) struct H7ImageIdentity {
     volume_serial: u32,
     file_index: u64,
     file_size: u64,
 }
 
 impl H7ImageIdentity {
+    pub(crate) fn file_size(self) -> u64 {
+        self.file_size
+    }
+
     fn wire(self) -> String {
         format!(
             "{:08x}-{:016x}-{:016x}",
@@ -317,7 +325,7 @@ impl H7ImageIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct H7NamespaceIdentity {
+pub(crate) struct H7NamespaceIdentity {
     volume_serial: u32,
     file_index: u64,
     directory: bool,
@@ -335,6 +343,7 @@ impl H7NamespaceIdentity {
     }
 }
 
+#[derive(Clone)]
 struct H7PreparedNamespace {
     path: PathBuf,
     parent: Arc<H7Handle>,
@@ -343,6 +352,10 @@ struct H7PreparedNamespace {
     leaf_share_access: u32,
     identity: H7NamespaceIdentity,
     chain: Vec<Arc<H7Handle>>,
+    // A workspace root borrowed from TrustedWorkspaceRoot has no pathname
+    // rebind step.  Its duplicate is already the retained authority; a
+    // revalidation only re-inspects that same handle.
+    handle_only_rebind: bool,
 }
 
 impl H7PreparedNamespace {
@@ -415,6 +428,7 @@ impl H7PreparedNamespace {
                     leaf_share_access,
                     identity,
                     chain,
+                    handle_only_rebind: false,
                 });
             }
             chain.push(Arc::clone(&handle));
@@ -424,6 +438,13 @@ impl H7PreparedNamespace {
     }
 
     fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
+        if self.handle_only_rebind {
+            let identity = namespace_identity(self.leaf.raw())?;
+            if identity != self.identity || identity.reparse || !identity.directory {
+                return Err("H7 retained root handle identity changed".to_string());
+            }
+            return Ok(Arc::clone(&self.leaf));
+        }
         let handle = Arc::new(if self.identity.directory {
             open_namespace_relative_directory(&self.parent, &self.leaf_name)?
         } else {
@@ -448,6 +469,881 @@ impl H7PreparedNamespace {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn from_retained_root_handle(
+        path: PathBuf,
+        handle: Arc<H7Handle>,
+        identity: H7NamespaceIdentity,
+    ) -> Self {
+        Self {
+            path,
+            parent: Arc::clone(&handle),
+            leaf: Arc::clone(&handle),
+            leaf_name: OsString::new(),
+            leaf_share_access: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            identity,
+            chain: vec![handle],
+            handle_only_rebind: true,
+        }
+    }
+}
+
+/// A fixed app-owned directory capability for typed D32 artifacts.  All child
+/// probes, creates, reads, and the final publish rename are rooted at the
+/// retained directory handle; callers never reopen the namespace by path.
+#[derive(Clone)]
+pub(crate) struct H7RetainedDirectory {
+    namespace: H7PreparedNamespace,
+}
+
+impl H7RetainedDirectory {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        Ok(Self {
+            namespace: H7PreparedNamespace::prepare(path, true)?,
+        })
+    }
+
+    /// Builds a retained H7 namespace from the already-authoritative
+    /// TrustedWorkspaceRoot handle.  The root display pathname is copied only
+    /// for diagnostics and projected child paths; it is never reopened or
+    /// used to establish authority.
+    pub(crate) fn from_trusted_workspace_root(root: &TrustedWorkspaceRoot) -> Result<Self, String> {
+        let raw = root
+            .duplicate_native_handle_for_retained()
+            .map_err(|error| format!("H7 workspace root handle duplication failed: {error}"))?;
+        let handle = Arc::new(H7Handle::new(raw)?);
+        let identity = namespace_identity(handle.raw())?;
+        if !identity.directory || identity.reparse {
+            return Err("H7 trusted workspace root was not a non-reparse directory".to_string());
+        }
+        Ok(Self {
+            namespace: H7PreparedNamespace::from_retained_root_handle(
+                root.final_path().to_path_buf(),
+                handle,
+                identity,
+            ),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.namespace.path()
+    }
+
+    pub(crate) fn identity(&self) -> H7NamespaceIdentity {
+        self.namespace.identity()
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        let rebound = self.namespace.rebind_leaf()?;
+        let identity = namespace_identity(rebound.raw())?;
+        if identity != self.namespace.identity() || identity.reparse || !identity.directory {
+            return Err("D32 retained directory identity changed".to_string());
+        }
+        Ok(())
+    }
+
+    /// Rebinds the retained directory leaf relative to its retained parent.
+    /// This is used by the final native fence; it never canonicalizes or
+    /// reopens the directory from the projected pathname.
+    pub(crate) fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
+        self.namespace.rebind_leaf()
+    }
+
+    pub(crate) fn open_or_create_child(&self, name: &OsStr) -> Result<Self, String> {
+        self.open_child(name, FILE_OPEN_IF)
+    }
+
+    pub(crate) fn open_existing_child(&self, name: &OsStr) -> Result<Self, String> {
+        self.open_child(name, FILE_OPEN)
+    }
+
+    /// Prepares one existing regular file relative to this retained
+    /// directory.  The returned namespace keeps the parent handle, so all
+    /// later identity probes/rebinds remain anchored to this capability
+    /// rather than reopening the file through its projected pathname.
+    fn prepare_existing_file_namespace(
+        &self,
+        name: &OsStr,
+        share_access: u32,
+    ) -> Result<H7PreparedNamespace, String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = Arc::new(
+            h7_open_namespace_relative_with_options(
+                &self.namespace.leaf,
+                name,
+                false,
+                share_access,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )
+            .map_err(|error| match error {
+                H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                    format!("D32 retained file namespace open failed: {status}")
+                }
+            })?,
+        );
+        let identity = namespace_identity(handle.raw())?;
+        if identity.directory || identity.reparse {
+            return Err("D32 retained file namespace was not a non-reparse file".to_string());
+        }
+        Ok(H7PreparedNamespace {
+            path: self.namespace.path().join(name),
+            parent: Arc::clone(&self.namespace.leaf),
+            leaf: Arc::clone(&handle),
+            leaf_name: name.to_os_string(),
+            leaf_share_access: share_access,
+            identity,
+            chain: vec![Arc::clone(&self.namespace.leaf), handle],
+            handle_only_rebind: false,
+        })
+    }
+
+    fn open_existing_child_if_present(&self, name: &OsStr) -> Result<Option<Self>, String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        match self.open_child_result(
+            name,
+            FILE_OPEN,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+        ) {
+            Ok(child) => Ok(Some(self.finish_child(name, child)?)),
+            Err(H7NamespaceOpenError::Missing(_)) => Ok(None),
+            Err(H7NamespaceOpenError::Failed(status)) => Err(format!(
+                "D32 retained child directory open failed: {status}"
+            )),
+        }
+    }
+
+    fn child_is_directory(&self, name: &OsStr) -> Result<bool, String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = h7_open_namespace_relative_with_options(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )
+        .map_err(|error| match error {
+            H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                format!("D32 retained child kind probe failed: {status}")
+            }
+        })?;
+        let identity = namespace_identity(handle.raw())?;
+        if identity.reparse {
+            return Err("D32 retained child kind probe found a reparse point".to_string());
+        }
+        Ok(identity.directory)
+    }
+
+    pub(crate) fn open_existing_path(&self, relative: &Path) -> Result<Self, String> {
+        let mut current = None;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err("D32 retained relative path contained an unsafe component".to_string());
+            };
+            let parent = current.as_ref().unwrap_or(self);
+            current = Some(parent.open_existing_child(name)?);
+        }
+        current.ok_or_else(|| "D32 retained relative path was empty".to_string())
+    }
+
+    pub(crate) fn open_or_create_path(&self, relative: &Path) -> Result<Self, String> {
+        let mut current = None;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err("D32 retained relative path contained an unsafe component".to_string());
+            };
+            let parent = current.as_ref().unwrap_or(self);
+            current = Some(parent.open_or_create_child(name)?);
+        }
+        current.ok_or_else(|| "D32 retained relative path was empty".to_string())
+    }
+
+    fn open_child(&self, name: &OsStr, create_disposition: u32) -> Result<Self, String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = self
+            .open_child_result(
+                name,
+                create_disposition,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            )
+            .map_err(|error| match error {
+                H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                    format!("D32 retained child directory open failed: {status}")
+                }
+            })?;
+        self.finish_child(name, handle)
+    }
+
+    fn open_child_result(
+        &self,
+        name: &OsStr,
+        create_disposition: u32,
+        desired_access: u32,
+    ) -> Result<H7Handle, H7NamespaceOpenError> {
+        h7_open_namespace_relative_with_options(
+            &self.namespace.leaf,
+            name,
+            true,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            create_disposition,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            desired_access | H7_FILE_LIST_DIRECTORY,
+        )
+    }
+
+    fn finish_child(&self, name: &OsStr, handle: H7Handle) -> Result<Self, String> {
+        let handle = Arc::new(handle);
+        let identity = namespace_identity(handle.raw())?;
+        if !identity.directory || identity.reparse {
+            return Err("D32 retained child directory was not non-reparse".to_string());
+        }
+        let path = self.namespace.path().join(name);
+        Ok(Self {
+            namespace: H7PreparedNamespace {
+                path,
+                parent: Arc::clone(&self.namespace.leaf),
+                leaf: Arc::clone(&handle),
+                leaf_name: name.to_os_string(),
+                leaf_share_access: FILE_SHARE_READ | FILE_SHARE_WRITE,
+                identity,
+                chain: vec![Arc::clone(&self.namespace.leaf), handle],
+                handle_only_rebind: false,
+            },
+        })
+    }
+
+    fn open_child_for_delete(&self, name: &OsStr) -> Result<Self, String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = self
+            .open_child_result(
+                name,
+                FILE_OPEN,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE | SYNCHRONIZE,
+            )
+            .map_err(|error| match error {
+                H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                    format!("D32 retained child directory removal open failed: {status}")
+                }
+            })?;
+        self.finish_child(name, handle)
+    }
+
+    /// Enumerates names from the retained directory handle.  The returned
+    /// names are only one-component candidates; every caller reopens each
+    /// candidate relative to this same retained handle before using it.
+    pub(crate) fn enumerate_children(&self) -> Result<Vec<OsString>, String> {
+        self.revalidate()?;
+        let mut names = Vec::new();
+        let mut restart_scan = true;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let mut status_block = IO_STATUS_BLOCK::default();
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    self.namespace.leaf.raw(),
+                    std::ptr::null_mut(),
+                    None,
+                    std::ptr::null(),
+                    &mut status_block,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    FileIdBothDirectoryInformation,
+                    true,
+                    std::ptr::null(),
+                    restart_scan,
+                )
+            };
+            if status == STATUS_NO_MORE_FILES || status == STATUS_NO_MORE_ENTRIES {
+                break;
+            }
+            if status < 0 {
+                return Err(format!(
+                    "D32 retained directory enumeration failed: NTSTATUS 0x{:08X}",
+                    status as u32
+                ));
+            }
+            let returned = usize::try_from(status_block.Information)
+                .ok()
+                .filter(|length| *length <= buffer.len())
+                .ok_or_else(|| {
+                    "D32 retained directory enumeration returned an invalid byte count".to_string()
+                })?;
+            if returned == 0 {
+                return Err(
+                    "D32 retained directory enumeration returned no entry bytes".to_string()
+                );
+            }
+            parse_h7_directory_names(&buffer, returned, &mut names)?;
+            restart_scan = false;
+            if names.len() > 8192 {
+                return Err("D32 retained directory exceeded its child bound".to_string());
+            }
+        }
+        self.revalidate()?;
+        Ok(names)
+    }
+
+    fn remove_file(&self, name: &OsStr) -> Result<(), String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = h7_open_namespace_relative_with_options(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        )
+        .map_err(|error| match error {
+            H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                format!("D32 retained file removal open failed: {status}")
+            }
+        })?;
+        let identity = file_identity_from_handle(handle.raw())?;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                handle.raw(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(format!("D32 retained file removal failed: {}", unsafe {
+                GetLastError()
+            }));
+        }
+        drop(handle);
+        self.revalidate()?;
+        if self
+            .probe_file_bounded(name, D32_NATIVE_EVIDENCE_MAX_BYTES)?
+            .is_some()
+        {
+            return Err("D32 retained file remained after removal".to_string());
+        }
+        let _ = identity;
+        Ok(())
+    }
+
+    fn remove_directory(&self, name: &OsStr) -> Result<(), String> {
+        validate_retained_child_name(name)?;
+        self.revalidate()?;
+        let handle = self
+            .open_child_result(
+                name,
+                FILE_OPEN,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE | SYNCHRONIZE,
+            )
+            .map_err(|error| match error {
+                H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                    format!("D32 retained directory removal open failed: {status}")
+                }
+            })?;
+        let identity = namespace_identity(handle.raw())?;
+        if !identity.directory || identity.reparse {
+            return Err("D32 retained directory removal target was unsafe".to_string());
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                handle.raw(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "D32 retained directory removal failed: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        drop(handle);
+        self.revalidate()
+    }
+
+    fn remove_contents(&self) -> Result<(), String> {
+        for name in self.enumerate_children()? {
+            if self.child_is_directory(&name)? {
+                let child = self.open_existing_child(&name)?;
+                child.remove_contents()?;
+                self.remove_directory(&name)?;
+            } else {
+                self.remove_file(&name)?;
+            }
+        }
+        self.revalidate()
+    }
+
+    /// Removes an app-owned retained subtree, including its root directory.
+    /// No pathname enumeration or recursive pathname deletion is used.
+    pub(crate) fn remove_self(&self) -> Result<(), String> {
+        self.remove_contents()?;
+        let handle = h7_open_namespace_relative_with_options(
+            &self.namespace.parent,
+            &self.namespace.leaf_name,
+            true,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE | SYNCHRONIZE,
+        )
+        .map_err(|error| match error {
+            H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                format!("D32 retained directory removal open failed: {status}")
+            }
+        })?;
+        let identity = namespace_identity(handle.raw())?;
+        if identity != self.namespace.identity || identity.reparse || !identity.directory {
+            return Err("D32 retained directory identity changed before removal".to_string());
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        if unsafe {
+            SetFileInformationByHandle(
+                handle.raw(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "D32 retained directory removal failed: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        drop(handle);
+        Ok(())
+    }
+
+    pub(crate) fn remove_child_tree_if_present(&self, name: &OsStr) -> Result<bool, String> {
+        let Some(child) = self.open_existing_child_if_present(name)? else {
+            return Ok(false);
+        };
+        child.remove_self()?;
+        Ok(true)
+    }
+
+    pub(crate) fn probe_file(&self, name: &OsStr) -> Result<Option<H7ImageIdentity>, String> {
+        self.probe_file_bounded(name, D32_NATIVE_EVIDENCE_MAX_BYTES)
+    }
+
+    pub(crate) fn probe_file_bounded(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<Option<H7ImageIdentity>, String> {
+        validate_retained_child_name(name)?;
+        match h7_open_namespace_relative_with_options(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        ) {
+            Ok(handle) => {
+                let identity = file_identity_from_handle(handle.raw())?;
+                if identity.file_size > max_bytes {
+                    return Err("D32 retained file exceeded its bound".to_string());
+                }
+                Ok(Some(identity))
+            }
+            Err(H7NamespaceOpenError::Missing(_)) => Ok(None),
+            Err(H7NamespaceOpenError::Failed(status)) => {
+                Err(format!("D32 retained child probe failed: {status}"))
+            }
+        }
+    }
+
+    pub(crate) fn read_file(&self, name: &OsStr, max_bytes: usize) -> Result<Vec<u8>, String> {
+        validate_retained_child_name(name)?;
+        let handle = open_retained_namespace_relative(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let identity = file_identity_from_handle(handle.raw())?;
+        if identity.file_size > max_bytes as u64 {
+            return Err("D32 retained file exceeded its bound".to_string());
+        }
+        let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+        let mut bytes = Vec::with_capacity(identity.file_size as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|_| "D32 retained file read failed".to_string())?;
+        if bytes.len() > max_bytes {
+            return Err("D32 retained file exceeded its bound".to_string());
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn hash_file_bounded(&self, name: &OsStr, max_bytes: u64) -> Result<String, String> {
+        let (_, digest) = self.hash_file_bounded_with_identity(name, max_bytes)?;
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    pub(crate) fn hash_file_bounded_with_identity(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<(H7ImageIdentity, [u8; 32]), String> {
+        validate_retained_child_name(name)?;
+        let handle = open_retained_namespace_relative(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let identity = file_identity_from_handle(handle.raw())?;
+        if identity.file_size > max_bytes {
+            return Err("D32 retained file exceeded its bound".to_string());
+        }
+        let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| "D32 retained file hash read failed".to_string())?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > max_bytes {
+                return Err("D32 retained file exceeded its bound".to_string());
+            }
+            digest.update(&buffer[..read]);
+        }
+        let after = file_identity_from_handle(file.as_raw_handle() as HANDLE)?;
+        if after != identity || after.file_size != total {
+            return Err("D32 retained file identity changed during hash".to_string());
+        }
+        Ok((identity, digest.finalize().into()))
+    }
+
+    pub(crate) fn copy_file_from(
+        &self,
+        source: &H7RetainedDirectory,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<(), String> {
+        validate_retained_child_name(source_name)?;
+        validate_retained_child_name(destination_name)?;
+        source.revalidate()?;
+        self.revalidate()?;
+        let source_handle = open_retained_namespace_relative(
+            &source.namespace.leaf,
+            source_name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let source_identity = file_identity_from_handle(source_handle.raw())?;
+        if source_identity.file_size > max_bytes {
+            return Err("D32 retained source file exceeded its bound".to_string());
+        }
+        let destination_handle = open_retained_namespace_relative(
+            &self.namespace.leaf,
+            destination_name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        )?;
+        let destination_identity = file_identity_from_handle(destination_handle.raw())?;
+        if destination_identity.file_size != 0 {
+            return Err("D32 retained destination file was unexpectedly reused".to_string());
+        }
+        let mut source_file =
+            unsafe { File::from_raw_handle(source_handle.into_raw() as RawHandle) };
+        let mut destination_file =
+            unsafe { File::from_raw_handle(destination_handle.into_raw() as RawHandle) };
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = source_file
+                .read(&mut buffer)
+                .map_err(|_| "D32 retained source file read failed".to_string())?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.saturating_add(read as u64);
+            if copied > max_bytes {
+                return Err("D32 retained source file exceeded its bound".to_string());
+            }
+            destination_file
+                .write_all(&buffer[..read])
+                .map_err(|_| "D32 retained destination file write failed".to_string())?;
+        }
+        if copied != source_identity.file_size {
+            return Err("D32 retained source file changed during copy".to_string());
+        }
+        destination_file
+            .flush()
+            .map_err(|_| "D32 retained destination file flush failed".to_string())?;
+        destination_file
+            .sync_all()
+            .map_err(|_| "D32 retained destination file sync failed".to_string())?;
+        let source_after = file_identity_from_handle(source_file.as_raw_handle() as HANDLE)?;
+        let destination_after =
+            file_identity_from_handle(destination_file.as_raw_handle() as HANDLE)?;
+        if source_after != source_identity
+            || destination_after.file_index != destination_identity.file_index
+            || destination_after.file_size != copied
+        {
+            return Err("D32 retained source or destination changed during copy".to_string());
+        }
+        source.revalidate()?;
+        self.revalidate()
+    }
+
+    pub(crate) fn create_new_file(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
+        validate_retained_child_name(name)?;
+        let handle = open_retained_namespace_relative(
+            &self.namespace.leaf,
+            name,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        )?;
+        let identity = file_identity_from_handle(handle.raw())?;
+        if identity.file_size != 0 {
+            return Err("D32 retained create unexpectedly reused a file".to_string());
+        }
+        let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+        file.write_all(bytes)
+            .map_err(|_| "D32 retained file write failed".to_string())?;
+        file.flush()
+            .map_err(|_| "D32 retained file flush failed".to_string())?;
+        file.sync_all()
+            .map_err(|_| "D32 retained file sync failed".to_string())
+    }
+
+    pub(crate) fn rename_file(&self, source: &OsStr, destination: &OsStr) -> Result<(), String> {
+        validate_retained_child_name(source)?;
+        validate_retained_child_name(destination)?;
+        let handle = open_retained_namespace_relative(
+            &self.namespace.leaf,
+            source,
+            false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        )?;
+        let name = destination.encode_wide().collect::<Vec<_>>();
+        let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+            .saturating_add(name.len().saturating_sub(1).saturating_mul(2));
+        let mut buffer = vec![0_u8; bytes];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).RootDirectory = self.namespace.leaf.raw();
+            (*info).FileNameLength = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            if SetFileInformationByHandle(
+                handle.raw(),
+                FileRenameInfo,
+                info.cast(),
+                buffer.len() as u32,
+            ) == 0
+            {
+                return Err(format!(
+                    "D32 retained atomic rename failed: {}",
+                    GetLastError()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rename_directory(
+        &self,
+        source: &OsStr,
+        destination: &OsStr,
+        replace_if_exists: bool,
+    ) -> Result<(), String> {
+        validate_retained_child_name(source)?;
+        validate_retained_child_name(destination)?;
+        let handle = h7_open_namespace_relative_with_options(
+            &self.namespace.leaf,
+            source,
+            true,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+        )
+        .map_err(|error| match error {
+            H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+                format!("D32 retained directory rename source open failed: {status}")
+            }
+        })?;
+        let name = destination.encode_wide().collect::<Vec<_>>();
+        let file_name_length = name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| "D32 retained directory rename name was too long".to_string())?;
+        let bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+            .checked_add(file_name_length as usize)
+            .ok_or_else(|| "D32 retained directory rename buffer was too large".to_string())?;
+        let mut buffer = vec![0_u8; bytes];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = replace_if_exists;
+            (*info).RootDirectory = self.namespace.leaf.raw();
+            (*info).FileNameLength = file_name_length;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            let status = NtSetInformationFile(
+                handle.raw(),
+                &mut status_block,
+                info.cast(),
+                buffer.len() as u32,
+                FileRenameInformation,
+            );
+            if status < 0 {
+                return Err(format!(
+                    "D32 retained directory rename failed: NTSTATUS 0x{:08X}",
+                    status as u32
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_h7_directory_names(
+    buffer: &[u8],
+    returned: usize,
+    names: &mut Vec<OsString>,
+) -> Result<(), String> {
+    // The flexible `FileName` member is followed by alignment padding in the
+    // Rust representation.  The kernel record header ends at the actual field
+    // offset, not at `size_of::<T>() - sizeof(WCHAR)`.
+    let header_bytes = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFORMATION, FileName);
+    let mut offset = 0usize;
+    while offset < returned {
+        if returned - offset < header_bytes {
+            return Err("D32 retained directory entry header was truncated".to_string());
+        }
+        let entry =
+            unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFORMATION) };
+        let name_length = usize::try_from(entry.FileNameLength)
+            .map_err(|_| "D32 retained directory name length overflow".to_string())?;
+        if name_length % size_of::<u16>() != 0
+            || name_length / size_of::<u16>() > 32_767
+            || header_bytes
+                .checked_add(name_length)
+                .and_then(|length| offset.checked_add(length))
+                .filter(|end| *end <= returned)
+                .is_none()
+        {
+            return Err("D32 retained directory entry name was outside the buffer".to_string());
+        }
+        let name = unsafe {
+            std::slice::from_raw_parts(entry.FileName.as_ptr(), name_length / size_of::<u16>())
+        };
+        let name = OsString::from_wide(name);
+        if name != OsStr::new(".") && name != OsStr::new("..") {
+            names.push(name);
+        }
+        let next = usize::try_from(entry.NextEntryOffset)
+            .map_err(|_| "D32 retained directory entry offset overflow".to_string())?;
+        if next == 0 {
+            break;
+        }
+        if next < header_bytes
+            || offset
+                .checked_add(next)
+                .filter(|end| *end <= returned)
+                .is_none()
+        {
+            return Err("D32 retained directory entry offset was invalid".to_string());
+        }
+        offset += next;
+    }
+    Ok(())
+}
+
+const D32_NATIVE_EVIDENCE_MAX_BYTES: u64 = 64 * 1024;
+const H7_FILE_LIST_DIRECTORY: u32 = 0x0001;
+
+fn validate_retained_child_name(name: &OsStr) -> Result<(), String> {
+    if name.is_empty()
+        || name == OsStr::new(".")
+        || name == OsStr::new("..")
+        || name.to_string_lossy().chars().any(|character| {
+            character == '/' || character == '\\' || character == ':' || character == '\0'
+        })
+    {
+        return Err("D32 retained child name was not one safe component".to_string());
+    }
+    Ok(())
+}
+
+/// Retained app-owned capabilities used to construct the fixed D32 catalog.
+/// The path fields in the catalog are launch projections only; the handles and
+/// identities below remain the authority through the final CreateProcessW
+/// fence.
+pub(crate) struct H7D32CatalogResources {
+    pub(crate) execution_root: Arc<H7RetainedDirectory>,
+    pub(crate) source_root: Arc<H7RetainedDirectory>,
+    pub(crate) cargo_home: Arc<H7RetainedDirectory>,
+    pub(crate) target: Arc<H7RetainedDirectory>,
+    pub(crate) toolchain_root: Arc<H7RetainedDirectory>,
+    pub(crate) toolchain_bin: Arc<H7RetainedDirectory>,
+}
+
+fn open_retained_namespace_relative(
+    parent: &Arc<H7Handle>,
+    component: &OsStr,
+    _directory: bool,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    desired_access: u32,
+) -> Result<H7Handle, String> {
+    h7_open_namespace_relative_with_options(
+        parent,
+        component,
+        _directory,
+        share_access,
+        create_disposition,
+        create_options,
+        desired_access,
+    )
+    .map_err(|error| match error {
+        H7NamespaceOpenError::Missing(status) | H7NamespaceOpenError::Failed(status) => {
+            format!("D32 retained namespace open failed: {status}")
+        }
+    })
 }
 
 struct PreparedExecutableNamespace(H7PreparedNamespace);
@@ -455,6 +1351,29 @@ struct PreparedExecutableNamespace(H7PreparedNamespace);
 impl PreparedExecutableNamespace {
     fn prepare(path: &Path) -> Result<Self, String> {
         Ok(Self(H7PreparedNamespace::prepare(path, false)?))
+    }
+
+    fn prepare_from_retained(parent: &H7RetainedDirectory, name: &OsStr) -> Result<Self, String> {
+        validate_retained_child_name(name)?;
+        parent.revalidate()?;
+        let handle = Arc::new(open_namespace_relative_executable_leaf(
+            &parent.namespace.leaf,
+            name,
+        )?);
+        let identity = namespace_identity(handle.raw())?;
+        if identity.directory || identity.reparse {
+            return Err("H7 retained executable image was not a non-reparse file".to_string());
+        }
+        Ok(Self(H7PreparedNamespace {
+            path: parent.namespace.path().join(name),
+            parent: Arc::clone(&parent.namespace.leaf),
+            leaf: Arc::clone(&handle),
+            leaf_name: name.to_os_string(),
+            leaf_share_access: FILE_SHARE_READ,
+            identity,
+            chain: vec![Arc::clone(&parent.namespace.leaf), handle],
+            handle_only_rebind: false,
+        }))
     }
 
     fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
@@ -471,6 +1390,10 @@ struct PreparedWorkingDirectory(H7PreparedNamespace);
 impl PreparedWorkingDirectory {
     fn prepare(path: &Path) -> Result<Self, String> {
         Ok(Self(H7PreparedNamespace::prepare(path, true)?))
+    }
+
+    fn from_retained(retained: &H7RetainedDirectory) -> Self {
+        Self(retained.namespace.clone())
     }
 
     fn rebind_leaf(&self) -> Result<Arc<H7Handle>, String> {
@@ -512,6 +1435,25 @@ impl PreparedExecutableImage {
         })
     }
 
+    fn prepare_from_retained(parent: &H7RetainedDirectory, name: &OsStr) -> Result<Self, String> {
+        let namespace = Arc::new(PreparedExecutableNamespace::prepare_from_retained(
+            parent, name,
+        )?);
+        let file = duplicate_file_handle(namespace.0.leaf.raw())?;
+        let identity = file_identity(&file)?;
+        if identity.file_size == 0 {
+            return Err("H7 executable image was empty".to_string());
+        }
+        let sha256 = hash_file(&file)?;
+        Ok(Self {
+            file,
+            path: namespace.0.path().to_path_buf(),
+            namespace,
+            identity,
+            sha256,
+        })
+    }
+
     fn reverify(&mut self, expected: H7ImageIdentity, expected_sha256: &str) -> Result<(), String> {
         let identity = file_identity(&self.file)?;
         let sha256 = hash_file(&self.file)?;
@@ -534,6 +1476,23 @@ impl PreparedExecutableImage {
             return Err("H7 retained executable identity changed".to_string());
         }
         self.namespace.rebind_leaf()
+    }
+
+    /// Duplicate the catalog's already-retained image handle for one action.
+    /// The child handle and namespace chain are carried forward directly;
+    /// action preparation never reopens the image from its display path.
+    fn duplicate_for_action(&self) -> Result<Self, String> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|_| "H7 catalog executable handle duplication failed".to_string())?;
+        Ok(Self {
+            file,
+            path: self.path.clone(),
+            namespace: Arc::clone(&self.namespace),
+            identity: self.identity,
+            sha256: self.sha256.clone(),
+        })
     }
 }
 
@@ -563,7 +1522,7 @@ fn open_namespace_drive_anchor(path: &Path) -> Result<H7Handle, String> {
     let handle = unsafe {
         CreateFileW(
             wide_null(path.as_os_str()).as_ptr(),
-            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | H7_FILE_LIST_DIRECTORY | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null::<SECURITY_ATTRIBUTES>(),
             OPEN_EXISTING,
@@ -619,6 +1578,36 @@ fn h7_open_namespace_relative_with_share(
     directory: bool,
     share_access: u32,
 ) -> Result<H7Handle, H7NamespaceOpenError> {
+    let desired_access = if directory {
+        FILE_READ_ATTRIBUTES | FILE_TRAVERSE | H7_FILE_LIST_DIRECTORY | SYNCHRONIZE
+    } else {
+        FILE_GENERIC_READ | SYNCHRONIZE
+    };
+    let create_options = if directory {
+        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    };
+    h7_open_namespace_relative_with_options(
+        parent,
+        component,
+        directory,
+        share_access,
+        FILE_OPEN,
+        create_options,
+        desired_access,
+    )
+}
+
+fn h7_open_namespace_relative_with_options(
+    parent: &Arc<H7Handle>,
+    component: &OsStr,
+    _directory: bool,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    desired_access: u32,
+) -> Result<H7Handle, H7NamespaceOpenError> {
     let mut name = component.encode_wide().collect::<Vec<_>>();
     let byte_length = name
         .len()
@@ -640,16 +1629,6 @@ fn h7_open_namespace_relative_with_share(
         SecurityDescriptor: std::ptr::null(),
         SecurityQualityOfService: std::ptr::null(),
     };
-    let desired_access = if directory {
-        FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE
-    } else {
-        FILE_GENERIC_READ | SYNCHRONIZE
-    };
-    let create_options = if directory {
-        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
-    } else {
-        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
-    };
     let mut status_block = IO_STATUS_BLOCK::default();
     let mut raw = std::ptr::null_mut();
     let status = unsafe {
@@ -661,7 +1640,7 @@ fn h7_open_namespace_relative_with_share(
             std::ptr::null(),
             0,
             share_access,
-            FILE_OPEN,
+            create_disposition,
             create_options,
             std::ptr::null(),
             0,
@@ -708,9 +1687,12 @@ fn namespace_identity(handle: HANDLE) -> Result<H7NamespaceIdentity, String> {
 }
 
 fn file_identity(file: &File) -> Result<H7ImageIdentity, String> {
+    file_identity_from_handle(file.as_raw_handle() as HANDLE)
+}
+
+fn file_identity_from_handle(handle: HANDLE) -> Result<H7ImageIdentity, String> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    let ok =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut information) };
     if ok == 0 {
         return Err(format!("H7 executable identity read failed: {}", unsafe {
             GetLastError()
@@ -758,6 +1740,10 @@ fn hash_file(file: &File) -> Result<String, String> {
 struct H7CatalogEntry {
     program_id: String,
     image_path: PathBuf,
+    // The catalog retains the image itself.  `image_path` is only the
+    // CreateProcess command-line projection; action preparation duplicates
+    // this handle instead of reopening the projected pathname.
+    image: PreparedExecutableImage,
     expected_image_identity: H7ImageIdentity,
     expected_image_namespace: H7NamespaceIdentity,
     expected_image_sha256: String,
@@ -771,6 +1757,12 @@ struct H7CatalogEntry {
     _owned_scratch: Option<Arc<TempDir>>,
     d32_execution_root: Option<PathBuf>,
     d32_toolchain_root: Option<PathBuf>,
+    d32_execution_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_source_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_cargo_home_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_target_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_toolchain_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_toolchain_bin_retained: Option<Arc<H7RetainedDirectory>>,
     d32_toolchain_manifest_hash: Option<String>,
 }
 
@@ -784,7 +1776,16 @@ impl H7ExecutableCatalog {
             return Err("H7 catalog paths must be absolute".to_string());
         }
         let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&working_directory)?);
-        let mut image = PreparedExecutableImage::prepare(&image_path)?;
+        let image_name = image_path
+            .file_name()
+            .ok_or_else(|| "H7 catalog image had no leaf name".to_string())?
+            .to_os_string();
+        let image_parent_path = image_path
+            .parent()
+            .ok_or_else(|| "H7 catalog image had no parent directory".to_string())?;
+        let image_parent_retained = Arc::new(H7RetainedDirectory::open(image_parent_path)?);
+        let mut image =
+            PreparedExecutableImage::prepare_from_retained(&image_parent_retained, &image_name)?;
         let expected_image_identity = image.identity;
         let expected_image_namespace = image.namespace.identity();
         let expected_image_sha256 = image.sha256.clone();
@@ -804,6 +1805,7 @@ impl H7ExecutableCatalog {
             entry: H7CatalogEntry {
                 program_id: H7_PROGRAM_ID.to_string(),
                 image_path,
+                image,
                 expected_image_identity,
                 expected_image_namespace,
                 expected_image_sha256,
@@ -817,57 +1819,77 @@ impl H7ExecutableCatalog {
                 _owned_scratch: None,
                 d32_execution_root: None,
                 d32_toolchain_root: None,
+                d32_execution_root_retained: None,
+                d32_source_root_retained: None,
+                d32_cargo_home_retained: None,
+                d32_target_retained: None,
+                d32_toolchain_root_retained: None,
+                d32_toolchain_bin_retained: None,
                 d32_toolchain_manifest_hash: None,
             },
         })
     }
 
     pub(crate) fn cargo_check_projected(
-        cargo_path: PathBuf,
-        source_path: PathBuf,
-        execution_root: PathBuf,
-        toolchain_root: PathBuf,
-        rustc_path: PathBuf,
-        rustdoc_path: PathBuf,
+        resources: H7D32CatalogResources,
+        expected_manifest_hash: String,
     ) -> Result<Self, String> {
-        for path in [
-            &cargo_path,
-            &source_path,
+        let H7D32CatalogResources {
+            execution_root,
+            source_root,
+            cargo_home,
+            target,
+            toolchain_root,
+            toolchain_bin,
+        } = resources;
+        for retained in [
             &execution_root,
+            &source_root,
+            &cargo_home,
+            &target,
             &toolchain_root,
-            &rustc_path,
-            &rustdoc_path,
+            &toolchain_bin,
         ] {
-            if !path.is_absolute() {
-                return Err("D32 projected profile paths must be absolute".to_string());
-            }
+            retained.revalidate()?;
         }
-        let execution_root = fs::canonicalize(&execution_root)
-            .map_err(|_| "D32 execution root could not be canonicalized".to_string())?;
-        let source_path = fs::canonicalize(&source_path)
-            .map_err(|_| "D32 projected source root could not be canonicalized".to_string())?;
-        let cargo_path = fs::canonicalize(&cargo_path)
-            .map_err(|_| "D32 projected cargo image could not be canonicalized".to_string())?;
-        let rustc_path = fs::canonicalize(&rustc_path)
-            .map_err(|_| "D32 projected rustc image could not be canonicalized".to_string())?;
-        let rustdoc_path = fs::canonicalize(&rustdoc_path)
-            .map_err(|_| "D32 projected rustdoc image could not be canonicalized".to_string())?;
-        let expected_source = execution_root.join("source");
-        let expected_toolchain = fs::canonicalize(&toolchain_root)
-            .map_err(|_| "D32 projected toolchain mirror could not be canonicalized".to_string())?;
-        let expected_cargo_home = execution_root.join("cargo-home");
-        let expected_target = execution_root.join("target");
+        let execution_path = execution_root.path().to_path_buf();
+        let source_path = source_root.path().to_path_buf();
+        let expected_source = execution_path.join("source");
+        let expected_cargo_home = execution_path.join("cargo-home");
+        let expected_target = execution_path.join("target");
+        let expected_toolchain = toolchain_root.path().to_path_buf();
+        let expected_bin = expected_toolchain.join("bin");
         if !h7_workspace_paths_equal(&source_path, &expected_source)
-            || !is_strict_descendant_path(&cargo_path, &expected_toolchain)
-            || !is_strict_descendant_path(&rustc_path, &expected_toolchain)
-            || !is_strict_descendant_path(&rustdoc_path, &expected_toolchain)
-            || !expected_cargo_home.is_dir()
-            || !expected_target.is_dir()
+            || !h7_workspace_paths_equal(cargo_home.path(), &expected_cargo_home)
+            || !h7_workspace_paths_equal(target.path(), &expected_target)
+            || !h7_workspace_paths_equal(toolchain_bin.path(), &expected_bin)
+            || !is_strict_descendant_path(
+                &toolchain_bin.path().join("cargo.exe"),
+                &expected_toolchain,
+            )
+            || toolchain_root.identity().directory != toolchain_bin.identity().directory
+            || !toolchain_bin.identity().directory
+            || expected_manifest_hash.len() != 64
+            || expected_manifest_hash
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
         {
-            return Err("D32 projected profile layout was not app-owned and exact".to_string());
+            return Err("D32 projected profile retained layout was not exact".to_string());
         }
-        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(&source_path)?);
-        let mut image = PreparedExecutableImage::prepare(&cargo_path)?;
+        let cargo_path = toolchain_bin.path().join("cargo.exe");
+        let rustc_path = toolchain_bin.path().join("rustc.exe");
+        let rustdoc_path = toolchain_bin.path().join("rustdoc.exe");
+        let mut image = PreparedExecutableImage::prepare_from_retained(
+            &toolchain_bin,
+            OsStr::new("cargo.exe"),
+        )?;
+        let _rustc_identity = toolchain_bin
+            .probe_file_bounded(OsStr::new("rustc.exe"), H7_MAX_EXECUTABLE_BYTES)?
+            .ok_or_else(|| "D32 projected rustc image was unavailable".to_string())?;
+        let _rustdoc_identity = toolchain_bin
+            .probe_file_bounded(OsStr::new("rustdoc.exe"), H7_MAX_EXECUTABLE_BYTES)?
+            .ok_or_else(|| "D32 projected rustdoc image was unavailable".to_string())?;
+        let working_directory = Arc::new(PreparedWorkingDirectory::from_retained(&source_root));
         let expected_image_identity = image.identity;
         let expected_image_namespace = image.namespace.identity();
         let expected_image_sha256 = image.sha256.clone();
@@ -899,11 +1921,17 @@ impl H7ExecutableCatalog {
             ),
         ]);
         image.reverify(expected_image_identity, &expected_image_sha256)?;
-        let manifest_hash = toolchain_manifest_hash_for_catalog(&expected_toolchain)?;
+        let manifest_hash = toolchain_manifest_hash_for_catalog_retained(&toolchain_root)?;
+        if manifest_hash != expected_manifest_hash {
+            return Err(
+                "D32 projected toolchain manifest changed before catalog construction".to_string(),
+            );
+        }
         Ok(Self {
             entry: H7CatalogEntry {
                 program_id: "cargo-check-v1".to_string(),
                 image_path: cargo_path,
+                image,
                 expected_image_identity,
                 expected_image_namespace,
                 expected_image_sha256,
@@ -915,8 +1943,14 @@ impl H7ExecutableCatalog {
                 stdout_bound: 64 * 1024,
                 stderr_bound: 64 * 1024,
                 _owned_scratch: None,
-                d32_execution_root: Some(execution_root),
+                d32_execution_root: Some(execution_path),
                 d32_toolchain_root: Some(expected_toolchain),
+                d32_execution_root_retained: Some(execution_root),
+                d32_source_root_retained: Some(source_root),
+                d32_cargo_home_retained: Some(cargo_home),
+                d32_target_retained: Some(target),
+                d32_toolchain_root_retained: Some(toolchain_root),
+                d32_toolchain_bin_retained: Some(toolchain_bin),
                 d32_toolchain_manifest_hash: Some(manifest_hash),
             },
         })
@@ -1029,12 +2063,15 @@ impl H7ExecutableCatalog {
         } else if sandbox.is_some() {
             return Err("sandbox identity was attached to a non-D32 action".to_string());
         }
-        let image = PreparedExecutableImage::prepare(&self.entry.image_path)?;
-        if image.identity != self.entry.expected_image_identity
-            || image.namespace.identity() != self.entry.expected_image_namespace
-            || image.sha256 != self.entry.expected_image_sha256
-        {
-            return Err("H7 executable image did not match the immutable catalog".to_string());
+        let mut image = self.entry.image.duplicate_for_action()?;
+        image.reverify(
+            self.entry.expected_image_identity,
+            &self.entry.expected_image_sha256,
+        )?;
+        if image.namespace.identity() != self.entry.expected_image_namespace {
+            return Err(
+                "H7 executable image namespace did not match the immutable catalog".to_string(),
+            );
         }
         let mut argv = Vec::with_capacity(request.args.len() + 1);
         argv.push(self.entry.image_path.to_string_lossy().into_owned());
@@ -1071,6 +2108,12 @@ impl H7ExecutableCatalog {
             sandbox,
             d32_execution_root: self.entry.d32_execution_root.clone(),
             d32_toolchain_root: self.entry.d32_toolchain_root.clone(),
+            d32_execution_root_retained: self.entry.d32_execution_root_retained.clone(),
+            d32_source_root_retained: self.entry.d32_source_root_retained.clone(),
+            d32_cargo_home_retained: self.entry.d32_cargo_home_retained.clone(),
+            d32_target_retained: self.entry.d32_target_retained.clone(),
+            d32_toolchain_root_retained: self.entry.d32_toolchain_root_retained.clone(),
+            d32_toolchain_bin_retained: self.entry.d32_toolchain_bin_retained.clone(),
             d32_toolchain_manifest_hash: self.entry.d32_toolchain_manifest_hash.clone(),
         }))
     }
@@ -1102,6 +2145,12 @@ pub(crate) struct PreparedProcessAction {
     sandbox: Option<Arc<H7SandboxProfile>>,
     d32_execution_root: Option<PathBuf>,
     d32_toolchain_root: Option<PathBuf>,
+    d32_execution_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_source_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_cargo_home_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_target_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_toolchain_root_retained: Option<Arc<H7RetainedDirectory>>,
+    d32_toolchain_bin_retained: Option<Arc<H7RetainedDirectory>>,
     d32_toolchain_manifest_hash: Option<String>,
 }
 
@@ -1164,6 +2213,24 @@ fn verify_workspace_root_binding(action: &PreparedProcessAction) -> Result<(), S
             .d32_execution_root
             .as_ref()
             .ok_or_else(|| "D32 execution projection was not retained".to_string())?;
+        let execution_root_retained = action
+            .d32_execution_root_retained
+            .as_ref()
+            .ok_or_else(|| "D32 retained execution root was absent".to_string())?;
+        let source_root_retained = action
+            .d32_source_root_retained
+            .as_ref()
+            .ok_or_else(|| "D32 retained source root was absent".to_string())?;
+        execution_root_retained.revalidate()?;
+        source_root_retained.revalidate()?;
+        if !h7_workspace_paths_equal(execution_root_retained.path(), execution_root)
+            || !h7_workspace_paths_equal(
+                source_root_retained.path(),
+                &execution_root.join("source"),
+            )
+        {
+            return Err("D32 retained projection paths were not exact".to_string());
+        }
         let expected_source = execution_root.join("source");
         if !h7_workspace_paths_equal(action.working_directory.path(), &expected_source) {
             return Err("D32 child cwd was not the app-owned source projection".to_string());
@@ -1241,18 +2308,68 @@ fn verify_d32_environment_policy(action: &PreparedProcessAction) -> Result<(), S
         .d32_toolchain_manifest_hash
         .as_deref()
         .ok_or_else(|| "D32 toolchain manifest evidence was absent".to_string())?;
-    for path in [&*root, &source, &cargo_home, &target, toolchain] {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|_| "D32 app-owned execution path became unavailable".to_string())?;
-        if metadata.file_type().is_symlink()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || !metadata.is_dir()
-        {
-            return Err("D32 app-owned execution path was not a stable directory".to_string());
-        }
+    let root_retained = action
+        .d32_execution_root_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained execution root was absent".to_string())?;
+    let source_retained = action
+        .d32_source_root_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained source projection was absent".to_string())?;
+    let cargo_home_retained = action
+        .d32_cargo_home_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained Cargo home was absent".to_string())?;
+    let target_retained = action
+        .d32_target_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained target directory was absent".to_string())?;
+    let toolchain_retained = action
+        .d32_toolchain_root_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained toolchain root was absent".to_string())?;
+    let toolchain_bin_retained = action
+        .d32_toolchain_bin_retained
+        .as_ref()
+        .ok_or_else(|| "D32 retained toolchain bin was absent".to_string())?;
+    for retained in [
+        root_retained,
+        source_retained,
+        cargo_home_retained,
+        target_retained,
+        toolchain_retained,
+        toolchain_bin_retained,
+    ] {
+        retained
+            .revalidate()
+            .map_err(|_| "D32 app-owned execution path identity changed".to_string())?;
     }
-    if toolchain_manifest_hash_for_catalog(toolchain)? != expected_manifest {
+    if !h7_workspace_paths_equal(action.working_directory.path(), source_retained.path()) {
+        return Err("D32 launch cwd was not the retained source projection".to_string());
+    }
+    if !h7_workspace_paths_equal(root, root_retained.path())
+        || !h7_workspace_paths_equal(toolchain, toolchain_retained.path())
+        || !h7_workspace_paths_equal(
+            &toolchain_retained.path().join("bin"),
+            toolchain_bin_retained.path(),
+        )
+        || !h7_workspace_paths_equal(&root.join("cargo-home"), cargo_home_retained.path())
+        || !h7_workspace_paths_equal(&root.join("target"), target_retained.path())
+    {
+        return Err("D32 retained launch layout did not match its projections".to_string());
+    }
+    if toolchain_manifest_hash_for_catalog_retained(&toolchain_retained)? != expected_manifest {
         return Err("D32 toolchain manifest changed during the launch fence".to_string());
+    }
+    for name in ["rustc.exe", "rustdoc.exe"] {
+        let identity = toolchain_bin_retained
+            .probe_file_bounded(OsStr::new(name), H7_MAX_EXECUTABLE_BYTES)?
+            .ok_or_else(|| "D32 retained toolchain image was unavailable".to_string())?;
+        let (hashed_identity, _) = toolchain_bin_retained
+            .hash_file_bounded_with_identity(OsStr::new(name), H7_MAX_EXECUTABLE_BYTES)?;
+        if identity != hashed_identity {
+            return Err("D32 retained toolchain image changed during launch fence".to_string());
+        }
     }
     Ok(())
 }
@@ -1371,50 +2488,58 @@ fn is_strict_descendant_path(path: &Path, root: &Path) -> bool {
     path.len() > root.len() && path.starts_with(&root)
 }
 
-fn toolchain_manifest_hash_for_catalog(root: &Path) -> Result<String, String> {
-    fn collect(
-        root: &Path,
-        current: &Path,
-        entries: &mut Vec<(String, String)>,
-    ) -> Result<(), String> {
-        for entry in fs::read_dir(current)
-            .map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?
-        {
-            let entry =
-                entry.map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|_| "D32 toolchain manifest metadata failed".to_string())?;
-            if metadata.file_type().is_symlink()
-                || (cfg!(windows) && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            {
-                return Err("D32 toolchain manifest rejected reparse entry".to_string());
-            }
-            if metadata.is_dir() {
-                collect(root, &path, entries)?;
-            } else if metadata.is_file() {
-                let digest = hash_d32_toolchain_file(&path)?;
-                entries.push((
-                    path.strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                    digest,
-                ));
-            }
-        }
-        Ok(())
-    }
+fn toolchain_manifest_hash_for_catalog_retained(
+    retained: &H7RetainedDirectory,
+) -> Result<String, String> {
     let mut entries = Vec::new();
-    collect(root, root, &mut entries)?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let encoded = serde_json::to_vec(&entries)
-        .map_err(|_| "D32 toolchain manifest serialization failed".to_string())?;
-    Ok(sha256_hex(&encoded))
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    collect_catalog_manifest(
+        &retained,
+        PathBuf::new(),
+        &mut entries,
+        &mut file_count,
+        &mut total_bytes,
+    )?;
+    protocol::d32_manifest_hash_hex(&mut entries)
+        .map_err(|_| "D32 toolchain manifest canonical encoding failed".to_string())
 }
 
-fn hash_d32_toolchain_file(path: &Path) -> Result<String, String> {
-    const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+fn collect_catalog_manifest(
+    retained: &H7RetainedDirectory,
+    relative_prefix: PathBuf,
+    entries: &mut Vec<(Vec<u8>, [u8; 32])>,
+    file_count: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), String> {
+    retained.revalidate()?;
+    for name in retained.enumerate_children()? {
+        let relative = relative_prefix.join(&name);
+        if let Ok(child) = retained.open_existing_child(&name) {
+            collect_catalog_manifest(&child, relative, entries, file_count, total_bytes)?;
+        } else {
+            let (identity, digest) = retained
+                .hash_file_bounded_with_identity(&name, protocol::D32_MANIFEST_MAX_FILE_BYTES)?;
+            *file_count = file_count.saturating_add(1);
+            *total_bytes = total_bytes.saturating_add(identity.file_size());
+            if *file_count > protocol::D32_MANIFEST_MAX_FILES
+                || *total_bytes > protocol::D32_MANIFEST_MAX_TOTAL_BYTES
+            {
+                return Err("D32 toolchain manifest exceeded its bounded total".to_string());
+            }
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| "D32 toolchain manifest path was not UTF-8".to_string())?
+                .replace('\\', "/")
+                .into_bytes();
+            entries.push((relative, digest));
+        }
+    }
+    retained.revalidate()
+}
+
+#[cfg(test)]
+fn hash_d32_toolchain_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file =
         File::open(path).map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
     let mut digest = Sha256::new();
@@ -1428,12 +2553,12 @@ fn hash_d32_toolchain_file(path: &Path) -> Result<String, String> {
             break;
         }
         total = total.saturating_add(read as u64);
-        if total > MAX_FILE_BYTES {
+        if total > protocol::D32_MANIFEST_MAX_FILE_BYTES {
             return Err("D32 toolchain manifest file exceeded its bound".to_string());
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest.finalize().into())
 }
 
 fn quote_windows_arg(argument: &str) -> String {
@@ -1772,20 +2897,21 @@ impl H7SandboxProfile {
     /// not widen any user-owned namespace.  Individual source/toolchain/scratch
     /// directories are created below the root and inherit the same bounded
     /// package identity.
-    pub(crate) fn grant_execution_root(&self, root: &Path, toolchain: &Path) -> Result<(), String> {
-        if !root.is_dir() {
-            return Err("D32 app-owned execution root was not a directory".to_string());
-        }
-        if !toolchain.is_dir() {
-            return Err("D32 app-owned toolchain mirror was not a directory".to_string());
-        }
-        let metadata = fs::symlink_metadata(root)
-            .map_err(|_| "D32 app-owned execution root metadata was unavailable".to_string())?;
-        if metadata.file_type().is_symlink()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
-            return Err("D32 app-owned execution root was a reparse point".to_string());
-        }
+    pub(crate) fn grant_execution_root(
+        &self,
+        root: &H7RetainedDirectory,
+        toolchain: &H7RetainedDirectory,
+    ) -> Result<(), String> {
+        root.revalidate()?;
+        toolchain.revalidate()?;
+        let root_path = root.path().to_path_buf();
+        let toolchain_path = toolchain.path().to_path_buf();
+        let source = root.open_existing_child(OsStr::new("source"))?;
+        let cargo_home = root.open_existing_child(OsStr::new("cargo-home"))?;
+        let target = root.open_existing_child(OsStr::new("target"))?;
+        source.revalidate()?;
+        cargo_home.revalidate()?;
+        target.revalidate()?;
         self.verify_no_loopback_exemption()?;
         // The projection root and immutable source/toolchain trees are read
         // only.  Cargo's two scratch namespaces receive the minimum extra
@@ -1793,21 +2919,29 @@ impl H7SandboxProfile {
         // The root itself is not executable user code; the execute bit here
         // is the bounded directory-traverse right required to reach the
         // explicitly projected source/toolchain/scratch children.
-        apply_appcontainer_acl(self.sid, root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
-        apply_appcontainer_acl(self.sid, &root.join("source"), FILE_GENERIC_READ)?;
         apply_appcontainer_acl(
             self.sid,
-            toolchain,
+            &root_path,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         )?;
-        for name in ["cargo-home", "target"] {
-            let path = root.join(name);
+        apply_appcontainer_acl(self.sid, source.path(), FILE_GENERIC_READ)?;
+        apply_appcontainer_acl(
+            self.sid,
+            &toolchain_path,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        for path in [cargo_home.path(), target.path()] {
             apply_appcontainer_acl(
                 self.sid,
-                &path,
+                path,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
             )?;
         }
+        root.revalidate()?;
+        toolchain.revalidate()?;
+        source.revalidate()?;
+        cargo_home.revalidate()?;
+        target.revalidate()?;
         Ok(())
     }
 }
@@ -2117,6 +3251,7 @@ impl Default for H7NativeLaunchDiagnostics {
 struct H7NativeResult {
     kind: H7NativeOutcomeKind,
     process_created: bool,
+    thread_resumed: bool,
     user_code_started: bool,
     exit_code: Option<u32>,
     stdout: Vec<u8>,
@@ -3582,8 +4717,14 @@ impl H7LaunchPreparation {
             let probe = image.namespace.rebind_leaf()?;
             (expected_identity, namespace, probe)
         };
-        let expected_working_directory = action.working_directory.0.identity();
-        let working_directory_probe = action.working_directory.rebind_leaf()?;
+        let expected_working_directory = action.d32_source_root_retained.as_ref().map_or_else(
+            || action.working_directory.0.identity(),
+            |retained| retained.identity(),
+        );
+        let working_directory_probe = action.d32_source_root_retained.as_ref().map_or_else(
+            || action.working_directory.rebind_leaf(),
+            |retained| retained.rebind_leaf(),
+        )?;
         if expected_working_directory.wire() != action.working_directory_identity {
             return Err("H7 working-directory binding was not host-owned".to_string());
         }
@@ -3724,7 +4865,10 @@ impl H7LaunchPreparation {
             )
         };
         let working_directory_identity = namespace_identity(self.working_directory_probe.raw())?;
-        let cwd_probe = action.working_directory.rebind_leaf()?;
+        let cwd_probe = action.d32_source_root_retained.as_ref().map_or_else(
+            || action.working_directory.rebind_leaf(),
+            |retained| retained.rebind_leaf(),
+        )?;
         let cwd_identity = namespace_identity(cwd_probe.raw())?;
         if image_identity != self.expected_image_identity
             || image_namespace_identity != self.expected_image_namespace
@@ -3759,6 +4903,7 @@ impl H7LaunchPreparation {
 struct H7NativeOptions {
     cancellation: Arc<AtomicBool>,
     metrics: Arc<H7SupervisorMetrics>,
+    d32_real_canary: bool,
     fault: H7NativeLaunchFault,
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
@@ -3784,80 +4929,8 @@ fn supervise_native(action: &PreparedProcessAction, options: H7NativeOptions) ->
     supervise_native_prepared(action, options, preparation, None)
 }
 
-/// The freeze canary drives the real D32 Host -> Vita -> Cargo chain with a
-/// build-script workload that invokes the adversarial fixture.  Keep the
-/// fixture's bounded JSON out of the public tool result, but validate every
-/// containment assertion at the native process boundary.  A missing,
-/// malformed, or negative observation is therefore a denial rather than a
-/// successful Cargo completion.
-fn validate_d32_real_sandbox_evidence(
-    action: &PreparedProcessAction,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> Result<bool, String> {
-    if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1")
-        || action.profile_id.as_deref() != Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
-    {
-        return Ok(false);
-    }
-    let mut combined = String::from_utf8_lossy(stdout).into_owned();
-    combined.push('\n');
-    combined.push_str(&String::from_utf8_lossy(stderr));
-    let marker = "D32A_SANDBOX_OBSERVATION=";
-    let line = combined
-        .lines()
-        .rev()
-        .find_map(|line| line.split_once(marker).map(|(_, value)| value.trim()))
-        .ok_or_else(|| "Cargo output omitted D32A_SANDBOX_OBSERVATION".to_string())?;
-    let observation: Value = serde_json::from_str(line)
-        .map_err(|error| format!("D32A sandbox observation was not JSON: {error}"))?;
-    for (field, expected) in [
-        ("allowed_read", true),
-        ("scratch_write", true),
-        ("outside_read_denied", true),
-        ("outside_write_denied", true),
-        ("user_profile_read_denied", true),
-        ("host_authority_read_denied", true),
-        ("recovery_read_denied", true),
-        ("credential_read_denied", true),
-        ("tcp_denied", true),
-        ("tcp_refused", false),
-        ("udp_denied", true),
-        ("external_tcp_denied", true),
-        ("external_tcp_refused", false),
-        ("external_udp_denied", true),
-        ("tcp_listener_denied", true),
-        ("udp_listener_denied", true),
-        ("grandchild_spawned", true),
-        ("grandchild_alive_after_probe", true),
-        ("breakaway_denied", true),
-        ("handle_count_observed", true),
-        ("credential_handle_probe_denied", true),
-        ("authority_handle_probe_denied", true),
-        ("forbidden_handle_probe_denied", true),
-        ("all_forbidden_handle_probes_denied", true),
-    ] {
-        if observation.get(field).and_then(Value::as_bool) != Some(expected) {
-            return Err(format!(
-                "D32A sandbox assertion {field} expected {expected}, observation={observation}"
-            ));
-        }
-    }
-    let handle_count = observation
-        .get("handle_count")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "D32A sandbox observation omitted handle_count".to_string())?;
-    if handle_count > 32 {
-        return Err(format!(
-            "D32A sandbox inherited handle count exceeded bound: {handle_count}"
-        ));
-    }
-    Ok(true)
-}
-
-fn d32_real_canary_replay_required(action: &PreparedProcessAction) -> bool {
-    std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() == Ok("1")
-        && action.profile_id.as_deref() == Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
+fn d32_real_canary_replay_required(action: &PreparedProcessAction, required: bool) -> bool {
+    required && action.profile_id.as_deref() == Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID)
 }
 
 fn supervise_native_prepared(
@@ -3887,6 +4960,7 @@ fn supervise_native_prepared(
                 H7NativeOutcomeKind::Denied
             },
             process_created: phase_at_least(&phase, H7LaunchPhase::CreatedSuspended),
+            thread_resumed: cleanup.user_code_started.load(Ordering::Acquire),
             user_code_started: cleanup.user_code_started.load(Ordering::Acquire),
             exit_code: None,
             stdout: Vec::new(),
@@ -4376,15 +5450,11 @@ fn supervise_native_inner(
     let stderr_retained_bytes = stderr_capture.retained_len();
     let stdout = std::mem::take(&mut stdout_capture.bytes);
     let stderr = std::mem::take(&mut stderr_capture.bytes);
-    let (real_sandbox_evidence_checked, real_sandbox_evidence_failed) =
-        match validate_d32_real_sandbox_evidence(action, &stdout, &stderr) {
-            Ok(checked) => (checked, false),
-            Err(error) => {
-                eprintln!("D32 real sandbox evidence failed closed: {error}");
-                diagnostics.final_local_fence_error_category = Some("sandbox_evidence".to_string());
-                (true, true)
-            }
-        };
+    // The child may emit diagnostic observations, but its stdout is not an
+    // authority source.  D32 native lifecycle evidence is published from the
+    // supervisor/H7ToolResult path and validated by the Host after the run.
+    let real_sandbox_evidence_checked = false;
+    let real_sandbox_evidence_failed = false;
     drop(stdout_capture);
     drop(stderr_capture);
     drop(_output_handle_guard);
@@ -4392,14 +5462,11 @@ fn supervise_native_inner(
         && !resources.job_terminated)
         || output_failure
         || !output_cleanup_bounded
-        || cleanup.process_tree_observer_failed.load(Ordering::Acquire)
-        || real_sandbox_evidence_failed;
+        || cleanup.process_tree_observer_failed.load(Ordering::Acquire);
     let kind = if cleanup.process_tree_observer_failed.load(Ordering::Acquire) {
         // A failed QueryInformationJobObject observation is never an
         // "unknown but usable" outcome.  The supervisor must report denial
         // and retain fail-closed cleanup evidence.
-        H7NativeOutcomeKind::Denied
-    } else if real_sandbox_evidence_failed {
         H7NativeOutcomeKind::Denied
     } else if termination_unproven {
         H7NativeOutcomeKind::StartedOutcomeUnknown
@@ -4417,6 +5484,7 @@ fn supervise_native_inner(
     H7NativeResult {
         kind,
         process_created: true,
+        thread_resumed: cleanup.user_code_started.load(Ordering::Acquire),
         user_code_started: true,
         exit_code,
         stdout,
@@ -4522,6 +5590,7 @@ fn launch_failed(
     H7NativeResult {
         kind: H7NativeOutcomeKind::LaunchFailed,
         process_created,
+        thread_resumed: false,
         user_code_started,
         exit_code: None,
         stdout: Vec::new(),
@@ -5982,7 +7051,11 @@ impl H7FinalFenceGate {
 pub(crate) struct H7ToolResult {
     status: &'static str,
     process_created: bool,
+    process_created_count: usize,
+    thread_resumed: bool,
+    thread_resumed_count: usize,
     user_code_started: bool,
+    user_code_started_count: usize,
     side_effect_count: usize,
     exit_code: Option<u32>,
     stdout: String,
@@ -6000,11 +7073,13 @@ pub(crate) struct H7ToolResult {
     job_termination_attempted: bool,
     job_terminated: bool,
     process_tree_observed: bool,
+    process_tree_observation_count: usize,
     process_tree_observer_failed: bool,
     process_tree_remaining: usize,
     direct_termination_attempted: bool,
     direct_termination_verified: bool,
     process_exit_verified: bool,
+    process_exit_count: usize,
     stdout_reader_joined: bool,
     stderr_reader_joined: bool,
     pending_stdout_reads: usize,
@@ -6022,7 +7097,11 @@ impl H7ToolResult {
         Self {
             status: "denied",
             process_created: false,
+            process_created_count: 0,
+            thread_resumed: false,
+            thread_resumed_count: 0,
             user_code_started: false,
+            user_code_started_count: 0,
             side_effect_count: 0,
             exit_code: None,
             stdout: String::new(),
@@ -6040,11 +7119,13 @@ impl H7ToolResult {
             job_termination_attempted: false,
             job_terminated: false,
             process_tree_observed: false,
+            process_tree_observation_count: 0,
             process_tree_observer_failed: false,
             process_tree_remaining: 0,
             direct_termination_attempted: false,
             direct_termination_verified: false,
             process_exit_verified: false,
+            process_exit_count: 0,
             stdout_reader_joined: true,
             stderr_reader_joined: true,
             pending_stdout_reads: 0,
@@ -6074,7 +7155,11 @@ impl H7ToolResult {
         Self {
             status,
             process_created: native.process_created,
+            process_created_count: usize::from(native.process_created),
+            thread_resumed: native.thread_resumed,
+            thread_resumed_count: usize::from(native.thread_resumed),
             user_code_started: native.user_code_started,
+            user_code_started_count: usize::from(native.user_code_started),
             side_effect_count: usize::from(native.process_created),
             exit_code: native.exit_code,
             stdout: String::from_utf8_lossy(&native.stdout).into_owned(),
@@ -6092,11 +7177,13 @@ impl H7ToolResult {
             job_termination_attempted: native.job_termination_attempted,
             job_terminated: native.job_terminated,
             process_tree_observed: native.process_tree_observed,
+            process_tree_observation_count: usize::from(native.process_tree_observed),
             process_tree_observer_failed: native.process_tree_observer_failed,
             process_tree_remaining: native.process_tree_remaining,
             direct_termination_attempted: native.direct_termination_attempted,
             direct_termination_verified: native.direct_termination_verified,
             process_exit_verified: native.process_exit_verified,
+            process_exit_count: usize::from(native.process_exit_verified),
             stdout_reader_joined: native.stdout_reader_joined,
             stderr_reader_joined: native.stderr_reader_joined,
             pending_stdout_reads: native.pending_stdout_reads,
@@ -6105,6 +7192,15 @@ impl H7ToolResult {
             stderr_retained_bytes: native.stderr_retained_bytes,
             diagnostics: native.diagnostics,
         }
+    }
+
+    fn set_native_metric_counts(&mut self, metrics: &H7SupervisorMetrics) {
+        self.process_created_count = metrics.process_created.load(Ordering::Acquire);
+        self.thread_resumed_count = metrics.thread_resumed.load(Ordering::Acquire);
+        self.user_code_started_count = self.thread_resumed_count;
+        self.process_exit_count = metrics.process_exit_verified.load(Ordering::Acquire);
+        self.process_tree_observation_count =
+            metrics.process_tree_observations.load(Ordering::Acquire);
     }
 
     fn value(&self) -> Value {
@@ -6148,6 +7244,7 @@ impl H7ToolResult {
     pub(crate) fn internal_process_evidence(&self) -> Value {
         json!({
             "process_created": self.process_created,
+            "thread_resumed": self.thread_resumed,
             "user_code_started": self.user_code_started,
             "process_tree_remaining": self.process_tree_remaining,
             "real_sandbox_evidence_checked": self.real_sandbox_evidence_checked,
@@ -6163,7 +7260,6 @@ impl H7ToolResult {
             "process_tree_observed": self.process_tree_observed,
             "process_tree_observer_failed": self.process_tree_observer_failed,
             "process_exit_verified": self.process_exit_verified,
-            "thread_resumed": self.process_created && self.user_code_started,
             "final_local_fence_error_category": self
                 .diagnostics
                 .final_local_fence_error_category
@@ -6174,6 +7270,31 @@ impl H7ToolResult {
             "assign_process_to_job_error": self.diagnostics.assign_process_to_job_error,
             "resume_thread_succeeded": self.diagnostics.resume_thread_succeeded,
             "resume_thread_error": self.diagnostics.resume_thread_error,
+        })
+    }
+
+    /// Native lifecycle evidence for the D32 canary sink.  This is derived
+    /// from the supervisor result, never from child stdout or a model-visible
+    /// tool result.  Numeric fields make zero/one counter assertions explicit
+    /// to the Host validator while the booleans preserve the H7 result facts.
+    pub(crate) fn d32_native_evidence(&self) -> Value {
+        json!({
+            "status": self.status,
+            "process_created": self.process_created,
+            "process_created_count": self.process_created_count,
+            "thread_resumed": self.thread_resumed,
+            "thread_resumed_count": self.thread_resumed_count,
+            "user_code_started": self.user_code_started,
+            "user_code_started_count": self.user_code_started_count,
+            "process_exit": self.process_exit_verified,
+            "process_exit_verified": self.process_exit_verified,
+            "process_exit_count": self.process_exit_count,
+            "process_tree_observed": self.process_tree_observed,
+            "process_tree_observation_count": self.process_tree_observation_count,
+            "process_tree_remaining": self.process_tree_remaining,
+            "process_tree_observer_failed": self.process_tree_observer_failed,
+            "job_termination_attempted": self.job_termination_attempted,
+            "job_terminated": self.job_terminated,
         })
     }
 }
@@ -6289,6 +7410,7 @@ pub(crate) struct H7ProcessBroker {
     catalog: Arc<H7ExecutableCatalog>,
     authority: Arc<dyn H7AuthorityPort>,
     bridge: Arc<H7PendingConfirmationBridge>,
+    d32_real_canary: bool,
     admission: Arc<H7ProcessAdmission>,
     active_cancellation: Arc<Mutex<Option<H7ActiveCancellation>>>,
     metrics: Arc<H7SupervisorMetrics>,
@@ -6314,6 +7436,7 @@ impl H7ProcessBroker {
             catalog,
             authority,
             bridge,
+            d32_real_canary: false,
             admission: h7_process_admission(),
             active_cancellation: Arc::new(Mutex::new(None)),
             metrics: Arc::new(H7SupervisorMetrics::default()),
@@ -6326,6 +7449,19 @@ impl H7ProcessBroker {
             post_host_mutation: H7PostHostMutation::None,
             output_terminality_gate: None,
         })
+    }
+
+    pub(crate) fn new_with_d32_real_canary(
+        context: VitaExecutionContext,
+        catalog: Arc<H7ExecutableCatalog>,
+        authority: Arc<dyn H7AuthorityPort>,
+        bridge: Arc<H7PendingConfirmationBridge>,
+    ) -> Arc<Self> {
+        let mut broker = Self::new(context, catalog, authority, bridge);
+        Arc::get_mut(&mut broker)
+            .expect("D32 real canary broker must be configured before sharing")
+            .d32_real_canary = true;
+        broker
     }
 
     fn with_final_fence_gate(mut self: Arc<Self>, gate: Arc<H7FinalFenceGate>) -> Arc<Self> {
@@ -6546,6 +7682,7 @@ impl H7ProcessBroker {
         let cancellation = Arc::clone(&cancellation);
         let metrics = Arc::clone(&self.metrics);
         let fault = self.native_fault;
+        let d32_real_canary = self.d32_real_canary;
         let pre_create_process_gate = self.post_host_gate.clone();
         let post_host_mutation = self.post_host_mutation;
         let output_terminality_gate = self.output_terminality_gate.clone();
@@ -6575,7 +7712,7 @@ impl H7ProcessBroker {
             let mut d32_replay_thread_resumed_before = 0usize;
             let mut d32_replay_process_created_after = 0usize;
             let mut d32_replay_thread_resumed_after = 0usize;
-            if d32_real_canary_replay_required(&action_for_launch) {
+            if d32_real_canary_replay_required(&action_for_launch, d32_real_canary) {
                 d32_replay_checked = true;
                 let mut replay_grant = grant.clone();
                 d32_replay_process_created_before = metrics.process_created.load(Ordering::Acquire);
@@ -6598,11 +7735,13 @@ impl H7ProcessBroker {
                     return H7ToolResult::denied();
                 }
             }
+            let result_metrics = Arc::clone(&metrics);
             let native = supervise_native_prepared(
                 &action_for_launch,
                 H7NativeOptions {
                     cancellation: Arc::clone(&worker_cancellation),
                     metrics,
+                    d32_real_canary,
                     fault,
                     unlisted_inheritable_handle,
                     post_host_mutation,
@@ -6629,6 +7768,7 @@ impl H7ProcessBroker {
             } else {
                 H7ToolResult::from_native(native)
             };
+            tool_result.set_native_metric_counts(&result_metrics);
             tool_result.d32_replay_checked = d32_replay_checked;
             tool_result.d32_replay_denied = d32_replay_denied;
             tool_result.d32_replay_process_created_before = d32_replay_process_created_before;
@@ -7032,6 +8172,7 @@ impl H7BWorkspaceProcessBroker {
                 H7NativeOptions {
                     cancellation: cancellation_for_launch,
                     metrics: Arc::clone(&metrics),
+                    d32_real_canary: false,
                     fault: H7NativeLaunchFault::None,
                     unlisted_inheritable_handle: None,
                     post_host_mutation: H7PostHostMutation::None,
@@ -7355,6 +8496,7 @@ struct H7CGitStatusProfile {
     stderr_bound: usize,
     git_metadata_fence: Arc<H7CGitMetadataFence>,
     git_metadata_fence_hash: String,
+    workspace_root_retained: Arc<H7RetainedDirectory>,
     _git_home: TempDir,
 }
 
@@ -7362,7 +8504,16 @@ impl H7CGitStatusProfile {
     fn new(root: &TrustedWorkspaceRoot, git_path: PathBuf) -> Result<Self, String> {
         root.verify_named_path_current()
             .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
-        let git_metadata_fence = h7c_validate_git_metadata(root)?;
+        // Derive every D29-H7-C workspace authority from the already-held
+        // TrustedWorkspaceRoot handle.  The projected pathname below is
+        // retained only for the child working-directory string; it is never
+        // reopened to establish cwd or Git metadata authority.
+        let workspace_root_retained = Arc::new(
+            H7RetainedDirectory::from_trusted_workspace_root(root)
+                .map_err(|error| format!("D29-H7-C workspace root retention failed: {error}"))?,
+        );
+        let git_metadata_fence =
+            h7c_validate_git_metadata(root, Arc::clone(&workspace_root_retained))?;
         if !git_path.is_absolute() {
             return Err("D29-H7-C Git image path was not absolute".to_string());
         }
@@ -7370,7 +8521,9 @@ impl H7CGitStatusProfile {
         let expected_image_identity = image.identity;
         let expected_image_namespace = image.namespace.identity();
         let expected_image_sha256 = image.sha256.clone();
-        let working_directory = Arc::new(PreparedWorkingDirectory::prepare(root.requested_path())?);
+        let working_directory = Arc::new(PreparedWorkingDirectory::from_retained(
+            &workspace_root_retained,
+        ));
         let working_directory_identity = working_directory.0.identity().wire();
         let git_home = tempfile::tempdir()
             .map_err(|_| "D29-H7-C could not create the owned Git home".to_string())?;
@@ -7398,8 +8551,8 @@ impl H7CGitStatusProfile {
             &serde_json::to_vec(&argv)
                 .map_err(|_| "D29-H7-C Git argv binding serialization failed".to_string())?,
         );
-        let ceiling = root
-            .requested_path()
+        let ceiling = working_directory
+            .path()
             .parent()
             .ok_or_else(|| "D29-H7-C workspace root had no ceiling directory".to_string())?;
         let environment = BTreeMap::from([
@@ -7436,6 +8589,7 @@ impl H7CGitStatusProfile {
             stderr_bound: H7_STDERR_BOUND,
             git_metadata_fence_hash: git_metadata_fence.fence_hash.clone(),
             git_metadata_fence,
+            workspace_root_retained,
             _git_home: git_home,
         })
     }
@@ -7446,6 +8600,7 @@ impl H7CGitStatusProfile {
         request: H7CGitStatusRequest,
         workspace_root: Option<TrustedWorkspaceRoot>,
     ) -> Result<Arc<PreparedProcessAction>, String> {
+        self.workspace_root_retained.revalidate()?;
         if let Some(root) = workspace_root.as_ref() {
             if root.identity() != self.workspace_root_identity
                 || !h7_workspace_paths_equal(self.working_directory.path(), root.final_path())
@@ -7491,6 +8646,12 @@ impl H7CGitStatusProfile {
             sandbox: None,
             d32_execution_root: None,
             d32_toolchain_root: None,
+            d32_execution_root_retained: None,
+            d32_source_root_retained: None,
+            d32_cargo_home_retained: None,
+            d32_target_retained: None,
+            d32_toolchain_root_retained: None,
+            d32_toolchain_bin_retained: None,
             d32_toolchain_manifest_hash: None,
         }))
     }
@@ -7525,6 +8686,7 @@ struct H7CWorkspaceSnapshot {
 }
 
 struct H7CGitMetadataFence {
+    workspace_root: Arc<H7RetainedDirectory>,
     git_directory: Arc<H7PreparedNamespace>,
     config_file: Arc<H7PreparedNamespace>,
     expected_git_directory_identity: H7NamespaceIdentity,
@@ -7535,24 +8697,21 @@ struct H7CGitMetadataFence {
 }
 
 impl H7CGitMetadataFence {
-    fn new(root: &TrustedWorkspaceRoot) -> Result<Arc<Self>, String> {
-        let git_target = root
-            .prepare_target(Path::new(".git"))
-            .map_err(|_| "D29-H7-C Git metadata target could not be prepared".to_string())?;
-        if git_target.kind() != crate::PreparedWorkspaceTargetKind::ExistingDirectory {
-            return Err("D29-H7-C external or file-form Git metadata was rejected".to_string());
-        }
-
-        let workspace_root = root.requested_path().to_path_buf();
-        let git_directory = Arc::new(H7PreparedNamespace::prepare(
-            &workspace_root.join(".git"),
-            true,
-        )?);
+    fn new(
+        root: &TrustedWorkspaceRoot,
+        workspace_root: Arc<H7RetainedDirectory>,
+    ) -> Result<Arc<Self>, String> {
+        workspace_root.revalidate()?;
+        root.verify_named_path_current()
+            .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
+        let git_directory_retained = workspace_root
+            .open_existing_child(OsStr::new(".git"))
+            .map_err(|_| "D29-H7-C external or file-form Git metadata was rejected".to_string())?;
+        let git_directory = Arc::new(git_directory_retained.namespace.clone());
         let expected_git_directory_identity = git_directory.identity();
         h7c_reject_forbidden_git_metadata(&git_directory.leaf)?;
-        let config_file = Arc::new(H7PreparedNamespace::prepare_with_leaf_share(
-            &workspace_root.join(".git/config"),
-            false,
+        let config_file = Arc::new(git_directory_retained.prepare_existing_file_namespace(
+            OsStr::new("config"),
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         )?);
         let config_handle = duplicate_file_handle(config_file.leaf.raw())?;
@@ -7570,6 +8729,7 @@ impl H7CGitMetadataFence {
         .map_err(|_| "D29-H7-C Git metadata fence serialization failed".to_string())?;
         let fence_hash = sha256_hex(&fence_material);
         Ok(Arc::new(Self {
+            workspace_root,
             git_directory,
             config_file,
             expected_git_directory_identity,
@@ -7581,6 +8741,7 @@ impl H7CGitMetadataFence {
     }
 
     fn revalidate(&self) -> Result<(), String> {
+        self.workspace_root.revalidate()?;
         let git_directory = self.git_directory.rebind_leaf()?;
         if namespace_identity(git_directory.raw())? != self.expected_git_directory_identity {
             return Err("D29-H7-C Git metadata directory identity changed".to_string());
@@ -7791,8 +8952,9 @@ fn h7c_reject_forbidden_git_metadata(git_directory: &Arc<H7Handle>) -> Result<()
 
 fn h7c_validate_git_metadata(
     root: &TrustedWorkspaceRoot,
+    workspace_root: Arc<H7RetainedDirectory>,
 ) -> Result<Arc<H7CGitMetadataFence>, String> {
-    H7CGitMetadataFence::new(root)
+    H7CGitMetadataFence::new(root, workspace_root)
 }
 
 fn h7c_snapshot_workspace(root: &Path) -> Result<H7CWorkspaceSnapshot, String> {
@@ -8054,6 +9216,7 @@ impl H7CGitStatusBroker {
                 H7NativeOptions {
                     cancellation: cancellation_for_launch,
                     metrics,
+                    d32_real_canary: false,
                     fault: H7NativeLaunchFault::None,
                     unlisted_inheritable_handle: None,
                     post_host_mutation: H7PostHostMutation::None,
@@ -10583,6 +11746,7 @@ mod tests {
         H7NativeOptions {
             cancellation: Arc::new(AtomicBool::new(false)),
             metrics,
+            d32_real_canary: false,
             fault,
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
@@ -10797,14 +11961,9 @@ mod tests {
         assert!(harness.authority.shutdown());
     }
 
+    #[cfg(feature = "d32-a-test-helper")]
     #[tokio::test(flavor = "current_thread")]
     async fn d32_a_real_sandbox_fixture_harness_uses_production_supervisor() {
-        if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-            eprintln!(
-                "skipping D32-A adversarial sandbox fixture; set D32_A_REQUIRE_REAL_CANARY=1 for the freeze gate"
-            );
-            return;
-        }
         let _lock = lock_h7_tests();
         let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -10937,8 +12096,12 @@ mod tests {
                 .expect("D32-A fixture catalog"),
         );
         let sandbox = Arc::new(H7SandboxProfile::new().expect("D32-A AppContainer profile"));
+        let retained_execution_root =
+            H7RetainedDirectory::open(execution_root.path()).expect("D32-A retained root");
+        let retained_toolchain =
+            H7RetainedDirectory::open(&toolchain).expect("D32-A retained toolchain");
         sandbox
-            .grant_execution_root(execution_root.path(), &toolchain)
+            .grant_execution_root(&retained_execution_root, &retained_toolchain)
             .expect("D32-A fixture ACL projection");
         let authority_port = H7Authority::new().expect("D32-A fixture authority");
         let (bridge, mut receiver) = H7PendingConfirmationBridge::new();

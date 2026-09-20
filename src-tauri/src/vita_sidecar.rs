@@ -144,6 +144,287 @@ pub struct VitaSidecarActionResponse {
     pub accepted: bool,
 }
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum D32HostCanaryMode {
+    Positive,
+    GrantReplay,
+    RevokeBeforeRevalidation,
+    LifeBeforeRevalidation,
+    CancelBeforeRevalidation,
+    MigrationBeforeRevalidation,
+    ExecutableIdentityTamper,
+    EnvironmentProfileTamper,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32HostCanaryMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "" | "positive" | "Positive" => Ok(Self::Positive),
+            "grant-replay" | "grant_replay" | "GrantReplay" => Ok(Self::GrantReplay),
+            "revoke"
+            | "revoke-before-revalidation"
+            | "revoke_before_revalidation"
+            | "Revoke"
+            | "RevokeBeforeRevalidation" => Ok(Self::RevokeBeforeRevalidation),
+            "life"
+            | "life-before-revalidation"
+            | "life_before_revalidation"
+            | "Life"
+            | "LifeBeforeRevalidation" => Ok(Self::LifeBeforeRevalidation),
+            "cancel"
+            | "cancel-before-revalidation"
+            | "cancel_before_revalidation"
+            | "Cancel"
+            | "CancelBeforeRevalidation" => Ok(Self::CancelBeforeRevalidation),
+            "migration"
+            | "migration-before-revalidation"
+            | "migration_before_revalidation"
+            | "Migration"
+            | "MigrationBeforeRevalidation" => Ok(Self::MigrationBeforeRevalidation),
+            "executable-identity-tamper"
+            | "executable_identity_tamper"
+            | "ExecutableIdentityTamper" => Ok(Self::ExecutableIdentityTamper),
+            "environment-profile-tamper"
+            | "environment_profile_tamper"
+            | "EnvironmentProfileTamper" => Ok(Self::EnvironmentProfileTamper),
+            other => Err(format!(
+                "D32_A_NOT_EXECUTABLE: unsupported canary mode '{other}'"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::GrantReplay => "grant-replay",
+            Self::RevokeBeforeRevalidation => "revoke-before-revalidation",
+            Self::LifeBeforeRevalidation => "life-before-revalidation",
+            Self::CancelBeforeRevalidation => "cancel-before-revalidation",
+            Self::MigrationBeforeRevalidation => "migration-before-revalidation",
+            Self::ExecutableIdentityTamper => "executable-identity-tamper",
+            Self::EnvironmentProfileTamper => "environment-profile-tamper",
+        }
+    }
+
+    fn expects_deny(self) -> bool {
+        !matches!(self, Self::Positive)
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32HostCanaryTraceSnapshot {
+    pub authority_evaluate: u64,
+    pub confirmation_required: u64,
+    pub issue_grant: u64,
+    pub revalidate_grant: u64,
+    pub grant_revalidated_allowed: u64,
+    pub grant_revalidated_denied: u64,
+    pub grant_denial_code: Option<String>,
+    pub turn_completed: u64,
+    pub turn_failed: u64,
+    pub action_cancelled: u64,
+    pub replay_checked: bool,
+    pub replay_denied: bool,
+    pub replay_exact_request_count: u64,
+    pub replay_exact_session_count: u64,
+    pub replay_first_allowed: u64,
+    pub replay_second_denied: u64,
+    pub replay_wire_responses: u64,
+    pub pre_native_fence_seen: bool,
+    pub tamper_denied: bool,
+    pub revoke_applied: bool,
+    pub life_switch_applied: bool,
+    pub isolated_migration_applied: bool,
+    pub exact_capability: bool,
+    pub exact_tool: bool,
+    pub exact_profile: bool,
+    pub exact_cargo_check: bool,
+    pub binding_fields_validated: bool,
+    pub native_evidence_run_id: Option<String>,
+    pub native_evidence_session_id: Option<String>,
+    pub native_evidence_life_id: Option<String>,
+    pub native_evidence_task_id: Option<String>,
+    pub native_evidence_turn_id: Option<String>,
+    pub native_evidence_tool_call_id: Option<String>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32CleanupOutcome {
+    pub attempted: bool,
+    pub validated: bool,
+    pub removed: bool,
+    pub unsafe_left: bool,
+    pub error: Option<String>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32HostCanaryReport {
+    pub mode: String,
+    pub status: String,
+    pub trace: D32HostCanaryTraceSnapshot,
+    pub native_evidence: D32NativeEvidenceReport,
+    pub terminal_phase: Option<protocol::TurnPhase>,
+    pub turn_error: Option<String>,
+    pub cleanup: D32CleanupOutcome,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32NativeEvidenceReport {
+    pub record: serde_json::Value,
+    pub sha256: String,
+    pub identity: String,
+    pub bytes: u64,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Default)]
+pub(crate) struct D32HostCanaryTrace {
+    snapshot: Mutex<D32HostCanaryTraceSnapshot>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32HostCanaryTrace {
+    fn update(&self, update: impl FnOnce(&mut D32HostCanaryTraceSnapshot)) {
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            update(&mut snapshot);
+        }
+    }
+
+    fn snapshot(&self) -> D32HostCanaryTraceSnapshot {
+        self.snapshot
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+pub(crate) struct D32HostCanaryControl {
+    pub(crate) mode: D32HostCanaryMode,
+    pub(crate) trace: Arc<D32HostCanaryTrace>,
+    cancel_signal: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    cancel_barrier: Arc<std::sync::Barrier>,
+    revoke_restore_revision: Mutex<Option<i64>>,
+    replay_capture_enabled: Mutex<bool>,
+    replay_captured_response: Mutex<Option<protocol::GrantRevalidated>>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32HostCanaryControl {
+    fn new(mode: D32HostCanaryMode) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            trace: Arc::new(D32HostCanaryTrace::default()),
+            cancel_signal: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            cancel_barrier: Arc::new(std::sync::Barrier::new(2)),
+            revoke_restore_revision: Mutex::new(None),
+            replay_capture_enabled: Mutex::new(false),
+            replay_captured_response: Mutex::new(None),
+        })
+    }
+
+    fn wait_for_cancel_signal(&self) {
+        let (signal, wake) = &*self.cancel_signal;
+        let Ok(mut signal) = signal.lock() else {
+            return;
+        };
+        while !*signal {
+            signal = match wake.wait(signal) {
+                Ok(signal) => signal,
+                Err(_) => return,
+            };
+        }
+    }
+
+    fn signal_cancel_worker(&self) {
+        let (signal, wake) = &*self.cancel_signal;
+        if let Ok(mut signal) = signal.lock() {
+            *signal = true;
+            wake.notify_one();
+        }
+    }
+
+    fn cancel_barrier(&self) -> Arc<std::sync::Barrier> {
+        Arc::clone(&self.cancel_barrier)
+    }
+
+    fn set_revoke_restore_revision(&self, revision: i64) {
+        if let Ok(mut value) = self.revoke_restore_revision.lock() {
+            *value = Some(revision);
+        }
+    }
+
+    fn take_revoke_restore_revision(&self) -> Option<i64> {
+        self.revoke_restore_revision
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take())
+    }
+
+    fn begin_replay_capture(&self) -> Result<(), String> {
+        let mut enabled = self
+            .replay_capture_enabled
+            .lock()
+            .map_err(|_| "D32 replay capture lock was poisoned".to_string())?;
+        let captured = self
+            .replay_captured_response
+            .lock()
+            .map_err(|_| "D32 replay response lock was poisoned".to_string())?;
+        if *enabled || captured.is_some() {
+            return Err("D32 replay capture was already active".to_string());
+        }
+        *enabled = true;
+        Ok(())
+    }
+
+    fn capture_replay_response(
+        &self,
+        response: &protocol::GrantRevalidated,
+    ) -> Result<bool, String> {
+        let enabled = self
+            .replay_capture_enabled
+            .lock()
+            .map_err(|_| "D32 replay capture lock was poisoned".to_string())?;
+        if !*enabled {
+            return Ok(false);
+        }
+        drop(enabled);
+        let mut captured = self
+            .replay_captured_response
+            .lock()
+            .map_err(|_| "D32 replay response lock was poisoned".to_string())?;
+        if captured.is_some() {
+            return Err("D32 replay produced more than one response".to_string());
+        }
+        *captured = Some(response.clone());
+        Ok(true)
+    }
+
+    fn finish_replay_capture(&self) -> Result<protocol::GrantRevalidated, String> {
+        let mut enabled = self
+            .replay_capture_enabled
+            .lock()
+            .map_err(|_| "D32 replay capture lock was poisoned".to_string())?;
+        *enabled = false;
+        drop(enabled);
+        self.replay_captured_response
+            .lock()
+            .map_err(|_| "D32 replay response lock was poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "D32 replay produced no captured response".to_string())
+    }
+}
+
 pub struct VitaSidecarCoordinator {
     authority_storage: Arc<StorageService>,
     registry: CapabilityRegistry,
@@ -153,6 +434,8 @@ pub struct VitaSidecarCoordinator {
     test_provider_override: Mutex<Option<protocol::ProviderConfiguration>>,
     #[cfg(windows)]
     inner: Mutex<WindowsCoordinatorState>,
+    #[cfg(all(windows, feature = "d32-a-host-canary"))]
+    d32_host_canary: Mutex<Option<Arc<D32HostCanaryControl>>>,
     #[cfg(not(windows))]
     inner: Mutex<()>,
 }
@@ -171,15 +454,97 @@ impl VitaSidecarCoordinator {
             test_provider_override: Mutex::new(None),
             #[cfg(windows)]
             inner: Mutex::new(WindowsCoordinatorState::default()),
+            #[cfg(all(windows, feature = "d32-a-host-canary"))]
+            d32_host_canary: Mutex::new(None),
             #[cfg(not(windows))]
             inner: Mutex::new(()),
         }
     }
 }
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl VitaSidecarCoordinator {
+    pub(crate) fn configure_d32_host_canary(
+        &self,
+        control: Arc<D32HostCanaryControl>,
+    ) -> Result<(), String> {
+        let mut configured = self
+            .d32_host_canary
+            .lock()
+            .map_err(|_| "D32 Host canary control lock was poisoned".to_string())?;
+        if configured.is_some() {
+            return Err("D32 Host canary control was already configured".to_string());
+        }
+        *configured = Some(control);
+        Ok(())
+    }
+
+    fn d32_host_canary_control(&self) -> Result<Option<Arc<D32HostCanaryControl>>, String> {
+        self.d32_host_canary
+            .lock()
+            .map(|control| control.clone())
+            .map_err(|_| "D32 Host canary control lock was poisoned".to_string())
+    }
+
+    pub(crate) fn clear_d32_host_canary(&self) -> Result<(), String> {
+        let mut configured = self
+            .d32_host_canary
+            .lock()
+            .map_err(|_| "D32 Host canary control lock was poisoned".to_string())?;
+        configured.take();
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) fn run_d32_a_host_integration(
+    app: tauri::App<tauri::Wry>,
+    mode: &str,
+) -> Result<D32HostCanaryReport, String> {
+    windows::run_d32_a_host_integration_impl(app, mode)
+}
+
+/// Perform the canary's provider gate before the production Tauri setup hook
+/// opens the writable Host storage connection.  This keeps a missing-provider
+/// canary invocation read-only with respect to the real app-data directory.
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) fn d32_a_preflight_chat_provider(identifier: &str, mode: &str) -> Result<(), String> {
+    windows::d32_a_preflight_chat_provider(identifier, mode)
+}
+
+/// Owns the canary-only filesystem projection and scoped path overrides.  The
+/// real Host app-data/resource namespaces remain read-only audit targets; all
+/// writable state used by the production builder is redirected below one
+/// process-unique temporary root.
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) struct D32HostIntegrationEnvironment {
+    inner: windows::D32HostIntegrationEnvironment,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+impl D32HostIntegrationEnvironment {
+    pub(crate) fn prepare(identifier: &str) -> Result<Self, String> {
+        windows::D32HostIntegrationEnvironment::prepare(identifier).map(|inner| Self { inner })
+    }
+
+    pub(crate) fn verify_real_roots_unchanged(&self) -> Result<(), String> {
+        self.inner.verify_real_roots_unchanged()
+    }
+
+    pub(crate) fn establish_stable_baseline(&mut self) -> Result<(), String> {
+        self.inner.establish_stable_baseline()
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<(), String> {
+        self.inner.cleanup()
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
+    #[cfg(feature = "d32-a-host-canary")]
+    use crate::capability::activation::apply_transition_for_host_canary;
     use crate::capability::authorization::{
         evaluate_capability_authorization, evaluate_capability_authorization_in_scope,
         CapabilityAuthorizationDecisionKind, CapabilityAuthorizationErrorCode,
@@ -214,26 +579,49 @@ mod windows {
     };
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs::{self, File};
-    use std::io::{BufReader, BufWriter, Read, Write};
-    use std::os::windows::ffi::OsStrExt;
+    use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+    use std::mem::size_of;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
-    use std::path::{Path, PathBuf};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::path::{Component, Path, PathBuf, Prefix};
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    use std::process::{Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Condvar, Weak};
     use std::thread::{self, JoinHandle};
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    use std::time::Instant;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tauri::{AppHandle, Manager, State};
     use vita_agent_protocol as protocol;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileIdBothDirectoryInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
+        NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_ID_BOTH_DIR_INFORMATION,
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
     };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+        NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NO_MORE_ENTRIES,
+        STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileDispositionInfo, FileRenameInfo, GetDriveTypeW,
+        GetFileInformationByHandle, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     // H7-C's fixed Git-status program identity is the profile identity.  The
     // generic H7 fixture program id is deliberately not accepted on this
@@ -249,10 +637,18 @@ mod windows {
     const D32_SOURCE_DIR_NAME: &str = "source";
     const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
     const D32_RUNS_DIR_NAME: &str = "runs";
+    const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v1";
+    const D32_NATIVE_EVIDENCE_MAX_BYTES: u64 = 64 * 1024;
     const D32_CARGO_SELECTION_FILE_NAME: &str = ".d32-cargo-selection-v1.json";
-    const D32_TOOLCHAIN_FILE_MAX_BYTES: u64 = 512 * 1024 * 1024;
-    const D32_TOOLCHAIN_TOTAL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    const D32_TOOLCHAIN_MAX_FILES: usize = 131_072;
+    const D32_TOOLCHAIN_FILE_MAX_BYTES: u64 = protocol::D32_MANIFEST_MAX_FILE_BYTES;
+    const D32_TOOLCHAIN_TOTAL_MAX_BYTES: u64 = protocol::D32_MANIFEST_MAX_TOTAL_BYTES;
+    const D32_TOOLCHAIN_MAX_FILES: usize = protocol::D32_MANIFEST_MAX_FILES;
+    // NtQueryDirectoryFile requires FILE_LIST_DIRECTORY on the retained
+    // directory handle.  Keep this explicit instead of reopening the
+    // directory by pathname for manifest/catalog authority.
+    const D32_FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const D32_AUDIT_MAX_ENTRIES: usize = 262_144;
+    const D32_AUDIT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     const D32_IMAGE_HASH_MAX_BYTES: u64 = 256 * 1024 * 1024;
     const GRANT_LIFETIME_MS: u64 = 30_000;
     // Cargo authority validation rechecks the app-owned toolchain mirror by
@@ -263,6 +659,38 @@ mod windows {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const READY_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_PENDING: usize = 1;
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct D32NativeEvidenceRecord {
+        version: u32,
+        run_id: String,
+        session_id: String,
+        life_id: String,
+        task_id: String,
+        turn_id: String,
+        tool_call_id: String,
+        capability_id: String,
+        program_id: String,
+        profile_id: String,
+        status: String,
+        process_created: bool,
+        process_created_count: u64,
+        thread_resumed: bool,
+        thread_resumed_count: u64,
+        user_code_started: bool,
+        user_code_started_count: u64,
+        process_exit: bool,
+        process_exit_verified: bool,
+        process_exit_count: u64,
+        process_tree_observed: bool,
+        process_tree_observation_count: u64,
+        process_tree_remaining: u64,
+        process_tree_observer_failed: bool,
+        job_termination_attempted: bool,
+        job_terminated: bool,
+    }
     // Active grants are bounded, but successful single-use grants are removed
     // immediately after final revalidation, so this is not a session lifetime
     // limit.
@@ -312,6 +740,16 @@ mod windows {
     struct HostPublishedCargoProfile {
         selection: HostCargoSelection,
         expected_profile_evidence: HostCargoCheckProfileEvidence,
+    }
+
+    /// The wire marker is only a locator.  During Host startup the selected
+    /// toolchain and its `bin` directory stay backed by the exact retained
+    /// handles that were used for selection; later mirror preparation consumes
+    /// this capability instead of reopening the user-profile path.
+    struct HostCargoSelectionAuthority {
+        selection: HostCargoSelection,
+        toolchain_retained: D32RetainedDirectory,
+        toolchain_bin_retained: D32RetainedDirectory,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,6 +843,1292 @@ mod windows {
         })
     }
 
+    struct D32RetainedHandle(HANDLE);
+
+    impl D32RetainedHandle {
+        fn new(handle: HANDLE) -> Result<Self, String> {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                Err(format!(
+                    "D32 Host native handle creation failed: {}",
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                ))
+            } else {
+                Ok(Self(handle))
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        fn into_raw(self) -> HANDLE {
+            let handle = self.0;
+            std::mem::forget(self);
+            handle
+        }
+    }
+
+    impl Drop for D32RetainedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn d32_duplicate_handle(handle: HANDLE) -> Result<D32RetainedHandle, String> {
+        let mut duplicate = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 || duplicate.is_null() || duplicate == INVALID_HANDLE_VALUE {
+            if !duplicate.is_null() && duplicate != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(duplicate);
+                }
+            }
+            return Err(format!(
+                "D32 Host retained handle duplication failed: {}",
+                unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            ));
+        }
+        D32RetainedHandle::new(duplicate)
+    }
+
+    // A retained handle is a process-local kernel reference.  The wrapper is
+    // moved only behind Arc within this module and is never serialized.
+    unsafe impl Send for D32RetainedHandle {}
+
+    unsafe impl Sync for D32RetainedHandle {}
+
+    #[derive(Clone)]
+    struct D32PreparedNamespace {
+        parent: Arc<D32RetainedHandle>,
+        leaf: Arc<D32RetainedHandle>,
+        leaf_name: OsString,
+        leaf_share_access: u32,
+        identity: HostFileIdentity,
+    }
+
+    impl D32PreparedNamespace {
+        fn prepare(path: &Path, directory: bool) -> Result<Self, String> {
+            let leaf_share_access = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            if !path.is_absolute() {
+                return Err("D32 Host namespace path was not absolute".to_string());
+            }
+            let mut normal_components = Vec::new();
+            for component in path.components() {
+                match component {
+                    Component::Prefix(prefix)
+                        if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
+                    Component::RootDir => {}
+                    Component::Normal(value) => normal_components.push(value.to_os_string()),
+                    _ => return Err("D32 Host namespace path had an unsafe component".to_string()),
+                }
+            }
+            let drive_letter = match path.components().next() {
+                Some(Component::Prefix(prefix)) => match prefix.kind() {
+                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                    _ => {
+                        return Err("D32 Host namespace path had no local drive anchor".to_string())
+                    }
+                },
+                _ => return Err("D32 Host namespace path had no local drive anchor".to_string()),
+            };
+            if normal_components.is_empty() {
+                return Err("D32 Host namespace path had no leaf component".to_string());
+            }
+            let drive_root = PathBuf::from(format!("{}:\\", drive_letter as char));
+            if unsafe { GetDriveTypeW(host_wide_path(&drive_root)?.as_ptr()) } == DRIVE_REMOTE {
+                return Err("D32 Host namespace path was on a remote drive".to_string());
+            }
+            let root = Arc::new(d32_open_namespace_drive_anchor(&drive_root)?);
+            let mut parent = Arc::clone(&root);
+            let leaf_name = normal_components
+                .last()
+                .cloned()
+                .ok_or_else(|| "D32 Host namespace leaf was missing".to_string())?;
+            for (index, component) in normal_components.iter().enumerate() {
+                let is_leaf = index + 1 == normal_components.len();
+                let handle = Arc::new(if is_leaf && !directory {
+                    d32_open_namespace_relative_with_share(
+                        &parent,
+                        component,
+                        false,
+                        leaf_share_access,
+                    )
+                    .map_err(d32_namespace_error)?
+                } else {
+                    d32_open_namespace_relative_with_share(
+                        &parent,
+                        component,
+                        true,
+                        leaf_share_access,
+                    )
+                    .map_err(d32_namespace_error)?
+                });
+                let identity = d32_handle_identity(handle.raw())?;
+                if identity.reparse
+                    || identity.directory != (if is_leaf { directory } else { true })
+                {
+                    return Err(
+                        "D32 Host namespace component was reparse or wrong kind".to_string()
+                    );
+                }
+                if is_leaf {
+                    return Ok(Self {
+                        parent,
+                        leaf: handle,
+                        leaf_name,
+                        leaf_share_access,
+                        identity,
+                    });
+                }
+                parent = handle;
+            }
+            Err("D32 Host namespace leaf acquisition failed".to_string())
+        }
+
+        fn rebind_leaf(&self) -> Result<Arc<D32RetainedHandle>, String> {
+            let handle = Arc::new(if self.identity.directory {
+                d32_open_namespace_relative_with_share(
+                    &self.parent,
+                    &self.leaf_name,
+                    true,
+                    self.leaf_share_access,
+                )
+                .map_err(d32_namespace_error)?
+            } else {
+                d32_open_namespace_relative_with_share(
+                    &self.parent,
+                    &self.leaf_name,
+                    false,
+                    self.leaf_share_access,
+                )
+                .map_err(d32_namespace_error)?
+            });
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity != self.identity || identity.reparse {
+                return Err("D32 Host namespace leaf identity changed".to_string());
+            }
+            Ok(handle)
+        }
+    }
+
+    /// A retained regular file whose authority is the parent handle plus its
+    /// fixed leaf name.  The display path is kept only for diagnostics and
+    /// command-line projection; identity/revalidation never reopens it by
+    /// pathname.
+    #[derive(Clone)]
+    struct D32RetainedFile {
+        namespace: D32PreparedNamespace,
+        display_path: PathBuf,
+    }
+
+    impl D32RetainedFile {
+        fn open(path: &Path) -> Result<Self, String> {
+            let namespace = D32PreparedNamespace::prepare(path, false)?;
+            Self::from_namespace(path.to_path_buf(), namespace)
+        }
+
+        fn from_namespace(
+            display_path: PathBuf,
+            namespace: D32PreparedNamespace,
+        ) -> Result<Self, String> {
+            if namespace.identity.directory || namespace.identity.reparse {
+                return Err("D32 Host retained file was not a non-reparse regular file".to_string());
+            }
+            Ok(Self {
+                namespace,
+                display_path,
+            })
+        }
+
+        fn from_child(
+            parent: &D32RetainedDirectory,
+            name: &OsStr,
+            handle: D32RetainedHandle,
+        ) -> Result<Self, String> {
+            let handle = Arc::new(handle);
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.directory || identity.reparse {
+                return Err("D32 Host retained file was not a non-reparse regular file".to_string());
+            }
+            Self::from_namespace(
+                parent.raw_path.join(name),
+                D32PreparedNamespace {
+                    parent: Arc::clone(&parent.namespace.leaf),
+                    leaf: handle,
+                    leaf_name: name.to_os_string(),
+                    leaf_share_access: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    identity,
+                },
+            )
+        }
+
+        fn identity(&self) -> HostFileIdentity {
+            self.namespace.identity
+        }
+
+        fn revalidate(&self, description: &str) -> Result<(), String> {
+            let retained_identity = d32_handle_identity(self.namespace.leaf.raw())?;
+            if retained_identity != self.namespace.identity
+                || retained_identity.reparse
+                || retained_identity.directory
+            {
+                return Err(format!("{description} retained file identity changed"));
+            }
+            let rebound = self.namespace.rebind_leaf()?;
+            let rebound_identity = d32_handle_identity(rebound.raw())?;
+            if rebound_identity != self.namespace.identity
+                || rebound_identity.reparse
+                || rebound_identity.directory
+            {
+                return Err(format!("{description} retained file name binding changed"));
+            }
+            Ok(())
+        }
+
+        fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>, String> {
+            self.revalidate("D32 retained file before read")?;
+            let duplicate = d32_duplicate_handle(self.namespace.leaf.raw())?;
+            let mut file = unsafe { File::from_raw_handle(duplicate.into_raw() as RawHandle) };
+            file.seek(SeekFrom::Start(0)).map_err(|_| {
+                format!(
+                    "D32 Host retained file could not seek: {}",
+                    self.display_path.display()
+                )
+            })?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|_| {
+                format!(
+                    "D32 Host retained file could not read: {}",
+                    self.display_path.display()
+                )
+            })?;
+            if bytes.len() > max_bytes {
+                return Err(format!(
+                    "D32 Host retained file exceeded its bound: {}",
+                    self.display_path.display()
+                ));
+            }
+            let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
+            if after != self.namespace.identity || after.file_size != bytes.len() as u64 {
+                return Err(format!(
+                    "D32 Host retained file changed during read: {}",
+                    self.display_path.display()
+                ));
+            }
+            drop(file);
+            self.revalidate("D32 retained file after read")?;
+            Ok(bytes)
+        }
+    }
+
+    #[derive(Clone)]
+    struct D32RetainedDirectory {
+        namespace: D32PreparedNamespace,
+        raw_path: PathBuf,
+        raw_identity: HostFileIdentity,
+        canonical_identity: HostFileIdentity,
+    }
+
+    impl D32RetainedDirectory {
+        fn open(path: &Path) -> Result<Self, String> {
+            let namespace = D32PreparedNamespace::prepare(path, true)?;
+            Self::from_namespace(path.to_path_buf(), namespace)
+        }
+
+        fn from_namespace(
+            raw_path: PathBuf,
+            namespace: D32PreparedNamespace,
+        ) -> Result<Self, String> {
+            host_verify_no_reparse_path(&raw_path, &raw_path)?;
+            let raw_identity = host_file_identity(&raw_path, true)?;
+            let canonical_path = fs::canonicalize(&raw_path).map_err(|_| {
+                "D32 Host retained directory could not be canonicalized".to_string()
+            })?;
+            host_verify_no_reparse_path(&canonical_path, &canonical_path)?;
+            let canonical_identity = host_file_identity(&canonical_path, true)?;
+            if raw_identity != canonical_identity
+                || raw_identity != namespace.identity
+                || namespace.identity.reparse
+            {
+                return Err(
+                    "D32 Host retained directory raw/canonical identity disagreed".to_string(),
+                );
+            }
+            Ok(Self {
+                namespace,
+                raw_path,
+                raw_identity,
+                canonical_identity,
+            })
+        }
+
+        fn from_retained_namespace(
+            raw_path: PathBuf,
+            namespace: D32PreparedNamespace,
+        ) -> Result<Self, String> {
+            let identity = namespace.identity;
+            if !identity.directory || identity.reparse {
+                return Err("D32 Host retained child was not a non-reparse directory".to_string());
+            }
+            Ok(Self {
+                raw_path,
+                raw_identity: identity,
+                canonical_identity: identity,
+                namespace,
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.raw_path
+        }
+
+        fn identity(&self) -> HostFileIdentity {
+            self.raw_identity
+        }
+
+        fn revalidate(&self, description: &str) -> Result<(), String> {
+            let retained = self.namespace.rebind_leaf()?;
+            let retained_identity = d32_handle_identity(retained.raw())?;
+            if retained_identity != self.namespace.identity
+                || retained_identity != self.raw_identity
+                || retained_identity != self.canonical_identity
+                || retained_identity.reparse
+                || !retained_identity.directory
+            {
+                return Err(format!("{description} retained root identity changed"));
+            }
+            Ok(())
+        }
+
+        fn open_or_create_child(&self, name: &OsStr) -> Result<Self, String> {
+            self.open_child(name, FILE_OPEN_IF)
+        }
+
+        fn open_existing_child(&self, name: &OsStr) -> Result<Self, String> {
+            self.open_child(name, FILE_OPEN)
+        }
+
+        fn open_existing_child_if_present(&self, name: &OsStr) -> Result<Option<Self>, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before child probe")?;
+            match self.open_child_result(
+                name,
+                FILE_OPEN,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | D32_FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            ) {
+                Ok(handle) => Ok(Some(self.finish_child(name, handle)?)),
+                Err(D32NamespaceOpenError::Missing(_)) => Ok(None),
+                Err(D32NamespaceOpenError::Failed(status)) => Err(format!(
+                    "D32 retained child directory probe failed: {status}"
+                )),
+            }
+        }
+
+        fn open_existing_file(&self, name: &OsStr) -> Result<D32RetainedFile, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file open")?;
+            let handle = self
+                .open_file(
+                    name,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )
+                .map_err(d32_namespace_error)?;
+            let file = D32RetainedFile::from_child(self, name, handle)?;
+            self.revalidate("D32 retained root after file open")?;
+            Ok(file)
+        }
+
+        fn open_existing_file_if_present(
+            &self,
+            name: &OsStr,
+        ) -> Result<Option<D32RetainedFile>, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before optional file probe")?;
+            let handle = match self.open_file(
+                name,
+                FILE_OPEN,
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            ) {
+                Ok(handle) => handle,
+                Err(D32NamespaceOpenError::Missing(_)) => return Ok(None),
+                Err(D32NamespaceOpenError::Failed(status)) => {
+                    return Err(format!("D32 retained optional file probe failed: {status}"))
+                }
+            };
+            let file = D32RetainedFile::from_child(self, name, handle)?;
+            self.revalidate("D32 retained root after optional file probe")?;
+            Ok(Some(file))
+        }
+
+        fn child_is_directory(&self, name: &OsStr) -> Result<bool, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before child kind probe")?;
+            let handle = d32_open_namespace_relative_with_options(
+                &self.namespace.leaf,
+                name,
+                false,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )
+            .map_err(d32_namespace_error)?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.reparse {
+                return Err("D32 retained child kind probe found a reparse point".to_string());
+            }
+            Ok(identity.directory)
+        }
+
+        fn open_child(&self, name: &OsStr, create_disposition: u32) -> Result<Self, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before child create")?;
+            let handle = self
+                .open_child_result(
+                    name,
+                    create_disposition,
+                    FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+                )
+                .map_err(d32_namespace_error)?;
+            let child = self.finish_child(name, handle)?;
+            self.revalidate("D32 retained root after child create")?;
+            Ok(child)
+        }
+
+        fn open_child_result(
+            &self,
+            name: &OsStr,
+            create_disposition: u32,
+            desired_access: u32,
+        ) -> Result<D32RetainedHandle, D32NamespaceOpenError> {
+            d32_open_namespace_relative_with_options(
+                &self.namespace.leaf,
+                name,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                create_disposition,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                desired_access | D32_FILE_LIST_DIRECTORY,
+            )
+        }
+
+        fn finish_child(&self, name: &OsStr, handle: D32RetainedHandle) -> Result<Self, String> {
+            let handle = Arc::new(handle);
+            let identity = d32_handle_identity(handle.raw())?;
+            if !identity.directory || identity.reparse {
+                return Err("D32 retained child directory was not non-reparse".to_string());
+            }
+            let child_path = self.raw_path.join(name);
+            let child_namespace = D32PreparedNamespace {
+                parent: Arc::clone(&self.namespace.leaf),
+                leaf: handle,
+                leaf_name: name.to_os_string(),
+                leaf_share_access: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                identity,
+            };
+            let child = Self::from_retained_namespace(child_path, child_namespace)?;
+            Ok(child)
+        }
+
+        fn open_file(
+            &self,
+            name: &OsStr,
+            create_disposition: u32,
+            desired_access: u32,
+        ) -> Result<D32RetainedHandle, D32NamespaceOpenError> {
+            d32_validate_child_name(name)
+                .map_err(|_| D32NamespaceOpenError::Failed(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            d32_open_namespace_relative_with_options(
+                &self.namespace.leaf,
+                name,
+                false,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                create_disposition,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                desired_access,
+            )
+        }
+
+        fn probe_file(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<Option<HostFileIdentity>, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file probe")?;
+            let result = match self.open_file(
+                name,
+                FILE_OPEN,
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            ) {
+                Ok(handle) => {
+                    let identity = d32_handle_identity(handle.raw())?;
+                    if identity.directory || identity.reparse || identity.file_size > max_bytes {
+                        return Err("D32 retained file was not a bounded regular file".to_string());
+                    }
+                    Some(identity)
+                }
+                Err(D32NamespaceOpenError::Missing(_)) => None,
+                Err(D32NamespaceOpenError::Failed(status)) => {
+                    return Err(format!("D32 retained file probe failed: {status}"));
+                }
+            };
+            self.revalidate("D32 retained root after file probe")?;
+            Ok(result)
+        }
+
+        fn read_file(&self, name: &OsStr, max_bytes: usize) -> Result<Vec<u8>, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file read")?;
+            let handle = self
+                .open_file(
+                    name,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained file open failed: {status}")
+                    }
+                })?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.directory || identity.reparse || identity.file_size > max_bytes as u64 {
+                return Err("D32 retained file exceeded its bound or was unsafe".to_string());
+            }
+            let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| "D32 retained file seek failed".to_string())?;
+            let mut bytes = Vec::with_capacity(identity.file_size as usize);
+            file.read_to_end(&mut bytes)
+                .map_err(|_| "D32 retained file read failed".to_string())?;
+            if bytes.len() > max_bytes {
+                return Err("D32 retained file exceeded its bound".to_string());
+            }
+            let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
+            if after != identity || after.file_size != bytes.len() as u64 {
+                return Err("D32 retained file identity changed during read".to_string());
+            }
+            drop(file);
+            self.revalidate("D32 retained root after file read")?;
+            Ok(bytes)
+        }
+
+        fn hash_file(&self, name: &OsStr, max_bytes: usize) -> Result<String, String> {
+            let bytes = self.read_file(name, max_bytes)?;
+            Ok(format!("{:x}", Sha256::digest(bytes)))
+        }
+
+        fn hash_file_with_identity(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(HostFileIdentity, [u8; 32]), String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file hash")?;
+            let handle = self
+                .open_file(
+                    name,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained file hash open failed: {status}")
+                    }
+                })?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.directory || identity.reparse || identity.file_size > max_bytes {
+                return Err(
+                    "D32 retained file hash target was unsafe or exceeded its bound".to_string(),
+                );
+            }
+            let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| "D32 retained file hash seek failed".to_string())?;
+            let mut digest = Sha256::new();
+            let mut total = 0_u64;
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|_| "D32 retained file hash read failed".to_string())?;
+                if read == 0 {
+                    break;
+                }
+                total = total.saturating_add(read as u64);
+                if total > max_bytes {
+                    return Err("D32 retained file exceeded its bound".to_string());
+                }
+                digest.update(&buffer[..read]);
+            }
+            let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
+            if after != identity || after.file_size != total {
+                return Err("D32 retained file identity changed during hash".to_string());
+            }
+            drop(file);
+            self.revalidate("D32 retained root after file hash")?;
+            Ok((identity, digest.finalize().into()))
+        }
+
+        fn copy_file_from(
+            &self,
+            source: &D32RetainedDirectory,
+            source_name: &OsStr,
+            destination_name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(), String> {
+            d32_validate_child_name(source_name)?;
+            d32_validate_child_name(destination_name)?;
+            source.revalidate("D32 retained source before copy")?;
+            self.revalidate("D32 retained destination before copy")?;
+            let source_handle = source
+                .open_file(
+                    source_name,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained source copy open failed: {status}")
+                    }
+                })?;
+            let source_identity = d32_handle_identity(source_handle.raw())?;
+            if source_identity.directory
+                || source_identity.reparse
+                || source_identity.file_size > max_bytes
+            {
+                return Err(
+                    "D32 retained source copy target was unsafe or exceeded its bound".to_string(),
+                );
+            }
+            let destination_handle = self
+                .open_file(
+                    destination_name,
+                    FILE_CREATE,
+                    FILE_GENERIC_READ
+                        | FILE_GENERIC_WRITE
+                        | FILE_READ_ATTRIBUTES
+                        | DELETE
+                        | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained destination copy create failed: {status}")
+                    }
+                })?;
+            let destination_identity = d32_handle_identity(destination_handle.raw())?;
+            if destination_identity.directory
+                || destination_identity.reparse
+                || destination_identity.file_size != 0
+            {
+                return Err(
+                    "D32 retained destination copy file was unexpectedly reused".to_string()
+                );
+            }
+            let mut source_file =
+                unsafe { File::from_raw_handle(source_handle.into_raw() as RawHandle) };
+            let mut destination_file =
+                unsafe { File::from_raw_handle(destination_handle.into_raw() as RawHandle) };
+            let mut copied = 0_u64;
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = source_file
+                    .read(&mut buffer)
+                    .map_err(|_| "D32 retained source copy read failed".to_string())?;
+                if read == 0 {
+                    break;
+                }
+                copied = copied.saturating_add(read as u64);
+                if copied > max_bytes {
+                    return Err("D32 retained source copy exceeded its bound".to_string());
+                }
+                destination_file
+                    .write_all(&buffer[..read])
+                    .map_err(|_| "D32 retained destination copy write failed".to_string())?;
+            }
+            if copied != source_identity.file_size {
+                return Err("D32 retained source changed during copy".to_string());
+            }
+            destination_file
+                .flush()
+                .map_err(|_| "D32 retained destination copy flush failed".to_string())?;
+            destination_file
+                .sync_all()
+                .map_err(|_| "D32 retained destination copy sync failed".to_string())?;
+            let source_after = d32_handle_identity(source_file.as_raw_handle() as HANDLE)?;
+            let destination_after =
+                d32_handle_identity(destination_file.as_raw_handle() as HANDLE)?;
+            if source_after != source_identity
+                || destination_after.file_index != destination_identity.file_index
+                || destination_after.file_size != copied
+            {
+                return Err("D32 retained source or destination changed during copy".to_string());
+            }
+            drop(source_file);
+            drop(destination_file);
+            source.revalidate("D32 retained source after copy")?;
+            self.revalidate("D32 retained destination after copy")
+        }
+
+        fn enumerate_children(&self) -> Result<Vec<OsString>, String> {
+            self.revalidate("D32 retained directory before enumeration")?;
+            let mut names = Vec::new();
+            let mut restart_scan = true;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let mut status_block = IO_STATUS_BLOCK::default();
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.namespace.leaf.raw(),
+                        std::ptr::null_mut(),
+                        None,
+                        std::ptr::null(),
+                        &mut status_block,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        FileIdBothDirectoryInformation,
+                        true,
+                        std::ptr::null(),
+                        restart_scan,
+                    )
+                };
+                if status == STATUS_NO_MORE_FILES || status == STATUS_NO_MORE_ENTRIES {
+                    break;
+                }
+                if status < 0 {
+                    return Err(format!(
+                        "D32 retained directory enumeration failed: NTSTATUS 0x{:08X}",
+                        status as u32
+                    ));
+                }
+                let returned = usize::try_from(status_block.Information)
+                    .ok()
+                    .filter(|length| *length <= buffer.len())
+                    .ok_or_else(|| {
+                        "D32 retained directory enumeration returned an invalid byte count"
+                            .to_string()
+                    })?;
+                if returned == 0 {
+                    return Err(
+                        "D32 retained directory enumeration returned no entry bytes".to_string()
+                    );
+                }
+                parse_host_directory_names(&buffer, returned, &mut names)?;
+                restart_scan = false;
+                if names.len() > 8192 {
+                    return Err("D32 retained directory exceeded its child bound".to_string());
+                }
+            }
+            self.revalidate("D32 retained directory after enumeration")?;
+            Ok(names)
+        }
+
+        fn create_new_file(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file create")?;
+            let handle = self
+                .open_file(
+                    name,
+                    FILE_CREATE,
+                    FILE_GENERIC_READ
+                        | FILE_GENERIC_WRITE
+                        | FILE_READ_ATTRIBUTES
+                        | DELETE
+                        | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained file create failed: {status}")
+                    }
+                })?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.directory || identity.reparse || identity.file_size != 0 {
+                return Err("D32 retained file create unexpectedly reused state".to_string());
+            }
+            let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
+            file.write_all(bytes)
+                .map_err(|_| "D32 retained file write failed".to_string())?;
+            file.flush()
+                .map_err(|_| "D32 retained file flush failed".to_string())?;
+            file.sync_all()
+                .map_err(|_| "D32 retained file sync failed".to_string())?;
+            let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
+            if after.file_index != identity.file_index || after.file_size != bytes.len() as u64 {
+                return Err("D32 retained file identity changed during create".to_string());
+            }
+            drop(file);
+            self.revalidate("D32 retained root after file create")
+        }
+
+        fn rename_file(
+            &self,
+            source: &OsStr,
+            destination: &OsStr,
+            replace_if_exists: bool,
+        ) -> Result<(), String> {
+            d32_validate_child_name(source)?;
+            d32_validate_child_name(destination)?;
+            self.revalidate("D32 retained root before file replace")?;
+            let _ = self.probe_file(destination, D32_NATIVE_EVIDENCE_MAX_BYTES)?;
+            let handle = self
+                .open_file(
+                    source,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ
+                        | FILE_GENERIC_WRITE
+                        | FILE_READ_ATTRIBUTES
+                        | DELETE
+                        | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained source open failed: {status}")
+                    }
+                })?;
+            let name = destination.encode_wide().collect::<Vec<_>>();
+            let bytes = size_of::<FILE_RENAME_INFO>()
+                .saturating_add(name.len().saturating_sub(1).saturating_mul(2));
+            let mut buffer = vec![0_u8; bytes];
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            unsafe {
+                (*info).Anonymous.ReplaceIfExists = replace_if_exists;
+                (*info).RootDirectory = self.namespace.leaf.raw();
+                (*info).FileNameLength = (name.len() * 2) as u32;
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    (*info).FileName.as_mut_ptr(),
+                    name.len(),
+                );
+                if SetFileInformationByHandle(
+                    handle.raw(),
+                    FileRenameInfo,
+                    info.cast(),
+                    buffer.len() as u32,
+                ) == 0
+                {
+                    return Err(format!(
+                        "D32 retained handle-relative rename failed: {}",
+                        windows_sys::Win32::Foundation::GetLastError()
+                    ));
+                }
+            }
+            drop(handle);
+            self.revalidate("D32 retained root after file replace")
+        }
+
+        fn remove_file(&self, name: &OsStr) -> Result<(), String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before file removal")?;
+            let handle = self
+                .open_file(name, FILE_OPEN, FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE)
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 retained file removal open failed: {status}")
+                    }
+                })?;
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            if unsafe {
+                SetFileInformationByHandle(
+                    handle.raw(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(format!(
+                    "D32 retained handle-relative file removal failed: {}",
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                ));
+            }
+            drop(handle);
+            self.revalidate("D32 retained root after file removal")
+        }
+
+        fn remove_directory(&self, name: &OsStr) -> Result<(), String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained root before directory removal")?;
+            let handle = self
+                .open_child_result(
+                    name,
+                    FILE_OPEN,
+                    FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE | SYNCHRONIZE,
+                )
+                .map_err(d32_namespace_error)?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if !identity.directory || identity.reparse {
+                return Err("D32 retained directory removal target was unsafe".to_string());
+            }
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            if unsafe {
+                SetFileInformationByHandle(
+                    handle.raw(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(format!(
+                    "D32 retained directory removal failed: {}",
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                ));
+            }
+            drop(handle);
+            self.revalidate("D32 retained root after directory removal")
+        }
+
+        fn remove_contents(&self) -> Result<(), String> {
+            for name in self.enumerate_children()? {
+                if self.child_is_directory(&name)? {
+                    let child = self.open_existing_child(&name)?;
+                    child.remove_contents()?;
+                    self.remove_directory(&name)?;
+                } else {
+                    self.remove_file(&name)?;
+                }
+            }
+            self.revalidate("D32 retained directory after contents removal")
+        }
+
+        fn remove_self(&self) -> Result<(), String> {
+            self.remove_contents()?;
+            let handle = d32_open_namespace_relative_with_options(
+                &self.namespace.parent,
+                &self.namespace.leaf_name,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE | SYNCHRONIZE,
+            )
+            .map_err(d32_namespace_error)?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity != self.namespace.identity || identity.reparse || !identity.directory {
+                return Err("D32 retained directory identity changed before removal".to_string());
+            }
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            if unsafe {
+                SetFileInformationByHandle(
+                    handle.raw(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(format!(
+                    "D32 retained directory removal failed: {}",
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                ));
+            }
+            drop(handle);
+            Ok(())
+        }
+
+        fn remove_child_tree_if_present(&self, name: &OsStr) -> Result<bool, String> {
+            let Some(child) = self.open_existing_child_if_present(name)? else {
+                return Ok(false);
+            };
+            child.remove_self()?;
+            Ok(true)
+        }
+
+        fn rename_directory(
+            &self,
+            source: &OsStr,
+            destination: &OsStr,
+            replace_if_exists: bool,
+        ) -> Result<(), String> {
+            d32_validate_child_name(source)?;
+            d32_validate_child_name(destination)?;
+            self.revalidate("D32 retained root before directory rename")?;
+            let handle = d32_open_namespace_relative_with_options(
+                &self.namespace.leaf,
+                source,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            )
+            .map_err(d32_namespace_error)?;
+            let name = destination.encode_wide().collect::<Vec<_>>();
+            let file_name_length = name
+                .len()
+                .checked_mul(size_of::<u16>())
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or_else(|| "D32 retained directory rename name was too long".to_string())?;
+            let bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+                .checked_add(file_name_length as usize)
+                .ok_or_else(|| "D32 retained directory rename buffer was too large".to_string())?;
+            let mut buffer = vec![0_u8; bytes];
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            let mut status_block = IO_STATUS_BLOCK::default();
+            unsafe {
+                (*info).Anonymous.ReplaceIfExists = replace_if_exists;
+                (*info).RootDirectory = self.namespace.leaf.raw();
+                (*info).FileNameLength = file_name_length;
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    (*info).FileName.as_mut_ptr(),
+                    name.len(),
+                );
+                let status = NtSetInformationFile(
+                    handle.raw(),
+                    &mut status_block,
+                    info.cast(),
+                    buffer.len() as u32,
+                    FileRenameInformation,
+                );
+                if status < 0 {
+                    return Err(format!(
+                        "D32 retained handle-relative directory rename failed: NTSTATUS 0x{:08X}",
+                        status as u32
+                    ));
+                }
+            }
+            drop(handle);
+            self.revalidate("D32 retained root after directory rename")
+        }
+    }
+
+    fn parse_host_directory_names(
+        buffer: &[u8],
+        returned: usize,
+        names: &mut Vec<OsString>,
+    ) -> Result<(), String> {
+        // The flexible `FileName` member is followed by alignment padding in
+        // the Rust representation.  The kernel record header ends at the
+        // actual field offset, not at `size_of::<T>() - sizeof(WCHAR)`.
+        let header_bytes = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFORMATION, FileName);
+        let mut offset = 0usize;
+        while offset < returned {
+            if returned - offset < header_bytes {
+                return Err("D32 retained directory entry header was truncated".to_string());
+            }
+            let entry =
+                unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFORMATION) };
+            let name_length = usize::try_from(entry.FileNameLength)
+                .map_err(|_| "D32 retained directory name length overflow".to_string())?;
+            if name_length % size_of::<u16>() != 0
+                || name_length / size_of::<u16>() > 32_767
+                || header_bytes
+                    .checked_add(name_length)
+                    .and_then(|length| offset.checked_add(length))
+                    .filter(|end| *end <= returned)
+                    .is_none()
+            {
+                return Err("D32 retained directory entry name was outside the buffer".to_string());
+            }
+            let name = unsafe {
+                std::slice::from_raw_parts(entry.FileName.as_ptr(), name_length / size_of::<u16>())
+            };
+            let name = OsString::from_wide(name);
+            if name != OsStr::new(".") && name != OsStr::new("..") {
+                names.push(name);
+            }
+            let next = usize::try_from(entry.NextEntryOffset)
+                .map_err(|_| "D32 retained directory entry offset overflow".to_string())?;
+            if next == 0 {
+                break;
+            }
+            if next < header_bytes
+                || offset
+                    .checked_add(next)
+                    .filter(|end| *end <= returned)
+                    .is_none()
+            {
+                return Err("D32 retained directory entry offset was invalid".to_string());
+            }
+            offset += next;
+        }
+        Ok(())
+    }
+
+    enum D32NamespaceOpenError {
+        Missing(NTSTATUS),
+        Failed(NTSTATUS),
+    }
+
+    fn d32_namespace_error(error: D32NamespaceOpenError) -> String {
+        match error {
+            D32NamespaceOpenError::Missing(status) | D32NamespaceOpenError::Failed(status) => {
+                format!("D32 Host handle-relative namespace open failed: {status}")
+            }
+        }
+    }
+
+    fn d32_validate_child_name(name: &OsStr) -> Result<(), String> {
+        if name.is_empty()
+            || name == OsStr::new(".")
+            || name == OsStr::new("..")
+            || name.to_string_lossy().chars().any(|character| {
+                character == '/' || character == '\\' || character == ':' || character == '\0'
+            })
+        {
+            return Err("D32 retained child name was not one safe component".to_string());
+        }
+        Ok(())
+    }
+
+    fn d32_open_namespace_drive_anchor(path: &Path) -> Result<D32RetainedHandle, String> {
+        let raw = unsafe {
+            CreateFileW(
+                host_wide_path(path)?.as_ptr(),
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | D32_FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let handle = D32RetainedHandle::new(raw)?;
+        let identity = d32_handle_identity(handle.raw())?;
+        if !identity.directory || identity.reparse {
+            return Err("D32 Host drive anchor was not a non-reparse directory".to_string());
+        }
+        Ok(handle)
+    }
+
+    fn d32_open_namespace_relative_with_share(
+        parent: &Arc<D32RetainedHandle>,
+        component: &OsStr,
+        directory: bool,
+        share_access: u32,
+    ) -> Result<D32RetainedHandle, D32NamespaceOpenError> {
+        let desired_access = if directory {
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | D32_FILE_LIST_DIRECTORY | SYNCHRONIZE
+        } else {
+            FILE_GENERIC_READ | SYNCHRONIZE
+        };
+        let create_options = if directory {
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+        } else {
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+        };
+        d32_open_namespace_relative_with_options(
+            parent,
+            component,
+            directory,
+            share_access,
+            FILE_OPEN,
+            create_options,
+            desired_access,
+        )
+    }
+
+    fn d32_open_namespace_relative_with_options(
+        parent: &Arc<D32RetainedHandle>,
+        component: &OsStr,
+        _directory: bool,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        desired_access: u32,
+    ) -> Result<D32RetainedHandle, D32NamespaceOpenError> {
+        let mut name = component.encode_wide().collect::<Vec<_>>();
+        let byte_length = name
+            .len()
+            .checked_mul(2)
+            .ok_or(D32NamespaceOpenError::Failed(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        if byte_length > u16::MAX as usize {
+            return Err(D32NamespaceOpenError::Failed(STATUS_OBJECT_NAME_NOT_FOUND));
+        }
+        let unicode_name = UNICODE_STRING {
+            Length: byte_length as u16,
+            MaximumLength: byte_length as u16,
+            Buffer: name.as_mut_ptr(),
+        };
+        let object_attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.raw(),
+            ObjectName: &unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut status_block = IO_STATUS_BLOCK::default();
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                desired_access,
+                &object_attributes,
+                &mut status_block,
+                std::ptr::null(),
+                0,
+                share_access,
+                create_disposition,
+                create_options,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 || raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            if !raw.is_null() && raw != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(raw);
+                }
+            }
+            return Err(
+                if matches!(
+                    status,
+                    STATUS_NO_SUCH_FILE
+                        | STATUS_OBJECT_NAME_NOT_FOUND
+                        | STATUS_OBJECT_PATH_NOT_FOUND
+                ) {
+                    D32NamespaceOpenError::Missing(status)
+                } else {
+                    D32NamespaceOpenError::Failed(status)
+                },
+            );
+        }
+        D32RetainedHandle::new(raw).map_err(|_| D32NamespaceOpenError::Failed(-1))
+    }
+
+    fn d32_handle_identity(handle: HANDLE) -> Result<HostFileIdentity, String> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+            return Err(format!(
+                "D32 Host retained identity read failed: {}",
+                unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            ));
+        }
+        Ok(HostFileIdentity {
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+            file_size: (u64::from(information.nFileSizeHigh) << 32)
+                | u64::from(information.nFileSizeLow),
+            directory: information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            reparse: information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        })
+    }
+
     fn host_hash_file(path: &Path, max_bytes: u64) -> Result<String, String> {
         let mut file = File::open(path)
             .map_err(|_| format!("D32 Host executable hash could not open {}", path.display()))?;
@@ -428,6 +2152,156 @@ mod windows {
             digest.update(&buffer[..read]);
         }
         Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_native_evidence_directory(
+        app_data_root_retained: &D32RetainedDirectory,
+    ) -> Result<D32RetainedDirectory, String> {
+        app_data_root_retained
+            .revalidate("D32 native evidence app-data root before child create")?;
+        let directory = app_data_root_retained
+            .open_or_create_child(OsStr::new(D32_NATIVE_EVIDENCE_DIR_NAME))?;
+        app_data_root_retained
+            .revalidate("D32 native evidence app-data root after child create")?;
+        directory.revalidate("D32 native evidence directory after open")?;
+        Ok(directory)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_prepare_native_evidence(
+        app_data_root_retained: &D32RetainedDirectory,
+    ) -> Result<(), String> {
+        let directory = d32_native_evidence_directory(app_data_root_retained)?;
+        directory.revalidate("D32 native evidence directory before prepare")?;
+        if !directory.enumerate_children()?.is_empty() {
+            return Err("D32 native evidence directory was stale or had extra entries".to_string());
+        }
+        directory.revalidate("D32 native evidence directory after prepare")?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_read_native_evidence(
+        app_data_root_retained: &D32RetainedDirectory,
+        trace: &D32HostCanaryTraceSnapshot,
+        mode: D32HostCanaryMode,
+    ) -> Result<D32NativeEvidenceReport, String> {
+        let directory = d32_native_evidence_directory(app_data_root_retained)?;
+        directory.revalidate("D32 native evidence directory before read")?;
+        let expected_run_id = trace
+            .native_evidence_run_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host run binding was missing".to_string())?;
+        let expected_session_id = trace
+            .native_evidence_session_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host session binding was missing".to_string())?;
+        let expected_life_id = trace
+            .native_evidence_life_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host Life binding was missing".to_string())?;
+        let expected_task_id = trace
+            .native_evidence_task_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host task binding was missing".to_string())?;
+        let expected_turn_id = trace
+            .native_evidence_turn_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host turn binding was missing".to_string())?;
+        let expected_tool_call_id = trace
+            .native_evidence_tool_call_id
+            .as_deref()
+            .ok_or_else(|| "D32 native evidence Host tool-call binding was missing".to_string())?;
+        if d32_run_id(expected_session_id, expected_turn_id, expected_tool_call_id)
+            != expected_run_id
+        {
+            return Err("D32 native evidence Host run binding hash was inconsistent".to_string());
+        }
+        let expected_name = format!("{expected_run_id}.json");
+        let expected_name = OsStr::new(&expected_name);
+        let names = directory.enumerate_children()?;
+        if names.len() != 1 || names.first() != Some(&expected_name.to_os_string()) {
+            return Err("D32 native evidence directory contained stale or extra state".to_string());
+        }
+        let identity_before = directory
+            .probe_file(expected_name, D32_NATIVE_EVIDENCE_MAX_BYTES)?
+            .ok_or_else(|| "D32 native evidence file was missing".to_string())?;
+        let bytes = directory.read_file(expected_name, D32_NATIVE_EVIDENCE_MAX_BYTES as usize)?;
+        let hash = directory.hash_file(expected_name, D32_NATIVE_EVIDENCE_MAX_BYTES as usize)?;
+        let identity_after = directory
+            .probe_file(expected_name, D32_NATIVE_EVIDENCE_MAX_BYTES)?
+            .ok_or_else(|| "D32 native evidence file disappeared during read".to_string())?;
+        if identity_before != identity_after {
+            return Err("D32 native evidence file identity changed during read".to_string());
+        }
+        let reread_hash = format!("{:x}", Sha256::digest(&bytes));
+        if hash != reread_hash {
+            return Err("D32 native evidence handle-relative hash disagreed".to_string());
+        }
+        let record: D32NativeEvidenceRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| "D32 native evidence JSON was invalid or had extra fields".to_string())?;
+        if record.version != 1
+            || record.run_id != expected_run_id
+            || record.session_id != expected_session_id
+            || record.life_id != expected_life_id
+            || record.task_id != expected_task_id
+            || record.turn_id != expected_turn_id
+            || record.tool_call_id != expected_tool_call_id
+            || record.capability_id != PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            || record.program_id != CARGO_PROGRAM_ID
+            || record.profile_id != PRODUCTION_CARGO_CHECK_PROFILE_ID
+        {
+            return Err("D32 native evidence binding did not match Host authority".to_string());
+        }
+        let bool_counts = [
+            (record.process_created, record.process_created_count),
+            (record.thread_resumed, record.thread_resumed_count),
+            (record.user_code_started, record.user_code_started_count),
+            (record.process_exit_verified, record.process_exit_count),
+        ];
+        if bool_counts
+            .iter()
+            .any(|(value, count)| *count != u64::from(*value))
+            || record.process_exit != record.process_exit_verified
+            || record.process_tree_observed != (record.process_tree_observation_count != 0)
+            || record.process_tree_remaining != 0
+            || record.process_tree_observer_failed
+        {
+            return Err("D32 native evidence lifecycle counters were inconsistent".to_string());
+        }
+        let positive = mode == D32HostCanaryMode::Positive;
+        if positive {
+            if record.status != "started_and_exited"
+                || !record.process_created
+                || !record.thread_resumed
+                || !record.user_code_started
+                || !record.process_exit_verified
+                || !record.process_tree_observed
+                || record.process_tree_observation_count == 0
+            {
+                return Err("D32 native evidence positive lifecycle was incomplete".to_string());
+            }
+        } else if record.status != "denied"
+            || record.process_created
+            || record.thread_resumed
+            || record.user_code_started
+            || record.process_exit_verified
+            || record.process_tree_observed
+            || record.process_tree_observation_count != 0
+            || record.job_termination_attempted
+            || record.job_terminated
+        {
+            return Err("D32 native evidence negative lane was not pre-native denied".to_string());
+        }
+        directory.revalidate("D32 native evidence directory after read")?;
+        Ok(D32NativeEvidenceReport {
+            record: serde_json::to_value(record)
+                .map_err(|_| "D32 native evidence report serialization failed".to_string())?,
+            sha256: hash,
+            identity: identity_before.image_wire(),
+            bytes: bytes.len() as u64,
+        })
     }
 
     fn host_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
@@ -463,375 +2337,552 @@ mod windows {
         Ok(())
     }
 
-    fn host_toolchain_manifest_hash(root: &Path) -> Result<String, String> {
-        fn collect(
-            root: &Path,
-            current: &Path,
-            entries: &mut Vec<(String, String)>,
-            file_count: &mut usize,
-            total_bytes: &mut u64,
-        ) -> Result<(), String> {
-            for entry in fs::read_dir(current).map_err(|_| {
+    #[cfg(test)]
+    fn host_canonical_directory_fence(path: &Path, description: &str) -> Result<PathBuf, String> {
+        if !path.is_absolute() {
+            return Err(format!("{description} was not absolute"));
+        }
+        host_verify_no_reparse_path(path, path)
+            .map_err(|error| format!("{description} raw no-reparse fence failed: {error}"))?;
+        let raw_identity = host_file_identity(path, true)
+            .map_err(|error| format!("{description} raw identity fence failed: {error}"))?;
+        let canonical = fs::canonicalize(path)
+            .map_err(|_| format!("{description} could not be canonicalized"))?;
+        host_verify_no_reparse_path(&canonical, &canonical)
+            .map_err(|error| format!("{description} canonical no-reparse fence failed: {error}"))?;
+        let canonical_identity = host_file_identity(&canonical, true)
+            .map_err(|error| format!("{description} canonical identity fence failed: {error}"))?;
+        if raw_identity != canonical_identity {
+            return Err(format!("{description} raw/canonical identity disagreed"));
+        }
+        Ok(canonical)
+    }
+
+    fn host_verify_no_reparse_tree(root: &Path) -> Result<(), String> {
+        host_verify_no_reparse_path(root, root)?;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            let metadata = fs::symlink_metadata(&current).map_err(|_| {
                 format!(
-                    "D32 Host toolchain enumeration failed: {}",
+                    "D32 Host app-owned tree metadata was unavailable: {}",
                     current.display()
                 )
-            })? {
-                let entry =
-                    entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path)
-                    .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
-                if host_metadata_is_reparse(&metadata) {
-                    return Err(format!(
-                        "D32 Host toolchain manifest rejected reparse entry: {}",
-                        path.display()
-                    ));
-                }
-                if metadata.is_dir() {
-                    collect(root, &path, entries, file_count, total_bytes)?;
-                } else if metadata.is_file() {
-                    *file_count = file_count.saturating_add(1);
-                    if metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES {
-                        return Err("D32 Host toolchain file exceeded its bound".to_string());
-                    }
-                    *total_bytes = total_bytes.saturating_add(metadata.len());
-                    if *file_count > D32_TOOLCHAIN_MAX_FILES
-                        || *total_bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
-                    {
-                        return Err("D32 Host toolchain manifest exceeded its bound".to_string());
-                    }
-                    entries.push((
-                        path.strip_prefix(root)
-                            .map_err(|_| {
-                                "D32 Host toolchain manifest path escaped root".to_string()
-                            })?
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                        host_hash_file(&path, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
-                    ));
-                } else {
-                    return Err(
-                        "D32 Host toolchain manifest encountered an unsupported entry".to_string(),
-                    );
-                }
-            }
-            Ok(())
-        }
-
-        let mut entries = Vec::new();
-        let mut file_count = 0usize;
-        let mut total_bytes = 0_u64;
-        collect(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let encoded = serde_json::to_vec(&entries)
-            .map_err(|_| "D32 Host toolchain manifest serialization failed".to_string())?;
-        Ok(format!("{:x}", Sha256::digest(encoded)))
-    }
-
-    fn host_toolchain_manifest_hash_with_cargo(
-        root: &Path,
-        cargo_path: &Path,
-    ) -> Result<String, String> {
-        let mut entries = Vec::new();
-        let mut file_count = 0usize;
-        let mut total_bytes = 0_u64;
-        // Reuse the same deterministic tree walk as the staged projection;
-        // the projection adds the Host-selected cargo.exe at toolchain/bin.
-        fn collect(
-            root: &Path,
-            current: &Path,
-            entries: &mut Vec<(String, String)>,
-            file_count: &mut usize,
-            total_bytes: &mut u64,
-        ) -> Result<(), String> {
-            for entry in fs::read_dir(current)
-                .map_err(|_| "D32 Host toolchain enumeration failed".to_string())?
-            {
-                let entry =
-                    entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path)
-                    .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
-                if host_metadata_is_reparse(&metadata) {
-                    return Err("D32 Host toolchain manifest rejected reparse entry".to_string());
-                }
-                if metadata.is_dir() {
-                    collect(root, &path, entries, file_count, total_bytes)?;
-                } else if metadata.is_file() {
-                    *file_count = file_count.saturating_add(1);
-                    *total_bytes = total_bytes.saturating_add(metadata.len());
-                    if *file_count > D32_TOOLCHAIN_MAX_FILES
-                        || metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES
-                        || *total_bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
-                    {
-                        return Err("D32 Host toolchain manifest exceeded its bound".to_string());
-                    }
-                    entries.push((
-                        path.strip_prefix(root)
-                            .map_err(|_| "D32 Host toolchain path escaped root".to_string())?
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                        host_hash_file(&path, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
-                    ));
-                }
-            }
-            Ok(())
-        }
-        collect(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
-        let cargo_relative = "bin/cargo.exe".to_string();
-        let cargo_hash = host_hash_file(cargo_path, D32_IMAGE_HASH_MAX_BYTES)?;
-        entries.retain(|entry| entry.0 != cargo_relative);
-        entries.push((cargo_relative, cargo_hash));
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let encoded = serde_json::to_vec(&entries)
-            .map_err(|_| "D32 Host toolchain manifest serialization failed".to_string())?;
-        Ok(format!("{:x}", Sha256::digest(encoded)))
-    }
-
-    fn host_stream_copy_bounded(
-        source: &Path,
-        destination: &Path,
-        max_bytes: u64,
-    ) -> Result<(), String> {
-        let mut input = File::open(source)
-            .map_err(|_| "D32 Host toolchain source could not be opened".to_string())?;
-        let mut output = File::create(destination).map_err(|_| {
-            "D32 Host toolchain mirror destination could not be created".to_string()
-        })?;
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = input
-                .read(&mut buffer)
-                .map_err(|_| "D32 Host toolchain source could not be read".to_string())?;
-            if read == 0 {
-                break;
-            }
-            total = total.saturating_add(read as u64);
-            if total > max_bytes {
-                return Err("D32 Host toolchain file exceeded its bound".to_string());
-            }
-            output.write_all(&buffer[..read]).map_err(|_| {
-                "D32 Host toolchain mirror destination could not be written".to_string()
             })?;
+            if host_metadata_is_reparse(&metadata) {
+                return Err(format!(
+                    "D32 Host app-owned tree contained a reparse point: {}",
+                    current.display()
+                ));
+            }
+            if metadata.is_dir() {
+                let children = fs::read_dir(&current)
+                    .map_err(|_| {
+                        format!(
+                            "D32 Host app-owned tree enumeration failed: {}",
+                            current.display()
+                        )
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "D32 Host app-owned tree enumeration failed".to_string())?;
+                pending.extend(children.into_iter().map(|entry| entry.path()));
+            }
         }
-        output.flush().map_err(|_| {
-            "D32 Host toolchain mirror destination could not be flushed".to_string()
-        })?;
         Ok(())
+    }
+
+    fn host_validate_existing_tree_without_reparse_retained(
+        root: &D32RetainedDirectory,
+    ) -> Result<(), String> {
+        fn visit(
+            current: &D32RetainedDirectory,
+            depth: usize,
+            entries: &mut usize,
+        ) -> Result<(), String> {
+            if depth > 256 {
+                return Err("D32 Host stale tree exceeded its path-depth bound".to_string());
+            }
+            for name in current.enumerate_children()? {
+                *entries = entries.saturating_add(1);
+                if *entries > D32_TOOLCHAIN_MAX_FILES + 16_384 {
+                    return Err("D32 Host stale tree exceeded its entry bound".to_string());
+                }
+                if let Ok(child) = current.open_existing_child(&name) {
+                    visit(&child, depth.saturating_add(1), entries)?;
+                } else if current.probe_file(&name, u64::MAX)?.is_none() {
+                    return Err("D32 Host stale tree contained an unsupported entry".to_string());
+                }
+            }
+            Ok(())
+        }
+
+        root.revalidate("D32 Host stale tree before validation")?;
+        let mut entries = 0usize;
+        visit(root, 0, &mut entries)?;
+        root.revalidate("D32 Host stale tree after validation")
+    }
+
+    fn host_retained_has_toolchain_images(root: &D32RetainedDirectory) -> bool {
+        let Ok(bin) = root.open_existing_child(OsStr::new("bin")) else {
+            return false;
+        };
+        ["cargo.exe", "rustc.exe", "rustdoc.exe"]
+            .into_iter()
+            .all(|name| {
+                bin.probe_file(OsStr::new(name), D32_TOOLCHAIN_FILE_MAX_BYTES)
+                    .is_ok_and(|value| value.is_some())
+            })
+    }
+
+    // Keep this representation byte-for-byte compatible with Vita's frozen
+    // production `toolchain_manifest_hash`: directories are not entries and
+    // each file is represented only by its slash-normalized relative path and
+    // content digest.  Enumeration, metadata, and hashing are all rooted in
+    // the same retained directory capability.
+    type HostToolchainManifestEntry = (Vec<u8>, [u8; 32]);
+
+    fn host_collect_toolchain_manifest(
+        retained: &D32RetainedDirectory,
+        relative_prefix: PathBuf,
+        entries: &mut Vec<HostToolchainManifestEntry>,
+        file_count: &mut usize,
+        total_bytes: &mut u64,
+    ) -> Result<(), String> {
+        retained.revalidate("D32 Host manifest directory before enumeration")?;
+        for name in retained.enumerate_children()? {
+            let relative = relative_prefix.join(&name);
+            if let Ok(child) = retained.open_existing_child(&name) {
+                host_collect_toolchain_manifest(
+                    &child,
+                    relative,
+                    entries,
+                    file_count,
+                    total_bytes,
+                )?;
+            } else {
+                let (identity, digest) =
+                    retained.hash_file_with_identity(&name, D32_TOOLCHAIN_FILE_MAX_BYTES)?;
+                *file_count = file_count.saturating_add(1);
+                *total_bytes = total_bytes.saturating_add(identity.file_size);
+                if *file_count > D32_TOOLCHAIN_MAX_FILES
+                    || *total_bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
+                {
+                    return Err("D32 Host toolchain manifest exceeded its bound".to_string());
+                }
+                let relative = relative
+                    .to_str()
+                    .ok_or_else(|| "D32 Host toolchain manifest path was not UTF-8".to_string())?
+                    .replace('\\', "/")
+                    .into_bytes();
+                entries.push((relative, digest));
+            }
+        }
+        retained.revalidate("D32 Host manifest directory after enumeration")
+    }
+
+    fn host_toolchain_manifest_hash_retained(
+        retained: &D32RetainedDirectory,
+    ) -> Result<String, String> {
+        retained.revalidate("D32 Host toolchain root before manifest")?;
+        let mut entries = Vec::new();
+        let mut file_count = 0usize;
+        let mut total_bytes = 0_u64;
+        host_collect_toolchain_manifest(
+            retained,
+            PathBuf::new(),
+            &mut entries,
+            &mut file_count,
+            &mut total_bytes,
+        )?;
+        let digest = protocol::d32_manifest_hash_hex(&mut entries)
+            .map_err(|_| "D32 Host toolchain manifest canonical encoding failed".to_string())?;
+        retained.revalidate("D32 Host toolchain root after manifest")?;
+        Ok(digest)
+    }
+
+    #[cfg(test)]
+    fn host_toolchain_manifest_hash(root: &Path) -> Result<String, String> {
+        let retained = D32RetainedDirectory::open(root)?;
+        host_toolchain_manifest_hash_retained(&retained)
     }
 
     fn host_copy_toolchain_tree(
-        source: &Path,
-        destination: &Path,
+        source: &D32RetainedDirectory,
+        destination: &D32RetainedDirectory,
         files: &mut usize,
         bytes: &mut u64,
     ) -> Result<(), String> {
-        for entry in
-            fs::read_dir(source).map_err(|_| "D32 Host toolchain enumeration failed".to_string())?
-        {
-            let entry = entry.map_err(|_| "D32 Host toolchain enumeration failed".to_string())?;
-            let source_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            let metadata = fs::symlink_metadata(&source_path)
-                .map_err(|_| "D32 Host toolchain metadata failed".to_string())?;
-            if host_metadata_is_reparse(&metadata) {
-                return Err("D32 Host toolchain mirror rejected a reparse entry".to_string());
-            }
-            if metadata.is_dir() {
-                fs::create_dir_all(&destination_path)
-                    .map_err(|_| "D32 Host toolchain mirror directory failed".to_string())?;
-                host_copy_toolchain_tree(&source_path, &destination_path, files, bytes)?;
-            } else if metadata.is_file() {
+        source.revalidate("D32 Host source before toolchain copy")?;
+        destination.revalidate("D32 Host destination before toolchain copy")?;
+        for name in source.enumerate_children()? {
+            if let Ok(source_child) = source.open_existing_child(&name) {
+                let destination_child = destination.open_or_create_child(&name)?;
+                host_copy_toolchain_tree(&source_child, &destination_child, files, bytes)?;
+            } else {
+                let identity = source
+                    .probe_file(&name, D32_TOOLCHAIN_FILE_MAX_BYTES)?
+                    .ok_or_else(|| {
+                        "D32 Host toolchain mirror encountered an unsupported entry".to_string()
+                    })?;
                 *files = files.saturating_add(1);
-                *bytes = bytes.saturating_add(metadata.len());
-                if *files > D32_TOOLCHAIN_MAX_FILES
-                    || metadata.len() > D32_TOOLCHAIN_FILE_MAX_BYTES
-                    || *bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES
-                {
+                *bytes = bytes.saturating_add(identity.file_size);
+                if *files > D32_TOOLCHAIN_MAX_FILES || *bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES {
                     return Err("D32 Host toolchain mirror exceeded its bound".to_string());
                 }
-                host_stream_copy_bounded(
-                    &source_path,
-                    &destination_path,
-                    D32_TOOLCHAIN_FILE_MAX_BYTES,
-                )?;
-            } else {
-                return Err(
-                    "D32 Host toolchain mirror encountered an unsupported entry".to_string()
-                );
+                destination.copy_file_from(source, &name, &name, D32_TOOLCHAIN_FILE_MAX_BYTES)?;
             }
         }
-        Ok(())
+        source.revalidate("D32 Host source after toolchain copy")?;
+        destination.revalidate("D32 Host destination after toolchain copy")
     }
 
-    fn host_prepare_toolchain_mirror(
-        app_data_root: &Path,
+    fn host_prepare_toolchain_mirror_retained(
+        app_data_root_retained: &D32RetainedDirectory,
         selection: &HostCargoSelection,
+        selected_root_retained: &D32RetainedDirectory,
     ) -> Result<PathBuf, String> {
-        let selected_root = fs::canonicalize(&selection.toolchain_path)
-            .map_err(|_| "D32 Host toolchain root could not be canonicalized".to_string())?;
-        let selected_cargo = fs::canonicalize(&selection.path)
-            .map_err(|_| "D32 Host Cargo image could not be canonicalized".to_string())?;
-        let mirror_parent = app_data_root.join(D32_TOOLCHAIN_MIRROR_ROOT_NAME);
-        fs::create_dir_all(&mirror_parent)
-            .map_err(|_| "D32 Host toolchain mirror parent could not be created".to_string())?;
+        app_data_root_retained.revalidate("D32 Host app-data root before mirror preparation")?;
+        let mirror_parent_retained = app_data_root_retained
+            .open_or_create_child(OsStr::new(D32_TOOLCHAIN_MIRROR_ROOT_NAME))?;
+        let mirror_parent = mirror_parent_retained.path().to_path_buf();
+        app_data_root_retained.revalidate("D32 Host app-data root before mirror parent create")?;
+        mirror_parent_retained.revalidate("D32 Host mirror parent after create")?;
+        app_data_root_retained.revalidate("D32 Host app-data root after mirror parent create")?;
+        let mirror_parent_identity = mirror_parent_retained.identity();
         let mirror = mirror_parent.join(&selection.toolchain_manifest_sha256);
-        let valid = fs::symlink_metadata(&mirror)
-            .ok()
-            .is_some_and(|metadata| !host_metadata_is_reparse(&metadata))
-            && mirror.is_dir()
-            && host_verify_no_reparse_path(&mirror_parent, &mirror).is_ok()
-            && host_toolchain_manifest_hash(&mirror).ok().as_deref()
-                == Some(selection.toolchain_manifest_sha256.as_str())
-            && mirror.join("bin/cargo.exe").is_file()
-            && mirror.join("bin/rustc.exe").is_file()
-            && mirror.join("bin/rustdoc.exe").is_file();
+        let existing_mirror = mirror_parent_retained
+            .open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))
+            .ok();
+        let valid = match existing_mirror.as_ref() {
+            Some(retained) => {
+                retained.revalidate("D32 Host mirror cache hit")?;
+                host_validate_existing_tree_without_reparse_retained(retained)?;
+                let manifest_matches = match host_toolchain_manifest_hash_retained(retained) {
+                    Ok(hash) => hash == selection.toolchain_manifest_sha256,
+                    Err(_) => false,
+                };
+                let cargo_hash_matches = retained
+                    .open_existing_child(OsStr::new("bin"))
+                    .and_then(|bin| {
+                        bin.hash_file_with_identity(
+                            OsStr::new("cargo.exe"),
+                            D32_IMAGE_HASH_MAX_BYTES,
+                        )
+                        .map(|(_, digest)| {
+                            digest
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                                == selection.sha256
+                        })
+                    })
+                    .unwrap_or(false);
+                manifest_matches
+                    && cargo_hash_matches
+                    && host_retained_has_toolchain_images(retained)
+            }
+            None => false,
+        };
         if !valid {
-            if fs::symlink_metadata(&mirror).is_ok() {
-                host_verify_no_reparse_path(&mirror_parent, &mirror)?;
-                fs::remove_dir_all(&mirror).map_err(|_| {
-                    "D32 stale Host toolchain mirror could not be removed".to_string()
-                })?;
+            drop(existing_mirror);
+            let selected_root_identity = selected_root_retained.identity();
+            let selected_bin_retained =
+                selected_root_retained.open_existing_child(OsStr::new("bin"))?;
+            let selected_cargo_identity = selected_bin_retained
+                .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
+                .ok_or_else(|| "D32 Host Cargo image was unavailable".to_string())?;
+            let selected_cargo_hash = selected_bin_retained
+                .hash_file_with_identity(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
+                .1;
+            if selected_cargo_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+                != selection.sha256
+            {
+                return Err("D32 Host selected Cargo image did not match selection".to_string());
             }
-            let staging =
-                mirror_parent.join(format!(".{}.staging", selection.toolchain_manifest_sha256));
-            if fs::symlink_metadata(&staging).is_ok() {
-                host_verify_no_reparse_path(&mirror_parent, &staging)?;
-                fs::remove_dir_all(&staging).map_err(|_| {
-                    "D32 stale Host toolchain staging could not be removed".to_string()
-                })?;
-            }
-            fs::create_dir_all(&staging)
-                .map_err(|_| "D32 Host toolchain staging root could not be created".to_string())?;
+            // A verified app-owned mirror is authoritative for a cache hit;
+            // only bind the selected source image when a fresh copy is
+            // actually required.  This keeps source availability from
+            // weakening the verified-mirror reuse path.
+            mirror_parent_retained
+                .remove_child_tree_if_present(OsStr::new(&selection.toolchain_manifest_sha256))?;
+            let staging_name =
+                OsString::from(format!(".{}.staging", selection.toolchain_manifest_sha256));
+            mirror_parent_retained.remove_child_tree_if_present(&staging_name)?;
+            let staging_retained = mirror_parent_retained.open_or_create_child(&staging_name)?;
             let mut files = 0usize;
             let mut bytes = 0u64;
-            host_copy_toolchain_tree(&selected_root, &staging, &mut files, &mut bytes)?;
-            host_stream_copy_bounded(
-                &selected_cargo,
-                &staging.join("bin/cargo.exe"),
-                D32_IMAGE_HASH_MAX_BYTES,
+            app_data_root_retained.revalidate("D32 Host app-data root before mirror copy")?;
+            selected_root_retained.revalidate("D32 Host toolchain root before mirror copy")?;
+            host_copy_toolchain_tree(
+                &selected_root_retained,
+                &staging_retained,
+                &mut files,
+                &mut bytes,
             )?;
-            let manifest = host_toolchain_manifest_hash(&staging)?;
+            app_data_root_retained.revalidate("D32 Host app-data root after mirror copy")?;
+            selected_root_retained.revalidate("D32 Host toolchain root after mirror copy")?;
+            if selected_root_retained.identity() != selected_root_identity
+                || selected_bin_retained
+                    .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
+                    != Some(selected_cargo_identity)
+            {
+                let _ = staging_retained.remove_self();
+                return Err("D32 Host toolchain source changed during mirror copy".to_string());
+            }
+            let manifest = host_toolchain_manifest_hash_retained(&staging_retained)?;
             if manifest != selection.toolchain_manifest_sha256 {
-                let _ = fs::remove_dir_all(&staging);
+                let _ = staging_retained.remove_self();
                 return Err(
                     "D32 Host toolchain mirror manifest did not match selection".to_string()
                 );
             }
-            fs::rename(&staging, &mirror)
-                .map_err(|_| "D32 Host toolchain mirror could not be finalized".to_string())?;
+            app_data_root_retained.revalidate("D32 Host app-data root before mirror finalize")?;
+            mirror_parent_retained.revalidate("D32 Host mirror parent before finalize")?;
+            drop(staging_retained);
+            mirror_parent_retained.rename_directory(
+                &staging_name,
+                OsStr::new(&selection.toolchain_manifest_sha256),
+                false,
+            )?;
+            app_data_root_retained.revalidate("D32 Host app-data root after mirror finalize")?;
         }
-        host_verify_no_reparse_path(&mirror_parent, &mirror)?;
-        if host_toolchain_manifest_hash(&mirror)? != selection.toolchain_manifest_sha256 {
+        app_data_root_retained.revalidate("D32 Host app-data root after mirror preparation")?;
+        let mirror_retained = mirror_parent_retained
+            .open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))?;
+        mirror_retained.revalidate("D32 Host final toolchain mirror")?;
+        if mirror_parent_retained.identity() != mirror_parent_identity {
+            return Err("D32 Host toolchain mirror parent changed during preparation".to_string());
+        }
+        if host_toolchain_manifest_hash_retained(&mirror_retained)?
+            != selection.toolchain_manifest_sha256
+        {
             return Err("D32 Host toolchain mirror changed after finalization".to_string());
         }
         Ok(mirror)
     }
 
-    fn host_select_cargo_image() -> Result<HostCargoSelection, String> {
+    #[cfg(test)]
+    fn host_prepare_toolchain_mirror(
+        app_data_root: &Path,
+        selection: &HostCargoSelection,
+    ) -> Result<PathBuf, String> {
+        let selected_root = host_canonical_directory_fence(
+            Path::new(&selection.toolchain_path),
+            "D32 Host toolchain root",
+        )?;
+        let selected_root_retained = D32RetainedDirectory::open(&selected_root)?;
+        let app_data_root_retained = D32RetainedDirectory::open(app_data_root)?;
+        host_prepare_toolchain_mirror_retained(
+            &app_data_root_retained,
+            selection,
+            &selected_root_retained,
+        )
+    }
+
+    fn host_select_cargo_image() -> Result<HostCargoSelectionAuthority, String> {
         let user_profile = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .ok_or_else(|| "D32 Host Rust toolchain root was unavailable".to_string())?;
         let toolchains = user_profile.join(".rustup").join("toolchains");
-        let mut candidates = fs::read_dir(&toolchains)
-            .map_err(|_| "D32 Host Rust toolchain directory was unavailable".to_string())?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter_map(|path| fs::canonicalize(path).ok())
-            .filter(|path| {
-                path.is_dir()
-                    && path.join("bin/cargo.exe").is_file()
-                    && path.join("bin/rustc.exe").is_file()
-                    && path.join("bin/rustdoc.exe").is_file()
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
-        let toolchain_path = candidates
+        let toolchains_retained = D32RetainedDirectory::open(&toolchains)?;
+        toolchains_retained.revalidate("D32 Host toolchain root before selection")?;
+        let mut candidates = Vec::new();
+        for name in toolchains_retained.enumerate_children()? {
+            if let Ok(candidate) = toolchains_retained.open_existing_child(&name) {
+                if host_retained_has_toolchain_images(&candidate) {
+                    candidates.push((candidate.path().to_path_buf(), candidate));
+                }
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        let (toolchain_path, toolchain_retained) = candidates
             .into_iter()
-            .find(|path| {
-                fs::symlink_metadata(path)
-                    .map(|metadata| !host_metadata_is_reparse(&metadata))
-                    .unwrap_or(false)
-            })
+            .next()
             .ok_or_else(|| "D32 Host Rust toolchain was unavailable".to_string())?;
-        let path = fs::canonicalize(toolchain_path.join("bin/cargo.exe"))
-            .map_err(|_| "D32 Host toolchain Cargo image was unavailable".to_string())?;
-        host_file_identity(&path, false)?;
-        let sha256 = host_hash_file(&path, D32_IMAGE_HASH_MAX_BYTES)?;
-        let toolchain_manifest_sha256 =
-            host_toolchain_manifest_hash_with_cargo(&toolchain_path, &path)?;
-        Ok(HostCargoSelection {
-            path: path.to_string_lossy().into_owned(),
-            sha256,
-            toolchain_path: toolchain_path.to_string_lossy().into_owned(),
-            toolchain_manifest_sha256,
+        let toolchain_bin_retained = toolchain_retained.open_existing_child(OsStr::new("bin"))?;
+        let cargo_path = toolchain_bin_retained.path().join("cargo.exe");
+        let (_, cargo_digest) = toolchain_bin_retained
+            .hash_file_with_identity(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?;
+        let sha256 = cargo_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for name in ["rustc.exe", "rustdoc.exe"] {
+            toolchain_bin_retained
+                .hash_file_with_identity(OsStr::new(name), D32_TOOLCHAIN_FILE_MAX_BYTES)?;
+        }
+        let toolchain_manifest_sha256 = host_toolchain_manifest_hash_retained(&toolchain_retained)?;
+        toolchain_retained.revalidate("D32 Host selected toolchain after evidence")?;
+        toolchain_bin_retained.revalidate("D32 Host selected toolchain bin after evidence")?;
+        toolchains_retained.revalidate("D32 Host toolchain root after selection")?;
+        Ok(HostCargoSelectionAuthority {
+            selection: HostCargoSelection {
+                path: cargo_path.to_string_lossy().into_owned(),
+                sha256,
+                toolchain_path: toolchain_path.to_string_lossy().into_owned(),
+                toolchain_manifest_sha256,
+            },
+            toolchain_retained,
+            toolchain_bin_retained,
         })
     }
 
+    #[cfg(test)]
     fn host_cargo_selection_path(app_data_root: &Path) -> PathBuf {
         app_data_root.join(D32_CARGO_SELECTION_FILE_NAME)
     }
 
-    fn host_publish_cargo_selection(
-        app_data_root: &Path,
-    ) -> Result<HostPublishedCargoProfile, String> {
-        if !app_data_root.is_absolute() {
-            return Err("D32 Host app-data root was not absolute".to_string());
+    fn host_write_cargo_selection_marker(
+        root: &D32RetainedDirectory,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let marker_name = OsStr::new(D32_CARGO_SELECTION_FILE_NAME);
+        root.revalidate("D32 Host app-data root before marker write")?;
+        let mut random = [0_u8; 12];
+        getrandom::fill(&mut random)
+            .map_err(|_| "D32 Host Cargo selection temporary identity unavailable".to_string())?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let temporary_name =
+            OsString::from(format!(".{D32_CARGO_SELECTION_FILE_NAME}.{}.tmp", suffix));
+        let expected_hash = format!("{:x}", Sha256::digest(payload));
+        let write_result = (|| {
+            root.create_new_file(&temporary_name, payload)?;
+            let temporary_bytes = root.read_file(&temporary_name, 16 * 1024)?;
+            if root.hash_file(&temporary_name, 16 * 1024)? != expected_hash
+                || temporary_bytes != payload
+            {
+                return Err(
+                    "D32 Host Cargo selection temporary file changed before replace".to_string(),
+                );
+            }
+            root.revalidate("D32 Host app-data root before marker replace")?;
+            root.rename_file(&temporary_name, marker_name, true)?;
+            let stored = root.read_file(marker_name, 16 * 1024)?;
+            if stored != payload || root.hash_file(marker_name, 16 * 1024)? != expected_hash {
+                return Err("D32 Host Cargo selection marker changed after replace".to_string());
+            }
+            root.revalidate("D32 Host app-data root after marker replace")?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = root.remove_file(&temporary_name);
         }
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
-        validate_private_app_data_root(&app_data_root)?;
+        write_result
+    }
+
+    fn host_publish_cargo_selection(
+        app_data_root_retained: &D32RetainedDirectory,
+    ) -> Result<HostPublishedCargoProfile, String> {
+        validate_private_app_data_root(app_data_root_retained.path())?;
         // Select and verify the source toolchain independently on every Host
         // startup.  A marker left in app data by an earlier session is a Vita
         // locator, not durable authority, so it must never redefine the
         // expected executable evidence for this session.
-        let selection = host_select_cargo_image()?;
-        host_prepare_toolchain_mirror(&app_data_root, &selection)?;
+        let selected = host_select_cargo_image()?;
+        host_prepare_toolchain_mirror_retained(
+            app_data_root_retained,
+            &selected.selection,
+            &selected.toolchain_retained,
+        )?;
+        selected
+            .toolchain_bin_retained
+            .revalidate("D32 Host selected toolchain bin before publication")?;
+        let selection = selected.selection;
         let expected_profile_evidence =
-            host_cargo_profile_evidence_for_selection(&app_data_root, &selection)?;
-        let marker = host_cargo_selection_path(&app_data_root);
-        match fs::symlink_metadata(&marker) {
-            Ok(_) => host_verify_no_reparse_path(&app_data_root, &marker)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("D32 Host Cargo selection metadata was unavailable".to_string()),
-        }
+            host_cargo_profile_evidence_for_selection(app_data_root_retained, &selection)?;
         let payload = serde_json::to_vec(&selection)
             .map_err(|_| "D32 Host Cargo selection serialization failed".to_string())?;
-        fs::write(&marker, payload)
-            .map_err(|_| "D32 Host Cargo selection could not be published".to_string())?;
-        host_verify_no_reparse_path(&app_data_root, &marker)?;
+        host_write_cargo_selection_marker(app_data_root_retained, &payload)?;
         Ok(HostPublishedCargoProfile {
             selection,
             expected_profile_evidence,
         })
     }
 
+    #[cfg(test)]
+    fn host_publish_cargo_selection_path(
+        app_data_root: &Path,
+    ) -> Result<HostPublishedCargoProfile, String> {
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let retained = D32RetainedDirectory::open(&app_data_root)?;
+        host_publish_cargo_selection(&retained)
+    }
+
+    #[cfg(test)]
     fn host_clear_cargo_selection(app_data_root: &Path) -> Result<(), String> {
-        let marker = host_cargo_selection_path(app_data_root);
-        match fs::symlink_metadata(&marker) {
-            Ok(_) => {
-                host_verify_no_reparse_path(app_data_root, &marker)?;
-                fs::remove_file(&marker)
-                    .map_err(|_| "D32 Host Cargo selection could not be cleared".to_string())?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("D32 Host Cargo selection metadata was unavailable".to_string()),
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let root = D32RetainedDirectory::open(&app_data_root)?;
+        let marker_name = OsStr::new(D32_CARGO_SELECTION_FILE_NAME);
+        if root.probe_file(marker_name, 16 * 1024)?.is_some() {
+            root.remove_file(marker_name)
+                .map_err(|_| "D32 Host Cargo selection could not be cleared".to_string())?;
         }
+        root.revalidate("D32 Host app-data root after marker cleanup")?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn host_read_cargo_selection_marker(
         app_data_root: &Path,
     ) -> Result<HostCargoSelection, String> {
-        let marker = host_cargo_selection_path(app_data_root);
-        host_verify_no_reparse_path(app_data_root, &marker)?;
-        let bytes = fs::read(&marker)
-            .map_err(|_| "D32 Host Cargo selection could not be read".to_string())?;
-        if bytes.len() > 16 * 1024 {
-            return Err("D32 Host Cargo selection exceeded its bound".to_string());
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let root = D32RetainedDirectory::open(&app_data_root)?;
+        let marker_name = OsStr::new(D32_CARGO_SELECTION_FILE_NAME);
+        let bytes = root.read_file(marker_name, 16 * 1024).map_err(|_| {
+            "D32 Host Cargo selection exceeded its bound or could not be read".to_string()
+        })?;
+        let reread = root.read_file(marker_name, 16 * 1024)?;
+        if bytes != reread {
+            return Err("D32 Host Cargo selection changed during read".to_string());
         }
+        root.revalidate("D32 Host app-data root after marker read")?;
+        let selection: HostCargoSelection = serde_json::from_slice(&bytes)
+            .map_err(|_| "D32 Host Cargo selection was malformed".to_string())?;
+        if selection.sha256.len() != 64
+            || selection
+                .sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("D32 Host Cargo selection hash was malformed".to_string());
+        }
+        if selection.toolchain_manifest_sha256.len() != 64
+            || selection
+                .toolchain_manifest_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("D32 Host toolchain selection hash was malformed".to_string());
+        }
+        if !PathBuf::from(&selection.path).is_absolute()
+            || !PathBuf::from(&selection.toolchain_path).is_absolute()
+        {
+            return Err("D32 Host Cargo selection path was not absolute".to_string());
+        }
+        Ok(selection)
+    }
+
+    fn host_read_cargo_selection_marker_retained(
+        root: &D32RetainedDirectory,
+    ) -> Result<HostCargoSelection, String> {
+        let marker_name = OsStr::new(D32_CARGO_SELECTION_FILE_NAME);
+        root.revalidate("D32 Host app-data root before marker read")?;
+        let bytes = root.read_file(marker_name, 16 * 1024).map_err(|_| {
+            "D32 Host Cargo selection exceeded its bound or could not be read".to_string()
+        })?;
+        let reread = root.read_file(marker_name, 16 * 1024)?;
+        if bytes != reread {
+            return Err("D32 Host Cargo selection changed during read".to_string());
+        }
+        root.revalidate("D32 Host app-data root after marker read")?;
         let selection: HostCargoSelection = serde_json::from_slice(&bytes)
             .map_err(|_| "D32 Host Cargo selection was malformed".to_string())?;
         if selection.sha256.len() != 64
@@ -859,82 +2910,100 @@ mod windows {
     }
 
     fn host_cargo_profile_evidence_for_selection(
-        app_data_root: &Path,
+        app_data_root_retained: &D32RetainedDirectory,
         selection: &HostCargoSelection,
     ) -> Result<HostCargoCheckProfileEvidence, String> {
-        if !app_data_root.is_absolute() {
-            return Err("D32 Host app-data root was not absolute".to_string());
-        }
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
+        app_data_root_retained.revalidate("D32 Host app-data root before profile evidence")?;
         // Every action is bound to the immutable app-owned mirror.  Do not
         // reread/hash the user-profile toolchain on the AuthorityEvaluate
         // path; Host publication already established this source evidence.
-        let toolchain = app_data_root
-            .join(D32_TOOLCHAIN_MIRROR_ROOT_NAME)
-            .join(&selection.toolchain_manifest_sha256);
-        let cargo = toolchain.join("bin").join("cargo.exe");
-        let rustc = toolchain.join("bin").join("rustc.exe");
-        let rustdoc = toolchain.join("bin").join("rustdoc.exe");
-        for path in [
-            &toolchain,
-            cargo.as_path(),
-            rustc.as_path(),
-            rustdoc.as_path(),
-        ] {
-            host_verify_no_reparse_path(&app_data_root, path)?;
-        }
-        let toolchain_identity = host_file_identity(&toolchain, true)?;
-        let cargo_identity = host_file_identity(&cargo, false)?;
-        let rustc_identity = host_file_identity(&rustc, false)?;
-        let rustdoc_identity = host_file_identity(&rustdoc, false)?;
-        let toolchain_manifest_hash = host_toolchain_manifest_hash(&toolchain)?;
+        let mirror_parent = app_data_root_retained
+            .open_existing_child(OsStr::new(D32_TOOLCHAIN_MIRROR_ROOT_NAME))?;
+        let toolchain_retained =
+            mirror_parent.open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))?;
+        toolchain_retained.revalidate("D32 Host toolchain mirror before profile evidence")?;
+        let toolchain_bin_retained = toolchain_retained.open_existing_child(OsStr::new("bin"))?;
+        let cargo_identity = toolchain_bin_retained
+            .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
+            .ok_or_else(|| "D32 Host mirror Cargo image was unavailable".to_string())?;
+        let rustc_identity = toolchain_bin_retained
+            .probe_file(OsStr::new("rustc.exe"), D32_TOOLCHAIN_FILE_MAX_BYTES)?
+            .ok_or_else(|| "D32 Host mirror rustc image was unavailable".to_string())?;
+        let rustdoc_identity = toolchain_bin_retained
+            .probe_file(OsStr::new("rustdoc.exe"), D32_TOOLCHAIN_FILE_MAX_BYTES)?
+            .ok_or_else(|| "D32 Host mirror rustdoc image was unavailable".to_string())?;
+        let toolchain_identity = toolchain_retained.identity();
+        let toolchain_manifest_hash = host_toolchain_manifest_hash_retained(&toolchain_retained)?;
         if toolchain_manifest_hash != selection.toolchain_manifest_sha256
-            || host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)? != selection.sha256
+            || toolchain_bin_retained
+                .hash_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES as usize)?
+                != selection.sha256
         {
             return Err("D32 Host toolchain mirror did not match selection".to_string());
         }
-        let staged_cargo_hash = host_hash_file(&cargo, D32_IMAGE_HASH_MAX_BYTES)?;
-        Ok(HostCargoCheckProfileEvidence {
+        let staged_cargo_hash = toolchain_bin_retained
+            .hash_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES as usize)?;
+        let evidence = HostCargoCheckProfileEvidence {
             executable_identity: cargo_identity.image_wire(),
             executable_sha256: staged_cargo_hash,
             rustc_identity: rustc_identity.image_wire(),
-            rustc_sha256: host_hash_file(&rustc, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
+            rustc_sha256: toolchain_bin_retained.hash_file(
+                OsStr::new("rustc.exe"),
+                D32_TOOLCHAIN_FILE_MAX_BYTES as usize,
+            )?,
             rustdoc_identity: rustdoc_identity.image_wire(),
-            rustdoc_sha256: host_hash_file(&rustdoc, D32_TOOLCHAIN_FILE_MAX_BYTES)?,
+            rustdoc_sha256: toolchain_bin_retained.hash_file(
+                OsStr::new("rustdoc.exe"),
+                D32_TOOLCHAIN_FILE_MAX_BYTES as usize,
+            )?,
             toolchain_root_identity: toolchain_identity.namespace_wire(),
             toolchain_manifest_hash,
             staged_working_directory_identity: "per-action-fresh-run-v1".to_string(),
             environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
             profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
-        })
+        };
+        toolchain_retained.revalidate("D32 Host toolchain mirror after profile evidence")?;
+        toolchain_bin_retained.revalidate("D32 Host toolchain bin after profile evidence")?;
+        app_data_root_retained.revalidate("D32 Host app-data root after profile evidence")?;
+        Ok(evidence)
     }
 
+    #[cfg(test)]
     fn host_cargo_profile_evidence(
         app_data_root: &Path,
     ) -> Result<HostCargoCheckProfileEvidence, String> {
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
-        let selection = host_read_cargo_selection_marker(&app_data_root)?;
-        host_cargo_profile_evidence_for_selection(&app_data_root, &selection)
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let root = D32RetainedDirectory::open(&app_data_root)?;
+        let selection = host_read_cargo_selection_marker_retained(&root)?;
+        host_cargo_profile_evidence_for_selection(&root, &selection)
     }
 
-    fn host_finalize_published_cargo_profile(
-        app_data_root: &Path,
+    fn host_finalize_published_cargo_profile_retained(
+        app_data_root_retained: &D32RetainedDirectory,
         published: &HostPublishedCargoProfile,
     ) -> Result<HostCargoCheckProfileEvidence, String> {
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
-        let current_selection = host_read_cargo_selection_marker(&app_data_root)?;
+        let current_selection = host_read_cargo_selection_marker_retained(app_data_root_retained)?;
         if current_selection != published.selection {
             return Err("D32 Host Cargo selection changed during Vita startup".to_string());
         }
         let current =
-            host_cargo_profile_evidence_for_selection(&app_data_root, &current_selection)?;
+            host_cargo_profile_evidence_for_selection(app_data_root_retained, &current_selection)?;
         if current != published.expected_profile_evidence {
             return Err("D32 Host Cargo profile evidence changed during Vita startup".to_string());
         }
         Ok(published.expected_profile_evidence.clone())
+    }
+
+    #[cfg(test)]
+    fn host_finalize_published_cargo_profile(
+        app_data_root: &Path,
+        published: &HostPublishedCargoProfile,
+    ) -> Result<HostCargoCheckProfileEvidence, String> {
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let root = D32RetainedDirectory::open(&app_data_root)?;
+        host_finalize_published_cargo_profile_retained(&root, published)
     }
 
     fn d32_run_id(session_id: &str, turn_id: &str, tool_call_id: &str) -> String {
@@ -949,23 +3018,38 @@ mod windows {
         )
     }
 
+    #[cfg(test)]
     fn host_cargo_run_source_identity(
         app_data_root: &Path,
         binding: &ProcessBinding,
     ) -> Result<String, String> {
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 Host app-data root could not be canonicalized".to_string())?;
-        let root = app_data_root
-            .join(D32_EXECUTION_ROOT_NAME)
-            .join(D32_RUNS_DIR_NAME)
-            .join(d32_run_id(
-                &binding.session_id,
-                &binding.turn_id,
-                &binding.tool_call_id,
-            ));
-        let source = root.join(D32_SOURCE_DIR_NAME);
-        host_verify_no_reparse_path(&app_data_root, &source)?;
-        Ok(host_file_identity(&source, true)?.namespace_wire())
+        let app_data_root =
+            host_canonical_directory_fence(app_data_root, "D32 Host app-data root")?;
+        let app_data_root_retained = D32RetainedDirectory::open(&app_data_root)?;
+        host_cargo_run_source_identity_retained(&app_data_root_retained, binding)
+    }
+
+    fn host_cargo_run_source_identity_retained(
+        app_data_root_retained: &D32RetainedDirectory,
+        binding: &ProcessBinding,
+    ) -> Result<String, String> {
+        app_data_root_retained.revalidate("D32 Host app-data root before run-source read")?;
+        let execution_root =
+            app_data_root_retained.open_existing_child(OsStr::new(D32_EXECUTION_ROOT_NAME))?;
+        let runs_root = execution_root.open_existing_child(OsStr::new(D32_RUNS_DIR_NAME))?;
+        let run_root = runs_root.open_existing_child(OsStr::new(&d32_run_id(
+            &binding.session_id,
+            &binding.turn_id,
+            &binding.tool_call_id,
+        )))?;
+        let source = run_root.open_existing_child(OsStr::new(D32_SOURCE_DIR_NAME))?;
+        execution_root.revalidate("D32 Host execution root after run-source read")?;
+        runs_root.revalidate("D32 Host runs root after run-source read")?;
+        run_root.revalidate("D32 Host run root after run-source read")?;
+        source.revalidate("D32 Host source root after run-source read")?;
+        let identity = source.identity().namespace_wire();
+        app_data_root_retained.revalidate("D32 Host app-data root after run-source read")?;
+        Ok(identity)
     }
 
     /// The Host-side turn authority is the security decision point for
@@ -1035,11 +3119,11 @@ mod windows {
         }))
     }
 
+    #[cfg(any(test, feature = "d32-a-host-canary"))]
     /// D32's mandatory real-canary gate must fail closed when the active Chat
     /// provider is unavailable.  The normal production entry point retains
     /// its existing provider/readiness semantics; this helper is the harness
     /// preflight and negative-evidence assertion.
-    #[cfg(test)]
     fn require_production_provider(
         provider: Option<protocol::ProviderConfiguration>,
     ) -> Result<protocol::ProviderConfiguration, String> {
@@ -1068,6 +3152,56 @@ mod windows {
             return Err("D32_A_NOT_EXECUTABLE: active Chat provider model is missing".to_string());
         }
         Ok(provider)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    pub(super) fn d32_a_preflight_chat_provider(
+        identifier: &str,
+        mode: &str,
+    ) -> Result<(), String> {
+        D32HostCanaryMode::parse(mode)?;
+        host_select_cargo_image()
+            .map_err(|error| d32_not_executable(format!("toolchain preflight failed: {error}")))?;
+        let app_data_root = std::env::var_os("D32_A_CANARY_APP_DATA_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .map(|root| root.join(identifier))
+            })
+            .ok_or_else(|| d32_not_executable("Windows RoamingAppData root is unavailable"))?;
+        let profile = crate::storage::d32_a_read_only_chat_provider_profile(&app_data_root)
+            .map_err(|error| {
+                d32_not_executable(format!("provider metadata read failed: {error:?}"))
+            })?;
+        let Some((profile_id, base_url, model)) = profile else {
+            return Err(d32_not_executable(
+                "active Chat provider profile or credential is unavailable",
+            ));
+        };
+        let credential_ref =
+            SecretIdentifier::new(credential_purpose(ModelPurpose::Chat), profile_id.clone())
+                .map_err(|_| {
+                    d32_not_executable("active Chat provider credential identifier is invalid")
+                })?;
+        let secrets = WindowsCredentialSecretStore::new();
+        if !secrets.has_secret(&credential_ref).map_err(|_| {
+            d32_not_executable("active Chat provider credential could not be checked")
+        })? {
+            return Err(d32_not_executable(
+                "active Chat provider profile or credential is unavailable",
+            ));
+        }
+        let provider = protocol::ProviderConfiguration {
+            profile_id: profile_id.clone(),
+            purpose: ModelPurpose::Chat.as_str().to_string(),
+            provider_kind: ModelProviderKind::OpenaiCompatible.as_str().to_string(),
+            base_url: base_url.clone(),
+            model,
+            credential_ref: profile_id,
+            credential_destination: base_url,
+        };
+        require_production_provider(Some(provider)).map(|_| ())
     }
 
     fn current_chat_provider_configuration(
@@ -2031,7 +4165,11 @@ mod windows {
         task_id: String,
         workspace_identity: String,
         cargo_profile: Option<HostCargoCheckProfileEvidence>,
-        cargo_profile_app_data_root: Option<PathBuf>,
+        // The app-data authority is acquired once during sidecar startup and
+        // retained for the complete session.  Production evidence and Cargo
+        // binding checks must use this capability rather than reopening the
+        // Initialize pathname.
+        app_data_root_retained: Option<Arc<D32RetainedDirectory>>,
         provider: Option<protocol::ProviderConfiguration>,
         writer: Mutex<Option<BufWriter<File>>>,
         pending: Mutex<HashMap<String, PendingAction>>,
@@ -2057,6 +4195,8 @@ mod windows {
         assistant_text: Mutex<Option<String>>,
         turn_error: Mutex<Option<String>>,
         recovery_result: Mutex<Option<protocol::RecoveryResult>>,
+        #[cfg(feature = "d32-a-host-canary")]
+        canary_control: Option<Arc<D32HostCanaryControl>>,
         #[cfg(test)]
         test_outbound: Mutex<Option<mpsc::Sender<HostMessage>>>,
     }
@@ -2418,6 +4558,37 @@ mod windows {
     }
 
     impl HostSessionState {
+        #[cfg(feature = "d32-a-host-canary")]
+        fn canary_control(&self) -> Option<Arc<D32HostCanaryControl>> {
+            self.canary_control.clone()
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        fn record_inbound(&self, message: &VitaMessage) {
+            let Some(control) = self.canary_control.as_ref() else {
+                return;
+            };
+            control.trace.update(|trace| match message {
+                VitaMessage::AuthorityEvaluate(_) => trace.authority_evaluate += 1,
+                VitaMessage::ConfirmationRequired(_) => trace.confirmation_required += 1,
+                VitaMessage::IssueGrant(_) => trace.issue_grant += 1,
+                VitaMessage::RevalidateGrant(request) => {
+                    trace.revalidate_grant += 1;
+                    if control.mode == D32HostCanaryMode::GrantReplay
+                        && request.session_id == self.session_id
+                        && request.grant.session_id == self.session_id
+                    {
+                        trace.replay_exact_request_count += 1;
+                        trace.replay_exact_session_count += 1;
+                    }
+                }
+                VitaMessage::TurnCompleted(_) => trace.turn_completed += 1,
+                VitaMessage::TurnFailed(_) => trace.turn_failed += 1,
+                VitaMessage::ActionCancelled(_) => trace.action_cancelled += 1,
+                _ => {}
+            });
+        }
+
         fn ensure_turn_idle(&self) -> Result<(), String> {
             let authority = self
                 .turn_authority
@@ -2686,6 +4857,29 @@ mod windows {
         }
 
         fn send(&self, message: &HostMessage) -> Result<(), String> {
+            #[cfg(feature = "d32-a-host-canary")]
+            if let Some(control) = self.canary_control.as_ref() {
+                if let HostMessage::GrantRevalidated(reply) = message {
+                    if control.capture_replay_response(reply)? {
+                        control.trace.update(|trace| {
+                            if !reply.allowed {
+                                trace.replay_second_denied += 1;
+                            }
+                        });
+                        return Ok(());
+                    }
+                    control.trace.update(|trace| {
+                        trace.replay_wire_responses += 1;
+                        if reply.allowed {
+                            trace.grant_revalidated_allowed += 1;
+                            trace.binding_fields_validated = true;
+                        } else {
+                            trace.grant_revalidated_denied += 1;
+                            trace.grant_denial_code = reply.error_code.clone();
+                        }
+                    });
+                }
+            }
             #[cfg(test)]
             if let Ok(hook) = self.test_outbound.lock() {
                 if let Some(sender) = hook.as_ref() {
@@ -3212,6 +5406,19 @@ mod windows {
     }
 
     impl VitaSidecarCoordinator {
+        #[cfg(feature = "d32-a-host-canary")]
+        fn d32_app_data_root_retained(&self) -> Result<Arc<D32RetainedDirectory>, String> {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|_| "D32 Host coordinator lock was poisoned".to_string())?;
+            guard
+                .running
+                .as_ref()
+                .and_then(|running| running.session.app_data_root_retained.clone())
+                .ok_or_else(|| "D32 Host app-data authority was not retained".to_string())
+        }
+
         #[cfg(test)]
         fn install_test_session(&self, session: Arc<HostSessionState>) {
             if let Ok(mut guard) = self.inner.lock() {
@@ -3295,14 +5502,33 @@ mod windows {
             let app_data_root = fs::canonicalize(&app_data_root)
                 .map_err(|_| "Vita app data root could not be canonicalized".to_string())?;
             validate_private_app_data_root(&app_data_root)?;
+            // Acquire the app-data capability once for this startup.  All
+            // subsequent marker/profile/evidence operations use this retained
+            // handle; the canonical path below is only a process/display
+            // projection.
+            let app_data_root_retained = D32RetainedDirectory::open(&app_data_root)
+                .map_err(|error| format!("Vita app-data authority unavailable: {error}"))?;
+            app_data_root_retained
+                .revalidate("D32 Host app-data root before Cargo publication")
+                .map_err(|error| format!("Vita app-data authority changed: {error}"))?;
             // Cargo image authority is published by the Host into its own
-            // private app-data namespace before Vita is started.  A missing
-            // or changed installation clears stale state, leaving D32
-            // unavailable rather than allowing Vita to choose an image.
-            let published_cargo_profile = host_publish_cargo_selection(&app_data_root).ok();
-            if published_cargo_profile.is_none() {
-                let _ = host_clear_cargo_selection(&app_data_root);
-            }
+            // private app-data namespace before Vita is started.  The
+            // mandatory D32 canary is fail-closed: missing or changed cargo,
+            // rustc, rustdoc, mirror, or profile evidence is a structured
+            // NOT_EXECUTABLE result rather than an optional/soft-disabled
+            // lane.  The ordinary production sidecar retains its historical
+            // optional readiness behavior.
+            #[cfg(feature = "d32-a-host-canary")]
+            let published_cargo_profile = Some(
+                host_publish_cargo_selection(&app_data_root_retained)
+                    .map_err(d32_not_executable)?,
+            );
+            #[cfg(not(feature = "d32-a-host-canary"))]
+            let published_cargo_profile =
+                host_publish_cargo_selection(&app_data_root_retained).ok();
+            app_data_root_retained
+                .revalidate("D32 Host app-data root after Cargo publication")
+                .map_err(|error| format!("Vita app-data authority changed: {error}"))?;
             let sidecar_app_data_root = normalize_sidecar_local_path(&app_data_root)?;
 
             let sidecar_binding = app_owned_sidecar_path(app)?;
@@ -3312,20 +5538,51 @@ mod windows {
             // below is only the app-owned resource lookup, not the authority.
             let image = VitaSidecarProcess::prepare_image(&sidecar, &sidecar_binding.resource_dir)
                 .map_err(map_process_error)?;
-            let process_root = app_data_root.join("vita-sidecar-process");
-            fs::create_dir_all(&process_root)
-                .map_err(|_| "Vita sidecar process root could not be created".to_string())?;
-            let process_root = fs::canonicalize(&process_root)
-                .map_err(|_| "Vita sidecar process root could not be canonicalized".to_string())?;
+            #[cfg(feature = "d32-a-host-canary")]
+            app_data_root_retained
+                .revalidate("D32 Host app-data root before sidecar process root create")
+                .map_err(d32_not_executable)?;
+            #[cfg(feature = "d32-a-host-canary")]
+            let process_root_retained = app_data_root_retained
+                .open_or_create_child(OsStr::new("vita-sidecar-process"))
+                .map_err(d32_not_executable)?;
+            #[cfg(feature = "d32-a-host-canary")]
+            let process_root = process_root_retained.path().to_path_buf();
+            #[cfg(not(feature = "d32-a-host-canary"))]
+            let process_root = {
+                let process_root = app_data_root.join("vita-sidecar-process");
+                fs::create_dir_all(&process_root)
+                    .map_err(|_| "Vita sidecar process root could not be created".to_string())?;
+                fs::canonicalize(&process_root).map_err(|_| {
+                    "Vita sidecar process root could not be canonicalized".to_string()
+                })?
+            };
+            #[cfg(feature = "d32-a-host-canary")]
+            app_data_root_retained
+                .revalidate("D32 Host app-data root after sidecar process root create")
+                .map_err(d32_not_executable)?;
             let git_path = resolve_git_path()?;
             let sidecar_git_path = normalize_sidecar_local_path(&git_path)?;
 
-            let mut process = VitaSidecarProcess::spawn_prepared(
-                image,
-                &[OsString::from("--serve-ipc")],
-                &process_root,
-            )
-            .map_err(map_process_error)?;
+            #[cfg(feature = "d32-a-host-canary")]
+            let sidecar_args = [OsString::from("--serve-ipc-d32-canary")];
+            #[cfg(not(feature = "d32-a-host-canary"))]
+            let sidecar_args = [OsString::from("--serve-ipc")];
+            #[cfg(feature = "d32-a-host-canary")]
+            app_data_root_retained
+                .revalidate("D32 Host app-data root before sidecar launch")
+                .map_err(d32_not_executable)?;
+            #[cfg(feature = "d32-a-host-canary")]
+            process_root_retained
+                .revalidate("D32 Host sidecar process root before sidecar launch")
+                .map_err(d32_not_executable)?;
+            let mut process =
+                VitaSidecarProcess::spawn_prepared(image, &sidecar_args, &process_root)
+                    .map_err(map_process_error)?;
+            #[cfg(feature = "d32-a-host-canary")]
+            app_data_root_retained
+                .revalidate("D32 Host app-data root after sidecar launch")
+                .map_err(d32_not_executable)?;
             let stdout = process
                 .take_stdout()
                 .ok_or_else(|| "Vita sidecar stdout pipe was unavailable".to_string())?;
@@ -3383,20 +5640,32 @@ mod windows {
             // the app-owned Cargo projection is unavailable; the Cargo lane
             // then stays fail-closed because validate_binding() requires this
             // Host-owned evidence before it can issue or revalidate a grant.
+            #[cfg(feature = "d32-a-host-canary")]
+            let cargo_profile = published_cargo_profile
+                .as_ref()
+                .map(|published| {
+                    host_finalize_published_cargo_profile_retained(
+                        &app_data_root_retained,
+                        published,
+                    )
+                })
+                .transpose()
+                .map_err(d32_not_executable)?;
+            #[cfg(not(feature = "d32-a-host-canary"))]
             let cargo_profile = published_cargo_profile.as_ref().and_then(|published| {
-                host_finalize_published_cargo_profile(&app_data_root, published).ok()
+                host_finalize_published_cargo_profile_retained(&app_data_root_retained, published)
+                    .ok()
             });
-            if cargo_profile.is_none() && published_cargo_profile.is_some() {
-                let _ = host_clear_cargo_selection(&app_data_root);
-            }
-            let cargo_profile_app_data_root = cargo_profile.as_ref().map(|_| app_data_root.clone());
+            let app_data_root_retained_session = Arc::new(app_data_root_retained.clone());
+            #[cfg(feature = "d32-a-host-canary")]
+            let canary_control = self.d32_host_canary_control()?;
             let session = Arc::new(HostSessionState {
                 session_id: session_id.clone(),
                 life_id: life.id.clone(),
                 task_id: request.task_id.clone(),
                 workspace_identity: ready.workspace_identity,
                 cargo_profile,
-                cargo_profile_app_data_root,
+                app_data_root_retained: Some(Arc::clone(&app_data_root_retained_session)),
                 provider,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -3422,6 +5691,8 @@ mod windows {
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
                 recovery_result: Mutex::new(None),
+                #[cfg(feature = "d32-a-host-canary")]
+                canary_control,
                 #[cfg(test)]
                 test_outbound: Mutex::new(None),
             });
@@ -4296,6 +6567,114 @@ mod windows {
         }
     }
 
+    fn dispatch_inbound_message(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        secrets: &WindowsCredentialSecretStore,
+        message: VitaMessage,
+    ) -> Result<(), String> {
+        match message {
+            VitaMessage::AuthorityEvaluate(request) => {
+                handle_authority_evaluate(session, storage, registry, request)
+            }
+            VitaMessage::ConfirmationRequired(request) => {
+                handle_confirmation_required(session, request)
+            }
+            VitaMessage::IssueGrant(request) => {
+                handle_issue_grant(session, storage, registry, request)
+            }
+            VitaMessage::RevalidateGrant(request) => {
+                handle_revalidate_grant_with_secrets(session, storage, registry, secrets, request)
+            }
+            VitaMessage::WorkspaceReadAuthorityEvaluate(request) => {
+                handle_workspace_read_authority_evaluate(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReadConfirmationRequired(request) => {
+                handle_workspace_read_confirmation_required(session, request)
+            }
+            VitaMessage::WorkspaceReadIssueGrant(request) => {
+                handle_workspace_read_issue_grant(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReadRevalidateGrant(request) => {
+                handle_workspace_read_revalidate_grant(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReadReleaseCheck(request) => {
+                handle_workspace_read_release_check(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReplaceAuthorityEvaluate(request) => {
+                handle_workspace_replace_authority_evaluate(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReplaceConfirmationRequired(request) => {
+                handle_workspace_replace_confirmation_required(session, request)
+            }
+            VitaMessage::WorkspaceReplaceIssueGrant(request) => {
+                handle_workspace_replace_issue_grant(session, storage, registry, request)
+            }
+            VitaMessage::WorkspaceReplaceRevalidateGrant(request) => {
+                handle_workspace_replace_revalidate_grant(session, storage, registry, request)
+            }
+            VitaMessage::RecoveryAuthorityEvaluate(request) => {
+                handle_recovery_authority_evaluate(session, storage, registry, request)
+            }
+            VitaMessage::RecoveryConfirmationRequired(request) => {
+                handle_recovery_confirmation_required(session, request)
+            }
+            VitaMessage::RecoveryIssueGrant(request) => {
+                handle_recovery_issue_grant(session, storage, registry, request)
+            }
+            VitaMessage::RecoveryRevalidateGrant(request) => {
+                handle_recovery_revalidate_grant(session, storage, registry, request)
+            }
+            VitaMessage::RecoveryPending(request) => handle_recovery_pending(session, request),
+            VitaMessage::RecoveryResult(result) => handle_recovery_result(session, result),
+            VitaMessage::CredentialRequired(request) => {
+                handle_credential_required(session, storage, secrets, request)
+            }
+            VitaMessage::TurnState(message) => handle_turn_state(session, message),
+            VitaMessage::TurnCompleted(message) => handle_turn_completed(session, message),
+            VitaMessage::TurnFailed(message) => handle_turn_failed(session, message),
+            VitaMessage::ActionCancelled(message) if message.session_id == session.session_id => {
+                Ok(())
+            }
+            VitaMessage::ShutdownAck(message) if message.session_id == session.session_id => Ok(()),
+            VitaMessage::Fatal(_) | VitaMessage::Handshake(_) | VitaMessage::Ready(_) => {
+                Err("Vita sidecar emitted an invalid Host-phase message".to_string())
+            }
+            VitaMessage::ActionCancelled(_) | VitaMessage::ShutdownAck(_) => {
+                Err("Vita sidecar lifecycle response session was not exact".to_string())
+            }
+        }
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_dispatch_replay_inbound(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        secrets: &WindowsCredentialSecretStore,
+        message: VitaMessage,
+    ) -> Result<(), String> {
+        let request_id = vita_request_id(&message);
+        let VitaMessage::RevalidateGrant(request) = &message else {
+            return Err("D32 replay message was not RevalidateGrant".to_string());
+        };
+        if request_id.is_empty()
+            || request_id.len() > protocol::MAX_ID_BYTES
+            || request.session_id != session.session_id
+            || request.grant.session_id != session.session_id
+        {
+            return Err("D32 replay request/session identity was not exact".to_string());
+        }
+        // Deliberately bypass only the outer request-id replay window: this
+        // feature-only seam proves that an exact duplicate still reaches the
+        // canonical inbound dispatch and is denied by the consumed grant
+        // ledger.  Production reader_loop retains the normal fail-closed
+        // duplicate-frame fence.
+        session.record_inbound(&message);
+        dispatch_inbound_message(session, storage, registry, secrets, message)
+    }
+
     fn reader_loop(
         mut reader: BufReader<File>,
         session: Arc<HostSessionState>,
@@ -4319,85 +6698,9 @@ mod windows {
             {
                 break;
             }
-            let result = match message {
-                VitaMessage::AuthorityEvaluate(request) => {
-                    handle_authority_evaluate(&session, &storage, &registry, request)
-                }
-                VitaMessage::ConfirmationRequired(request) => {
-                    handle_confirmation_required(&session, request)
-                }
-                VitaMessage::IssueGrant(request) => {
-                    handle_issue_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::RevalidateGrant(request) => {
-                    handle_revalidate_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReadAuthorityEvaluate(request) => {
-                    handle_workspace_read_authority_evaluate(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReadConfirmationRequired(request) => {
-                    handle_workspace_read_confirmation_required(&session, request)
-                }
-                VitaMessage::WorkspaceReadIssueGrant(request) => {
-                    handle_workspace_read_issue_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReadRevalidateGrant(request) => {
-                    handle_workspace_read_revalidate_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReadReleaseCheck(request) => {
-                    handle_workspace_read_release_check(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReplaceAuthorityEvaluate(request) => {
-                    handle_workspace_replace_authority_evaluate(
-                        &session, &storage, &registry, request,
-                    )
-                }
-                VitaMessage::WorkspaceReplaceConfirmationRequired(request) => {
-                    handle_workspace_replace_confirmation_required(&session, request)
-                }
-                VitaMessage::WorkspaceReplaceIssueGrant(request) => {
-                    handle_workspace_replace_issue_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::WorkspaceReplaceRevalidateGrant(request) => {
-                    handle_workspace_replace_revalidate_grant(
-                        &session, &storage, &registry, request,
-                    )
-                }
-                VitaMessage::RecoveryAuthorityEvaluate(request) => {
-                    handle_recovery_authority_evaluate(&session, &storage, &registry, request)
-                }
-                VitaMessage::RecoveryConfirmationRequired(request) => {
-                    handle_recovery_confirmation_required(&session, request)
-                }
-                VitaMessage::RecoveryIssueGrant(request) => {
-                    handle_recovery_issue_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::RecoveryRevalidateGrant(request) => {
-                    handle_recovery_revalidate_grant(&session, &storage, &registry, request)
-                }
-                VitaMessage::RecoveryPending(request) => handle_recovery_pending(&session, request),
-                VitaMessage::RecoveryResult(result) => handle_recovery_result(&session, result),
-                VitaMessage::CredentialRequired(request) => {
-                    handle_credential_required(&session, &storage, &secrets, request)
-                }
-                VitaMessage::TurnState(message) => handle_turn_state(&session, message),
-                VitaMessage::TurnCompleted(message) => handle_turn_completed(&session, message),
-                VitaMessage::TurnFailed(message) => handle_turn_failed(&session, message),
-                VitaMessage::ActionCancelled(message)
-                    if message.session_id == session.session_id =>
-                {
-                    Ok(())
-                }
-                VitaMessage::ShutdownAck(message) if message.session_id == session.session_id => {
-                    Ok(())
-                }
-                VitaMessage::Fatal(_) | VitaMessage::Handshake(_) | VitaMessage::Ready(_) => {
-                    Err("Vita sidecar emitted an invalid Host-phase message".to_string())
-                }
-                VitaMessage::ActionCancelled(_) | VitaMessage::ShutdownAck(_) => {
-                    Err("Vita sidecar lifecycle response session was not exact".to_string())
-                }
-            };
+            #[cfg(feature = "d32-a-host-canary")]
+            session.record_inbound(&message);
+            let result = dispatch_inbound_message(&session, &storage, &registry, &secrets, message);
             if result.is_err() {
                 break;
             }
@@ -5213,12 +7516,12 @@ mod windows {
         result
     }
 
-    fn handle_revalidate_grant(
+    fn revalidate_grant_decision(
         session: &Arc<HostSessionState>,
         storage: &StorageService,
         registry: &CapabilityRegistry,
         request: RevalidateGrant,
-    ) -> Result<(), String> {
+    ) -> Result<GrantRevalidated, String> {
         request
             .validate()
             .map_err(|_| "Vita revalidation request was malformed".to_string())?;
@@ -5236,24 +7539,24 @@ mod windows {
             HostTurnAuthority::Active(active)
                 if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
-            return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+            return Ok(GrantRevalidated {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: false,
                 grant: None,
                 error_code: Some("TURN_NOT_ACTIVE".to_string()),
-            }));
+            });
         }
         let authority_scope = match storage.capability_authorization_scope() {
             Ok(scope) => scope,
             Err(error) => {
-                return session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+                return Ok(GrantRevalidated {
                     request_id: request.request_id,
                     session_id: session.session_id.clone(),
                     allowed: false,
                     grant: None,
                     error_code: Some(error.code),
-                }));
+                });
             }
         };
         let result = require_current_session_life_in_scope(&authority_scope, session)
@@ -5278,23 +7581,328 @@ mod windows {
                 )
             });
         let result = match result {
-            Ok(grant) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+            Ok(grant) => GrantRevalidated {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: true,
                 grant: Some(grant),
                 error_code: None,
-            })),
-            Err(error) => session.send(&HostMessage::GrantRevalidated(GrantRevalidated {
+            },
+            Err(error) => GrantRevalidated {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: false,
                 grant: None,
                 error_code: Some(error_code(&error)),
-            })),
+            },
         };
         drop(authority);
-        result
+        Ok(result)
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn canary_exact_cargo_request(session: &HostSessionState, request: &RevalidateGrant) -> bool {
+        request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+            && request.binding.task_id == session.task_id
+            && request.binding.life_id == session.life_id
+            && request.binding.session_id == session.session_id
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn canary_prepare_revalidation(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: &mut RevalidateGrant,
+    ) -> Result<Option<D32HostCanaryMode>, String> {
+        let Some(control) = session.canary_control() else {
+            return Ok(None);
+        };
+        if !canary_exact_cargo_request(session, request) {
+            return Ok(None);
+        }
+        let exact_capability =
+            request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID;
+        let exact_tool = request.binding.program_id == CARGO_PROGRAM_ID;
+        let exact_profile = request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID;
+        let exact_cargo_check = request.binding.argv_count == 2
+            && request.binding.argv_hash == CARGO_ARGV_HASH
+            && request.binding.stdout_bound == 65_536
+            && request.binding.stderr_bound == 65_536
+            && request.binding.timeout_ms == 120_000
+            && request.binding.environment_policy_hash == CARGO_ENVIRONMENT_POLICY_HASH
+            && request.binding.git_metadata_fence_hash == CARGO_NO_GIT_METADATA_FENCE;
+        control.trace.update(|trace| {
+            trace.exact_capability = exact_capability;
+            trace.exact_tool = exact_tool;
+            trace.exact_profile = exact_profile;
+            trace.exact_cargo_check = exact_cargo_check;
+        });
+        let first_fence = control.trace.snapshot().pre_native_fence_seen;
+        if first_fence {
+            return Ok(None);
+        }
+        let run_id = d32_run_id(
+            &request.binding.session_id,
+            &request.binding.turn_id,
+            &request.binding.tool_call_id,
+        );
+        control.trace.update(|trace| {
+            trace.native_evidence_run_id = Some(run_id);
+            trace.native_evidence_session_id = Some(request.binding.session_id.clone());
+            trace.native_evidence_life_id = Some(request.binding.life_id.clone());
+            trace.native_evidence_task_id = Some(request.binding.task_id.clone());
+            trace.native_evidence_turn_id = Some(request.binding.turn_id.clone());
+            trace.native_evidence_tool_call_id = Some(request.binding.tool_call_id.clone());
+        });
+        control
+            .trace
+            .update(|trace| trace.pre_native_fence_seen = true);
+        match control.mode {
+            D32HostCanaryMode::Positive | D32HostCanaryMode::GrantReplay => Ok(Some(control.mode)),
+            D32HostCanaryMode::RevokeBeforeRevalidation => {
+                let capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
+                    .map_err(|_| d32_not_executable("Cargo capability id invalid"))?;
+                let authority = storage
+                    .capability_authorization_scope()
+                    .map_err(|error| d32_not_executable(error.code))?;
+                let row = authority
+                    .find_capability_authorization(&session.life_id, &capability_id)
+                    .map_err(|_| d32_not_executable("Cargo capability authorization unavailable"))?
+                    .ok_or_else(|| d32_not_executable("Cargo capability authorization missing"))?;
+                if !row.enabled {
+                    return Err(d32_not_executable(
+                        "Cargo capability root was already disabled before revoke mode",
+                    ));
+                }
+                drop(authority);
+                let transition = apply_transition_for_host_canary(
+                    storage,
+                    registry,
+                    PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
+                    false,
+                    row.revision,
+                    &session.life_id,
+                )
+                .map_err(|error| {
+                    d32_not_executable(format!("revoke transition failed: {error:?}"))
+                })?;
+                control.set_revoke_restore_revision(transition.revision);
+                control.trace.update(|trace| trace.revoke_applied = true);
+                Ok(Some(control.mode))
+            }
+            D32HostCanaryMode::CancelBeforeRevalidation => {
+                control.signal_cancel_worker();
+                control.cancel_barrier().wait();
+                Ok(Some(control.mode))
+            }
+            D32HostCanaryMode::ExecutableIdentityTamper => {
+                request.binding.executable_identity =
+                    format!("d32-a-tampered-{}", request.binding.executable_identity);
+                Ok(Some(control.mode))
+            }
+            D32HostCanaryMode::EnvironmentProfileTamper => {
+                request.binding.environment_policy_hash =
+                    format!("d32-a-tampered-{}", request.binding.environment_policy_hash);
+                Ok(Some(control.mode))
+            }
+            D32HostCanaryMode::LifeBeforeRevalidation => {
+                d32_life_switch_snapshot(storage)?;
+                control
+                    .trace
+                    .update(|trace| trace.life_switch_applied = true);
+                Ok(Some(control.mode))
+            }
+            D32HostCanaryMode::MigrationBeforeRevalidation => {
+                d32_migration_snapshot(storage)?;
+                control
+                    .trace
+                    .update(|trace| trace.isolated_migration_applied = true);
+                Ok(Some(control.mode))
+            }
+        }
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_life_switch_snapshot(storage: &StorageService) -> Result<(), String> {
+        let before = storage
+            .get_current_life()
+            .map_err(|error| d32_not_executable(format!("canary Life read failed: {error:?}")))?
+            .ok_or_else(|| d32_not_executable("canary current Life was not published"))?;
+        let persona_id = format!("d32-a-persona-{}", std::process::id());
+        let life_id = format!("d32-a-life-switch-{}", std::process::id());
+        storage
+            .save_persona(crate::storage::PersonaTemplateRecord {
+                id: persona_id.clone(),
+                name: "D32-A canary Life-switch persona".to_string(),
+                version: 1,
+                persona_json: "{}".to_string(),
+            })
+            .map_err(|error| {
+                d32_not_executable(format!("canary persona write failed: {error:?}"))
+            })?;
+        storage
+            .save_life(crate::storage::LifeIdentityRecord {
+                id: life_id.clone(),
+                name: "D32-A canary Life-switch life".to_string(),
+                created_at: "2026-09-19T00:00:00.000Z".to_string(),
+                version: 1,
+                body_id: format!("d32-a-body-{}", std::process::id()),
+                persona_id,
+                persona_version: 1,
+            })
+            .map_err(|error| d32_not_executable(format!("canary Life write failed: {error:?}")))?;
+        let current = storage
+            .get_current_life()
+            .map_err(|error| {
+                d32_not_executable(format!("canary Life switch read failed: {error:?}"))
+            })?
+            .ok_or_else(|| d32_not_executable("canary switched Life was not published"))?;
+        if current.id == before.id || current.id != life_id {
+            return Err(d32_not_executable("canary Life switch was not exact"));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_migration_snapshot(storage: &StorageService) -> Result<(), String> {
+        let source = storage.active_data_root().map_err(|error| {
+            d32_not_executable(format!("canary active root unavailable: {error:?}"))
+        })?;
+        let parent = source
+            .parent()
+            .ok_or_else(|| d32_not_executable("canary migration parent unavailable"))?;
+        let target = parent.join(format!("d32-a-migration-target-{}", std::process::id()));
+        if target.exists() {
+            return Err(d32_not_executable("canary migration target already exists"));
+        }
+        let migration = storage.migrate_location(
+            target
+                .to_str()
+                .ok_or_else(|| d32_not_executable("canary migration target path invalid"))?,
+        );
+        if !migration.success || !migration.restart_required {
+            return Err(d32_not_executable(format!(
+                "canary migration did not return restart-required success: {:?}",
+                migration.failed_stage
+            )));
+        }
+        let current = storage
+            .get_current_life()
+            .map_err(|error| {
+                d32_not_executable(format!("canary migrated Life read failed: {error:?}"))
+            })?
+            .ok_or_else(|| d32_not_executable("canary migrated Life was absent"))?;
+        if current.id.is_empty() {
+            return Err(d32_not_executable(
+                "canary migrated Life identity was empty",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn handle_revalidate_grant_canary(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        secrets: &WindowsCredentialSecretStore,
+        request: RevalidateGrant,
+    ) -> Result<(), String> {
+        let mut effective_request = request.clone();
+        let mode = canary_prepare_revalidation(session, storage, registry, &mut effective_request)?;
+        let Some(control) = session.canary_control() else {
+            let response =
+                revalidate_grant_decision(session, storage, registry, effective_request)?;
+            return session.send(&HostMessage::GrantRevalidated(response));
+        };
+        let response = revalidate_grant_decision(session, storage, registry, effective_request)?;
+        let expected_restart_code = match mode {
+            Some(D32HostCanaryMode::LifeBeforeRevalidation) => Some(LIFE_RESTART_REQUIRED),
+            Some(D32HostCanaryMode::MigrationBeforeRevalidation) => {
+                Some(CAPABILITY_AUTHORITY_RESTART_REQUIRED)
+            }
+            _ => None,
+        };
+        if let Some(expected_code) = expected_restart_code {
+            if response.allowed || response.error_code.as_deref() != Some(expected_code) {
+                return Err(d32_not_executable(format!(
+                    "canonical restart denial was not exact: expected {expected_code}, got {:?}",
+                    response.error_code
+                )));
+            }
+        }
+        if mode == Some(D32HostCanaryMode::GrantReplay) && response.allowed {
+            // Hold the first canonical response.  The exact same parsed
+            // inbound request is then sent through the canonical dispatch
+            // boundary a second time; the consumed Host ledger must deny it.
+            // Only that safe denial is released on the wire.
+            control
+                .trace
+                .update(|trace| trace.replay_first_allowed += 1);
+            control.begin_replay_capture()?;
+            let replay_result = d32_dispatch_replay_inbound(
+                session,
+                storage,
+                registry,
+                secrets,
+                VitaMessage::RevalidateGrant(request.clone()),
+            );
+            if let Err(error) = replay_result {
+                let _ = control.finish_replay_capture();
+                return Err(error);
+            }
+            let replay_response = control.finish_replay_capture()?;
+            let replay_denied = !replay_response.allowed;
+            control.trace.update(|trace| {
+                trace.replay_checked = true;
+                trace.replay_denied = replay_denied;
+            });
+            if !replay_denied {
+                return Err(
+                    "D32_A_HOST_FAILURE: GrantReplay canonical duplicate was allowed".to_string(),
+                );
+            }
+            return session.send(&HostMessage::GrantRevalidated(replay_response));
+        }
+        if matches!(
+            mode,
+            Some(
+                D32HostCanaryMode::ExecutableIdentityTamper
+                    | D32HostCanaryMode::EnvironmentProfileTamper
+            )
+        ) {
+            control
+                .trace
+                .update(|trace| trace.tamper_denied = !response.allowed);
+        }
+        session.send(&HostMessage::GrantRevalidated(response))
+    }
+
+    fn handle_revalidate_grant_with_secrets(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        _secrets: &WindowsCredentialSecretStore,
+        request: RevalidateGrant,
+    ) -> Result<(), String> {
+        #[cfg(feature = "d32-a-host-canary")]
+        if session.canary_control().is_some() {
+            return handle_revalidate_grant_canary(session, storage, registry, _secrets, request);
+        }
+        let response = revalidate_grant_decision(session, storage, registry, request)?;
+        session.send(&HostMessage::GrantRevalidated(response))
+    }
+
+    fn handle_revalidate_grant(
+        session: &Arc<HostSessionState>,
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        request: RevalidateGrant,
+    ) -> Result<(), String> {
+        let secrets = WindowsCredentialSecretStore::new();
+        handle_revalidate_grant_with_secrets(session, storage, registry, &secrets, request)
     }
 
     fn current_workspace_revision(
@@ -5373,19 +7981,30 @@ mod windows {
             let Some(expected) = session.cargo_profile.as_ref() else {
                 return Err("D32 Host Cargo profile evidence was absent".to_string());
             };
-            let current = match session.cargo_profile_app_data_root.as_deref() {
-                Some(root) => host_cargo_profile_evidence(root).map_err(|_| {
-                    "D32 Host Cargo profile evidence changed or became unavailable".to_string()
-                })?,
-                None => expected.clone(),
+            let current = {
+                match session.app_data_root_retained.as_ref() {
+                    Some(root) => {
+                        let selection = host_read_cargo_selection_marker_retained(root)?;
+                        host_cargo_profile_evidence_for_selection(root, &selection).map_err(
+                            |_| {
+                                "D32 Host Cargo profile evidence changed or became unavailable"
+                                    .to_string()
+                            },
+                        )?
+                    }
+                    None => expected.clone(),
+                }
             };
-            let fresh_source_exact = match session.cargo_profile_app_data_root.as_deref() {
-                Some(root) => match host_cargo_run_source_identity(root, binding) {
-                    Ok(identity) => identity == binding.working_directory_identity,
-                    Err(_) => false,
-                },
-                None => {
-                    binding.working_directory_identity == expected.staged_working_directory_identity
+            let fresh_source_exact = {
+                match session.app_data_root_retained.as_ref() {
+                    Some(root) => match host_cargo_run_source_identity_retained(root, binding) {
+                        Ok(identity) => identity == binding.working_directory_identity,
+                        Err(_) => false,
+                    },
+                    None => {
+                        binding.working_directory_identity
+                            == expected.staged_working_directory_identity
+                    }
                 }
             };
             current == *expected
@@ -6784,6 +9403,10 @@ mod windows {
         if let Some(root) = std::env::var_os("D32_A_TEST_APP_DATA_ROOT") {
             return Ok(PathBuf::from(root));
         }
+        #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+        if let Some(root) = std::env::var_os("D32_A_CANARY_APP_DATA_ROOT") {
+            return Ok(PathBuf::from(root));
+        }
         app.path()
             .app_data_dir()
             .map_err(|error| format!("Vita app data root unavailable: {error}"))
@@ -6792,6 +9415,10 @@ mod windows {
     fn sidecar_resource_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
         #[cfg(test)]
         if let Some(root) = std::env::var_os("D32_A_TEST_RESOURCE_DIR") {
+            return Ok(PathBuf::from(root));
+        }
+        #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+        if let Some(root) = std::env::var_os("D32_A_CANARY_RESOURCE_DIR") {
             return Ok(PathBuf::from(root));
         }
         app.path()
@@ -6985,6 +9612,1825 @@ mod windows {
         coordinator.stop()
     }
 
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_not_executable(message: impl Into<String>) -> String {
+        format!("D32_A_NOT_EXECUTABLE: {}", message.into())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_require_cargo_root(storage: &StorageService, life_id: &str) -> Result<(), String> {
+        let capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
+            .map_err(|_| d32_not_executable("Cargo capability id invalid"))?;
+        let authority = storage
+            .capability_authorization_scope()
+            .map_err(|error| d32_not_executable(error.code))?;
+        let row = authority
+            .find_capability_authorization(life_id, &capability_id)
+            .map_err(|_| d32_not_executable("Cargo capability authorization unavailable"))?;
+        if row.is_some_and(|row| row.enabled) {
+            Ok(())
+        } else {
+            Err(d32_not_executable("Cargo capability root is not enabled"))
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_parse_git_config_section(name: &str) -> Result<(String, bool), String> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(d32_not_executable(
+                "candidate Git config section was malformed",
+            ));
+        }
+        let mut pieces = name.splitn(2, char::is_whitespace);
+        let section = pieces.next().unwrap_or_default().trim();
+        let remainder = pieces.next().unwrap_or_default().trim();
+        if section.is_empty() {
+            return Err(d32_not_executable(
+                "candidate Git config section was malformed",
+            ));
+        }
+        if remainder.is_empty() {
+            return Ok((section.to_ascii_lowercase(), false));
+        }
+        if !remainder.starts_with('"') || !remainder.ends_with('"') || remainder.len() < 2 {
+            return Err(d32_not_executable(
+                "candidate Git config subsection was malformed",
+            ));
+        }
+        Ok((section.to_ascii_lowercase(), true))
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_validate_git_config_bytes(bytes: &[u8]) -> Result<String, String> {
+        const MAX_CONFIG_BYTES: usize = 256 * 1024;
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(d32_not_executable(
+                "candidate Git config exceeded its bound",
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| d32_not_executable("candidate Git config was not UTF-8"))?;
+        let mut section = None;
+        for raw_line in text.lines() {
+            if raw_line.trim_end().ends_with('\\') {
+                return Err(d32_not_executable(
+                    "candidate Git config continuation was rejected",
+                ));
+            }
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') {
+                if !line.ends_with(']') || line.len() < 3 {
+                    return Err(d32_not_executable(
+                        "candidate Git config section was malformed",
+                    ));
+                }
+                let parsed = d32_parse_git_config_section(&line[1..line.len() - 1])?;
+                if parsed.0 == "include"
+                    || parsed.0.starts_with("includeif")
+                    || parsed.0.starts_with("include.")
+                    || parsed.0 == "core.worktree"
+                {
+                    return Err(d32_not_executable(
+                        "candidate Git config external indirection was rejected",
+                    ));
+                }
+                section = Some(parsed);
+                continue;
+            }
+            let (section, has_subsection) = section
+                .as_ref()
+                .map(|(name, has_subsection)| (name.as_str(), *has_subsection))
+                .ok_or_else(|| {
+                    d32_not_executable("candidate Git config key preceded its section")
+                })?;
+            let key_end = line
+                .find(|character: char| character == '=' || character.is_ascii_whitespace())
+                .unwrap_or(line.len());
+            let key = line[..key_end].trim();
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            {
+                return Err(d32_not_executable("candidate Git config key was malformed"));
+            }
+            let key = key.to_ascii_lowercase();
+            let dotted_key = if key.contains('.') {
+                key.clone()
+            } else {
+                format!("{section}.{key}")
+            };
+            let filter_command = section == "filter"
+                && has_subsection
+                && matches!(key.as_str(), "clean" | "process" | "smudge");
+            if dotted_key == "core.worktree"
+                || dotted_key == "include.path"
+                || dotted_key.starts_with("includeif.")
+                || dotted_key == "extensions.worktreeconfig"
+                || dotted_key == "core.excludesfile"
+                || dotted_key == "core.attributesfile"
+                || filter_command
+                || (dotted_key.starts_with("filter.")
+                    && (dotted_key.ends_with(".clean")
+                        || dotted_key.ends_with(".process")
+                        || dotted_key.ends_with(".smudge")))
+            {
+                return Err(d32_not_executable(
+                    "candidate Git config external execution or indirection was rejected",
+                ));
+            }
+        }
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    struct D32GitMetadataFence {
+        // All production authority below is retained-handle based.  The
+        // command's repository pathname remains a launch projection only.
+        workspace_root: D32RetainedDirectory,
+        git_directory: D32RetainedDirectory,
+        config_retained: D32RetainedFile,
+        git_directory_identity: HostFileIdentity,
+        config_identity: HostFileIdentity,
+        config_bytes: Vec<u8>,
+        config_hash: String,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_optional_git_metadata_retained(
+        git_directory: &D32RetainedDirectory,
+        name: &OsStr,
+        expect_directory: bool,
+        description: &str,
+    ) -> Result<Option<HostFileIdentity>, String> {
+        if expect_directory {
+            return git_directory
+                .open_existing_child_if_present(name)
+                .map(|child| child.map(|child| child.identity()))
+                .map_err(|error| {
+                    d32_not_executable(format!(
+                        "candidate Git metadata fence failed for {description}: {error}"
+                    ))
+                });
+        }
+        git_directory
+            .open_existing_file_if_present(name)
+            .map(|file| file.map(|file| file.identity()))
+            .map_err(|error| {
+                d32_not_executable(format!(
+                    "candidate Git metadata fence failed for {description}: {error}"
+                ))
+            })
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_validate_forbidden_git_metadata(
+        git_directory: &D32RetainedDirectory,
+        phase: &str,
+    ) -> Result<(), String> {
+        for (name, expect_directory, description) in [
+            (OsStr::new("gitdir"), false, ".git/gitdir"),
+            (OsStr::new("commondir"), false, ".git/commondir"),
+            (OsStr::new("worktrees"), true, ".git/worktrees"),
+        ] {
+            if d32_optional_git_metadata_retained(
+                git_directory,
+                name,
+                expect_directory,
+                description,
+            )?
+            .is_some()
+            {
+                return Err(d32_not_executable(format!(
+                    "forbidden Git metadata {phase}: {description}"
+                )));
+            }
+        }
+        let Some(objects) = git_directory.open_existing_child_if_present(OsStr::new("objects"))?
+        else {
+            return Ok(());
+        };
+        let Some(info) = objects.open_existing_child_if_present(OsStr::new("info"))? else {
+            return Ok(());
+        };
+        if d32_optional_git_metadata_retained(
+            &info,
+            OsStr::new("alternates"),
+            false,
+            ".git/objects/info/alternates",
+        )?
+        .is_some()
+        {
+            return Err(d32_not_executable(format!(
+                "forbidden Git metadata {phase}: .git/objects/info/alternates"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl D32GitMetadataFence {
+        fn capture(workspace_root: D32RetainedDirectory) -> Result<Self, String> {
+            workspace_root.revalidate("candidate Git workspace root before metadata capture")?;
+            let git_directory = workspace_root
+                .open_existing_child(OsStr::new(".git"))
+                .map_err(|error| {
+                    d32_not_executable(format!("candidate Git metadata identity failed: {error}"))
+                })?;
+            let config_retained = git_directory
+                .open_existing_file(OsStr::new("config"))
+                .map_err(|error| {
+                    d32_not_executable(format!("candidate Git config identity failed: {error}"))
+                })?;
+            let config_bytes = config_retained
+                .read_bounded(256 * 1024)
+                .map_err(|error| d32_not_executable(error))?;
+            let config_hash = d32_validate_git_config_bytes(&config_bytes)?;
+            workspace_root.revalidate("candidate Git workspace root after metadata capture")?;
+            git_directory.revalidate("candidate Git metadata after capture")?;
+            config_retained.revalidate("candidate Git config after capture")?;
+            d32_validate_forbidden_git_metadata(&git_directory, "was present")?;
+            let git_directory_identity = git_directory.identity();
+            let config_identity = config_retained.identity();
+            Ok(Self {
+                workspace_root,
+                git_directory,
+                config_retained,
+                git_directory_identity,
+                config_identity,
+                config_bytes,
+                config_hash,
+            })
+        }
+
+        fn revalidate(&self) -> Result<(), String> {
+            self.workspace_root
+                .revalidate("candidate Git workspace root recheck")?;
+            self.git_directory
+                .revalidate("candidate Git metadata recheck")?;
+            if self.git_directory.identity() != self.git_directory_identity {
+                return Err(d32_not_executable(
+                    "candidate Git metadata directory identity changed",
+                ));
+            }
+            self.config_retained
+                .revalidate("candidate Git config recheck")?;
+            if self.config_retained.identity() != self.config_identity {
+                return Err(d32_not_executable("candidate Git config identity changed"));
+            }
+            let bytes = self
+                .config_retained
+                .read_bounded(256 * 1024)
+                .map_err(|error| d32_not_executable(error))?;
+            if bytes != self.config_bytes
+                || d32_validate_git_config_bytes(&bytes)? != self.config_hash
+            {
+                return Err(d32_not_executable("candidate Git config bytes changed"));
+            }
+            d32_validate_forbidden_git_metadata(&self.git_directory, "appeared")
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_validate_git_status_output(output: &[u8]) -> Result<bool, String> {
+        if output.len() > 1024 * 1024 {
+            return Err(d32_not_executable(
+                "trusted Git status output exceeded its bound",
+            ));
+        }
+        if output.is_empty() {
+            return Ok(false);
+        }
+        if !output.ends_with(&[0]) {
+            return Err(d32_not_executable(
+                "trusted Git status output was not NUL framed",
+            ));
+        }
+        let mut records = output
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty());
+        let validate_path = |path: &[u8]| {
+            if path.is_empty()
+                || path.starts_with(b"/")
+                || path.starts_with(b"\\")
+                || path.windows(2).any(|pair| pair == b"..")
+            {
+                return Err(d32_not_executable(
+                    "trusted Git status output contained an unsafe path",
+                ));
+            }
+            Ok(())
+        };
+        while let Some(record) = records.next() {
+            if record.len() < 4 || record[2] != b' ' {
+                return Err(d32_not_executable(
+                    "trusted Git status output was malformed",
+                ));
+            }
+            let path = &record[3..];
+            validate_path(path)?;
+            if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
+                let Some(rename_source) = records.next() else {
+                    return Err(d32_not_executable(
+                        "trusted Git status rename record was incomplete",
+                    ));
+                };
+                validate_path(rename_source)?;
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_read_pipe_bounded<R: Read>(mut reader: R) -> Result<Vec<u8>, String> {
+        const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|_| "trusted Git output could not be drained".to_string())?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+            if bytes.len().saturating_add(read) > MAX_OUTPUT_BYTES {
+                return Err("trusted Git output exceeded its bound".to_string());
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_run_bounded_git_command(
+        command: &mut Command,
+        timeout: Duration,
+        pre_spawn_fence: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+        // The fence is evaluated at the last possible point before
+        // CreateProcessW is reached by std::process::Command.  Earlier
+        // validation remains useful for diagnostics, but cannot be the final
+        // authority check across command construction.
+        pre_spawn_fence()?;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| "trusted Git status process failed to spawn".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "trusted Git stdout pipe was unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "trusted Git stderr pipe was unavailable".to_string())?;
+        let (sender, receiver) = mpsc::channel::<(&'static str, Result<Vec<u8>, String>)>();
+        let stdout_sender = sender.clone();
+        let _stdout_reader = thread::spawn(move || {
+            let _ = stdout_sender.send(("stdout", d32_read_pipe_bounded(stdout)));
+        });
+        let stderr_sender = sender;
+        let _stderr_reader = thread::spawn(move || {
+            let _ = stderr_sender.send(("stderr", d32_read_pipe_bounded(stderr)));
+        });
+
+        let deadline = Instant::now() + timeout;
+        let mut status = None;
+        let mut stdout_bytes = None;
+        let mut stderr_bytes = None;
+        loop {
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .map_err(|_| "trusted Git status process could not be reaped".to_string())?;
+            }
+            while let Ok((stream, result)) = receiver.try_recv() {
+                let bytes = result.map_err(|error| {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    error
+                })?;
+                match stream {
+                    "stdout" => stdout_bytes = Some(bytes),
+                    "stderr" => stderr_bytes = Some(bytes),
+                    _ => return Err("trusted Git returned an unknown output stream".to_string()),
+                }
+            }
+            if let (Some(status), Some(stdout), Some(stderr)) = (
+                status.as_ref(),
+                stdout_bytes.as_ref(),
+                stderr_bytes.as_ref(),
+            ) {
+                return Ok((status.clone(), stdout.clone(), stderr.clone()));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("trusted Git status process exceeded its timeout".to_string());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_run_trusted_git_command(
+        repository_root: &Path,
+        git_path: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
+        let git_image = D32RetainedFile::open(git_path).map_err(|error| {
+            d32_not_executable(format!("trusted Git image fence failed: {error}"))
+        })?;
+        let workspace_root = D32RetainedDirectory::open(repository_root).map_err(|error| {
+            d32_not_executable(format!("trusted Git workspace retention failed: {error}"))
+        })?;
+        let metadata_fence = D32GitMetadataFence::capture(workspace_root)?;
+        let mut random = [0_u8; 12];
+        getrandom::fill(&mut random)
+            .map_err(|_| d32_not_executable("trusted Git home identity was unavailable"))?;
+        let home = std::env::temp_dir().join(format!(
+            "digital-life-d32a-git-home-{}-{}",
+            std::process::id(),
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+        fs::create_dir(&home)
+            .map_err(|_| d32_not_executable("trusted Git home could not be created"))?;
+        let ceiling = repository_root
+            .parent()
+            .ok_or_else(|| d32_not_executable("candidate repository root had no Git ceiling"))?;
+        let result = (|| {
+            metadata_fence.revalidate()?;
+            git_image
+                .revalidate("trusted Git image recheck before launch")
+                .map_err(|error| {
+                    d32_not_executable(format!("trusted Git image recheck failed: {error}"))
+                })?;
+            let mut command = Command::new(git_path);
+            command
+                .current_dir(repository_root)
+                .args(args)
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GCM_INTERACTIVE", "Never")
+                .env("GIT_CEILING_DIRECTORIES", ceiling)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", &home);
+            if let Some(system_root) = std::env::var_os("SystemRoot") {
+                command.env("SystemRoot", system_root);
+            }
+            d32_run_bounded_git_command(&mut command, timeout, || {
+                metadata_fence.revalidate()?;
+                git_image
+                    .revalidate("trusted Git image final fence")
+                    .map_err(|error| {
+                        d32_not_executable(format!("trusted Git image final fence failed: {error}"))
+                    })?;
+                Ok(())
+            })
+            .map_err(d32_not_executable)
+        })();
+        let cleanup = fs::remove_dir_all(&home).map_err(|error| {
+            d32_not_executable(format!("trusted Git home cleanup failed: {error}"))
+        });
+        let result = match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        };
+        git_image
+            .revalidate("trusted Git image recheck after launch")
+            .map_err(|error| {
+                d32_not_executable(format!("trusted Git image recheck failed: {error}"))
+            })?;
+        metadata_fence.revalidate()?;
+        result
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_verify_trusted_git_status(
+        repository_root: &Path,
+        git_path: &Path,
+    ) -> Result<(), String> {
+        let (status, stdout, _stderr) = d32_run_trusted_git_command(
+            repository_root,
+            git_path,
+            &[
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "submodule.recurse=false",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            Duration::from_secs(5),
+        )?;
+        if !status.success() {
+            return Err(d32_not_executable("trusted Git status process was denied"));
+        }
+        if d32_validate_git_status_output(&stdout)? {
+            return Err(d32_not_executable("candidate checkout was not clean"));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_candidate_release_image() -> Result<(PathBuf, String), String> {
+        let configured = std::env::var_os("D32_A_CANDIDATE_RELEASE_IMAGE")
+            .ok_or_else(|| d32_not_executable("candidate Vita release image is unavailable"))?;
+        let path = fs::canonicalize(PathBuf::from(configured))
+            .map_err(|_| d32_not_executable("candidate Vita release image is not readable"))?;
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| d32_not_executable("candidate repository root is unavailable"))?
+            .to_path_buf();
+        let expected_release_path = fs::canonicalize(
+            repository_root
+                .join("vita-agent")
+                .join("target")
+                .join("release")
+                .join(SIDECAR_RESOURCE_NAME),
+        )
+        .map_err(|_| d32_not_executable("exact candidate Vita release image is unavailable"))?;
+        if path != expected_release_path
+            || path.file_name().and_then(|name| name.to_str()) != Some(SIDECAR_RESOURCE_NAME)
+        {
+            return Err(d32_not_executable(
+                "candidate Vita release image is not the exact pinned production image",
+            ));
+        }
+        host_file_identity(&path, false).map_err(|error| {
+            d32_not_executable(format!("candidate sidecar identity failed: {error}"))
+        })?;
+        let expected = std::env::var("D32_A_CANDIDATE_RELEASE_IMAGE_SHA256")
+            .map_err(|_| d32_not_executable("candidate Vita release image hash is unavailable"))?;
+        if expected.len() != 64 || expected.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+            return Err(d32_not_executable(
+                "candidate Vita release image hash is malformed",
+            ));
+        }
+        let expected = expected.to_ascii_lowercase();
+        let actual = host_hash_file(&path, D32_IMAGE_HASH_MAX_BYTES).map_err(|error| {
+            d32_not_executable(format!("candidate sidecar hash failed: {error}"))
+        })?;
+        if actual != expected {
+            return Err(d32_not_executable(
+                "candidate Vita release image hash does not match the supplied evidence",
+            ));
+        }
+
+        let candidate_sha = std::env::var("D32_A_CANDIDATE_SHA")
+            .map_err(|_| d32_not_executable("candidate Git SHA is unavailable"))?;
+        if candidate_sha.len() != 40
+            || candidate_sha
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(d32_not_executable("candidate Git SHA is malformed"));
+        }
+        let git_path = resolve_git_path()
+            .map_err(|error| d32_not_executable(format!("trusted Git is unavailable: {error}")))?;
+        let (git_sha_status, git_sha_stdout, _git_sha_stderr) = d32_run_trusted_git_command(
+            &repository_root,
+            &git_path,
+            &["rev-parse", "--verify", "HEAD"],
+            Duration::from_secs(5),
+        )?;
+        let git_sha_stdout = std::str::from_utf8(&git_sha_stdout)
+            .map_err(|_| d32_not_executable("candidate Git provenance output was not UTF-8"))?;
+        let git_sha_line = git_sha_stdout.strip_suffix('\n').ok_or_else(|| {
+            d32_not_executable(
+                "candidate Git provenance output was not one newline-terminated line",
+            )
+        })?;
+        if !git_sha_status.success()
+            || git_sha_line != candidate_sha
+            || git_sha_stdout[..git_sha_stdout.len() - 1]
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b' ' | b'\t'))
+        {
+            return Err(d32_not_executable(
+                "candidate release image is not bound to the exact repository SHA",
+            ));
+        }
+        d32_verify_trusted_git_status(&repository_root, &git_path)?;
+
+        let provenance_path = std::env::var_os("D32_A_CANDIDATE_PROVENANCE")
+            .ok_or_else(|| d32_not_executable("candidate provenance manifest is unavailable"))?;
+        let provenance_path = fs::canonicalize(provenance_path)
+            .map_err(|_| d32_not_executable("candidate provenance manifest is unreadable"))?;
+        host_file_identity(&provenance_path, false).map_err(|error| {
+            d32_not_executable(format!("candidate provenance identity failed: {error}"))
+        })?;
+        let metadata = fs::metadata(&provenance_path)
+            .map_err(|_| d32_not_executable("candidate provenance metadata is unavailable"))?;
+        if metadata.len() > 64 * 1024 {
+            return Err(d32_not_executable(
+                "candidate provenance manifest exceeded its bound",
+            ));
+        }
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&fs::read(&provenance_path).map_err(|_| {
+                d32_not_executable("candidate provenance manifest could not be read")
+            })?)
+            .map_err(|_| d32_not_executable("candidate provenance manifest was not valid JSON"))?;
+        let field = |name: &str| provenance.get(name).and_then(serde_json::Value::as_str);
+        if field("candidate_sha") != Some(candidate_sha.as_str())
+            || field("source_repo") != Some(repository_root.to_string_lossy().as_ref())
+            || field("image_path") != Some(path.to_string_lossy().as_ref())
+            || field("image_sha256") != Some(expected.as_str())
+            || field("git_status") != Some("clean")
+            || field("build_profile") != Some("release")
+            || field("build_command")
+                != Some("cargo build --manifest-path vita-agent/Cargo.toml --release --locked --bin vita-agent")
+        {
+            return Err(d32_not_executable(
+                "candidate provenance manifest did not match the exact release contract",
+            ));
+        }
+        Ok((path, expected))
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_restore_revoke(
+        storage: &StorageService,
+        registry: &CapabilityRegistry,
+        life_id: &str,
+        control: &D32HostCanaryControl,
+    ) -> Result<(), String> {
+        let Some(revision) = control.take_revoke_restore_revision() else {
+            return Ok(());
+        };
+        let restored = apply_transition_for_host_canary(
+            storage,
+            registry,
+            PRODUCTION_CARGO_CHECK_CAPABILITY_ID,
+            true,
+            revision,
+            life_id,
+        )
+        .map_err(|error| format!("D32_A_HOST_FAILURE: revoke restoration failed: {error:?}"))?;
+        if !restored.enabled {
+            return Err(
+                "D32_A_HOST_FAILURE: revoke restoration did not re-enable Cargo".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_validate_trace(
+        mode: D32HostCanaryMode,
+        trace: &D32HostCanaryTraceSnapshot,
+        terminal_phase: Option<protocol::TurnPhase>,
+        turn_error: Option<&str>,
+    ) -> Result<(), String> {
+        let common_exact = trace.exact_capability
+            && trace.exact_tool
+            && trace.exact_profile
+            && trace.exact_cargo_check;
+        let expected_revalidate_count = if mode == D32HostCanaryMode::GrantReplay {
+            2
+        } else {
+            1
+        };
+        if !common_exact
+            || trace.authority_evaluate != 1
+            || trace.confirmation_required != 1
+            || trace.issue_grant != 1
+            || trace.revalidate_grant != expected_revalidate_count
+            || trace.replay_wire_responses != 1
+        {
+            return Err(format!(
+                "D32_A_HOST_FAILURE: Host trace was not exact for {mode:?}: {trace:?}"
+            ));
+        }
+        if mode.expects_deny() {
+            if trace.grant_revalidated_allowed != 0
+                || trace.grant_revalidated_denied != 1
+                || trace.turn_completed != 0
+                || trace.turn_failed + trace.action_cancelled != 1
+                || trace.grant_denial_code.as_deref().is_none()
+                || turn_error.is_none()
+                || !matches!(
+                    terminal_phase,
+                    Some(
+                        protocol::TurnPhase::Failed
+                            | protocol::TurnPhase::Cancelled
+                            | protocol::TurnPhase::TimedOut
+                    )
+                )
+            {
+                return Err(format!(
+                    "D32_A_HOST_FAILURE: negative Host trace was not fail-closed: {trace:?}"
+                ));
+            }
+        } else if trace.grant_revalidated_allowed != 1
+            || trace.grant_revalidated_denied != 0
+            || trace.turn_completed != 1
+            || trace.turn_failed != 0
+            || trace.grant_denial_code.is_some()
+            || turn_error.is_some()
+            || !trace.binding_fields_validated
+            || terminal_phase != Some(protocol::TurnPhase::Completed)
+        {
+            return Err(format!(
+                "D32_A_HOST_FAILURE: positive Host trace was not exact: {trace:?}"
+            ));
+        }
+        if mode == D32HostCanaryMode::GrantReplay {
+            if !trace.replay_checked
+                || !trace.replay_denied
+                || trace.replay_exact_request_count != 2
+                || trace.replay_exact_session_count != 2
+                || trace.replay_first_allowed != 1
+                || trace.replay_second_denied != 1
+            {
+                return Err(
+                    "D32_A_HOST_FAILURE: GrantReplay did not prove exact canonical pre-native denial"
+                        .to_string(),
+                );
+            }
+        } else if trace.replay_exact_request_count != 0
+            || trace.replay_exact_session_count != 0
+            || trace.replay_first_allowed != 0
+            || trace.replay_second_denied != 0
+        {
+            return Err(format!(
+                "D32_A_HOST_FAILURE: unexpected replay evidence for {mode:?}: {trace:?}"
+            ));
+        }
+        if matches!(
+            mode,
+            D32HostCanaryMode::ExecutableIdentityTamper
+                | D32HostCanaryMode::EnvironmentProfileTamper
+        ) && !trace.tamper_denied
+        {
+            return Err("D32_A_HOST_FAILURE: tamper lane was not denied".to_string());
+        }
+        if mode == D32HostCanaryMode::RevokeBeforeRevalidation && !trace.revoke_applied {
+            return Err("D32_A_HOST_FAILURE: revoke seam was not applied".to_string());
+        }
+        if mode == D32HostCanaryMode::CancelBeforeRevalidation && trace.action_cancelled == 0 {
+            return Err(
+                "D32_A_HOST_FAILURE: cancellation acknowledgement was not observed".to_string(),
+            );
+        }
+        if mode == D32HostCanaryMode::LifeBeforeRevalidation && !trace.life_switch_applied {
+            return Err("D32_A_HOST_FAILURE: isolated Life seam was not applied".to_string());
+        }
+        if mode == D32HostCanaryMode::MigrationBeforeRevalidation
+            && !trace.isolated_migration_applied
+        {
+            return Err("D32_A_HOST_FAILURE: isolated migration seam was not applied".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    struct D32TreeManifestEntry {
+        relative_path: String,
+        kind: &'static str,
+        identity: String,
+        length: u64,
+        readonly: bool,
+        file_attributes: u32,
+        last_write_time: u64,
+        sha256: Option<String>,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct D32TreeManifest {
+        exists: bool,
+        entries: Vec<D32TreeManifestEntry>,
+        digest: String,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_hash_file_exact(path: &Path) -> Result<String, String> {
+        let mut file = File::open(path)
+            .map_err(|_| format!("D32 Host audit could not open {}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| format!("D32 Host audit could not read {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_tree_manifest_entry(
+        path: &Path,
+        relative_path: String,
+    ) -> Result<D32TreeManifestEntry, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|_| {
+            format!(
+                "D32 Host audit metadata was unavailable: {}",
+                path.display()
+            )
+        })?;
+        if host_metadata_is_reparse(&metadata) {
+            return Err(format!(
+                "D32 Host audit rejected a reparse entry: {}",
+                path.display()
+            ));
+        }
+        let is_directory = metadata.is_dir();
+        let is_file = metadata.is_file();
+        if !is_directory && !is_file {
+            return Err(format!(
+                "D32 Host audit encountered an unsupported entry: {}",
+                path.display()
+            ));
+        }
+        let identity = host_file_identity(path, is_directory)?.namespace_wire();
+        let length = if is_file { metadata.len() } else { 0 };
+        if length > D32_AUDIT_MAX_BYTES {
+            return Err(format!(
+                "D32 Host audit file exceeded its byte bound: {}",
+                path.display()
+            ));
+        }
+        let mut entry = D32TreeManifestEntry {
+            relative_path,
+            kind: if is_directory { "directory" } else { "file" },
+            identity,
+            length,
+            readonly: metadata.permissions().readonly(),
+            file_attributes: metadata.file_attributes(),
+            last_write_time: metadata.last_write_time(),
+            sha256: None,
+        };
+        if is_file {
+            entry.sha256 = Some(d32_hash_file_exact(path)?);
+        }
+        let after = fs::symlink_metadata(path)
+            .map_err(|_| format!("D32 Host audit metadata changed: {}", path.display()))?;
+        let after_identity = host_file_identity(path, is_directory)?.namespace_wire();
+        let after_sha256 = if is_file {
+            Some(d32_hash_file_exact(path)?)
+        } else {
+            None
+        };
+        if host_metadata_is_reparse(&after)
+            || after_identity != entry.identity
+            || (is_file && after.len() != entry.length)
+            || after.file_attributes() != entry.file_attributes
+            || after.last_write_time() != entry.last_write_time
+            || after_sha256 != entry.sha256
+        {
+            return Err(format!(
+                "D32 Host audit observed a concurrent metadata/content change: {}",
+                path.display()
+            ));
+        }
+        Ok(entry)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_collect_tree_manifest(
+        current: &Path,
+        relative_path: &str,
+        entries: &mut Vec<D32TreeManifestEntry>,
+        total_bytes: &mut u64,
+    ) -> Result<(), String> {
+        if entries.len() >= D32_AUDIT_MAX_ENTRIES {
+            return Err("D32 Host audit tree exceeded its entry bound".to_string());
+        }
+        let entry = d32_tree_manifest_entry(current, relative_path.to_string())?;
+        *total_bytes = total_bytes
+            .checked_add(entry.length)
+            .ok_or_else(|| "D32 Host audit tree byte bound overflowed".to_string())?;
+        if *total_bytes > D32_AUDIT_MAX_BYTES {
+            return Err("D32 Host audit tree exceeded its byte bound".to_string());
+        }
+        entries.push(entry);
+        if current.is_dir() {
+            let mut children = fs::read_dir(current)
+                .map_err(|_| format!("D32 Host audit enumeration failed: {}", current.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "D32 Host audit enumeration failed".to_string())?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let child_path = child.path();
+                let child_name = child.file_name().to_string_lossy().into_owned();
+                let child_relative = if relative_path == "." {
+                    child_name
+                } else {
+                    format!("{relative_path}/{child_name}")
+                };
+                d32_collect_tree_manifest(&child_path, &child_relative, entries, total_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_tree_manifest(path: &Path) -> Result<D32TreeManifest, String> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(D32TreeManifest {
+                    exists: false,
+                    entries: Vec::new(),
+                    digest: format!("{:x}", Sha256::digest(b"D32_A_MISSING_TREE")),
+                });
+            }
+            Err(_) => {
+                return Err(format!(
+                    "D32 Host audit metadata was unavailable: {}",
+                    path.display()
+                ));
+            }
+        };
+        if !metadata.is_dir() || host_metadata_is_reparse(&metadata) {
+            return Err(format!(
+                "D32 Host audit root was not a regular non-reparse directory: {}",
+                path.display()
+            ));
+        }
+        let canonical = fs::canonicalize(path).map_err(|_| {
+            format!(
+                "D32 Host audit root could not be canonicalized: {}",
+                path.display()
+            )
+        })?;
+        if canonical != path {
+            // Canonicalization is part of the identity fence.  Callers pass
+            // canonical roots; accepting a different path here would reopen a
+            // potentially redirected namespace during the post-audit check.
+            return Err(format!(
+                "D32 Host audit root was not canonical: {}",
+                path.display()
+            ));
+        }
+        let mut entries = Vec::new();
+        let mut total_bytes = 0;
+        d32_collect_tree_manifest(path, ".", &mut entries, &mut total_bytes)?;
+        let encoded = serde_json::to_vec(&entries)
+            .map_err(|_| "D32 Host audit manifest serialization failed".to_string())?;
+        Ok(D32TreeManifest {
+            exists: true,
+            entries,
+            digest: format!("{:x}", Sha256::digest(encoded)),
+        })
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    #[derive(Debug)]
+    struct HostDirectoryFence {
+        raw: PathBuf,
+        canonical: PathBuf,
+        raw_identity: HostFileIdentity,
+        canonical_identity: HostFileIdentity,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl HostDirectoryFence {
+        fn capture(path: &Path, description: &str) -> Result<Self, String> {
+            if !path.is_absolute() {
+                return Err(d32_not_executable(format!(
+                    "{description} was not absolute"
+                )));
+            }
+            host_verify_no_reparse_path(path, path).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} raw no-reparse fence failed: {error}"
+                ))
+            })?;
+            let raw_identity = host_file_identity(path, true).map_err(|error| {
+                d32_not_executable(format!("{description} raw identity fence failed: {error}"))
+            })?;
+            let canonical = fs::canonicalize(path).map_err(|_| {
+                d32_not_executable(format!("{description} could not be canonicalized"))
+            })?;
+            host_verify_no_reparse_path(&canonical, &canonical).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} canonical no-reparse fence failed: {error}"
+                ))
+            })?;
+            let canonical_identity = host_file_identity(&canonical, true).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} canonical identity fence failed: {error}"
+                ))
+            })?;
+            if raw_identity != canonical_identity {
+                return Err(d32_not_executable(format!(
+                    "{description} raw/canonical identity disagreed"
+                )));
+            }
+            Ok(Self {
+                raw: path.to_path_buf(),
+                canonical,
+                raw_identity,
+                canonical_identity,
+            })
+        }
+
+        fn revalidate(&self, description: &str) -> Result<(), String> {
+            host_verify_no_reparse_path(&self.raw, &self.raw).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} raw no-reparse recheck failed: {error}"
+                ))
+            })?;
+            let raw_identity = host_file_identity(&self.raw, true).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} raw identity recheck failed: {error}"
+                ))
+            })?;
+            host_verify_no_reparse_path(&self.canonical, &self.canonical).map_err(|error| {
+                d32_not_executable(format!(
+                    "{description} canonical no-reparse recheck failed: {error}"
+                ))
+            })?;
+            let canonical_identity =
+                host_file_identity(&self.canonical, true).map_err(|error| {
+                    d32_not_executable(format!(
+                        "{description} canonical identity recheck failed: {error}"
+                    ))
+                })?;
+            if raw_identity != self.raw_identity
+                || canonical_identity != self.canonical_identity
+                || raw_identity != canonical_identity
+            {
+                return Err(d32_not_executable(format!(
+                    "{description} raw/canonical identity changed"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_real_app_data_root(identifier: &str) -> Result<PathBuf, String> {
+        let root = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| d32_not_executable("Windows RoamingAppData root is unavailable"))?;
+        if !root.is_absolute() {
+            return Err(d32_not_executable(
+                "Windows RoamingAppData root was not absolute",
+            ));
+        }
+        let app_root = root.join(identifier);
+        let app_fence = HostDirectoryFence::capture(&app_root, "real app-data root")?;
+        app_fence.revalidate("real app-data root")?;
+        Ok(app_fence.canonical)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_real_storage_roots(default_root: &Path) -> Result<Vec<HostDirectoryFence>, String> {
+        let default_fence = HostDirectoryFence::capture(default_root, "default storage root")?;
+        let active_root =
+            crate::storage::d32_a_resolve_active_root(default_root).map_err(|error| {
+                d32_not_executable(format!("active storage root resolution failed: {error:?}"))
+            })?;
+        default_fence.revalidate("default storage root")?;
+        let active_fence = HostDirectoryFence::capture(&active_root, "active storage root")?;
+        let mut roots = vec![default_fence];
+        if !roots
+            .iter()
+            .any(|root| root.canonical == active_fence.canonical)
+        {
+            roots.push(active_fence);
+        }
+        Ok(roots)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    fn d32_real_resource_roots() -> Result<Vec<HostDirectoryFence>, String> {
+        let mut candidates = Vec::new();
+        if let Some(root) = std::env::var_os("D32_A_REAL_RESOURCE_DIR") {
+            candidates.push(PathBuf::from(root));
+        }
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                candidates.push(parent.to_path_buf());
+                candidates.push(parent.join("resources"));
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let mut roots: Vec<HostDirectoryFence> = Vec::new();
+        for candidate in candidates {
+            let Ok(fence) = HostDirectoryFence::capture(&candidate, "real resource root") else {
+                continue;
+            };
+            if fence.revalidate("real resource root").is_err() {
+                continue;
+            }
+            if !roots.iter().any(|root| root.canonical == fence.canonical) {
+                roots.push(fence);
+            }
+        }
+        if roots.is_empty() {
+            return Err(d32_not_executable("real Host resource tree is unavailable"));
+        }
+        Ok(roots)
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    pub(super) struct D32HostIntegrationEnvironment {
+        root: PathBuf,
+        real_roots: Vec<PathBuf>,
+        real_root_fences: Vec<HostDirectoryFence>,
+        real_tree_manifests: Option<Vec<(PathBuf, D32TreeManifest)>>,
+        previous_environment: Vec<(String, Option<OsString>)>,
+        cleaned: bool,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl D32HostIntegrationEnvironment {
+        pub(super) fn prepare(identifier: &str) -> Result<Self, String> {
+            let real_app_data_root = d32_real_app_data_root(identifier)?;
+            let storage_roots = d32_real_storage_roots(&real_app_data_root)?;
+            let resource_roots = d32_real_resource_roots()?;
+            let real_root_fences = storage_roots
+                .into_iter()
+                .chain(resource_roots)
+                .collect::<Vec<_>>();
+            let real_roots = real_root_fences
+                .iter()
+                .map(|fence| fence.canonical.clone())
+                .collect::<Vec<_>>();
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random)
+                .map_err(|_| d32_not_executable("canary isolation identity unavailable"))?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let root = std::env::temp_dir().join(format!(
+                "digital-life-d32a-canary-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir(&root)
+                .map_err(|_| d32_not_executable("canary isolation root could not be created"))?;
+            let app_data_root = root.join("app-data");
+            let resource_root = root.join("resource");
+            let temp_root = root.join("temp");
+            let setup = (|| {
+                fs::create_dir(&app_data_root).map_err(|_| {
+                    d32_not_executable("canary isolated app-data root could not be created")
+                })?;
+                fs::create_dir(&resource_root).map_err(|_| {
+                    d32_not_executable("canary isolated resource root could not be created")
+                })?;
+                fs::create_dir(&temp_root).map_err(|_| {
+                    d32_not_executable("canary isolated temp root could not be created")
+                })?;
+                crate::storage::d32_a_snapshot_app_data(&real_app_data_root, &app_data_root)
+                    .map_err(|error| {
+                        d32_not_executable(format!(
+                            "canary app-data snapshot failed: {}",
+                            error.message
+                        ))
+                    })?;
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = setup {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+
+            let environment_values = [
+                (
+                    "D32_A_CANARY_APP_DATA_ROOT",
+                    OsString::from(app_data_root.as_os_str()),
+                ),
+                (
+                    "D32_A_CANARY_RESOURCE_DIR",
+                    OsString::from(resource_root.as_os_str()),
+                ),
+                ("TMP", OsString::from(temp_root.as_os_str())),
+                ("TEMP", OsString::from(temp_root.as_os_str())),
+            ];
+            let mut previous_environment = Vec::with_capacity(environment_values.len());
+            for (name, value) in environment_values {
+                previous_environment.push((name.to_string(), std::env::var_os(name)));
+                std::env::set_var(name, value);
+            }
+            Ok(Self {
+                root,
+                real_roots,
+                real_root_fences,
+                real_tree_manifests: None,
+                previous_environment,
+                cleaned: false,
+            })
+        }
+
+        pub(super) fn establish_stable_baseline(&mut self) -> Result<(), String> {
+            if self.real_tree_manifests.is_some() {
+                return Err(
+                    "D32_A_HOST_FAILURE: real Host tree baseline was already established"
+                        .to_string(),
+                );
+            }
+            for fence in &self.real_root_fences {
+                fence.revalidate("real Host root")?;
+            }
+            let manifests = self
+                .real_roots
+                .iter()
+                .map(|root| d32_tree_manifest(root).map(|manifest| (root.clone(), manifest)))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.real_tree_manifests = Some(manifests);
+            Ok(())
+        }
+
+        pub(super) fn verify_real_roots_unchanged(&self) -> Result<(), String> {
+            let Some(expected_manifests) = self.real_tree_manifests.as_ref() else {
+                return Err(
+                    "D32_A_HOST_FAILURE: real Host tree baseline was not established".to_string(),
+                );
+            };
+            for fence in &self.real_root_fences {
+                fence.revalidate("real Host root")?;
+            }
+            for (path, expected) in expected_manifests {
+                let current = d32_tree_manifest(path)?;
+                if &current != expected {
+                    return Err(format!(
+                        "D32_A_HOST_FAILURE: real Host tree manifest changed during canary: {}",
+                        path.display()
+                    ));
+                }
+            }
+            for fence in &self.real_root_fences {
+                fence.revalidate("real Host root")?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn cleanup(&mut self) -> Result<(), String> {
+            if self.cleaned {
+                return Ok(());
+            }
+            match fs::symlink_metadata(&self.root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.cleaned = true;
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "D32_A_HOST_FAILURE: canary isolation cleanup metadata failed: {error}"
+                )),
+                Ok(metadata) => {
+                    if host_metadata_is_reparse(&metadata) {
+                        return Err(
+                            "D32_A_HOST_FAILURE: canary isolation root became a reparse point"
+                                .to_string(),
+                        );
+                    }
+                    host_verify_no_reparse_tree(&self.root)?;
+                    fs::remove_dir_all(&self.root).map_err(|error| {
+                        format!("D32_A_HOST_FAILURE: canary isolation cleanup failed: {error}")
+                    })?;
+                    if fs::symlink_metadata(&self.root).is_ok() {
+                        return Err(
+                            "D32_A_HOST_FAILURE: canary isolation cleanup left unsafe state"
+                                .to_string(),
+                        );
+                    }
+                    self.cleaned = true;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl Drop for D32HostIntegrationEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in self.previous_environment.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            if !self.cleaned {
+                if let Err(error) = self.cleanup() {
+                    eprintln!("{error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    struct D32ProductionCanaryEnvironment {
+        workspace: PathBuf,
+        staged_sidecar: Option<PathBuf>,
+        cleaned: bool,
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl D32ProductionCanaryEnvironment {
+        fn prepare<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
+            let workspace = Self::create_workspace()?;
+            let mut environment = Self {
+                workspace,
+                staged_sidecar: None,
+                cleaned: false,
+            };
+            if let Err(error) = environment.stage_sidecar(app) {
+                return Err(error);
+            }
+            Ok(environment)
+        }
+
+        fn create_workspace() -> Result<PathBuf, String> {
+            let mut random = [0_u8; 12];
+            getrandom::fill(&mut random).map_err(|_| {
+                d32_not_executable("canary workspace identity could not be generated")
+            })?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let workspace = std::env::temp_dir().join(format!(
+                "digital-life-d32a-host-{}-{suffix}",
+                std::process::id()
+            ));
+            let mut created = false;
+            let result = (|| {
+                fs::create_dir(&workspace)
+                    .map_err(|_| d32_not_executable("canary workspace could not be created"))?;
+                created = true;
+                fs::create_dir(workspace.join("src")).map_err(|_| {
+                    d32_not_executable("canary workspace source root could not be created")
+                })?;
+                fs::write(
+                    workspace.join("Cargo.toml"),
+                    b"[package]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                )
+                .map_err(|_| d32_not_executable("canary workspace manifest could not be written"))?;
+                fs::write(
+                    workspace.join("Cargo.lock"),
+                    b"# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\n",
+                )
+                .map_err(|_| d32_not_executable("canary workspace lockfile could not be written"))?;
+                fs::write(
+                    workspace.join("src/lib.rs"),
+                    b"pub fn d32_a_real_canary() -> u32 { 32 }\n",
+                )
+                .map_err(|_| d32_not_executable("canary workspace source could not be written"))?;
+                fs::write(
+                    workspace.join("unrelated.txt"),
+                    b"D32-A unrelated fixture must remain unchanged\n",
+                )
+                .map_err(|_| d32_not_executable("canary unrelated fixture could not be written"))?;
+                Ok(workspace.clone())
+            })();
+            if created && result.is_err() {
+                let _ = fs::remove_dir_all(&workspace);
+            }
+            result
+        }
+
+        fn stage_sidecar<R: Runtime>(&mut self, app: &AppHandle<R>) -> Result<(), String> {
+            let (candidate, expected_hash) = d32_candidate_release_image()?;
+            let resource_dir = sidecar_resource_dir(app).map_err(|error| {
+                d32_not_executable(format!("resource directory unavailable: {error}"))
+            })?;
+            let resource_dir = fs::canonicalize(&resource_dir)
+                .map_err(|_| d32_not_executable("resource directory could not be canonicalized"))?;
+            host_verify_no_reparse_path(&resource_dir, &resource_dir).map_err(|error| {
+                d32_not_executable(format!("resource directory is not app-owned: {error}"))
+            })?;
+            let destination = resource_dir.join(SIDECAR_RESOURCE_NAME);
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    if host_metadata_is_reparse(&metadata) || !metadata.is_file() {
+                        return Err(d32_not_executable(
+                            "installed Vita sidecar resource is not a regular file",
+                        ));
+                    }
+                    let installed = fs::canonicalize(&destination).map_err(|_| {
+                        d32_not_executable(
+                            "installed Vita sidecar resource could not be canonicalized",
+                        )
+                    })?;
+                    if installed.parent() != Some(resource_dir.as_path()) {
+                        return Err(d32_not_executable(
+                            "installed Vita sidecar resource escaped its app-owned directory",
+                        ));
+                    }
+                    let installed_hash = host_hash_file(&installed, D32_IMAGE_HASH_MAX_BYTES)
+                        .map_err(|error| {
+                            d32_not_executable(format!("installed sidecar hash failed: {error}"))
+                        })?;
+                    if installed_hash != expected_hash {
+                        return Err(d32_not_executable(
+                            "installed Vita sidecar does not match the candidate image",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut input = File::open(&candidate).map_err(|_| {
+                        d32_not_executable("candidate Vita release image could not be opened")
+                    })?;
+                    let mut output = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&destination)
+                        .map_err(|_| {
+                            d32_not_executable("app-owned sidecar resource could not be staged")
+                        })?;
+                    // Own the destination before any copy/identity/hash
+                    // validation can fail so the environment Drop removes a
+                    // partial or rejected staged image as well.
+                    self.staged_sidecar = Some(destination.clone());
+                    std::io::copy(&mut input, &mut output).map_err(|_| {
+                        d32_not_executable("app-owned sidecar resource copy failed")
+                    })?;
+                    output.flush().map_err(|_| {
+                        d32_not_executable("app-owned sidecar resource flush failed")
+                    })?;
+                    host_verify_no_reparse_path(&resource_dir, &destination).map_err(|error| {
+                        d32_not_executable(format!(
+                            "staged sidecar resource was not app-owned: {error}"
+                        ))
+                    })?;
+                    let staged_hash = host_hash_file(&destination, D32_IMAGE_HASH_MAX_BYTES)
+                        .map_err(|error| {
+                            d32_not_executable(format!("staged sidecar hash failed: {error}"))
+                        })?;
+                    if staged_hash != expected_hash {
+                        return Err(d32_not_executable(
+                            "staged Vita sidecar does not match the candidate image",
+                        ));
+                    }
+                }
+                Err(_) => {
+                    return Err(d32_not_executable(
+                        "installed Vita sidecar resource metadata was unavailable",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn cleanup(&mut self) -> D32CleanupOutcome {
+            if self.cleaned {
+                return D32CleanupOutcome {
+                    attempted: false,
+                    validated: true,
+                    removed: true,
+                    unsafe_left: false,
+                    error: None,
+                };
+            }
+            let mut outcome = D32CleanupOutcome {
+                attempted: true,
+                validated: false,
+                removed: false,
+                unsafe_left: false,
+                error: None,
+            };
+            let mut errors = Vec::new();
+            if let Some(path) = self.staged_sidecar.as_ref() {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) => {
+                        if host_metadata_is_reparse(&metadata) || !metadata.is_file() {
+                            outcome.unsafe_left = true;
+                            errors.push(format!(
+                                "staged sidecar was not a regular non-reparse file: {}",
+                                path.display()
+                            ));
+                        } else if let Err(error) = fs::remove_file(path) {
+                            errors.push(format!(
+                                "staged sidecar could not be removed: {}: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => errors.push(format!(
+                        "staged sidecar metadata unavailable: {}: {error}",
+                        path.display()
+                    )),
+                }
+                if fs::symlink_metadata(path).is_ok() {
+                    outcome.unsafe_left = true;
+                }
+            }
+            match fs::symlink_metadata(&self.workspace) {
+                Ok(metadata) => {
+                    if host_metadata_is_reparse(&metadata) {
+                        outcome.unsafe_left = true;
+                        errors.push("canary workspace became a reparse point".to_string());
+                    } else if let Err(error) = host_verify_no_reparse_tree(&self.workspace) {
+                        outcome.unsafe_left = true;
+                        errors.push(error);
+                    } else if let Err(error) = fs::remove_dir_all(&self.workspace) {
+                        errors.push(format!("canary workspace could not be removed: {error}"));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    errors.push(format!("canary workspace metadata unavailable: {error}"))
+                }
+            }
+            if fs::symlink_metadata(&self.workspace).is_ok() {
+                outcome.unsafe_left = true;
+            }
+            outcome.validated = errors.is_empty() && !outcome.unsafe_left;
+            outcome.removed = outcome.validated;
+            if !errors.is_empty() {
+                outcome.error = Some(errors.join("; "));
+            } else if outcome.unsafe_left {
+                outcome.error = Some("cleanup left unsafe state".to_string());
+            }
+            if outcome.validated {
+                self.cleaned = true;
+                self.staged_sidecar = None;
+            }
+            outcome
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    impl Drop for D32ProductionCanaryEnvironment {
+        fn drop(&mut self) {
+            if !self.cleaned {
+                let outcome = self.cleanup();
+                if outcome.error.is_some() || outcome.unsafe_left {
+                    eprintln!("D32_A_HOST_FAILURE: canary cleanup outcome: {outcome:?}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    pub(super) fn run_d32_a_host_integration_impl(
+        app: tauri::App<tauri::Wry>,
+        mode: &str,
+    ) -> Result<D32HostCanaryReport, String> {
+        let mode = D32HostCanaryMode::parse(mode)?;
+        let app_handle = app.handle().clone();
+        let storage = app_handle.state::<StorageService>();
+        let secrets = app_handle.state::<WindowsCredentialSecretStore>();
+        let provider = active_chat_provider_configuration(storage.inner(), secrets.inner())
+            .map_err(|error| {
+                d32_not_executable(format!(
+                    "active Chat provider metadata read failed: {error}"
+                ))
+            })?;
+        require_production_provider(provider)?;
+        let life = storage
+            .get_current_life()
+            .map_err(|error| {
+                d32_not_executable(format!("current Life read failed: {}", error.message))
+            })?
+            .ok_or_else(|| d32_not_executable("current Life is unavailable"))?;
+        d32_require_cargo_root(storage.inner(), &life.id)?;
+
+        let mut environment = D32ProductionCanaryEnvironment::prepare(&app_handle)?;
+        let app_data_root = sidecar_app_data_root(&app_handle)?;
+        let coordinator = app_handle.state::<VitaSidecarCoordinator>();
+        let control = D32HostCanaryControl::new(mode);
+        coordinator.configure_d32_host_canary(Arc::clone(&control))?;
+        let cancel_worker = if mode == D32HostCanaryMode::CancelBeforeRevalidation {
+            let worker_control = Arc::clone(&control);
+            let worker_app = app_handle.clone();
+            let barrier = control.cancel_barrier();
+            Some(
+                thread::Builder::new()
+                    .name("d32-a-cancel-coordinator-worker".to_string())
+                    .spawn(move || {
+                        worker_control.wait_for_cancel_signal();
+                        let result = {
+                            let coordinator = worker_app.state::<VitaSidecarCoordinator>();
+                            coordinator.cancel_turn().map(|_| ())
+                        };
+                        barrier.wait();
+                        result
+                    })
+                    .map_err(|_| d32_not_executable("cancel coordinator worker unavailable"))?,
+            )
+        } else {
+            None
+        };
+        let mut app_data_root_retained = None;
+        let run_result = (|| {
+            coordinator.start(
+                &app_handle,
+                VitaSidecarStartRequest {
+                    life_id: life.id.clone(),
+                    task_id: "d32-a-real-production-canary".to_string(),
+                    workspace_path: environment.workspace.to_string_lossy().into_owned(),
+                },
+            )?;
+            let retained = coordinator
+                .d32_app_data_root_retained()
+                .map_err(d32_not_executable)?;
+            retained
+                .revalidate("D32 native evidence app-data root before canary")
+                .map_err(d32_not_executable)?;
+            d32_prepare_native_evidence(&retained)?;
+            app_data_root_retained = Some(retained);
+            coordinator.start_turn(VitaTurnStartRequest {
+                prompt: "Use the provided vita_workspace_cargo_check tool exactly once on the current workspace, wait for its result, and then report the result.".to_string(),
+            })?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(360);
+            let mut confirmation_seen = false;
+            let mut action_taken = false;
+            let terminal = loop {
+                let status = coordinator.status()?;
+                if status.pending.is_some() {
+                    confirmation_seen = true;
+                    if !action_taken {
+                        action_taken = true;
+                        if let Some(pending) = status.pending.as_ref() {
+                            coordinator.confirm(pending.pending_id.clone())?;
+                        }
+                    }
+                }
+                if matches!(
+                    status.turn_phase,
+                    Some(
+                        protocol::TurnPhase::Completed
+                            | protocol::TurnPhase::Failed
+                            | protocol::TurnPhase::Cancelled
+                            | protocol::TurnPhase::TimedOut
+                    )
+                ) && status.active_turn_id.is_none()
+                {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("D32-A production real canary timed out".to_string());
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            if !confirmation_seen {
+                return Err(d32_not_executable(
+                    "provider produced no governed cargo confirmation",
+                ));
+            }
+            if mode.expects_deny() {
+                if !matches!(
+                    terminal.turn_phase,
+                    Some(
+                        protocol::TurnPhase::Failed
+                            | protocol::TurnPhase::Cancelled
+                            | protocol::TurnPhase::TimedOut
+                    )
+                ) {
+                    return Err(format!(
+                        "D32-A negative lane unexpectedly completed: {:?}",
+                        terminal.turn_phase
+                    ));
+                }
+            } else {
+                if terminal.turn_phase != Some(protocol::TurnPhase::Completed)
+                    || terminal.turn_error.is_some()
+                    || terminal.assistant_text.is_none()
+                {
+                    return Err(format!(
+                        "D32-A production provider/tool turn did not complete: {:?}",
+                        terminal.turn_error
+                    ));
+                }
+            }
+            Ok(terminal)
+        })();
+        let stop_result = coordinator.stop().map(|_| ());
+        let worker_result = if let Some(worker) = cancel_worker {
+            control.signal_cancel_worker();
+            if !control.trace.snapshot().pre_native_fence_seen {
+                control.cancel_barrier().wait();
+            }
+            worker
+                .join()
+                .map_err(|_| "D32_A_HOST_FAILURE: cancel coordinator worker panicked".to_string())?
+        } else {
+            Ok(())
+        };
+        // The revalidation reader owns the coordinator's authority view.  A
+        // revoke must be restored through that same view so the canary cannot
+        // accidentally prove a different StorageService path than the one
+        // that performed the canonical transition.
+        let restore_result = d32_restore_revoke(
+            coordinator.authority_storage.as_ref(),
+            &coordinator.registry,
+            &life.id,
+            &control,
+        );
+        let result = run_result
+            .and_then(|terminal| stop_result.map(|_| terminal))
+            .and_then(|terminal| worker_result.map(|_| terminal))
+            .and_then(|terminal| restore_result.map(|_| terminal));
+        let terminal = match result {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let cleanup = environment.cleanup();
+                return Err(format!("{error}; D32 cleanup outcome: {cleanup:?}"));
+            }
+        };
+        let report_result = (|| -> Result<D32HostCanaryReport, String> {
+            if environment.workspace.join("target").exists() {
+                return Err(
+                    "D32_A_HOST_FAILURE: production cargo lane wrote into the governed workspace"
+                        .to_string(),
+                );
+            }
+            let unrelated = environment.workspace.join("unrelated.txt");
+            if !fs::read(&unrelated)
+                .map(|bytes| bytes == b"D32-A unrelated fixture must remain unchanged\n")
+                .unwrap_or(false)
+            {
+                return Err(
+                    "D32_A_HOST_FAILURE: production cargo lane mutated an unrelated fixture"
+                        .to_string(),
+                );
+            }
+            let runs_root = app_data_root
+                .join(D32_EXECUTION_ROOT_NAME)
+                .join(D32_RUNS_DIR_NAME);
+            if runs_root.exists()
+                && fs::read_dir(&runs_root)
+                    .map_err(|_| {
+                        "D32_A_HOST_FAILURE: production run root enumeration failed".to_string()
+                    })?
+                    .next()
+                    .is_some()
+            {
+                return Err(
+                    "D32_A_HOST_FAILURE: production cargo run root was not cleaned".to_string(),
+                );
+            }
+            let trace = control.trace.snapshot();
+            d32_validate_trace(
+                mode,
+                &trace,
+                terminal.turn_phase,
+                terminal.turn_error.as_deref(),
+            )?;
+            let app_data_root_retained = app_data_root_retained
+                .as_ref()
+                .ok_or_else(|| d32_not_executable("D32 app-data authority was not retained"))?;
+            let native_evidence = d32_read_native_evidence(app_data_root_retained, &trace, mode)?;
+            Ok(D32HostCanaryReport {
+                mode: mode.as_str().to_string(),
+                status: if mode.expects_deny() {
+                    "DENIED".to_string()
+                } else {
+                    "EXECUTED".to_string()
+                },
+                trace,
+                native_evidence,
+                terminal_phase: terminal.turn_phase,
+                turn_error: terminal.turn_error,
+                cleanup: D32CleanupOutcome {
+                    attempted: false,
+                    validated: false,
+                    removed: false,
+                    unsafe_left: false,
+                    error: None,
+                },
+            })
+        })();
+        let clear_result = coordinator.clear_d32_host_canary();
+        let cleanup = environment.cleanup();
+        match (report_result, clear_result, cleanup.error.clone()) {
+            (Ok(mut report), Ok(()), None) if cleanup.validated && cleanup.removed => {
+                report.cleanup = cleanup;
+                Ok(report)
+            }
+            (Ok(_), Ok(()), _) => Err(format!(
+                "D32_A_HOST_FAILURE: cleanup did not validate: {cleanup:?}"
+            )),
+            (Err(error), Ok(()), _) => Err(format!("{error}; D32 cleanup outcome: {cleanup:?}")),
+            (result, clear, _) => Err(format!(
+                "D32_A_HOST_FAILURE: report={result:?}, clear={clear:?}, cleanup={cleanup:?}"
+            )),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -7072,8 +11518,10 @@ mod windows {
                 toolchain_path: mirror.to_string_lossy().into_owned(),
                 toolchain_manifest_sha256: manifest,
             };
+            let app_data_root_retained =
+                D32RetainedDirectory::open(app_data_root).expect("D32 startup retained root");
             let expected_profile_evidence =
-                host_cargo_profile_evidence_for_selection(app_data_root, &selection)
+                host_cargo_profile_evidence_for_selection(&app_data_root_retained, &selection)
                     .expect("D32 startup tamper expected evidence");
             HostPublishedCargoProfile {
                 selection,
@@ -10754,7 +15202,7 @@ mod windows {
                 task_id: "task".to_string(),
                 workspace_identity: "workspace".to_string(),
                 cargo_profile: Some(test_cargo_profile_evidence("workspace")),
-                cargo_profile_app_data_root: None,
+                app_data_root_retained: None,
                 provider,
                 writer: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
@@ -10780,6 +15228,8 @@ mod windows {
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
                 recovery_result: Mutex::new(None),
+                #[cfg(feature = "d32-a-host-canary")]
+                canary_control: None,
                 test_outbound: Mutex::new(Some(sender)),
             });
             (session, receiver)
@@ -11065,18 +15515,6 @@ mod windows {
             );
         }
 
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        enum D32CargoCanaryMode {
-            Positive,
-            RevokeBeforeRevalidation,
-            CancelBeforeRevalidation,
-            LifeBeforeRevalidation,
-            MigrationBeforeRevalidation,
-            GrantIdTamper,
-            ExecutableIdentityTamper,
-            EnvironmentProfileTamper,
-        }
-
         #[test]
         fn d32_production_provider_prerequisites_fail_closed() {
             assert!(require_production_provider(None)
@@ -11105,450 +15543,30 @@ mod windows {
                 .contains("D32_A_NOT_EXECUTABLE"));
         }
 
-        struct D32CanaryEnvironment {
-            _lock: std::sync::MutexGuard<'static, ()>,
-            previous_app_data: Option<OsString>,
-            previous_resource_dir: Option<OsString>,
-        }
-
-        static D32_CANARY_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        impl D32CanaryEnvironment {
-            fn install(app_data_root: &Path, resource_dir: &Path) -> Self {
-                let lock = D32_CANARY_ENVIRONMENT_LOCK
-                    .lock()
-                    .expect("D32-A canary environment lock");
-                let previous_app_data = std::env::var_os("D32_A_TEST_APP_DATA_ROOT");
-                let previous_resource_dir = std::env::var_os("D32_A_TEST_RESOURCE_DIR");
-                std::env::set_var("D32_A_TEST_APP_DATA_ROOT", app_data_root);
-                std::env::set_var("D32_A_TEST_RESOURCE_DIR", resource_dir);
-                Self {
-                    _lock: lock,
-                    previous_app_data,
-                    previous_resource_dir,
-                }
-            }
-        }
-
-        impl Drop for D32CanaryEnvironment {
-            fn drop(&mut self) {
-                match self.previous_app_data.take() {
-                    Some(value) => std::env::set_var("D32_A_TEST_APP_DATA_ROOT", value),
-                    None => std::env::remove_var("D32_A_TEST_APP_DATA_ROOT"),
-                }
-                match self.previous_resource_dir.take() {
-                    Some(value) => std::env::set_var("D32_A_TEST_RESOURCE_DIR", value),
-                    None => std::env::remove_var("D32_A_TEST_RESOURCE_DIR"),
-                }
-            }
-        }
-
-        fn d32_real_digital_life_storage_root() -> PathBuf {
-            let app_data = std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .expect("D32-A Digital Life APPDATA root");
-            let root = app_data.join("com.digitallife.app");
-            assert!(
-                root.is_dir(),
-                "D32_A_NOT_EXECUTABLE: Digital Life storage root is unavailable"
-            );
-            root
-        }
-
-        fn d32_require_cargo_root(storage: &StorageService, life_id: &str) -> Result<(), String> {
-            let capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
-                .map_err(|_| "D32_A_NOT_EXECUTABLE: Cargo capability id invalid".to_string())?;
-            let authority = storage
-                .capability_authorization_scope()
-                .map_err(|error| format!("D32_A_NOT_EXECUTABLE: {}", error.code))?;
-            let row = authority
-                .find_capability_authorization(life_id, &capability_id)
-                .map_err(|_| {
-                    "D32_A_NOT_EXECUTABLE: Cargo capability authorization unavailable".to_string()
-                })?;
-            if row.is_some_and(|row| row.enabled) {
-                Ok(())
-            } else {
-                Err("D32_A_NOT_EXECUTABLE: Cargo capability root is not enabled".to_string())
-            }
-        }
-
-        fn run_d32_a_real_production_canary(mode: D32CargoCanaryMode) {
-            let executable = d32_candidate_release_image();
-            let workspace = tempfile::tempdir().expect("D32-A production canary workspace");
-            fs::create_dir(workspace.path().join("src")).expect("D32-A workspace source root");
-            fs::write(
-                workspace.path().join("Cargo.toml"),
-                b"[package]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            )
-            .expect("D32-A production canary manifest");
-            fs::write(
-                workspace.path().join("Cargo.lock"),
-                b"# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\n",
-            )
-            .expect("D32-A production canary lockfile");
-            fs::write(
-                workspace.path().join("src/lib.rs"),
-                b"pub fn d32_a_real_canary() -> u32 { 32 }\n",
-            )
-            .expect("D32-A production canary source");
-
-            let app_data = tempfile::tempdir().expect("D32-A production app-data root");
-            let resource_dir = tempfile::tempdir().expect("D32-A production resource root");
-            let staged_image = resource_dir.path().join(SIDECAR_RESOURCE_NAME);
-            let expected_hash = std::env::var("D32_A_CANDIDATE_RELEASE_IMAGE_SHA256")
-                .expect("D32-A candidate image hash");
-            let source_size = fs::metadata(&executable)
-                .expect("D32-A candidate image metadata")
-                .len();
-            assert_eq!(
-                fs::copy(&executable, &staged_image).expect("D32-A stage production image"),
-                source_size
-            );
-            assert_eq!(
-                host_hash_file(&staged_image, D32_IMAGE_HASH_MAX_BYTES)
-                    .expect("D32-A staged production image hash"),
-                expected_hash,
-                "D32-A staged image changed before production start_inner"
-            );
-
-            // The test-only path roots affect lookup only; process creation,
-            // image preparation, hermetic child environment, and IPC all go
-            // through the same production `start_inner` implementation.
-            let _environment = D32CanaryEnvironment::install(app_data.path(), resource_dir.path());
-            let app = tauri::test::mock_app();
-            app.manage(WindowsCredentialSecretStore::new());
-            let app_handle = app.handle().clone();
-
-            let storage = Arc::new(
-                StorageService::initialize_with_roots(d32_real_digital_life_storage_root(), None)
-                    .expect("D32-A Digital Life authority storage"),
-            );
-            let secrets = WindowsCredentialSecretStore::new();
-            let _provider = require_production_provider(
-                active_chat_provider_configuration(&storage, &secrets)
-                    .expect("D32-A active Chat provider metadata read"),
-            )
-            .unwrap_or_else(|error| panic!("{error}"));
-            let life = storage
-                .get_current_life()
-                .expect("D32-A current Life read")
-                .expect("D32_A_NOT_EXECUTABLE: current Life is unavailable");
-            d32_require_cargo_root(&storage, &life.id).unwrap_or_else(|error| panic!("{error}"));
-            host_publish_cargo_selection(app_data.path())
-                .unwrap_or_else(|error| panic!("D32_A_NOT_EXECUTABLE: {error}"));
-
-            let registry = CapabilityRegistry::production().expect("D32-A production registry");
-            let coordinator = VitaSidecarCoordinator::new(Arc::clone(&storage), registry);
-            let start_request = VitaSidecarStartRequest {
-                life_id: life.id.clone(),
-                task_id: "d32-a-real-production-canary".to_string(),
-                workspace_path: workspace.path().to_string_lossy().into_owned(),
-            };
-            coordinator
-                .start(&app_handle, start_request)
-                .unwrap_or_else(|error| panic!("D32-A production start_inner failed: {error}"));
-            coordinator
-                .start_turn(VitaTurnStartRequest {
-                    prompt: "Use the provided vita_workspace_cargo_check tool exactly once on the current workspace, wait for its result, and then report the result.".to_string(),
-                })
-                .unwrap_or_else(|error| panic!("D32-A production StartTurn failed: {error}"));
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(360);
-            let mut confirmation_seen = false;
-            let mut confirmed = HashSet::new();
-            let terminal = loop {
-                let status = coordinator
-                    .status()
-                    .expect("D32-A production status projection");
-                if let Some(pending) = status.pending.as_ref() {
-                    confirmation_seen = true;
-                    if confirmed.insert(pending.pending_id.clone()) {
-                        if mode == D32CargoCanaryMode::Positive {
-                            coordinator
-                                .confirm(pending.pending_id.clone())
-                                .expect("D32-A production explicit confirmation");
-                        } else {
-                            // Every non-positive mandatory lane still uses
-                            // the production Host/Vita/Codex path.  The
-                            // cancellation fence is exercised at the first
-                            // real confirmation, while the focused Host
-                            // tests retain the deterministic revoke/life/
-                            // migration/binding negative evidence.
-                            coordinator
-                                .cancel_turn()
-                                .expect("D32-A production cancellation fence");
-                        }
-                    }
-                }
-                if matches!(
-                    status.turn_phase,
-                    Some(
-                        protocol::TurnPhase::Completed
-                            | protocol::TurnPhase::Failed
-                            | protocol::TurnPhase::Cancelled
-                            | protocol::TurnPhase::TimedOut
-                    )
-                ) && status.active_turn_id.is_none()
-                {
-                    break status;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "D32-A production real canary timed out"
-                );
-                thread::sleep(Duration::from_millis(100));
-            };
-            coordinator.stop().expect("D32-A production sidecar stop");
-            assert!(
-                confirmation_seen,
-                "D32_A_NOT_EXECUTABLE: provider produced no governed cargo confirmation"
-            );
-            if mode == D32CargoCanaryMode::Positive {
-                assert_eq!(
-                    terminal.turn_phase,
-                    Some(protocol::TurnPhase::Completed),
-                    "D32-A production provider/tool turn did not complete: {:?}",
-                    terminal.turn_error
-                );
-                assert!(
-                    terminal.turn_error.is_none(),
-                    "D32-A production canary turn reported an error: {:?}",
-                    terminal.turn_error
-                );
-                assert!(
-                    terminal.assistant_text.is_some(),
-                    "D32-A production canary returned no assistant result"
-                );
-            } else {
-                assert!(
-                    matches!(
-                        terminal.turn_phase,
-                        Some(
-                            protocol::TurnPhase::Failed
-                                | protocol::TurnPhase::Cancelled
-                                | protocol::TurnPhase::TimedOut
-                        )
-                    ),
-                    "D32-A production negative lane unexpectedly completed: {:?}",
-                    terminal.turn_phase
-                );
-            }
-            assert!(
-                !workspace.path().join("target").exists(),
-                "D32-A production cargo lane wrote into the governed workspace"
-            );
-            let runs_root = app_data
-                .path()
-                .join(D32_EXECUTION_ROOT_NAME)
-                .join(D32_RUNS_DIR_NAME);
-            if runs_root.exists() {
-                assert_eq!(
-                    fs::read_dir(runs_root)
-                        .expect("D32-A production run root enumeration")
-                        .count(),
-                    0,
-                    "D32-A production cargo run root was not cleaned"
-                );
-            }
-        }
-
-        fn d32_candidate_release_image() -> PathBuf {
-            let configured = std::env::var_os("D32_A_CANDIDATE_RELEASE_IMAGE")
-                .expect("D32-A mandatory canary requires D32_A_CANDIDATE_RELEASE_IMAGE");
-            let path = fs::canonicalize(PathBuf::from(configured))
-                .expect("D32-A candidate release image must be canonicalizable");
-            let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("D32-A candidate repository root")
-                .to_path_buf();
-            let expected_release_path = fs::canonicalize(
-                repository_root
-                    .join("vita-agent")
-                    .join("target")
-                    .join("release")
-                    .join(SIDECAR_RESOURCE_NAME),
-            )
-            .expect("D32-A candidate production release image must exist at the pinned path");
-            assert_eq!(
-                path, expected_release_path,
-                "D32-A canary must execute the exact candidate production release artifact"
-            );
-            assert_eq!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("vita-agent.exe"),
-                "D32-A candidate image must be the pinned Vita release image"
-            );
-            let expected = std::env::var("D32_A_CANDIDATE_RELEASE_IMAGE_SHA256")
-                .expect("D32-A mandatory canary requires candidate image SHA-256");
-            assert_eq!(expected.len(), 64, "D32-A candidate image hash length");
-            assert!(
-                expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "D32-A candidate image hash must be hexadecimal"
-            );
-            let candidate_sha = std::env::var("D32_A_CANDIDATE_SHA")
-                .expect("D32-A mandatory canary requires the exact candidate Git SHA");
-            assert_eq!(candidate_sha.len(), 40, "D32-A candidate Git SHA length");
-            assert!(
-                candidate_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "D32-A candidate Git SHA must be hexadecimal"
-            );
-            let git_path = resolve_git_path().expect("D32-A trusted Git for provenance");
-            let git_sha = Command::new(git_path)
-                .current_dir(&repository_root)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("D32-A candidate Git provenance command");
-            assert!(
-                git_sha.status.success(),
-                "D32-A candidate Git provenance command failed"
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&git_sha.stdout).trim(),
-                candidate_sha,
-                "D32-A release image provenance was not bound to the exact candidate SHA"
-            );
-            let provenance_path = std::env::var_os("D32_A_CANDIDATE_PROVENANCE")
-                .expect("D32-A mandatory canary requires clean-build provenance manifest");
-            let provenance: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(provenance_path)
-                    .expect("D32-A candidate provenance manifest must be readable"),
-            )
-            .expect("D32-A candidate provenance manifest must be JSON");
-            assert_eq!(
-                provenance
-                    .get("candidate_sha")
-                    .and_then(serde_json::Value::as_str),
-                Some(candidate_sha.as_str()),
-                "D32-A provenance candidate SHA mismatch"
-            );
-            assert_eq!(
-                provenance
-                    .get("source_repo")
-                    .and_then(serde_json::Value::as_str),
-                Some(repository_root.to_string_lossy().as_ref()),
-                "D32-A provenance source repository mismatch"
-            );
-            assert_eq!(
-                provenance
-                    .get("image_path")
-                    .and_then(serde_json::Value::as_str),
-                Some(path.to_string_lossy().as_ref()),
-                "D32-A provenance image path mismatch"
-            );
-            assert_eq!(
-                provenance
-                    .get("image_sha256")
-                    .and_then(serde_json::Value::as_str),
-                Some(expected.as_str()),
-                "D32-A provenance image hash mismatch"
-            );
-            assert_eq!(
-                provenance
-                    .get("git_status")
-                    .and_then(serde_json::Value::as_str),
-                Some("clean"),
-                "D32-A candidate build was not produced from a clean checkout"
-            );
-            assert_eq!(
-                provenance
-                    .get("build_profile")
-                    .and_then(serde_json::Value::as_str),
-                Some("release"),
-                "D32-A candidate provenance profile was not release"
-            );
-            assert_eq!(
-                provenance
-                    .get("build_command")
-                    .and_then(serde_json::Value::as_str),
-                Some("cargo build --manifest-path vita-agent/Cargo.toml --release --locked --bin vita-agent"),
-                "D32-A candidate provenance build command was not the frozen release command"
-            );
-            let actual = host_hash_file(&path, D32_IMAGE_HASH_MAX_BYTES)
-                .expect("D32-A candidate release image hash");
-            assert_eq!(
-                actual, expected,
-                "D32-A canary image hash did not match the exact built candidate"
-            );
-            path
-        }
-
-        fn d32_require_real_canary_enabled() {
-            if std::env::var("D32_A_REQUIRE_REAL_CANARY").as_deref() != Ok("1") {
-                panic!(
-                    "D32_A_NOT_EXECUTABLE: mandatory real canary requires D32_A_REQUIRE_REAL_CANARY=1"
-                );
-            }
-        }
-
+        #[cfg(feature = "d32-a-host-canary")]
         #[test]
-        fn d32_a_real_host_vita_codex_cargo_canary() {
-            d32_require_real_canary_enabled();
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::Positive);
-        }
-
-        #[test]
-        fn d32_a_real_host_vita_codex_revoke_canary() {
-            d32_require_real_canary_enabled();
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::RevokeBeforeRevalidation);
-        }
-
-        #[test]
-        fn d32_a_real_host_vita_codex_life_canary() {
-            d32_require_real_canary_enabled();
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::LifeBeforeRevalidation);
-        }
-
-        #[test]
-        fn d32_a_real_host_vita_codex_cancel_canary() {
-            d32_require_real_canary_enabled();
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::CancelBeforeRevalidation);
-        }
-
-        #[test]
-        fn d32_a_real_host_vita_codex_migration_canary() {
-            d32_require_real_canary_enabled();
-            run_d32_a_real_process_cargo_canary(D32CargoCanaryMode::MigrationBeforeRevalidation);
-        }
-
-        #[test]
-        fn d32_a_real_host_vita_codex_binding_tamper_canaries() {
-            d32_require_real_canary_enabled();
-            let mut failures = Vec::new();
+        fn d32_each_host_mode_has_uniform_missing_provider_preflight() {
             for mode in [
-                D32CargoCanaryMode::GrantIdTamper,
-                D32CargoCanaryMode::ExecutableIdentityTamper,
-                D32CargoCanaryMode::EnvironmentProfileTamper,
+                "positive",
+                "grant-replay",
+                "revoke",
+                "life",
+                "cancel",
+                "migration",
+                "executable-identity-tamper",
+                "environment-profile-tamper",
             ] {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_d32_a_real_process_cargo_canary(mode);
-                }));
-                if result.is_err() {
-                    failures.push(format!("{mode:?}"));
-                }
-            }
-            assert!(
-                failures.is_empty(),
-                "D32-A binding tamper lanes failed: {failures:?}"
-            );
-        }
-
-        fn run_d32_a_real_process_cargo_canary(mode: D32CargoCanaryMode) {
-            if !matches!(
-                mode,
-                D32CargoCanaryMode::Positive | D32CargoCanaryMode::CancelBeforeRevalidation
-            ) {
-                panic!(
-                    "D32_A_NOT_EXECUTABLE: production Host harness does not synthesize {mode:?}"
+                assert!(
+                    D32HostCanaryMode::parse(mode).is_ok(),
+                    "mode parser rejected {mode}"
+                );
+                let error = require_production_provider(None)
+                    .expect_err("missing provider must fail closed for every mode");
+                assert!(
+                    error.starts_with("D32_A_NOT_EXECUTABLE:"),
+                    "mode {mode} returned non-structured preflight error: {error}"
                 );
             }
-            // Positive and cancellation evidence use the Host-owned
-            // production lifecycle.  Revoke/Life/migration/binding-tamper
-            // lanes remain fail-closed here rather than being misreported as
-            // cancellation evidence; their deterministic Host-side proofs
-            // are retained in the focused suite until a real orchestration
-            // canary is available.
-            run_d32_a_real_production_canary(mode);
         }
 
         #[test]
@@ -13068,7 +17086,7 @@ mod windows {
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
                 cargo_profile: None,
-                cargo_profile_app_data_root: None,
+                app_data_root_retained: None,
                 provider: Some(provider.clone()),
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -13094,6 +17112,8 @@ mod windows {
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
                 recovery_result: Mutex::new(None),
+                #[cfg(feature = "d32-a-host-canary")]
+                canary_control: None,
                 test_outbound: Mutex::new(None),
             });
             session
@@ -13516,7 +17536,7 @@ mod windows {
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
                 cargo_profile: None,
-                cargo_profile_app_data_root: None,
+                app_data_root_retained: None,
                 provider: None,
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -13542,6 +17562,8 @@ mod windows {
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
                 recovery_result: Mutex::new(None),
+                #[cfg(feature = "d32-a-host-canary")]
+                canary_control: None,
                 test_outbound: Mutex::new(None),
             });
             handle_recovery_pending(&session, recovery_pending.clone())
@@ -13913,7 +17935,7 @@ mod windows {
                 task_id: task_id.clone(),
                 workspace_identity: ready.workspace_identity,
                 cargo_profile: None,
-                cargo_profile_app_data_root: None,
+                app_data_root_retained: None,
                 provider: Some(provider.clone()),
                 writer: Mutex::new(Some(writer)),
                 pending: Mutex::new(HashMap::new()),
@@ -13939,6 +17961,8 @@ mod windows {
                 assistant_text: Mutex::new(None),
                 turn_error: Mutex::new(None),
                 recovery_result: Mutex::new(None),
+                #[cfg(feature = "d32-a-host-canary")]
+                canary_control: None,
                 test_outbound: Mutex::new(None),
             });
             session

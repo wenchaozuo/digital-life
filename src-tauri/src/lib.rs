@@ -1,4 +1,5 @@
 mod candidate_memory_internal;
+#[cfg(not(test))]
 use std::sync::Arc;
 // D11-B1 is the emotion authority foundation; the emotion domain has no
 // production caller until the D11-B2+ policy/conversation stages, so the
@@ -65,10 +66,11 @@ mod storage;
 pub mod vector_store;
 mod vita_sidecar;
 
+#[cfg(not(test))]
 use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+#[cfg(not(test))]
+fn production_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -276,10 +278,73 @@ pub fn run() {
             perception::screen_vision_delivery::abandon_main_screen_vision_delivery,
             perception::screen_vision_delivery::offer_screen_vision_result_to_chat,
         ])
+}
+
+#[cfg(not(test))]
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    production_builder()
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
+#[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
+pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, String> {
+    let context = tauri::generate_context!();
+    let mut environment =
+        vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier)?;
+    let result = (|| {
+        // Complete every real-root read and the isolated provider preflight
+        // before publishing the stable baseline.  SQLite's read-only online
+        // backup may legitimately touch its live WAL/SHM bookkeeping; that
+        // transient setup activity must not be mistaken for a later external
+        // writer, while any stable mutation after this point remains a Host
+        // failure.
+        let preflight =
+            vita_sidecar::d32_a_preflight_chat_provider(&context.config().identifier, mode);
+        let baseline = environment.establish_stable_baseline();
+        preflight?;
+        baseline?;
+        let mut app = production_builder()
+            .any_thread()
+            .build(context)
+            .map_err(|error| {
+                let message = error.to_string();
+                message
+                    .find("D32_A_NOT_EXECUTABLE:")
+                    .map(|index| message[index..].to_string())
+                    .unwrap_or_else(|| format!("D32-A production Host bootstrap failed: {message}"))
+            })?;
+
+        // `Builder::build` constructs the App but deliberately defers the
+        // production setup hook until the runtime enters its event loop.  The
+        // canary must execute that real setup (state management, configured
+        // windows, and protocol registration) before handing the App to the
+        // integration harness, while still returning to the standalone process
+        // instead of entering the normal forever-running UI loop.
+        #[allow(deprecated)]
+        app.run_iteration(|_, _| {});
+
+        let report = vita_sidecar::run_d32_a_host_integration(app, mode)?;
+        serde_json::to_value(report).map_err(|error| {
+            format!("D32_A_HOST_FAILURE: canary report serialization failed: {error}")
+        })
+    })();
+    let audit = environment.verify_real_roots_unchanged();
+    let cleanup = environment.cleanup();
+    drop(environment);
+    match (result, audit, cleanup) {
+        (_, Err(audit_error), Err(cleanup_error)) => Err(format!(
+            "{audit_error}; D32 cleanup outcome: {cleanup_error}"
+        )),
+        (_, Err(audit_error), Ok(())) => Err(audit_error),
+        (_, Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(report), Ok(()), Ok(())) => Ok(report),
+    }
+}
+
+#[cfg(not(test))]
 fn create_configured_windows(app: &mut tauri::App) -> Result<(), std::io::Error> {
     let windows = app.config().app.windows.clone();
     for config in windows.iter().filter(|window| !window.create) {
@@ -292,15 +357,18 @@ fn create_configured_windows(app: &mut tauri::App) -> Result<(), std::io::Error>
 }
 
 #[tauri::command]
+#[cfg(not(test))]
 fn open_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
     show_secondary_window(&app, "settings")
 }
 
 #[tauri::command]
+#[cfg(not(test))]
 fn open_chat_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
     show_secondary_window(&app, "chat")
 }
 
+#[cfg(not(test))]
 fn show_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), storage::StorageError> {
     let window = app.get_webview_window(label).ok_or_else(|| {
         storage::StorageError::new(
@@ -320,10 +388,12 @@ fn show_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), stor
 }
 
 #[tauri::command]
+#[cfg(not(test))]
 fn close_settings_window(app: tauri::AppHandle) -> Result<(), storage::StorageError> {
     hide_secondary_window(&app, "settings")
 }
 
+#[cfg(not(test))]
 fn hide_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), storage::StorageError> {
     let window = app.get_webview_window(label).ok_or_else(|| {
         storage::StorageError::new(
@@ -340,6 +410,7 @@ fn hide_secondary_window(app: &tauri::AppHandle, label: &str) -> Result<(), stor
         })
 }
 
+#[cfg(not(test))]
 fn configure_window_lifecycle(app: &mut tauri::App) -> Result<(), std::io::Error> {
     for label in ["chat", "settings"] {
         let window = app.get_webview_window(label).ok_or_else(|| {

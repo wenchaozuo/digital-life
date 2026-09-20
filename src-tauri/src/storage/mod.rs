@@ -101,6 +101,8 @@ use std::{
 };
 
 use location::{ConfigSnapshot, StorageLocationResolver};
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+use rusqlite::OpenFlags;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -521,6 +523,11 @@ impl<'a> CapabilityAuthorizationScope<'a> {
 
 impl StorageService {
     pub fn initialize(app: &AppHandle) -> Result<Self, StorageError> {
+        #[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+        if let Some(canary_root) = std::env::var_os("D32_A_CANARY_APP_DATA_ROOT") {
+            let canary_root = PathBuf::from(canary_root);
+            return Self::initialize_with_roots(canary_root, std::env::current_dir().ok());
+        }
         let default_root = app.path().app_data_dir().map_err(StorageError::database)?;
         let project_root = std::env::current_dir().ok();
         Self::initialize_with_roots(default_root, project_root)
@@ -1351,6 +1358,124 @@ impl StorageService {
             persona_id: row.get(5)?,
             persona_version: row.get(6)?,
         })
+    }
+}
+
+/// Snapshot the active Host database into a caller-owned canary root without
+/// copying individual SQLite files.  The source location is resolved by the
+/// production `StorageLocationResolver`; the source connection is read-only
+/// and the destination is produced by the production SQLite Online Backup /
+/// verification path.  This keeps WAL/SHM state coherent and prevents a
+/// hand-written storage-location parser or a per-file copy from becoming a
+/// second storage authority.
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) fn d32_a_snapshot_app_data(
+    default_root: &Path,
+    snapshot_root: &Path,
+) -> Result<(), StorageError> {
+    fs::create_dir_all(snapshot_root).map_err(StorageError::database)?;
+    // Do not create a real app-data directory merely to discover that the
+    // mandatory canary has no storage.  Once it exists, all path resolution
+    // is delegated to the same resolver used by StorageService itself.
+    if !default_root.is_dir() {
+        return Ok(());
+    }
+
+    let resolver = StorageLocationResolver::new(default_root.to_path_buf(), None);
+    let active_root = resolver.resolve_active_root()?;
+    let database_path = active_root.join(DATABASE_FILE_NAME);
+    if !database_path.is_file() {
+        return Ok(());
+    }
+
+    let source = Connection::open_with_flags(
+        &database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| StorageError::connection_open_failed())?;
+    let schema_version = connection::read_schema_version(&source)?;
+    let current_life_id = StorageService::current_life_id(&source)?.ok_or_else(|| {
+        StorageError::new(
+            "MIGRATION_CURRENT_LIFE_MISSING",
+            "The active storage database has no current Life.",
+            true,
+        )
+    })?;
+    migration::backup_and_verify(
+        &source,
+        &snapshot_root.join(DATABASE_FILE_NAME),
+        schema_version,
+        &current_life_id,
+    )
+}
+
+/// Feature-only audit seam for the D32 Host canary.  It intentionally exposes
+/// only the resolver-selected active root; production callers retain the
+/// `StorageService::active_data_root` accessor and no alternate path parser is
+/// introduced.
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) fn d32_a_resolve_active_root(default_root: &Path) -> Result<PathBuf, StorageError> {
+    if !default_root.is_dir() {
+        return Ok(default_root.to_path_buf());
+    }
+    StorageLocationResolver::new(default_root.to_path_buf(), None).resolve_active_root()
+}
+
+/// Read the active Chat profile for the D32-A production-canary preflight
+/// without opening the writable Host storage connection.  The canary must be
+/// able to return `D32_A_NOT_EXECUTABLE` for a missing provider before the
+/// production Tauri setup hook initializes SQLite (which enables WAL and can
+/// otherwise update the real app-data directory even for a fail-closed run).
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+pub(crate) fn d32_a_read_only_chat_provider_profile(
+    default_root: &Path,
+) -> Result<Option<(String, String, String)>, StorageError> {
+    // Even a read-only SQLite connection may touch the live `-shm` file while
+    // joining a WAL database. Snapshot the three SQLite files first so this
+    // preflight cannot update timestamps, locks, or contents in real
+    // APPDATA. A failed snapshot is deliberately fail-closed.
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| StorageError::database("The provider preflight identity was unavailable."))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let snapshot_root = std::env::temp_dir().join(format!(
+        "digital-life-d32a-provider-preflight-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&snapshot_root).map_err(StorageError::database)?;
+    let result = (|| {
+        d32_a_snapshot_app_data(default_root, &snapshot_root)?;
+        let snapshot_database = snapshot_root.join(DATABASE_FILE_NAME);
+        if !snapshot_database.is_file() {
+            return Ok(None);
+        }
+        let connection = Connection::open_with_flags(
+            &snapshot_database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| StorageError::connection_open_failed())?;
+        connection
+            .query_row(
+                "SELECT p.id, p.base_url, p.model_name
+                 FROM active_model_profile AS a
+                 JOIN model_profile AS p
+                   ON p.id = a.profile_id AND p.purpose = a.purpose
+                 WHERE a.purpose = 'chat'
+                   AND p.purpose = 'chat'
+                   AND p.provider_kind = 'openai_compatible'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| StorageError::database("The active Chat profile could not be read."))
+    })();
+    let cleanup = fs::remove_dir_all(&snapshot_root).map_err(StorageError::database);
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
 }
 

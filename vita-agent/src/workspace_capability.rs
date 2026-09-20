@@ -607,6 +607,14 @@ struct TrustedWorkspaceRootInner {
     final_path: PathBuf,
     identity: WorkspaceRootIdentity,
     #[cfg(windows)]
+    // The authority is always `handle`.  These two fields are retained only
+    // so a name revalidation can open the configured leaf relative to the
+    // already-acquired parent; they must never be reconstructed from the
+    // absolute requested pathname.
+    parent_handle: Arc<platform::OwnedHandle>,
+    #[cfg(windows)]
+    leaf_name: OsString,
+    #[cfg(windows)]
     handle: Arc<platform::OwnedHandle>,
 }
 
@@ -676,6 +684,17 @@ impl TrustedWorkspaceRoot {
         }
     }
 
+    /// D32/H7 may borrow the already-acquired workspace capability without
+    /// reopening its display pathname.  The returned native handle is a
+    /// process-local duplicate of the retained root handle and must be
+    /// wrapped immediately by the crate-private H7 retained-directory API.
+    #[cfg(windows)]
+    pub(crate) fn duplicate_native_handle_for_retained(
+        &self,
+    ) -> Result<windows_sys::Win32::Foundation::HANDLE, VitaAgentError> {
+        platform::duplicate_root_handle(&self.inner.handle)
+    }
+
     /// Resolves one relative target from the root handle and returns only
     /// resource identity and classification.  No later pathname reopen is
     /// implied by this API.
@@ -703,6 +722,8 @@ impl TrustedWorkspaceRoot {
         requested_path: PathBuf,
         final_path: PathBuf,
         identity: WorkspaceRootIdentity,
+        parent_handle: Arc<platform::OwnedHandle>,
+        leaf_name: OsString,
         handle: Arc<platform::OwnedHandle>,
     ) -> Self {
         Self {
@@ -710,6 +731,8 @@ impl TrustedWorkspaceRoot {
                 requested_path,
                 final_path,
                 identity,
+                parent_handle,
+                leaf_name,
                 handle,
             }),
         }
@@ -1346,10 +1369,11 @@ mod platform {
         FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-        OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_NO_MORE_ENTRIES, STATUS_NO_MORE_FILES,
-        STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+        CloseHandle, DuplicateHandle, RtlNtStatusToDosError, DUPLICATE_SAME_ACCESS, HANDLE,
+        INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        STATUS_NO_MORE_ENTRIES, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+        UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileIdInfo, FlushFileBuffers, GetDriveTypeW, GetFileInformationByHandle,
@@ -1362,6 +1386,7 @@ mod platform {
         FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
         SYNCHRONIZE,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::WindowsProgramming::{
         DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
     };
@@ -1394,6 +1419,34 @@ mod platform {
     // OwnedHandle.  Arc ensures all cloned capabilities share its lifetime.
     unsafe impl Send for OwnedHandle {}
     unsafe impl Sync for OwnedHandle {}
+
+    pub(super) fn duplicate_root_handle(
+        handle: &Arc<OwnedHandle>,
+    ) -> Result<HANDLE, VitaAgentError> {
+        let mut duplicate = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle.0,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 || duplicate.is_null() || duplicate == INVALID_HANDLE_VALUE {
+            if !duplicate.is_null() && duplicate != INVALID_HANDLE_VALUE {
+                unsafe {
+                    let _ = CloseHandle(duplicate);
+                }
+            }
+            return Err(VitaAgentError::KernelInvariant(
+                "retained workspace root handle duplication failed",
+            ));
+        }
+        Ok(duplicate)
+    }
 
     impl fmt::Debug for OwnedHandle {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1568,6 +1621,8 @@ mod platform {
             acquired.requested_path,
             acquired.final_path,
             acquired.identity,
+            acquired.parent_handle,
+            acquired.leaf_name,
             acquired.handle,
         ))
     }
@@ -1576,6 +1631,8 @@ mod platform {
         requested_path: PathBuf,
         final_path: PathBuf,
         identity: WorkspaceRootIdentity,
+        parent_handle: Arc<OwnedHandle>,
+        leaf_name: OsString,
         handle: Arc<OwnedHandle>,
     }
 
@@ -1602,8 +1659,12 @@ mod platform {
 
         let anchor_final_path = anchor_details.final_path.clone();
         let mut parent_handle = Arc::new(drive_anchor);
+        let mut root_parent_handle = Arc::clone(&parent_handle);
+        let mut root_leaf_name = OsString::new();
         let mut final_details = anchor_details;
         for component in &components {
+            root_parent_handle = Arc::clone(&parent_handle);
+            root_leaf_name = component.clone();
             let child = match open_relative(&parent_handle, component, true) {
                 Ok(child) => child,
                 Err(error) => return Err(relative_open_error(requested_path, error)),
@@ -1632,6 +1693,8 @@ mod platform {
             requested_path: requested_path.to_path_buf(),
             final_path: final_details.final_path,
             identity: final_details.identity,
+            parent_handle: root_parent_handle,
+            leaf_name: root_leaf_name,
             handle: parent_handle,
         })
     }
@@ -1668,12 +1731,20 @@ mod platform {
     }
 
     pub(super) fn verify_root_name(root: &TrustedWorkspaceRoot) -> Result<(), VitaAgentError> {
-        // Revalidation uses the same handle-relative, no-reparse acquisition
-        // path as initial acquisition.  It never treats a full pathname open
-        // or canonicalize result as the authority.
-        let rebound = acquire_root(root.requested_path())?;
-        if rebound.identity() != root.identity()
-            || !same_path(root.final_path(), rebound.final_path())
+        // Revalidation is relative to the retained parent and fixed leaf
+        // captured during acquisition.  In particular, do not call
+        // acquire_root(root.requested_path()): that would create a
+        // pathname-check -> absolute-reopen authority window.  The retained
+        // root handle remains the authority; this open is only a binding
+        // probe for the configured name.
+        let rebound = if root.inner.leaf_name.is_empty() {
+            inspect_handle(&root.inner.handle, true)?
+        } else {
+            let rebound = open_relative(&root.inner.parent_handle, &root.inner.leaf_name, true)
+                .map_err(|error| relative_open_error(root.requested_path(), error))?;
+            inspect_handle(&rebound, true)?
+        };
+        if rebound.identity != root.identity() || !same_path(root.final_path(), &rebound.final_path)
         {
             return Err(unsafe_root_path(
                 root.requested_path(),
@@ -3774,11 +3845,17 @@ mod platform {
         root: &TrustedWorkspaceRoot,
         requested_path: PathBuf,
     ) -> TrustedWorkspaceRoot {
+        let leaf_name = requested_path
+            .file_name()
+            .map(OsStr::to_os_string)
+            .unwrap_or_else(|| root.inner.leaf_name.clone());
         TrustedWorkspaceRoot {
             inner: Arc::new(TrustedWorkspaceRootInner {
                 requested_path,
                 final_path: root.inner.final_path.clone(),
                 identity: root.inner.identity,
+                parent_handle: Arc::clone(&root.inner.parent_handle),
+                leaf_name,
                 handle: Arc::clone(&root.inner.handle),
             }),
         }

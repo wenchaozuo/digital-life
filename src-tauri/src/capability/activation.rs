@@ -519,12 +519,36 @@ fn apply_transition(
     )
 }
 
-/// Narrow composition seam for Host integration tests.  Production callers
-/// must use the Settings-window command below; keeping this helper behind
-/// `cfg(test)` lets Vita tests exercise the exact D30 transition path without
-/// widening the runtime authorization API.
-#[cfg(test)]
+/// Narrow composition seam for Host integration tests and the default-off
+/// production canary. Production callers must use the Settings-window command
+/// below; the feature-gated build is not part of the ordinary release and does
+/// not widen the runtime authorization API.
+#[cfg(any(test, feature = "d32-a-host-canary"))]
 pub(crate) fn apply_transition_for_test(
+    storage: &StorageService,
+    registry: &CapabilityRegistry,
+    capability_id: &str,
+    enabled: bool,
+    expected_revision: i64,
+    observed_life_id: &str,
+) -> Result<CapabilityAuthorizationUpdateResult, CapabilityActivationCommandError> {
+    apply_transition(
+        storage,
+        registry,
+        capability_id,
+        enabled,
+        expected_revision,
+        observed_life_id,
+    )
+}
+
+/// Narrow Host-only composition seam for the D32 real canary.  The canary
+/// must exercise the same Settings event/application route as production; it
+/// is not allowed to call the test-labelled helper above.  This wrapper keeps
+/// the feature boundary explicit while delegating all validation, CAS, event
+/// minting, and durable application to the canonical transition function.
+#[cfg(feature = "d32-a-host-canary")]
+pub(crate) fn apply_transition_for_host_canary(
     storage: &StorageService,
     registry: &CapabilityRegistry,
     capability_id: &str,

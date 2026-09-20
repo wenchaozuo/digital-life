@@ -13,23 +13,24 @@ use codex_extension_api::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::Digest;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::ffi::{OsStr, OsString};
+#[cfg(test)]
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+#[cfg(feature = "d32-a-test-helper")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
+use vita_agent_protocol as protocol;
 
 use crate::d29h7::{
-    H7AuthorityPort, H7ExecutableCatalog, H7PendingConfirmationBridge, H7PendingProcessAction,
-    H7ProcessBroker, H7ProcessRequest, H7SandboxProfile, VitaGitStatusAuthorityAdapter,
+    H7AuthorityPort, H7D32CatalogResources, H7ExecutableCatalog, H7PendingConfirmationBridge,
+    H7PendingProcessAction, H7ProcessBroker, H7ProcessRequest, H7RetainedDirectory,
+    H7SandboxProfile, H7ToolResult, VitaGitStatusAuthorityAdapter,
     VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID, VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID,
     VITA_WORKSPACE_CARGO_CHECK_TOOL_NAME,
 };
-use crate::{TrustedWorkspaceRoot, VitaExecutionContext, VitaGitStatusAuthority};
+use crate::{SidecarRunMode, TrustedWorkspaceRoot, VitaExecutionContext, VitaGitStatusAuthority};
 
 pub(crate) const D32_CARGO_PROGRAM_ID: &str = "cargo-check-v1";
 pub(crate) const D32_CARGO_PROFILE_ID: &str = VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID;
@@ -44,14 +45,16 @@ pub(crate) const D32_TARGET_DIR_NAME: &str = "target";
 
 const D32_MAX_SOURCE_FILES: usize = 16_384;
 const D32_MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
-const D32_MAX_TOOLCHAIN_FILES: usize = 131_072;
-const D32_MAX_TOOLCHAIN_FILE_BYTES: usize = 512 * 1024 * 1024;
-const D32_MAX_TOOLCHAIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const D32_MAX_TOOLCHAIN_FILES: usize = protocol::D32_MANIFEST_MAX_FILES;
+const D32_MAX_TOOLCHAIN_FILE_BYTES: usize = protocol::D32_MANIFEST_MAX_FILE_BYTES as usize;
+const D32_MAX_TOOLCHAIN_BYTES: u64 = protocol::D32_MANIFEST_MAX_TOTAL_BYTES;
 const D32_MAX_SOURCE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const D32_MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
 pub(crate) const D32_RUNS_DIR_NAME: &str = "runs";
+const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v1";
+const D32_NATIVE_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "d32-a-test-helper")]
 static D32_TEST_EVIDENCE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
@@ -76,9 +79,11 @@ pub(crate) fn take_internal_evidence() -> Option<Value> {
 /// A Host-selected Rust toolchain mirrored below private app data.  The
 /// selected user-profile root is consulted only while this immutable mirror
 /// is built; production children receive only these app-owned paths.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct D32ToolchainMirror {
     pub(crate) root: PathBuf,
+    pub(crate) retained_root: Arc<H7RetainedDirectory>,
+    pub(crate) retained_bin: Arc<H7RetainedDirectory>,
     pub(crate) cargo_path: PathBuf,
     pub(crate) rustc_path: PathBuf,
     pub(crate) rustdoc_path: PathBuf,
@@ -86,15 +91,15 @@ pub(crate) struct D32ToolchainMirror {
 }
 
 impl D32ToolchainMirror {
-    pub(crate) fn prepare(
-        app_data_root: &std::path::Path,
+    pub(crate) fn prepare_from_retained(
+        app_data_root_retained: Arc<H7RetainedDirectory>,
         selected_cargo_path: &std::path::Path,
-        selected_root: &std::path::Path,
+        selected_root_retained: Arc<H7RetainedDirectory>,
+        selected_bin_retained: Arc<H7RetainedDirectory>,
         expected_manifest_hash: &str,
     ) -> Result<Arc<Self>, String> {
-        if !app_data_root.is_absolute()
+        if !app_data_root_retained.path().is_absolute()
             || !selected_cargo_path.is_absolute()
-            || !selected_root.is_absolute()
             || expected_manifest_hash.len() != 64
             || expected_manifest_hash
                 .bytes()
@@ -102,67 +107,84 @@ impl D32ToolchainMirror {
         {
             return Err("D32 Host toolchain mirror evidence was not exact".to_string());
         }
-        let app_data_root = fs::canonicalize(app_data_root)
-            .map_err(|_| "D32 app-data root could not be canonicalized".to_string())?;
-        let selected_root = fs::canonicalize(selected_root)
-            .map_err(|_| "D32 selected toolchain root could not be canonicalized".to_string())?;
-        let selected_cargo = fs::canonicalize(selected_cargo_path).ok();
-        let root_cargo = fs::canonicalize(selected_root.join("bin/cargo.exe")).ok();
-        if !selected_root.is_dir()
-            || !selected_root.join("bin/rustc.exe").is_file()
-            || !selected_root.join("bin/rustdoc.exe").is_file()
-            || selected_cargo.is_none()
-            || selected_cargo != root_cargo
+        selected_root_retained.revalidate()?;
+        selected_bin_retained.revalidate()?;
+        app_data_root_retained.revalidate()?;
+        let app_data_retained = app_data_root_retained;
+        let selected_cargo_name = OsStr::new("cargo.exe");
+        if selected_cargo_path.file_name() != Some(selected_cargo_name)
+            || selected_cargo_path.parent().is_none_or(|parent| {
+                parent.to_string_lossy().to_ascii_lowercase()
+                    != selected_bin_retained
+                        .path()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+            })
         {
+            return Err("D32 Host-selected Cargo path was not the retained bin child".to_string());
+        }
+        let selected_cargo_identity = selected_bin_retained
+            .probe_file_bounded(selected_cargo_name, D32_MAX_IMAGE_BYTES as u64)?
+            .ok_or_else(|| "D32 selected Cargo image was unavailable".to_string())?;
+        let root_cargo_identity = selected_bin_retained
+            .probe_file_bounded(OsStr::new("cargo.exe"), D32_MAX_IMAGE_BYTES as u64)?
+            .ok_or_else(|| "D32 toolchain Cargo image was unavailable".to_string())?;
+        let _root_rustc_retained = selected_bin_retained
+            .probe_file_bounded(OsStr::new("rustc.exe"), D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?
+            .ok_or_else(|| "D32 toolchain rustc image was unavailable".to_string())?;
+        let _root_rustdoc_retained = selected_bin_retained
+            .probe_file_bounded(
+                OsStr::new("rustdoc.exe"),
+                D32_MAX_TOOLCHAIN_FILE_BYTES as u64,
+            )?
+            .ok_or_else(|| "D32 toolchain rustdoc image was unavailable".to_string())?;
+        if selected_cargo_identity != root_cargo_identity {
             return Err("D32 Host-selected Rust toolchain was incomplete".to_string());
         }
 
-        let mirror_parent = app_data_root.join(D32_TOOLCHAIN_MIRROR_ROOT_NAME);
-        fs::create_dir_all(&mirror_parent)
-            .map_err(|_| "D32 toolchain mirror parent could not be created".to_string())?;
+        let mirror_parent_retained =
+            app_data_retained.open_or_create_child(OsStr::new(D32_TOOLCHAIN_MIRROR_ROOT_NAME))?;
+        let mirror_parent = mirror_parent_retained.path().to_path_buf();
         let mirror_root = mirror_parent.join(expected_manifest_hash);
-        let valid_existing = fs::symlink_metadata(&mirror_root)
-            .ok()
-            .is_some_and(|metadata| !is_reparse(&metadata))
-            && mirror_root.is_dir()
-            && validate_existing_tree_without_reparse(&mirror_root).is_ok()
-            && toolchain_manifest_hash(&mirror_root).ok().as_deref()
-                == Some(expected_manifest_hash)
-            && mirror_root.join("bin/cargo.exe").is_file()
-            && mirror_root.join("bin/rustc.exe").is_file()
-            && mirror_root.join("bin/rustdoc.exe").is_file();
+        let existing_mirror = mirror_parent_retained
+            .open_existing_child(OsStr::new(expected_manifest_hash))
+            .ok();
+        let valid_existing = existing_mirror.as_ref().is_some_and(|mirror| {
+            mirror.revalidate().is_ok()
+                && validate_existing_tree_without_reparse_retained(mirror).is_ok()
+                && toolchain_manifest_hash_retained(mirror).ok().as_deref()
+                    == Some(expected_manifest_hash)
+                && retained_toolchain_images_present(mirror)
+        });
 
         if !valid_existing {
-            if fs::symlink_metadata(&mirror_root).is_ok() {
-                validate_existing_tree_without_reparse(&mirror_root)?;
-                fs::remove_dir_all(&mirror_root)
-                    .map_err(|_| "D32 stale toolchain mirror could not be removed".to_string())?;
-            }
-            let staging = mirror_parent.join(format!(".{expected_manifest_hash}.staging"));
-            if fs::symlink_metadata(&staging).is_ok() {
-                validate_existing_tree_without_reparse(&staging)?;
-                fs::remove_dir_all(&staging)
-                    .map_err(|_| "D32 stale toolchain staging could not be removed".to_string())?;
-            }
-            fs::create_dir_all(&staging)
-                .map_err(|_| "D32 toolchain staging root could not be created".to_string())?;
+            mirror_parent_retained
+                .remove_child_tree_if_present(OsStr::new(expected_manifest_hash))?;
+            let staging_name = OsString::from(format!(".{expected_manifest_hash}.staging"));
+            mirror_parent_retained.remove_child_tree_if_present(&staging_name)?;
+            let staging_retained = mirror_parent_retained.open_or_create_child(&staging_name)?;
             let mut limits = CopyLimits::new(D32_MAX_TOOLCHAIN_FILES, D32_MAX_TOOLCHAIN_BYTES);
-            copy_tree_without_reparse(&selected_root, &staging, &mut limits)?;
-            copy_regular_file_without_reparse(
-                selected_cargo_path,
-                &staging.join("bin/cargo.exe"),
-                D32_MAX_IMAGE_BYTES,
-            )?;
-            let staged_manifest = toolchain_manifest_hash(&staging)?;
+            copy_tree_without_reparse(&selected_root_retained, &staging_retained, &mut limits)?;
+            let staged_manifest = toolchain_manifest_hash_retained(&staging_retained)?;
             if staged_manifest != expected_manifest_hash {
-                let _ = fs::remove_dir_all(&staging);
+                let _ = staging_retained.remove_self();
                 return Err("D32 staged toolchain mirror did not match Host evidence".to_string());
             }
-            fs::rename(&staging, &mirror_root)
-                .map_err(|_| "D32 toolchain mirror could not be finalized".to_string())?;
+            drop(staging_retained);
+            mirror_parent_retained.rename_directory(
+                &staging_name,
+                OsStr::new(expected_manifest_hash),
+                false,
+            )?;
         }
 
-        let manifest_hash = toolchain_manifest_hash(&mirror_root)?;
+        let retained_root = Arc::new(
+            mirror_parent_retained.open_existing_child(OsStr::new(expected_manifest_hash))?,
+        );
+        retained_root.revalidate()?;
+        let retained_bin = Arc::new(retained_root.open_existing_child(OsStr::new("bin"))?);
+        retained_bin.revalidate()?;
+        let manifest_hash = toolchain_manifest_hash_retained(&retained_root)?;
         if manifest_hash != expected_manifest_hash {
             return Err("D32 toolchain mirror manifest changed".to_string());
         }
@@ -171,6 +193,8 @@ impl D32ToolchainMirror {
             rustc_path: mirror_root.join("bin/rustc.exe"),
             rustdoc_path: mirror_root.join("bin/rustdoc.exe"),
             root: mirror_root,
+            retained_root,
+            retained_bin,
             manifest_hash,
         }))
     }
@@ -180,9 +204,15 @@ impl D32ToolchainMirror {
 /// live workspace and the user-profile toolchain never become the child cwd or
 /// executable image; they are copied once, before the production contributor
 /// is exposed, into this deterministic root.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct D32ExecutionProjection {
     pub(crate) root: PathBuf,
+    pub(crate) retained_root: Arc<H7RetainedDirectory>,
+    pub(crate) retained_source: Arc<H7RetainedDirectory>,
+    pub(crate) retained_cargo_home: Arc<H7RetainedDirectory>,
+    pub(crate) retained_target: Arc<H7RetainedDirectory>,
+    pub(crate) retained_toolchain: Arc<H7RetainedDirectory>,
+    pub(crate) retained_toolchain_bin: Arc<H7RetainedDirectory>,
     pub(crate) source_root: PathBuf,
     pub(crate) toolchain_root: PathBuf,
     pub(crate) cargo_home: PathBuf,
@@ -198,18 +228,19 @@ pub(crate) struct D32ExecutionProjection {
 /// to the H7 action or explicitly cleaned up.  This guard is intentionally
 /// independent of the async tool path: an early `?`, a panic, or a failed
 /// copy must not leave a partial app-owned projection behind.
-#[derive(Debug)]
 struct D32ProjectionRollbackState {
     root: PathBuf,
+    retained_root: Arc<H7RetainedDirectory>,
     armed: AtomicBool,
     cleanup_failed: AtomicBool,
     cleanup_failure: Mutex<Option<String>>,
 }
 
 impl D32ProjectionRollbackState {
-    fn new(root: PathBuf) -> Arc<Self> {
+    fn new(root: PathBuf, retained_root: Arc<H7RetainedDirectory>) -> Arc<Self> {
         Arc::new(Self {
             root,
+            retained_root,
             armed: AtomicBool::new(true),
             cleanup_failed: AtomicBool::new(false),
             cleanup_failure: Mutex::new(None),
@@ -243,30 +274,25 @@ impl Drop for D32ProjectionRollbackState {
         // A reparse point or an uninspectable tree is deliberately left in
         // place.  Removing an unsafe path during panic cleanup would turn a
         // containment failure into an arbitrary deletion primitive.
-        match fs::symlink_metadata(&self.root) {
-            Ok(metadata) if !is_reparse(&metadata) => {
-                if let Err(error) = validate_existing_tree_without_reparse(&self.root) {
-                    self.mark_cleanup_failed(error);
-                } else if let Err(error) = fs::remove_dir_all(&self.root) {
-                    self.mark_cleanup_failed(format!(
-                        "D32 run root could not be removed during rollback: {error}"
-                    ));
-                }
-            }
-            Ok(_) => self.mark_cleanup_failed("D32 run root became a reparse point"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.disarm();
-            }
-            Err(error) => self.mark_cleanup_failed(format!(
-                "D32 run root metadata was unavailable during rollback: {error}"
-            )),
+        if let Err(error) = self.retained_root.revalidate() {
+            self.mark_cleanup_failed(format!(
+                "D32 retained run root changed during rollback: {error}"
+            ));
+            return;
+        }
+        if let Err(error) = self.retained_root.remove_self() {
+            self.mark_cleanup_failed(format!(
+                "D32 run root could not be removed during rollback: {error}"
+            ));
+        } else {
+            self.disarm();
         }
     }
 }
 
 impl D32ExecutionProjection {
     pub(crate) fn prepare(
-        app_data_root: PathBuf,
+        app_data_root_retained: Arc<H7RetainedDirectory>,
         workspace_root: &TrustedWorkspaceRoot,
         toolchain: Arc<D32ToolchainMirror>,
         session_id: &str,
@@ -274,7 +300,7 @@ impl D32ExecutionProjection {
         tool_call_id: &str,
     ) -> Result<Arc<Self>, String> {
         let projection = Self::prepare_layout(
-            app_data_root,
+            app_data_root_retained,
             workspace_root,
             toolchain,
             session_id,
@@ -290,14 +316,14 @@ impl D32ExecutionProjection {
     /// workspace.  D32's Host authority must complete its fresh D28 scope
     /// evaluation before [`Self::populate`] snapshots any workspace bytes.
     pub(crate) fn prepare_layout(
-        app_data_root: PathBuf,
+        app_data_root_retained: Arc<H7RetainedDirectory>,
         workspace_root: &TrustedWorkspaceRoot,
         toolchain: Arc<D32ToolchainMirror>,
         session_id: &str,
         turn_id: &str,
         tool_call_id: &str,
     ) -> Result<Arc<Self>, String> {
-        if !app_data_root.is_absolute()
+        if !app_data_root_retained.path().is_absolute()
             || session_id.is_empty()
             || turn_id.is_empty()
             || tool_call_id.is_empty()
@@ -307,43 +333,47 @@ impl D32ExecutionProjection {
         workspace_root
             .verify_named_path_current()
             .map_err(|_| "D32 governed workspace changed before staging".to_string())?;
-        let app_data_root = fs::canonicalize(&app_data_root)
-            .map_err(|_| "D32 app-data root could not be canonicalized".to_string())?;
-        let root = app_data_root
-            .join(D32_EXECUTION_ROOT_NAME)
-            .join(D32_RUNS_DIR_NAME)
-            .join(d32_run_id(session_id, turn_id, tool_call_id));
-        match fs::symlink_metadata(&root) {
-            Ok(metadata) => {
-                if is_reparse(&metadata) {
-                    return Err("D32 stale app-owned projection was a reparse point".to_string());
-                }
-                validate_existing_tree_without_reparse(&root)?;
-                fs::remove_dir_all(&root).map_err(|_| {
-                    "D32 stale app-owned projection could not be removed".to_string()
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err("D32 stale app-owned projection metadata was unavailable".to_string())
-            }
-        }
+        let app_data_retained = app_data_root_retained;
+        app_data_retained.revalidate()?;
+        let execution_parent =
+            app_data_retained.open_or_create_child(OsStr::new(D32_EXECUTION_ROOT_NAME))?;
+        let runs_parent = execution_parent.open_or_create_child(OsStr::new(D32_RUNS_DIR_NAME))?;
+        let run_name = OsString::from(d32_run_id(session_id, turn_id, tool_call_id));
+        runs_parent.remove_child_tree_if_present(&run_name)?;
+        let root = runs_parent.path().join(&run_name);
+        let root_retained = Arc::new(runs_parent.open_or_create_child(&run_name)?);
+        root_retained.revalidate()?;
         let source_root = root.join(D32_SOURCE_DIR_NAME);
         let toolchain_root = toolchain.root.clone();
         let cargo_home = root.join(D32_CARGO_HOME_DIR_NAME);
         let target = root.join(D32_TARGET_DIR_NAME);
-        let rollback = D32ProjectionRollbackState::new(root.clone());
-        for path in [&source_root, &cargo_home, &target] {
-            fs::create_dir_all(path).map_err(|_| {
-                format!(
-                    "D32 projection directory could not be created: {}",
-                    path.display()
-                )
-            })?;
+        let rollback = D32ProjectionRollbackState::new(root.clone(), Arc::clone(&root_retained));
+        for name in [
+            OsStr::new(D32_SOURCE_DIR_NAME),
+            OsStr::new(D32_CARGO_HOME_DIR_NAME),
+            OsStr::new(D32_TARGET_DIR_NAME),
+        ] {
+            root_retained.open_or_create_child(name)?;
         }
+        root_retained.revalidate()?;
+        let retained_source =
+            Arc::new(root_retained.open_existing_child(OsStr::new(D32_SOURCE_DIR_NAME))?);
+        let retained_cargo_home =
+            Arc::new(root_retained.open_existing_child(OsStr::new(D32_CARGO_HOME_DIR_NAME))?);
+        let retained_target =
+            Arc::new(root_retained.open_existing_child(OsStr::new(D32_TARGET_DIR_NAME))?);
+        retained_source.revalidate()?;
+        retained_cargo_home.revalidate()?;
+        retained_target.revalidate()?;
 
         Ok(Arc::new(Self {
             root,
+            retained_root: root_retained,
+            retained_source,
+            retained_cargo_home,
+            retained_target,
+            retained_toolchain: Arc::clone(&toolchain.retained_root),
+            retained_toolchain_bin: Arc::clone(&toolchain.retained_bin),
             source_root,
             toolchain_root,
             cargo_home,
@@ -360,58 +390,47 @@ impl D32ExecutionProjection {
     /// source root.  The caller invokes this only after Host D28 scope
     /// evaluation has completed, then proceeds to confirmation and grant.
     pub(crate) fn populate(&self, workspace_root: &TrustedWorkspaceRoot) -> Result<(), String> {
+        self.retained_root.revalidate()?;
+        let source_retained = Arc::clone(&self.retained_source);
+        source_retained.revalidate()?;
         workspace_root
             .verify_named_path_current()
             .map_err(|_| "D32 governed workspace changed before staging".to_string())?;
+        // The retained workspace capability is derived only after the
+        // handle-relative binding probe above.  The probe never reopens the
+        // absolute requested pathname; the duplicated root handle remains
+        // the authority for the snapshot below.
+        let workspace_retained = H7RetainedDirectory::from_trusted_workspace_root(workspace_root)?;
+        workspace_retained.revalidate()?;
 
         let mut source_limits = CopyLimits::new(D32_MAX_SOURCE_FILES, D32_MAX_SOURCE_BYTES);
         snapshot_workspace(
-            workspace_root,
-            workspace_root.final_path(),
-            &self.source_root,
+            &workspace_retained,
+            &source_retained,
             PathBuf::new(),
             &mut source_limits,
         )?;
 
-        if !self.toolchain_root.is_absolute()
-            || !self.toolchain_root.is_dir()
-            || !self.cargo_path.is_file()
-            || !self.rustc_path.is_file()
-            || !self.rustdoc_path.is_file()
-        {
+        if !retained_toolchain_images_present(&self.retained_toolchain) {
             return Err("D32 app-owned toolchain mirror was incomplete".to_string());
         }
+        self.retained_root.revalidate()?;
+        source_retained.revalidate()?;
+        self.retained_cargo_home.revalidate()?;
+        self.retained_target.revalidate()?;
+        self.retained_toolchain.revalidate()?;
+        workspace_retained.revalidate()?;
         Ok(())
     }
 
     pub(crate) fn cleanup(&self) -> Result<(), String> {
-        match fs::symlink_metadata(&self.root) {
-            Ok(metadata) => {
-                if is_reparse(&metadata) {
-                    let error = "D32 run root became a reparse point".to_string();
-                    self.rollback.mark_cleanup_failed(error.clone());
-                    return Err(error);
-                }
-                if let Err(error) = validate_existing_tree_without_reparse(&self.root) {
-                    self.rollback.mark_cleanup_failed(error.clone());
-                    return Err(error);
-                }
-                if let Err(error) = fs::remove_dir_all(&self.root) {
-                    let error = format!("D32 run root could not be cleaned: {error}");
-                    self.rollback.mark_cleanup_failed(error.clone());
-                    return Err(error);
-                }
-                self.rollback.disarm();
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.rollback.disarm();
-            }
-            Err(error) => {
-                let error = format!("D32 run root metadata was unavailable: {error}");
-                self.rollback.mark_cleanup_failed(error.clone());
-                return Err(error);
-            }
+        self.retained_root.revalidate()?;
+        if let Err(error) = self.retained_root.remove_self() {
+            let error = format!("D32 run root could not be cleaned: {error}");
+            self.rollback.mark_cleanup_failed(error.clone());
+            return Err(error);
         }
+        self.rollback.disarm();
         Ok(())
     }
 
@@ -428,42 +447,171 @@ pub(crate) fn d32_run_id(session_id: &str, turn_id: &str, tool_call_id: &str) ->
     )
 }
 
-fn validate_existing_tree_without_reparse(root: &std::path::Path) -> Result<(), String> {
-    let mut pending = vec![(root.to_path_buf(), 0usize)];
-    let mut entries = 0usize;
-    while let Some((current, depth)) = pending.pop() {
+/// The only production D32 evidence writer.  It is constructed exclusively
+/// for the typed `D32Canary` sidecar mode; ordinary production Cargo runs do
+/// not create this namespace or publish a second result channel.
+struct D32NativeEvidenceSink {
+    directory: Arc<H7RetainedDirectory>,
+}
+
+impl D32NativeEvidenceSink {
+    fn new(app_data_root_retained: Arc<H7RetainedDirectory>) -> Result<Self, String> {
+        if !app_data_root_retained.path().is_absolute() {
+            return Err("D32 native evidence root was not absolute".to_string());
+        }
+        app_data_root_retained.revalidate()?;
+        let directory = app_data_root_retained
+            .open_or_create_child(OsStr::new(D32_NATIVE_EVIDENCE_DIR_NAME))?;
+        let sink = Self {
+            directory: Arc::new(directory),
+        };
+        sink.validate_directory(&[])?;
+        Ok(sink)
+    }
+
+    fn validate_directory(&self, allowed: &[&OsStr]) -> Result<(), String> {
+        self.directory.revalidate()?;
+        let mut entries = 0usize;
+        for name in self.directory.enumerate_children()? {
+            if !allowed.iter().any(|allowed| **allowed == name) {
+                return Err("D32 native evidence directory had stale or extra state".to_string());
+            }
+            self.directory.probe_file(&name)?;
+            entries = entries.saturating_add(1);
+            if entries > allowed.len() {
+                return Err(
+                    "D32 native evidence directory was stale or had extra entries".to_string(),
+                );
+            }
+        }
+        self.directory.revalidate()?;
+        Ok(())
+    }
+
+    fn read_bounded(&self, name: &OsStr) -> Result<Vec<u8>, String> {
+        let before = self.directory.probe_file(name)?;
+        let bytes = self
+            .directory
+            .read_file(name, D32_NATIVE_EVIDENCE_MAX_BYTES)?;
+        let after = self.directory.probe_file(name)?;
+        if before != after || bytes.len() > D32_NATIVE_EVIDENCE_MAX_BYTES {
+            return Err("D32 native evidence file identity changed during read".to_string());
+        }
+        Ok(bytes)
+    }
+
+    fn publish(
+        &self,
+        context: &VitaExecutionContext,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        result: &H7ToolResult,
+    ) -> Result<(), String> {
+        self.validate_directory(&[])?;
+        let run_id = d32_run_id(session_id, turn_id, tool_call_id);
+        let final_name = OsString::from(format!("{run_id}.json"));
+        let temporary_name = OsString::from(format!(".{run_id}.tmp"));
+        if self.directory.probe_file(&final_name)?.is_some()
+            || self.directory.probe_file(&temporary_name)?.is_some()
+        {
+            return Err("D32 native evidence publication found stale state".to_string());
+        }
+
+        let mut record = result.d32_native_evidence();
+        let object = record
+            .as_object_mut()
+            .ok_or_else(|| "D32 native evidence was not an object".to_string())?;
+        object.insert("version".to_string(), json!(1));
+        object.insert("run_id".to_string(), json!(run_id));
+        object.insert("session_id".to_string(), json!(session_id));
+        object.insert("life_id".to_string(), json!(context.life_id()));
+        object.insert("task_id".to_string(), json!(context.task_id()));
+        object.insert("turn_id".to_string(), json!(turn_id));
+        object.insert("tool_call_id".to_string(), json!(tool_call_id));
+        object.insert("capability_id".to_string(), json!(D32_CARGO_CAPABILITY_ID));
+        object.insert("program_id".to_string(), json!(D32_CARGO_PROGRAM_ID));
+        object.insert("profile_id".to_string(), json!(D32_CARGO_PROFILE_ID));
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|_| "D32 native evidence serialization failed".to_string())?;
+        if bytes.is_empty() || bytes.len() > D32_NATIVE_EVIDENCE_MAX_BYTES {
+            return Err("D32 native evidence exceeded its publication bound".to_string());
+        }
+
+        let result = (|| {
+            self.directory.create_new_file(&temporary_name, &bytes)?;
+            self.directory.revalidate()?;
+            let written = self.read_bounded(&temporary_name)?;
+            if written != bytes || crate::sha256_hex(&written) != crate::sha256_hex(&bytes) {
+                return Err("D32 native evidence temporary file identity/hash changed".to_string());
+            }
+            self.directory.revalidate()?;
+            self.directory.rename_file(&temporary_name, &final_name)?;
+            self.directory.revalidate()?;
+            let published = self.read_bounded(&final_name)?;
+            if published != bytes || crate::sha256_hex(&published) != crate::sha256_hex(&bytes) {
+                return Err("D32 native evidence published identity/hash changed".to_string());
+            }
+            self.validate_directory(&[&final_name])
+        })();
+        result
+    }
+}
+
+fn validate_existing_tree_without_reparse_retained(
+    root: &H7RetainedDirectory,
+) -> Result<(), String> {
+    fn visit(
+        current: &H7RetainedDirectory,
+        depth: usize,
+        entries: &mut usize,
+    ) -> Result<(), String> {
         if depth > 256 {
             return Err("D32 stale app-owned projection exceeded its path-depth bound".to_string());
         }
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|_| "D32 stale app-owned projection metadata was unavailable".to_string())?;
-        if is_reparse(&metadata) {
-            return Err(format!(
-                "D32 stale app-owned projection contained a reparse entry: {}",
-                current.display()
-            ));
-        }
-        if metadata.is_dir() {
-            for entry in fs::read_dir(&current)
-                .map_err(|_| "D32 stale app-owned projection enumeration failed".to_string())?
-            {
-                let entry = entry
-                    .map_err(|_| "D32 stale app-owned projection enumeration failed".to_string())?;
-                entries = entries.saturating_add(1);
-                if entries > D32_MAX_TOOLCHAIN_FILES + D32_MAX_SOURCE_FILES {
-                    return Err(
-                        "D32 stale app-owned projection exceeded its entry bound".to_string()
-                    );
-                }
-                pending.push((entry.path(), depth.saturating_add(1)));
+        for name in current.enumerate_children()? {
+            *entries = entries.saturating_add(1);
+            if *entries > D32_MAX_TOOLCHAIN_FILES + D32_MAX_SOURCE_FILES {
+                return Err("D32 stale app-owned projection exceeded its entry bound".to_string());
             }
-        } else if !metadata.is_file() {
-            return Err(
-                "D32 stale app-owned projection contained an unsupported entry".to_string(),
-            );
+            if let Ok(child) = current.open_existing_child(&name) {
+                visit(&child, depth.saturating_add(1), entries)?;
+            } else if current.probe_file_bounded(&name, u64::MAX)?.is_none() {
+                return Err(
+                    "D32 stale app-owned projection contained an unsupported entry".to_string(),
+                );
+            }
         }
+        Ok(())
     }
-    Ok(())
+
+    root.revalidate()?;
+    let mut entries = 0usize;
+    visit(root, 0, &mut entries)?;
+    root.revalidate()
+}
+
+fn retained_toolchain_images_present(root: &H7RetainedDirectory) -> bool {
+    let Ok(bin) = root.open_existing_child(OsStr::new("bin")) else {
+        return false;
+    };
+    bin.probe_file_bounded(OsStr::new("cargo.exe"), D32_MAX_IMAGE_BYTES as u64)
+        .ok()
+        .flatten()
+        .is_some()
+        && bin
+            .probe_file_bounded(OsStr::new("rustc.exe"), D32_MAX_TOOLCHAIN_FILE_BYTES as u64)
+            .ok()
+            .flatten()
+            .is_some()
+        && bin
+            .probe_file_bounded(
+                OsStr::new("rustdoc.exe"),
+                D32_MAX_TOOLCHAIN_FILE_BYTES as u64,
+            )
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 struct CopyLimits {
@@ -493,35 +641,15 @@ impl CopyLimits {
     }
 }
 
-fn is_reparse(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
 fn snapshot_workspace(
-    root: &TrustedWorkspaceRoot,
-    source: &std::path::Path,
-    destination: &std::path::Path,
+    source: &H7RetainedDirectory,
+    destination: &H7RetainedDirectory,
     relative: PathBuf,
     limits: &mut CopyLimits,
 ) -> Result<(), String> {
-    let entries = fs::read_dir(source).map_err(|_| {
-        format!(
-            "D32 governed workspace could not be enumerated: {}",
-            source.display()
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|_| "D32 governed workspace enumeration failed".to_string())?;
-        let name = entry.file_name();
+    source.revalidate()?;
+    destination.revalidate()?;
+    for name in source.enumerate_children()? {
         if relative.as_os_str().is_empty()
             && matches!(
                 name.to_string_lossy().as_ref(),
@@ -530,41 +658,19 @@ fn snapshot_workspace(
         {
             continue;
         }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| "D32 workspace metadata read failed".to_string())?;
-        if is_reparse(&metadata) {
-            return Err(format!(
-                "D32 workspace snapshot rejected reparse entry: {}",
-                path.display()
-            ));
-        }
         let child_relative = relative.join(&name);
-        let child_destination = destination.join(&name);
-        if metadata.is_dir() {
-            fs::create_dir_all(&child_destination)
-                .map_err(|_| "D32 source projection directory creation failed".to_string())?;
-            snapshot_workspace(root, &path, &child_destination, child_relative, limits)?;
-        } else if metadata.is_file() {
-            let prepared = root
-                .prepare_target(&child_relative)
-                .map_err(|_| "D32 workspace target preparation failed".to_string())?;
-            if prepared.kind() != crate::PreparedWorkspaceTargetKind::ExistingFile {
-                return Err("D32 workspace snapshot target classification changed".to_string());
-            }
-            let size = metadata.len();
+        if let Ok(source_child) = source.open_existing_child(&name) {
+            let destination_child = destination.open_or_create_child(&name)?;
+            snapshot_workspace(&source_child, &destination_child, child_relative, limits)?;
+        } else if let Some(identity) =
+            source.probe_file_bounded(&name, D32_MAX_SOURCE_FILE_BYTES as u64)?
+        {
+            let size = identity.file_size();
             if size > D32_MAX_SOURCE_FILE_BYTES as u64 {
                 return Err("D32 workspace snapshot file exceeded its bound".to_string());
             }
             limits.file(size)?;
-            let bytes = prepared
-                .read_existing_file_raw_bounded_with_limit(D32_MAX_SOURCE_FILE_BYTES)
-                .map_err(|_| "D32 workspace snapshot read failed".to_string())?;
-            if bytes.len() as u64 != size {
-                return Err("D32 workspace snapshot changed during read".to_string());
-            }
-            fs::write(&child_destination, bytes)
-                .map_err(|_| "D32 source projection write failed".to_string())?;
+            destination.copy_file_from(source, &name, &name, D32_MAX_SOURCE_FILE_BYTES as u64)?;
         } else {
             return Err(
                 "D32 workspace snapshot encountered an unsupported namespace entry".to_string(),
@@ -575,172 +681,85 @@ fn snapshot_workspace(
 }
 
 fn copy_tree_without_reparse(
-    source: &std::path::Path,
-    destination: &std::path::Path,
+    source_retained: &H7RetainedDirectory,
+    destination_retained: &H7RetainedDirectory,
     limits: &mut CopyLimits,
 ) -> Result<(), String> {
-    let entries = fs::read_dir(source)
-        .map_err(|_| "D32 toolchain projection enumeration failed".to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|_| "D32 toolchain projection enumeration failed".to_string())?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|_| "D32 toolchain metadata read failed".to_string())?;
-        if is_reparse(&metadata) {
-            return Err(format!(
-                "D32 toolchain projection rejected reparse entry: {}",
-                source_path.display()
-            ));
-        }
-        if metadata.is_dir() {
-            fs::create_dir_all(&destination_path)
-                .map_err(|_| "D32 toolchain projection directory creation failed".to_string())?;
-            copy_tree_without_reparse(&source_path, &destination_path, limits)?;
-        } else if metadata.is_file() {
-            copy_regular_file_without_reparse_with_limits(&source_path, &destination_path, limits)?;
+    source_retained.revalidate()?;
+    destination_retained.revalidate()?;
+    for name in source_retained.enumerate_children()? {
+        if let Ok(source_child) = source_retained.open_existing_child(&name) {
+            let destination_child = destination_retained.open_or_create_child(&name)?;
+            copy_tree_without_reparse(&source_child, &destination_child, limits)?;
         } else {
-            return Err(
-                "D32 toolchain projection encountered an unsupported namespace entry".to_string(),
-            );
+            let identity = source_retained
+                .probe_file_bounded(&name, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?
+                .ok_or_else(|| {
+                    "D32 toolchain projection encountered an unsupported namespace entry"
+                        .to_string()
+                })?;
+            limits.file(identity.file_size())?;
+            destination_retained.copy_file_from(
+                source_retained,
+                &name,
+                &name,
+                D32_MAX_TOOLCHAIN_FILE_BYTES as u64,
+            )?;
         }
     }
+    source_retained.revalidate()?;
+    destination_retained.revalidate()?;
     Ok(())
 }
 
-fn copy_regular_file_without_reparse(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-    max_bytes: usize,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|_| "D32 executable metadata read failed".to_string())?;
-    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > max_bytes as u64 {
-        return Err("D32 executable projection source was not a bounded regular file".to_string());
-    }
-    stream_copy(source, destination, metadata.len())?;
-    Ok(())
-}
-
-fn copy_regular_file_without_reparse_with_limits(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-    limits: &mut CopyLimits,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|_| "D32 toolchain metadata read failed".to_string())?;
-    if is_reparse(&metadata)
-        || !metadata.is_file()
-        || metadata.len() > D32_MAX_TOOLCHAIN_FILE_BYTES as u64
-    {
-        return Err("D32 toolchain projection source was not a bounded regular file".to_string());
-    }
-    limits.file(metadata.len())?;
-    stream_copy(source, destination, metadata.len())?;
-    Ok(())
-}
-
-fn stream_copy(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-    expected_bytes: u64,
-) -> Result<(), String> {
-    let mut input =
-        File::open(source).map_err(|_| "D32 projection source could not be opened".to_string())?;
-    let mut output = File::create(destination)
-        .map_err(|_| "D32 projection destination could not be created".to_string())?;
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|_| "D32 projection source could not be read".to_string())?;
-        if read == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|_| "D32 projection destination could not be written".to_string())?;
-        copied = copied.saturating_add(read as u64);
-    }
-    if copied != expected_bytes {
-        return Err("D32 projection source changed during streaming copy".to_string());
-    }
-    output
-        .flush()
-        .map_err(|_| "D32 projection destination could not be flushed".to_string())?;
-    Ok(())
-}
-
-fn toolchain_manifest_hash(root: &std::path::Path) -> Result<String, String> {
+pub(crate) fn toolchain_manifest_hash_retained(
+    retained: &H7RetainedDirectory,
+) -> Result<String, String> {
     let mut entries = Vec::new();
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
-    collect_manifest_entries(root, root, &mut entries, &mut file_count, &mut total_bytes)?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let encoded = serde_json::to_vec(&entries)
-        .map_err(|_| "D32 toolchain manifest serialization failed".to_string())?;
-    Ok(crate::sha256_hex(&encoded))
+    collect_manifest_entries_retained(
+        retained,
+        PathBuf::new(),
+        &mut entries,
+        &mut file_count,
+        &mut total_bytes,
+    )?;
+    let digest = protocol::d32_manifest_hash_hex(&mut entries)
+        .map_err(|_| "D32 toolchain manifest canonical encoding failed".to_string())?;
+    Ok(digest)
 }
 
-fn collect_manifest_entries(
-    root: &std::path::Path,
-    current: &std::path::Path,
-    entries: &mut Vec<(String, String)>,
+fn collect_manifest_entries_retained(
+    retained: &H7RetainedDirectory,
+    relative_prefix: PathBuf,
+    entries: &mut Vec<(Vec<u8>, [u8; 32])>,
     file_count: &mut usize,
     total_bytes: &mut u64,
 ) -> Result<(), String> {
-    for entry in fs::read_dir(current)
-        .map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?
-    {
-        let entry = entry.map_err(|_| "D32 toolchain manifest enumeration failed".to_string())?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| "D32 toolchain manifest metadata failed".to_string())?;
-        if is_reparse(&metadata) {
-            return Err("D32 toolchain manifest rejected reparse entry".to_string());
-        }
-        if metadata.is_dir() {
-            collect_manifest_entries(root, &path, entries, file_count, total_bytes)?;
-        } else if metadata.is_file() {
+    retained.revalidate()?;
+    for name in retained.enumerate_children()? {
+        let relative = relative_prefix.join(&name);
+        if let Ok(child) = retained.open_existing_child(&name) {
+            collect_manifest_entries_retained(&child, relative, entries, file_count, total_bytes)?;
+        } else {
+            let (identity, digest) = retained
+                .hash_file_bounded_with_identity(&name, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?;
             *file_count = file_count.saturating_add(1);
-            *total_bytes = total_bytes.saturating_add(metadata.len());
+            *total_bytes = total_bytes.saturating_add(identity.file_size());
             if *file_count > D32_MAX_TOOLCHAIN_FILES || *total_bytes > D32_MAX_TOOLCHAIN_BYTES {
                 return Err("D32 toolchain manifest exceeded its bounded total".to_string());
             }
-            let digest = hash_bounded_file(&path, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?;
-            entries.push((
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                digest,
-            ));
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| "D32 toolchain manifest path was not UTF-8".to_string())?
+                .replace('\\', "/")
+                .into_bytes();
+            entries.push((relative, digest));
         }
     }
+    retained.revalidate()?;
     Ok(())
-}
-
-fn hash_bounded_file(path: &std::path::Path, max_bytes: u64) -> Result<String, String> {
-    let mut file =
-        File::open(path).map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
-    let mut digest = sha2::Sha256::new();
-    let mut total = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|_| "D32 toolchain manifest file read failed".to_string())?;
-        if read == 0 {
-            break;
-        }
-        total = total.saturating_add(read as u64);
-        if total > max_bytes {
-            return Err("D32 toolchain manifest file exceeded its bound".to_string());
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 type CargoConfirmationReceiver = tokio::sync::mpsc::Receiver<H7PendingProcessAction>;
@@ -748,13 +767,15 @@ type CargoConfirmationReceiver = tokio::sync::mpsc::Receiver<H7PendingProcessAct
 struct CargoInner {
     context: VitaExecutionContext,
     workspace_root: TrustedWorkspaceRoot,
-    app_data_root: PathBuf,
+    app_data_root_retained: Arc<H7RetainedDirectory>,
     session_id: String,
     toolchain: Arc<D32ToolchainMirror>,
     sandbox: Arc<H7SandboxProfile>,
     authority: Arc<dyn H7AuthorityPort>,
     confirmation: Arc<H7PendingConfirmationBridge>,
     active_broker: Mutex<Option<Arc<H7ProcessBroker>>>,
+    run_mode: SidecarRunMode,
+    native_evidence: Option<Arc<D32NativeEvidenceSink>>,
 }
 
 /// Production D32 Cargo profile.  If a trusted toolchain or AppContainer
@@ -772,40 +793,46 @@ impl VitaCargoCheckProduction {
     pub fn new(
         context: VitaExecutionContext,
         workspace_root: TrustedWorkspaceRoot,
-        app_data_root: PathBuf,
-        cargo_path: PathBuf,
-        trusted_toolchain_root: Option<PathBuf>,
-        expected_toolchain_manifest_hash: Option<String>,
+        cargo_selection: Option<crate::sidecar::ResolvedCargoSelection>,
         authority: Arc<dyn VitaGitStatusAuthority>,
         session_id: String,
+        run_mode: SidecarRunMode,
     ) -> Self {
         let (confirmation, receiver) =
             H7PendingConfirmationBridge::new_with_timeout(std::time::Duration::from_secs(30));
         let attempted = (|| {
-            let selected_root = trusted_toolchain_root
-                .ok_or_else(|| "D32 Host-selected Rust toolchain was unavailable".to_string())?;
-            let expected_manifest_hash = expected_toolchain_manifest_hash.ok_or_else(|| {
-                "D32 Host toolchain manifest evidence was unavailable".to_string()
-            })?;
-            let toolchain = D32ToolchainMirror::prepare(
-                &app_data_root,
-                &cargo_path,
-                &selected_root,
-                &expected_manifest_hash,
+            let selected = cargo_selection
+                .ok_or_else(|| "D32 Host Cargo selection was unavailable".to_string())?;
+            let app_data_root_retained = Arc::clone(&selected.app_data_root_retained);
+            let toolchain = D32ToolchainMirror::prepare_from_retained(
+                Arc::clone(&app_data_root_retained),
+                &selected.cargo_path,
+                Arc::clone(&selected.toolchain_root_retained),
+                Arc::clone(&selected.toolchain_bin_retained),
+                &selected.toolchain_manifest_sha256,
             )?;
             let sandbox = H7SandboxProfile::new()?;
+            let native_evidence = if run_mode == SidecarRunMode::D32Canary {
+                Some(Arc::new(D32NativeEvidenceSink::new(Arc::clone(
+                    &app_data_root_retained,
+                ))?))
+            } else {
+                None
+            };
             let authority: Arc<dyn H7AuthorityPort> =
                 Arc::new(VitaGitStatusAuthorityAdapter::new(authority));
             Ok::<_, String>(Arc::new(CargoInner {
                 context,
                 workspace_root,
-                app_data_root,
+                app_data_root_retained,
                 session_id,
                 toolchain,
                 sandbox,
                 authority,
                 confirmation: Arc::clone(&confirmation),
                 active_broker: Mutex::new(None),
+                run_mode,
+                native_evidence,
             }))
         })();
         let (inner, unavailable_reason) = match attempted {
@@ -984,7 +1011,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     // workspace remains unread until Host has performed its
                     // canonical D28 scope evaluation below.
                     let projection = D32ExecutionProjection::prepare_layout(
-                        inner.app_data_root.clone(),
+                        Arc::clone(&inner.app_data_root_retained),
                         &inner.workspace_root,
                         Arc::clone(&inner.toolchain),
                         &inner.session_id,
@@ -1001,12 +1028,15 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         }
                     };
                     let catalog = match H7ExecutableCatalog::cargo_check_projected(
-                        projection.cargo_path.clone(),
-                        projection.source_root.clone(),
-                        projection.root.clone(),
-                        projection.toolchain_root.clone(),
-                        projection.rustc_path.clone(),
-                        projection.rustdoc_path.clone(),
+                        H7D32CatalogResources {
+                            execution_root: Arc::clone(&projection.retained_root),
+                            source_root: Arc::clone(&projection.retained_source),
+                            cargo_home: Arc::clone(&projection.retained_cargo_home),
+                            target: Arc::clone(&projection.retained_target),
+                            toolchain_root: Arc::clone(&projection.retained_toolchain),
+                            toolchain_bin: Arc::clone(&projection.retained_toolchain_bin),
+                        },
+                        projection.toolchain_manifest_hash.clone(),
                     ) {
                         Ok(catalog) => Arc::new(catalog),
                         Err(_error) => {
@@ -1021,7 +1051,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     };
                     if inner
                         .sandbox
-                        .grant_execution_root(&projection.root, &projection.toolchain_root)
+                        .grant_execution_root(
+                            &projection.retained_root,
+                            &projection.retained_toolchain,
+                        )
                         .is_err()
                     {
                         if let Err(error) = projection.cleanup() {
@@ -1032,12 +1065,21 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                             Some(false),
                         )) as Box<dyn ToolOutput>);
                     }
-                    let broker = H7ProcessBroker::new(
-                        inner.context.clone(),
-                        Arc::clone(&catalog),
-                        Arc::clone(&inner.authority),
-                        Arc::clone(&inner.confirmation),
-                    );
+                    let broker = if inner.run_mode == SidecarRunMode::D32Canary {
+                        H7ProcessBroker::new_with_d32_real_canary(
+                            inner.context.clone(),
+                            Arc::clone(&catalog),
+                            Arc::clone(&inner.authority),
+                            Arc::clone(&inner.confirmation),
+                        )
+                    } else {
+                        H7ProcessBroker::new(
+                            inner.context.clone(),
+                            Arc::clone(&catalog),
+                            Arc::clone(&inner.authority),
+                            Arc::clone(&inner.confirmation),
+                        )
+                    };
                     let request = H7ProcessRequest::synthetic_fixed(
                         &call_id,
                         &turn_id,
@@ -1075,7 +1117,32 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                                 }
                                 #[cfg(feature = "d32-a-test-helper")]
                                 record_internal_evidence(result.internal_process_evidence());
-                                result.cargo_value()
+                                let evidence_published = if inner.run_mode
+                                    == SidecarRunMode::D32Canary
+                                {
+                                    inner
+                                        .native_evidence
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            "D32 native evidence sink was unavailable".to_string()
+                                        })
+                                        .and_then(|sink| {
+                                            sink.publish(
+                                                &inner.context,
+                                                &inner.session_id,
+                                                &turn_id,
+                                                &call_id,
+                                                &result,
+                                            )
+                                        })
+                                } else {
+                                    Ok(())
+                                };
+                                if evidence_published.is_ok() {
+                                    result.cargo_value()
+                                } else {
+                                    denied_value()
+                                }
                             }
                         }
                         Err(_error) => denied_value(),
@@ -1190,13 +1257,20 @@ mod tests {
         }
         let mirror = Arc::new(D32ToolchainMirror {
             root: toolchain.path().to_path_buf(),
+            retained_root: Arc::new(
+                H7RetainedDirectory::open(toolchain.path()).expect("retained toolchain"),
+            ),
+            retained_bin: Arc::new(
+                H7RetainedDirectory::open(toolchain.path().join("bin").as_path())
+                    .expect("retained toolchain bin"),
+            ),
             cargo_path: cargo.clone(),
             rustc_path: rustc,
             rustdoc_path: rustdoc,
             manifest_hash: "0".repeat(64),
         });
         let projection = D32ExecutionProjection::prepare_layout(
-            app_data.path().to_path_buf(),
+            Arc::new(H7RetainedDirectory::open(app_data.path()).expect("retained app data root")),
             &trusted,
             mirror,
             "d32-test-session",

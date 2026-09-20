@@ -102,12 +102,30 @@ pub(crate) use d32a::{
 
 #[cfg(windows)]
 pub fn run_sidecar_ipc() -> Result<(), String> {
-    run_sidecar_ipc_with_mode(false)
+    run_sidecar_ipc_with_mode(SidecarRunMode::Production)
+}
+
+/// Starts the narrow production D32-A real-canary entrypoint.  This is a
+/// distinct argv-selected mode so the ordinary `--serve-ipc` contract cannot
+/// accidentally inherit D32 evidence requirements or be made to pass by a
+/// parent environment variable.
+#[cfg(windows)]
+pub fn run_sidecar_ipc_d32_canary() -> Result<(), String> {
+    run_sidecar_ipc_with_mode(SidecarRunMode::D32Canary)
 }
 
 #[cfg(all(windows, feature = "d29-h9-test-helper"))]
 pub fn run_sidecar_ipc_test_canary() -> Result<(), String> {
-    run_sidecar_ipc_with_mode(true)
+    run_sidecar_ipc_with_mode(SidecarRunMode::TestCanary)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SidecarRunMode {
+    Production,
+    D32Canary,
+    #[cfg(feature = "d29-h9-test-helper")]
+    TestCanary,
 }
 
 /// Creates one deterministic H5 recovery-required fixture for the production
@@ -173,7 +191,7 @@ pub fn seed_recovery_fixture(
 }
 
 #[cfg(windows)]
-fn run_sidecar_ipc_with_mode(test_canary: bool) -> Result<(), String> {
+fn run_sidecar_ipc_with_mode(mode: SidecarRunMode) -> Result<(), String> {
     // The pinned Codex turn machinery has a deliberately deep synchronous
     // setup path.  Keep the process-isolated sidecar runtime bounded while
     // giving that one private runtime thread an explicit stack budget instead
@@ -186,7 +204,7 @@ fn run_sidecar_ipc_with_mode(test_canary: bool) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("Vita sidecar runtime could not start: {error}"))?;
-            runtime.block_on(sidecar::serve_ipc(test_canary))
+            runtime.block_on(sidecar::serve_ipc(mode))
         })
         .map_err(|error| format!("Vita sidecar runtime thread could not start: {error}"))?;
     worker

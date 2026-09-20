@@ -87,6 +87,22 @@ fn main() {
         }
     }
 
+    if probe.as_deref() == Some(OsStr::new("--serve-ipc-d32-canary")) && no_extra_arguments {
+        #[cfg(windows)]
+        {
+            if let Err(error) = vita_agent::run_sidecar_ipc_d32_canary() {
+                eprintln!("Vita D32-A canary sidecar terminated: {error}");
+                exit(1);
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("Vita sidecar is supported only on Windows");
+            exit(2);
+        }
+    }
+
     #[cfg(all(windows, feature = "d29-h9-test-helper"))]
     if probe.as_deref() == Some(OsStr::new("--serve-ipc-test-canary")) && no_extra_arguments {
         if let Err(error) = vita_agent::run_sidecar_ipc_test_canary() {
@@ -96,6 +112,6 @@ fn main() {
         return;
     }
 
-    eprintln!("usage: vita-agent --probe | --serve-ipc");
+    eprintln!("usage: vita-agent --probe | --serve-ipc | --serve-ipc-d32-canary");
     exit(2);
 }

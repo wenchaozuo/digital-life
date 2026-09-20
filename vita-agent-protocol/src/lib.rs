@@ -14,6 +14,87 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+/// D32-A toolchain/candidate manifests are a compact JSON tuple-array
+/// contract.  All three implementations (Host, Vita D32, and the H7
+/// catalog) use these limits and this encoder.
+pub const D32_MANIFEST_MAX_FILES: usize = 131_072;
+pub const D32_MANIFEST_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub const D32_MANIFEST_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum D32ManifestError {
+    TooManyFiles,
+    TooManyBytes,
+    EmptyPath,
+    InvalidPath,
+    DuplicatePath,
+    PathTooLong,
+}
+
+/// Encode the canonical D32 manifest material.
+///
+/// Entries are `(relative UTF-8 path bytes, raw SHA-256 digest)` pairs.  The
+/// caller may enumerate in any order; this function sorts by the path bytes,
+/// rejects duplicates and unsafe path spellings, and emits the exact compact
+/// JSON tuple array `[[path, lowercase_sha256_hex], ...]`.
+///
+/// The path bytes must already use `/` separators.  The explicit UTF-8 and
+/// slash validation keeps Host, Vita, and the H7 catalog independent of
+/// platform path encoding while preserving one literal wire/hash contract.
+pub fn encode_d32_manifest(
+    entries: &mut Vec<(Vec<u8>, [u8; 32])>,
+) -> Result<Vec<u8>, D32ManifestError> {
+    if entries.len() > D32_MANIFEST_MAX_FILES {
+        return Err(D32ManifestError::TooManyFiles);
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut previous: Option<&[u8]> = None;
+    let mut wire = Vec::<(String, String)>::with_capacity(entries.len());
+    for (path, digest) in entries.iter() {
+        if path.is_empty() {
+            return Err(D32ManifestError::EmptyPath);
+        }
+        if path[0] == b'/'
+            || path[0] == b'\\'
+            || path.iter().any(|byte| *byte == b'\\')
+            || path
+                .split(|byte| *byte == b'/')
+                .any(|part| part.is_empty() || part == b"." || part == b"..")
+            || path.iter().any(|byte| *byte == 0)
+        {
+            return Err(D32ManifestError::InvalidPath);
+        }
+        if previous == Some(path.as_slice()) {
+            return Err(D32ManifestError::DuplicatePath);
+        }
+        previous = Some(path.as_slice());
+        let path = String::from_utf8(path.clone()).map_err(|_| D32ManifestError::InvalidPath)?;
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        wire.push((path, digest));
+    }
+    serde_json::to_vec(&wire).map_err(|_| D32ManifestError::InvalidPath)
+}
+
+/// Hash canonical D32 manifest material using the shared byte-level encoder.
+pub fn d32_manifest_hash(
+    entries: &mut Vec<(Vec<u8>, [u8; 32])>,
+) -> Result<[u8; 32], D32ManifestError> {
+    let encoded = encode_d32_manifest(entries)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+pub fn d32_manifest_hash_hex(
+    entries: &mut Vec<(Vec<u8>, [u8; 32])>,
+) -> Result<String, D32ManifestError> {
+    Ok(d32_manifest_hash(entries)?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// Digital Life's private Host↔Vita wire version.  D31-C adds only the typed
 /// whole-file replace and host-controlled recovery authority messages. Old
 /// and new sidecars fail closed during the initialization handshake instead of
@@ -2116,6 +2197,84 @@ fn valid_path(value: &str) -> Result<(), FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d32_manifest_encoding_has_stable_golden_vector() {
+        let mut entries = vec![
+            (
+                b"bin/rustc.exe".to_vec(),
+                <[u8; 32]>::try_from(hex_bytes(
+                    "6fcd351889eb0caf54c459904e996ac7480a7843a5e8a25c8c6b59a0f975ca19",
+                ))
+                .expect("rustc digest"),
+            ),
+            (
+                b"bin/cargo.exe".to_vec(),
+                <[u8; 32]>::try_from(hex_bytes(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                ))
+                .expect("cargo digest"),
+            ),
+        ];
+        let encoded = encode_d32_manifest(&mut entries).expect("canonical manifest");
+        let expected = br#"[["bin/cargo.exe","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"],["bin/rustc.exe","6fcd351889eb0caf54c459904e996ac7480a7843a5e8a25c8c6b59a0f975ca19"]]"#;
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            d32_manifest_hash_hex(&mut entries).expect("manifest hash"),
+            "81fc31ae5055427663e654eb777837bf9b076cd515559547952f4610e3875150"
+        );
+    }
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).expect("hex high");
+                let low = (pair[1] as char).to_digit(16).expect("hex low");
+                ((high << 4) | low) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn d32_manifest_encoding_rejects_unsafe_and_duplicate_entries() {
+        for path in [b"".as_slice(), b"/absolute", b"a//b", b"a/../b", b"a\\b"] {
+            let mut entries = vec![(path.to_vec(), [0_u8; 32])];
+            assert_eq!(
+                encode_d32_manifest(&mut entries),
+                Err(if path.is_empty() {
+                    D32ManifestError::EmptyPath
+                } else {
+                    D32ManifestError::InvalidPath
+                })
+            );
+        }
+        let mut invalid_utf8 = vec![(vec![0xff], [0_u8; 32])];
+        assert_eq!(
+            encode_d32_manifest(&mut invalid_utf8),
+            Err(D32ManifestError::InvalidPath)
+        );
+        let mut entries = vec![
+            (b"same".to_vec(), [0_u8; 32]),
+            (b"same".to_vec(), [1_u8; 32]),
+        ];
+        assert_eq!(
+            encode_d32_manifest(&mut entries),
+            Err(D32ManifestError::DuplicatePath)
+        );
+    }
+
+    #[test]
+    fn d32_manifest_encoding_enforces_file_count_bound() {
+        let mut entries = (0..=D32_MANIFEST_MAX_FILES)
+            .map(|index| (format!("{index:06}").into_bytes(), [0_u8; 32]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encode_d32_manifest(&mut entries),
+            Err(D32ManifestError::TooManyFiles)
+        );
+    }
     use std::io::Cursor;
 
     fn read_binding() -> WorkspaceReadBinding {

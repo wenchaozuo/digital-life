@@ -165,6 +165,67 @@ const H7_ENV_ALLOWLIST_VALUE: &str = "fixture-v1";
 const H7C_MAX_CONFIG_BYTES: usize = 64 * 1024;
 const H7C_MAX_SNAPSHOT_FILES: usize = 4096;
 const H7C_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+// Retained D32 reads must be bounded even when the source is concurrently
+// grown after its initial identity check. Keep the fixed I/O chunk on the
+// heap; these methods run on the default Windows thread stack.
+const H7_RETAINED_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stream a retained file with a strict `max_bytes + 1` read ceiling.
+///
+/// The extra byte is intentionally read into the bounded heap buffer so a
+/// concurrent growth is detected at the boundary, but it is never delivered
+/// to the consumer. This keeps hash and copy consumers from processing data
+/// outside their frozen limit.
+fn read_retained_bounded<R, F>(
+    reader: &mut R,
+    max_bytes: u64,
+    buffer: &mut [u8],
+    mut consume: F,
+) -> Result<u64, String>
+where
+    R: Read,
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
+    if buffer.is_empty() {
+        return Err("D32 retained read buffer was empty".to_string());
+    }
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| "D32 retained file bound overflowed".to_string())?;
+    let mut limited = reader.take(read_limit);
+    let mut total = 0_u64;
+    loop {
+        let remaining = max_bytes
+            .checked_sub(total)
+            .ok_or_else(|| "D32 retained file exceeded its bound".to_string())?;
+        let read_capacity = if remaining >= buffer.len() as u64 {
+            buffer.len()
+        } else {
+            usize::try_from(
+                remaining
+                    .checked_add(1)
+                    .ok_or_else(|| "D32 retained file bound overflowed".to_string())?,
+            )
+            .map_err(|_| "D32 retained file bound was not representable".to_string())?
+        };
+        let read = limited
+            .read(&mut buffer[..read_capacity])
+            .map_err(|_| "D32 retained file read failed".to_string())?;
+        if read == 0 {
+            break;
+        }
+        let read = u64::try_from(read)
+            .map_err(|_| "D32 retained file read was not representable".to_string())?;
+        if read > remaining {
+            return Err("D32 retained file exceeded its bound".to_string());
+        }
+        consume(&buffer[..read as usize])?;
+        total = total
+            .checked_add(read)
+            .ok_or_else(|| "D32 retained file exceeded its bound".to_string())?;
+    }
+    Ok(total)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -873,16 +934,24 @@ impl H7RetainedDirectory {
     }
 
     fn remove_contents(&self) -> Result<(), String> {
-        for name in self.enumerate_children()? {
-            if self.child_is_directory(&name)? {
-                let child = self.open_existing_child(&name)?;
-                child.remove_contents()?;
-                self.remove_directory(&name)?;
-            } else {
-                self.remove_file(&name)?;
+        fn remove_at_depth(current: &H7RetainedDirectory, depth: usize) -> Result<(), String> {
+            if depth > D32_TREE_MAX_DEPTH {
+                return Err(
+                    "D32 retained directory removal exceeded its path-depth bound".to_string(),
+                );
             }
+            for name in current.enumerate_children()? {
+                if current.child_is_directory(&name)? {
+                    let child = current.open_existing_child(&name)?;
+                    remove_at_depth(&child, depth.saturating_add(1))?;
+                    current.remove_directory(&name)?;
+                } else {
+                    current.remove_file(&name)?;
+                }
+            }
+            current.revalidate()
         }
-        self.revalidate()
+        remove_at_depth(self, 0)
     }
 
     /// Removes an app-owned retained subtree, including its root directory.
@@ -983,11 +1052,17 @@ impl H7RetainedDirectory {
             return Err("D32 retained file exceeded its bound".to_string());
         }
         let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
-        let mut bytes = Vec::with_capacity(identity.file_size as usize);
-        file.read_to_end(&mut bytes)
-            .map_err(|_| "D32 retained file read failed".to_string())?;
-        if bytes.len() > max_bytes {
-            return Err("D32 retained file exceeded its bound".to_string());
+        let initial_capacity = usize::try_from(identity.file_size)
+            .map_err(|_| "D32 retained file size was not representable".to_string())?;
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let total = read_retained_bounded(&mut file, max_bytes as u64, &mut buffer, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        let after = file_identity_from_handle(file.as_raw_handle() as HANDLE)?;
+        if after != identity || after.file_size != total {
+            return Err("D32 retained file identity changed during read".to_string());
         }
         Ok(bytes)
     }
@@ -1018,21 +1093,14 @@ impl H7RetainedDirectory {
         }
         let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
         let mut digest = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|_| "D32 retained file hash read failed".to_string())?;
-            if read == 0 {
-                break;
-            }
-            total = total.saturating_add(read as u64);
-            if total > max_bytes {
-                return Err("D32 retained file exceeded its bound".to_string());
-            }
-            digest.update(&buffer[..read]);
-        }
+        // The sidecar may execute on a default Windows thread stack.  Keep
+        // the bounded I/O buffer on the heap so the 1 MiB bound cannot itself
+        // trigger STATUS_STACK_OVERFLOW on function entry.
+        let mut buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let total = read_retained_bounded(&mut file, max_bytes, &mut buffer, |chunk| {
+            digest.update(chunk);
+            Ok(())
+        })?;
         let after = file_identity_from_handle(file.as_raw_handle() as HANDLE)?;
         if after != identity || after.file_size != total {
             return Err("D32 retained file identity changed during hash".to_string());
@@ -1081,23 +1149,13 @@ impl H7RetainedDirectory {
             unsafe { File::from_raw_handle(source_handle.into_raw() as RawHandle) };
         let mut destination_file =
             unsafe { File::from_raw_handle(destination_handle.into_raw() as RawHandle) };
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; 1024 * 1024];
-        loop {
-            let read = source_file
-                .read(&mut buffer)
-                .map_err(|_| "D32 retained source file read failed".to_string())?;
-            if read == 0 {
-                break;
-            }
-            copied = copied.saturating_add(read as u64);
-            if copied > max_bytes {
-                return Err("D32 retained source file exceeded its bound".to_string());
-            }
+        // Keep the bounded copy buffer on the heap for default-stack safety.
+        let mut buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let copied = read_retained_bounded(&mut source_file, max_bytes, &mut buffer, |chunk| {
             destination_file
-                .write_all(&buffer[..read])
-                .map_err(|_| "D32 retained destination file write failed".to_string())?;
-        }
+                .write_all(chunk)
+                .map_err(|_| "D32 retained destination file write failed".to_string())
+        })?;
         if copied != source_identity.file_size {
             return Err("D32 retained source file changed during copy".to_string());
         }
@@ -1293,6 +1351,7 @@ fn parse_h7_directory_names(
 }
 
 const D32_NATIVE_EVIDENCE_MAX_BYTES: u64 = 64 * 1024;
+const D32_TREE_MAX_DEPTH: usize = 256;
 const H7_FILE_LIST_DIRECTORY: u32 = 0x0001;
 
 fn validate_retained_child_name(name: &OsStr) -> Result<(), String> {
@@ -2500,6 +2559,7 @@ fn toolchain_manifest_hash_for_catalog_retained(
         &mut entries,
         &mut file_count,
         &mut total_bytes,
+        0,
     )?;
     protocol::d32_manifest_hash_hex(&mut entries)
         .map_err(|_| "D32 toolchain manifest canonical encoding failed".to_string())
@@ -2511,12 +2571,23 @@ fn collect_catalog_manifest(
     entries: &mut Vec<(Vec<u8>, [u8; 32])>,
     file_count: &mut usize,
     total_bytes: &mut u64,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > D32_TREE_MAX_DEPTH {
+        return Err("D32 toolchain manifest exceeded its path-depth bound".to_string());
+    }
     retained.revalidate()?;
     for name in retained.enumerate_children()? {
         let relative = relative_prefix.join(&name);
         if let Ok(child) = retained.open_existing_child(&name) {
-            collect_catalog_manifest(&child, relative, entries, file_count, total_bytes)?;
+            collect_catalog_manifest(
+                &child,
+                relative,
+                entries,
+                file_count,
+                total_bytes,
+                depth.saturating_add(1),
+            )?;
         } else {
             let (identity, digest) = retained
                 .hash_file_bounded_with_identity(&name, protocol::D32_MANIFEST_MAX_FILE_BYTES)?;
@@ -2544,7 +2615,7 @@ fn hash_d32_toolchain_file(path: &Path) -> Result<[u8; 32], String> {
         File::open(path).map_err(|_| "D32 toolchain manifest file open failed".to_string())?;
     let mut digest = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -9462,6 +9533,139 @@ mod tests {
         Builder::new()
             .prefix("d29h7-test-")
             .tempdir_in(repository_root)
+    }
+
+    struct GrowingReader {
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+        offset: usize,
+    }
+
+    impl GrowingReader {
+        fn new(prefix: Vec<u8>, suffix: Vec<u8>) -> Self {
+            Self {
+                prefix,
+                suffix,
+                offset: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for GrowingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let total = self.prefix.len() + self.suffix.len();
+            if self.offset >= total {
+                return Ok(0);
+            }
+            let (source, source_offset) = if self.offset < self.prefix.len() {
+                (&self.prefix, self.offset)
+            } else {
+                (&self.suffix, self.offset - self.prefix.len())
+            };
+            let read = (source.len() - source_offset).min(buffer.len());
+            buffer[..read].copy_from_slice(&source[source_offset..source_offset + read]);
+            self.offset += read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn d32_retained_bounded_reader_rejects_growth_without_delivering_extra() {
+        let max_bytes = 5_u64;
+        let mut buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let mut delivered = Vec::new();
+        let result = read_retained_bounded(
+            &mut GrowingReader::new(vec![0x11; max_bytes as usize], vec![0xee]),
+            max_bytes,
+            &mut buffer,
+            |chunk| {
+                delivered.extend_from_slice(chunk);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "growth beyond the bound must fail closed");
+        assert_eq!(delivered.len(), max_bytes as usize);
+        assert!(delivered.iter().all(|byte| *byte == 0x11));
+
+        let mut exact_buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let mut exact = Vec::new();
+        let total = read_retained_bounded(
+            &mut GrowingReader::new(vec![0x22; max_bytes as usize], Vec::new()),
+            max_bytes,
+            &mut exact_buffer,
+            |chunk| {
+                exact.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .expect("an exact-bound source must be accepted");
+        assert_eq!(total, max_bytes);
+        assert_eq!(exact.len(), max_bytes as usize);
+
+        let mut oversized_buffer = vec![0_u8; H7_RETAINED_READ_CHUNK_BYTES];
+        let mut oversized_delivered = Vec::new();
+        assert!(read_retained_bounded(
+            &mut GrowingReader::new(vec![0x33; max_bytes as usize + 1], Vec::new()),
+            max_bytes,
+            &mut oversized_buffer,
+            |chunk| {
+                oversized_delivered.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(oversized_delivered.is_empty());
+    }
+
+    #[test]
+    fn d32_retained_file_io_does_not_consume_default_stack_for_buffers() {
+        // A default Windows worker stack must not reserve the 1 MiB streaming
+        // buffers used by the retained hash/copy paths.  This deliberately
+        // small stack turns a regression back to a stack array into a
+        // process-level STATUS_STACK_OVERFLOW instead of hiding it behind the
+        // test harness's larger worker stack.
+        let worker = thread::Builder::new()
+            .name("d32-h7-retained-io-stack-regression".to_string())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let source = tempdir().expect("D32 H7 stack source tempdir");
+                let destination = tempdir().expect("D32 H7 stack destination tempdir");
+                let payload = vec![0x5a_u8; 2 * 1024 * 1024];
+                fs::write(source.path().join("cargo.exe"), &payload)
+                    .expect("D32 H7 stack source payload");
+
+                let source_retained = H7RetainedDirectory::open(source.path())
+                    .expect("D32 H7 stack source retained root");
+                let destination_retained = H7RetainedDirectory::open(destination.path())
+                    .expect("D32 H7 stack destination retained root");
+                let (source_identity, source_digest) = source_retained
+                    .hash_file_bounded_with_identity(
+                        OsStr::new("cargo.exe"),
+                        protocol::D32_MANIFEST_MAX_FILE_BYTES,
+                    )
+                    .expect("D32 H7 stack source hash");
+                destination_retained
+                    .copy_file_from(
+                        &source_retained,
+                        OsStr::new("cargo.exe"),
+                        OsStr::new("cargo.exe"),
+                        protocol::D32_MANIFEST_MAX_FILE_BYTES,
+                    )
+                    .expect("D32 H7 stack retained copy");
+                let (destination_identity, destination_digest) = destination_retained
+                    .hash_file_bounded_with_identity(
+                        OsStr::new("cargo.exe"),
+                        protocol::D32_MANIFEST_MAX_FILE_BYTES,
+                    )
+                    .expect("D32 H7 stack destination hash");
+                assert_eq!(source_identity.file_size(), payload.len() as u64);
+                assert_eq!(destination_identity.file_size(), payload.len() as u64);
+                assert_eq!(source_digest, destination_digest);
+            })
+            .expect("D32 H7 retained I/O regression worker");
+        worker
+            .join()
+            .expect("D32 H7 retained I/O must not overflow its stack");
     }
 
     struct H7EnvironmentGuard {

@@ -50,6 +50,7 @@ const D32_MAX_TOOLCHAIN_FILE_BYTES: usize = protocol::D32_MANIFEST_MAX_FILE_BYTE
 const D32_MAX_TOOLCHAIN_BYTES: u64 = protocol::D32_MANIFEST_MAX_TOTAL_BYTES;
 const D32_MAX_SOURCE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const D32_MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+const D32_MAX_TREE_DEPTH: usize = 256;
 
 pub(crate) const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
 pub(crate) const D32_RUNS_DIR_NAME: &str = "runs";
@@ -164,7 +165,7 @@ impl D32ToolchainMirror {
             mirror_parent_retained.remove_child_tree_if_present(&staging_name)?;
             let staging_retained = mirror_parent_retained.open_or_create_child(&staging_name)?;
             let mut limits = CopyLimits::new(D32_MAX_TOOLCHAIN_FILES, D32_MAX_TOOLCHAIN_BYTES);
-            copy_tree_without_reparse(&selected_root_retained, &staging_retained, &mut limits)?;
+            copy_tree_without_reparse(&selected_root_retained, &staging_retained, &mut limits, 0)?;
             let staged_manifest = toolchain_manifest_hash_retained(&staging_retained)?;
             if staged_manifest != expected_manifest_hash {
                 let _ = staging_retained.remove_self();
@@ -409,6 +410,7 @@ impl D32ExecutionProjection {
             &source_retained,
             PathBuf::new(),
             &mut source_limits,
+            0,
         )?;
 
         if !retained_toolchain_images_present(&self.retained_toolchain) {
@@ -646,7 +648,11 @@ fn snapshot_workspace(
     destination: &H7RetainedDirectory,
     relative: PathBuf,
     limits: &mut CopyLimits,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > D32_MAX_TREE_DEPTH {
+        return Err("D32 workspace snapshot exceeded its path-depth bound".to_string());
+    }
     source.revalidate()?;
     destination.revalidate()?;
     for name in source.enumerate_children()? {
@@ -661,7 +667,13 @@ fn snapshot_workspace(
         let child_relative = relative.join(&name);
         if let Ok(source_child) = source.open_existing_child(&name) {
             let destination_child = destination.open_or_create_child(&name)?;
-            snapshot_workspace(&source_child, &destination_child, child_relative, limits)?;
+            snapshot_workspace(
+                &source_child,
+                &destination_child,
+                child_relative,
+                limits,
+                depth.saturating_add(1),
+            )?;
         } else if let Some(identity) =
             source.probe_file_bounded(&name, D32_MAX_SOURCE_FILE_BYTES as u64)?
         {
@@ -684,13 +696,22 @@ fn copy_tree_without_reparse(
     source_retained: &H7RetainedDirectory,
     destination_retained: &H7RetainedDirectory,
     limits: &mut CopyLimits,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > D32_MAX_TREE_DEPTH {
+        return Err("D32 toolchain projection exceeded its path-depth bound".to_string());
+    }
     source_retained.revalidate()?;
     destination_retained.revalidate()?;
     for name in source_retained.enumerate_children()? {
         if let Ok(source_child) = source_retained.open_existing_child(&name) {
             let destination_child = destination_retained.open_or_create_child(&name)?;
-            copy_tree_without_reparse(&source_child, &destination_child, limits)?;
+            copy_tree_without_reparse(
+                &source_child,
+                &destination_child,
+                limits,
+                depth.saturating_add(1),
+            )?;
         } else {
             let identity = source_retained
                 .probe_file_bounded(&name, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?
@@ -724,6 +745,7 @@ pub(crate) fn toolchain_manifest_hash_retained(
         &mut entries,
         &mut file_count,
         &mut total_bytes,
+        0,
     )?;
     let digest = protocol::d32_manifest_hash_hex(&mut entries)
         .map_err(|_| "D32 toolchain manifest canonical encoding failed".to_string())?;
@@ -736,12 +758,23 @@ fn collect_manifest_entries_retained(
     entries: &mut Vec<(Vec<u8>, [u8; 32])>,
     file_count: &mut usize,
     total_bytes: &mut u64,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > D32_MAX_TREE_DEPTH {
+        return Err("D32 toolchain manifest exceeded its path-depth bound".to_string());
+    }
     retained.revalidate()?;
     for name in retained.enumerate_children()? {
         let relative = relative_prefix.join(&name);
         if let Ok(child) = retained.open_existing_child(&name) {
-            collect_manifest_entries_retained(&child, relative, entries, file_count, total_bytes)?;
+            collect_manifest_entries_retained(
+                &child,
+                relative,
+                entries,
+                file_count,
+                total_bytes,
+                depth.saturating_add(1),
+            )?;
         } else {
             let (identity, digest) = retained
                 .hash_file_bounded_with_identity(&name, D32_MAX_TOOLCHAIN_FILE_BYTES as u64)?;
@@ -1238,6 +1271,25 @@ mod tests {
                 "telemetry leaked: {forbidden}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_toolchain_manifest_fails_closed_on_excessive_depth() {
+        let root = tempfile::tempdir().expect("D32 depth-bound root");
+        let mut current = root.path().to_path_buf();
+        for index in 0..=D32_MAX_TREE_DEPTH {
+            current.push(format!("d{index:03}"));
+            fs::create_dir(&current).expect("D32 depth-bound directory");
+        }
+        let retained = H7RetainedDirectory::open(root.path()).expect("D32 retained root");
+
+        let error = toolchain_manifest_hash_retained(&retained)
+            .expect_err("D32 toolchain manifest must reject excessive depth");
+        assert!(
+            error.contains("path-depth"),
+            "unexpected depth-bound error: {error}"
+        );
     }
 
     #[cfg(windows)]

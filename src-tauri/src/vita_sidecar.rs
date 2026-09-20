@@ -649,6 +649,13 @@ mod windows {
     const D32_FILE_LIST_DIRECTORY: u32 = 0x0001;
     const D32_AUDIT_MAX_ENTRIES: usize = 262_144;
     const D32_AUDIT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    const D32_AUDIT_MAX_PATH_BYTES: usize = protocol::MAX_PATH_BYTES;
+    const D32_AUDIT_MAX_NAME_BYTES: usize = protocol::MAX_PATH_BYTES;
+    const D32_AUDIT_MAX_NAMESPACE_BYTES: u64 = D32_AUDIT_MAX_BYTES;
+    // All D32 tree walkers fail closed before an attacker-controlled nested
+    // directory can consume the Windows thread stack.
+    const D32_TREE_MAX_DEPTH: usize = 256;
+    const D32_RETAINED_READ_CHUNK_BYTES: usize = 64 * 1024;
     const D32_IMAGE_HASH_MAX_BYTES: u64 = 256 * 1024 * 1024;
     const GRANT_LIFETIME_MS: u64 = 30_000;
     // Cargo authority validation rechecks the app-owned toolchain mirror by
@@ -659,6 +666,63 @@ mod windows {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const READY_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_PENDING: usize = 1;
+
+    /// Stream a retained file with a strict `max_bytes + 1` read ceiling.
+    ///
+    /// The extra byte is read into the bounded heap buffer so a concurrent
+    /// growth is detected at the boundary, but it is never delivered to the
+    /// consumer. Hash and copy consumers therefore cannot process bytes
+    /// outside their frozen limit.
+    fn read_retained_bounded<R, F>(
+        reader: &mut R,
+        max_bytes: u64,
+        buffer: &mut [u8],
+        mut consume: F,
+    ) -> Result<u64, String>
+    where
+        R: Read,
+        F: FnMut(&[u8]) -> Result<(), String>,
+    {
+        if buffer.is_empty() {
+            return Err("D32 retained read buffer was empty".to_string());
+        }
+        let read_limit = max_bytes
+            .checked_add(1)
+            .ok_or_else(|| "D32 retained file bound overflowed".to_string())?;
+        let mut limited = reader.take(read_limit);
+        let mut total = 0_u64;
+        loop {
+            let remaining = max_bytes
+                .checked_sub(total)
+                .ok_or_else(|| "D32 retained file exceeded its bound".to_string())?;
+            let read_capacity = if remaining >= buffer.len() as u64 {
+                buffer.len()
+            } else {
+                usize::try_from(
+                    remaining
+                        .checked_add(1)
+                        .ok_or_else(|| "D32 retained file bound overflowed".to_string())?,
+                )
+                .map_err(|_| "D32 retained file bound was not representable".to_string())?
+            };
+            let read = limited
+                .read(&mut buffer[..read_capacity])
+                .map_err(|_| "D32 retained file read failed".to_string())?;
+            if read == 0 {
+                break;
+            }
+            let read = u64::try_from(read)
+                .map_err(|_| "D32 retained file read was not representable".to_string())?;
+            if read > remaining {
+                return Err("D32 retained file exceeded its bound".to_string());
+            }
+            consume(&buffer[..read as usize])?;
+            total = total
+                .checked_add(read)
+                .ok_or_else(|| "D32 retained file exceeded its bound".to_string())?;
+        }
+        Ok(total)
+    }
 
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1109,18 +1173,45 @@ mod windows {
                     self.display_path.display()
                 )
             })?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|_| {
+            let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
                 format!(
-                    "D32 Host retained file could not read: {}",
+                    "D32 Host retained file bound overflowed: {}",
                     self.display_path.display()
                 )
             })?;
-            if bytes.len() > max_bytes {
-                return Err(format!(
-                    "D32 Host retained file exceeded its bound: {}",
-                    self.display_path.display()
-                ));
+            // The caller supplies a frozen D32 bound (currently the 256 KiB
+            // Git-config limit).  Allocate at most that bound and read one
+            // bounded extra byte so growth beyond the bound fails closed.
+            let mut bytes = Vec::with_capacity(max_bytes);
+            let mut limited = Read::by_ref(&mut file).take(read_limit as u64);
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            loop {
+                let remaining = max_bytes.saturating_sub(bytes.len());
+                let read_capacity = remaining
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        format!(
+                            "D32 Host retained file bound overflowed: {}",
+                            self.display_path.display()
+                        )
+                    })?
+                    .min(buffer.len());
+                let read = limited.read(&mut buffer[..read_capacity]).map_err(|_| {
+                    format!(
+                        "D32 Host retained file could not read: {}",
+                        self.display_path.display()
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                if read > remaining {
+                    return Err(format!(
+                        "D32 Host retained file exceeded its bound: {}",
+                        self.display_path.display()
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..read]);
             }
             let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
             if after != self.namespace.identity || after.file_size != bytes.len() as u64 {
@@ -1414,11 +1505,28 @@ mod windows {
             let mut file = unsafe { File::from_raw_handle(handle.into_raw() as RawHandle) };
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| "D32 retained file seek failed".to_string())?;
-            let mut bytes = Vec::with_capacity(identity.file_size as usize);
-            file.read_to_end(&mut bytes)
-                .map_err(|_| "D32 retained file read failed".to_string())?;
-            if bytes.len() > max_bytes {
-                return Err("D32 retained file exceeded its bound".to_string());
+            let read_limit = max_bytes
+                .checked_add(1)
+                .ok_or_else(|| "D32 retained file bound overflowed".to_string())?;
+            let mut bytes = Vec::with_capacity(max_bytes);
+            let mut limited = Read::by_ref(&mut file).take(read_limit as u64);
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            loop {
+                let remaining = max_bytes.saturating_sub(bytes.len());
+                let read_capacity = remaining
+                    .checked_add(1)
+                    .ok_or_else(|| "D32 retained file bound overflowed".to_string())?
+                    .min(buffer.len());
+                let read = limited
+                    .read(&mut buffer[..read_capacity])
+                    .map_err(|_| "D32 retained file read failed".to_string())?;
+                if read == 0 {
+                    break;
+                }
+                if read > remaining {
+                    return Err("D32 retained file exceeded its bound".to_string());
+                }
+                bytes.extend_from_slice(&buffer[..read]);
             }
             let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
             if after != identity || after.file_size != bytes.len() as u64 {
@@ -1463,21 +1571,14 @@ mod windows {
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| "D32 retained file hash seek failed".to_string())?;
             let mut digest = Sha256::new();
-            let mut total = 0_u64;
-            let mut buffer = [0_u8; 1024 * 1024];
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .map_err(|_| "D32 retained file hash read failed".to_string())?;
-                if read == 0 {
-                    break;
-                }
-                total = total.saturating_add(read as u64);
-                if total > max_bytes {
-                    return Err("D32 retained file exceeded its bound".to_string());
-                }
-                digest.update(&buffer[..read]);
-            }
+            // Keep the bounded I/O buffer on the heap.  This method runs on
+            // the default Windows thread stack; a 1 MiB stack array can
+            // exhaust that stack before the first statement executes.
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let total = read_retained_bounded(&mut file, max_bytes, &mut buffer, |chunk| {
+                digest.update(chunk);
+                Ok(())
+            })?;
             let after = d32_handle_identity(file.as_raw_handle() as HANDLE)?;
             if after != identity || after.file_size != total {
                 return Err("D32 retained file identity changed during hash".to_string());
@@ -1548,23 +1649,15 @@ mod windows {
                 unsafe { File::from_raw_handle(source_handle.into_raw() as RawHandle) };
             let mut destination_file =
                 unsafe { File::from_raw_handle(destination_handle.into_raw() as RawHandle) };
-            let mut copied = 0_u64;
-            let mut buffer = [0_u8; 1024 * 1024];
-            loop {
-                let read = source_file
-                    .read(&mut buffer)
-                    .map_err(|_| "D32 retained source copy read failed".to_string())?;
-                if read == 0 {
-                    break;
-                }
-                copied = copied.saturating_add(read as u64);
-                if copied > max_bytes {
-                    return Err("D32 retained source copy exceeded its bound".to_string());
-                }
-                destination_file
-                    .write_all(&buffer[..read])
-                    .map_err(|_| "D32 retained destination copy write failed".to_string())?;
-            }
+            // Keep the bounded I/O buffer on the heap; see the hash path
+            // above for the Windows default-stack constraint.
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let copied =
+                read_retained_bounded(&mut source_file, max_bytes, &mut buffer, |chunk| {
+                    destination_file
+                        .write_all(chunk)
+                        .map_err(|_| "D32 retained destination copy write failed".to_string())
+                })?;
             if copied != source_identity.file_size {
                 return Err("D32 retained source changed during copy".to_string());
             }
@@ -1801,16 +1894,24 @@ mod windows {
         }
 
         fn remove_contents(&self) -> Result<(), String> {
-            for name in self.enumerate_children()? {
-                if self.child_is_directory(&name)? {
-                    let child = self.open_existing_child(&name)?;
-                    child.remove_contents()?;
-                    self.remove_directory(&name)?;
-                } else {
-                    self.remove_file(&name)?;
+            fn remove_at_depth(current: &D32RetainedDirectory, depth: usize) -> Result<(), String> {
+                if depth > D32_TREE_MAX_DEPTH {
+                    return Err(
+                        "D32 retained directory removal exceeded its path-depth bound".to_string(),
+                    );
                 }
+                for name in current.enumerate_children()? {
+                    if current.child_is_directory(&name)? {
+                        let child = current.open_existing_child(&name)?;
+                        remove_at_depth(&child, depth.saturating_add(1))?;
+                        current.remove_directory(&name)?;
+                    } else {
+                        current.remove_file(&name)?;
+                    }
+                }
+                current.revalidate("D32 retained directory after contents removal")
             }
-            self.revalidate("D32 retained directory after contents removal")
+            remove_at_depth(self, 0)
         }
 
         fn remove_self(&self) -> Result<(), String> {
@@ -2309,6 +2410,43 @@ mod windows {
             || (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
     }
 
+    fn d32_audit_path_bytes(path: &Path) -> Result<usize, String> {
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .count()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| "D32 Host audit path length overflowed".to_string())?;
+        if bytes > D32_AUDIT_MAX_PATH_BYTES {
+            return Err("D32 Host audit path exceeded its bound".to_string());
+        }
+        Ok(bytes)
+    }
+
+    fn d32_audit_name_bytes(name: &OsStr) -> Result<usize, String> {
+        let bytes = name
+            .encode_wide()
+            .count()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| "D32 Host audit name length overflowed".to_string())?;
+        if bytes > D32_AUDIT_MAX_NAME_BYTES {
+            return Err("D32 Host audit name exceeded its bound".to_string());
+        }
+        Ok(bytes)
+    }
+
+    fn d32_audit_namespace_bytes_add(total: &mut u64, amount: usize) -> Result<(), String> {
+        let amount = u64::try_from(amount)
+            .map_err(|_| "D32 Host audit namespace byte bound overflowed".to_string())?;
+        *total = total
+            .checked_add(amount)
+            .ok_or_else(|| "D32 Host audit namespace byte bound overflowed".to_string())?;
+        if *total > D32_AUDIT_MAX_NAMESPACE_BYTES {
+            return Err("D32 Host audit namespace exceeded its byte bound".to_string());
+        }
+        Ok(())
+    }
+
     fn host_verify_no_reparse_path(root: &Path, path: &Path) -> Result<(), String> {
         let relative = path
             .strip_prefix(root)
@@ -2359,9 +2497,40 @@ mod windows {
     }
 
     fn host_verify_no_reparse_tree(root: &Path) -> Result<(), String> {
+        host_verify_no_reparse_tree_with_limits(
+            root,
+            D32_AUDIT_MAX_ENTRIES,
+            D32_AUDIT_MAX_BYTES,
+            D32_TREE_MAX_DEPTH,
+        )
+    }
+
+    fn host_verify_no_reparse_tree_with_limits(
+        root: &Path,
+        max_entries: usize,
+        max_file_bytes: u64,
+        max_depth: usize,
+    ) -> Result<(), String> {
+        let root_path_bytes = d32_audit_path_bytes(root)?;
         host_verify_no_reparse_path(root, root)?;
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(current) = pending.pop() {
+        let mut pending = Vec::with_capacity(1);
+        pending.push((root.to_path_buf(), 0_usize));
+        let mut entries_seen = 1_usize;
+        let mut file_bytes = 0_u64;
+        let mut discovered_file_bytes = 0_u64;
+        let mut path_bytes = 0_u64;
+        let mut name_bytes = 0_u64;
+        d32_audit_namespace_bytes_add(&mut path_bytes, root_path_bytes)?;
+        while let Some((current, depth)) = pending.pop() {
+            if depth > max_depth {
+                return Err("D32 Host app-owned tree exceeded its path-depth bound".to_string());
+            }
+            if pending.len() >= max_entries {
+                return Err("D32 Host app-owned tree exceeded its pending-entry bound".to_string());
+            }
+            if entries_seen > max_entries {
+                return Err("D32 Host app-owned tree exceeded its entry bound".to_string());
+            }
             let metadata = fs::symlink_metadata(&current).map_err(|_| {
                 format!(
                     "D32 Host app-owned tree metadata was unavailable: {}",
@@ -2374,17 +2543,89 @@ mod windows {
                     current.display()
                 ));
             }
+            if metadata.is_file() {
+                file_bytes = file_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| "D32 Host app-owned tree byte bound overflowed".to_string())?;
+                if file_bytes > max_file_bytes {
+                    return Err("D32 Host app-owned tree exceeded its byte bound".to_string());
+                }
+            }
             if metadata.is_dir() {
-                let children = fs::read_dir(&current)
-                    .map_err(|_| {
+                let mut children = Vec::new();
+                for child in fs::read_dir(&current).map_err(|_| {
+                    format!(
+                        "D32 Host app-owned tree enumeration failed: {}",
+                        current.display()
+                    )
+                })? {
+                    if children.len() >= max_entries {
+                        return Err(
+                            "D32 Host app-owned tree exceeded its per-directory entry bound"
+                                .to_string(),
+                        );
+                    }
+                    let child = child
+                        .map_err(|_| "D32 Host app-owned tree enumeration failed".to_string())?;
+                    let child_name = child.file_name();
+                    let child_name_bytes = d32_audit_name_bytes(&child_name)?;
+                    d32_audit_namespace_bytes_add(&mut name_bytes, child_name_bytes)?;
+                    let child_depth = depth.checked_add(1).ok_or_else(|| {
+                        "D32 Host app-owned tree path-depth bound overflowed".to_string()
+                    })?;
+                    if child_depth > max_depth {
+                        return Err(
+                            "D32 Host app-owned tree exceeded its path-depth bound".to_string()
+                        );
+                    }
+                    let child_path = child.path();
+                    let child_path_bytes = d32_audit_path_bytes(&child_path)?;
+                    d32_audit_namespace_bytes_add(&mut path_bytes, child_path_bytes)?;
+                    let child_metadata = fs::symlink_metadata(&child_path).map_err(|_| {
                         format!(
-                            "D32 Host app-owned tree enumeration failed: {}",
-                            current.display()
+                            "D32 Host app-owned tree metadata was unavailable: {}",
+                            child_path.display()
                         )
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| "D32 Host app-owned tree enumeration failed".to_string())?;
-                pending.extend(children.into_iter().map(|entry| entry.path()));
+                    })?;
+                    if host_metadata_is_reparse(&child_metadata) {
+                        return Err(format!(
+                            "D32 Host app-owned tree contained a reparse point: {}",
+                            child_path.display()
+                        ));
+                    }
+                    if child_metadata.is_file() {
+                        discovered_file_bytes = discovered_file_bytes
+                            .checked_add(child_metadata.len())
+                            .ok_or_else(|| {
+                                "D32 Host app-owned tree byte bound overflowed".to_string()
+                            })?;
+                        if discovered_file_bytes > max_file_bytes {
+                            return Err(
+                                "D32 Host app-owned tree exceeded its byte bound".to_string()
+                            );
+                        }
+                    }
+                    let discovered = entries_seen.checked_add(1).ok_or_else(|| {
+                        "D32 Host app-owned tree entry bound overflowed".to_string()
+                    })?;
+                    if discovered > max_entries {
+                        return Err("D32 Host app-owned tree exceeded its entry bound".to_string());
+                    }
+                    entries_seen = discovered;
+                    children.push((child_path, child_name, child_depth));
+                }
+                // The stack is LIFO; reverse the deterministic name order so
+                // traversal remains stable without collecting an unbounded
+                // directory listing.
+                children.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+                for (child_path, _child_name, child_depth) in children.into_iter().rev() {
+                    if pending.len() >= max_entries {
+                        return Err(
+                            "D32 Host app-owned tree exceeded its pending-entry bound".to_string()
+                        );
+                    }
+                    pending.push((child_path, child_depth));
+                }
             }
         }
         Ok(())
@@ -2446,7 +2687,11 @@ mod windows {
         entries: &mut Vec<HostToolchainManifestEntry>,
         file_count: &mut usize,
         total_bytes: &mut u64,
+        depth: usize,
     ) -> Result<(), String> {
+        if depth > D32_TREE_MAX_DEPTH {
+            return Err("D32 Host toolchain manifest exceeded its path-depth bound".to_string());
+        }
         retained.revalidate("D32 Host manifest directory before enumeration")?;
         for name in retained.enumerate_children()? {
             let relative = relative_prefix.join(&name);
@@ -2457,6 +2702,7 @@ mod windows {
                     entries,
                     file_count,
                     total_bytes,
+                    depth.saturating_add(1),
                 )?;
             } else {
                 let (identity, digest) =
@@ -2492,6 +2738,7 @@ mod windows {
             &mut entries,
             &mut file_count,
             &mut total_bytes,
+            0,
         )?;
         let digest = protocol::d32_manifest_hash_hex(&mut entries)
             .map_err(|_| "D32 Host toolchain manifest canonical encoding failed".to_string())?;
@@ -2510,13 +2757,23 @@ mod windows {
         destination: &D32RetainedDirectory,
         files: &mut usize,
         bytes: &mut u64,
+        depth: usize,
     ) -> Result<(), String> {
+        if depth > D32_TREE_MAX_DEPTH {
+            return Err("D32 Host toolchain mirror exceeded its path-depth bound".to_string());
+        }
         source.revalidate("D32 Host source before toolchain copy")?;
         destination.revalidate("D32 Host destination before toolchain copy")?;
         for name in source.enumerate_children()? {
             if let Ok(source_child) = source.open_existing_child(&name) {
                 let destination_child = destination.open_or_create_child(&name)?;
-                host_copy_toolchain_tree(&source_child, &destination_child, files, bytes)?;
+                host_copy_toolchain_tree(
+                    &source_child,
+                    &destination_child,
+                    files,
+                    bytes,
+                    depth.saturating_add(1),
+                )?;
             } else {
                 let identity = source
                     .probe_file(&name, D32_TOOLCHAIN_FILE_MAX_BYTES)?
@@ -2620,6 +2877,7 @@ mod windows {
                 &staging_retained,
                 &mut files,
                 &mut bytes,
+                0,
             )?;
             app_data_root_retained.revalidate("D32 Host app-data root after mirror copy")?;
             selected_root_retained.revalidate("D32 Host toolchain root after mirror copy")?;
@@ -10516,7 +10774,17 @@ mod windows {
         relative_path: &str,
         entries: &mut Vec<D32TreeManifestEntry>,
         total_bytes: &mut u64,
+        path_bytes: &mut u64,
+        name_bytes: &mut u64,
+        depth: usize,
     ) -> Result<(), String> {
+        if depth > D32_TREE_MAX_DEPTH {
+            return Err("D32 Host audit tree exceeded its path-depth bound".to_string());
+        }
+        d32_audit_path_bytes(current)?;
+        if relative_path.as_bytes().len() > D32_AUDIT_MAX_PATH_BYTES {
+            return Err("D32 Host audit relative path exceeded its bound".to_string());
+        }
         if entries.len() >= D32_AUDIT_MAX_ENTRIES {
             return Err("D32 Host audit tree exceeded its entry bound".to_string());
         }
@@ -10529,20 +10797,73 @@ mod windows {
         }
         entries.push(entry);
         if current.is_dir() {
-            let mut children = fs::read_dir(current)
+            let mut children = Vec::new();
+            let mut projected_total_bytes = *total_bytes;
+            for child in fs::read_dir(current)
                 .map_err(|_| format!("D32 Host audit enumeration failed: {}", current.display()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "D32 Host audit enumeration failed".to_string())?;
-            children.sort_by_key(|entry| entry.file_name());
-            for child in children {
+            {
+                if children.len() >= D32_AUDIT_MAX_ENTRIES {
+                    return Err(
+                        "D32 Host audit tree exceeded its per-directory entry bound".to_string()
+                    );
+                }
+                let child = child.map_err(|_| "D32 Host audit enumeration failed".to_string())?;
+                let child_name_os = child.file_name();
+                let child_name_bytes = d32_audit_name_bytes(&child_name_os)?;
+                d32_audit_namespace_bytes_add(name_bytes, child_name_bytes)?;
                 let child_path = child.path();
-                let child_name = child.file_name().to_string_lossy().into_owned();
+                let child_path_bytes = d32_audit_path_bytes(&child_path)?;
+                d32_audit_namespace_bytes_add(path_bytes, child_path_bytes)?;
+                let child_name = child_name_os.to_string_lossy().into_owned();
                 let child_relative = if relative_path == "." {
-                    child_name
+                    child_name.clone()
                 } else {
                     format!("{relative_path}/{child_name}")
                 };
-                d32_collect_tree_manifest(&child_path, &child_relative, entries, total_bytes)?;
+                if child_relative.as_bytes().len() > D32_AUDIT_MAX_PATH_BYTES {
+                    return Err("D32 Host audit relative path exceeded its bound".to_string());
+                }
+                let projected_entries = entries
+                    .len()
+                    .checked_add(children.len())
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| "D32 Host audit tree entry bound overflowed".to_string())?;
+                if projected_entries > D32_AUDIT_MAX_ENTRIES {
+                    return Err("D32 Host audit tree exceeded its entry bound".to_string());
+                }
+                let child_metadata = fs::symlink_metadata(&child_path).map_err(|_| {
+                    format!(
+                        "D32 Host audit metadata was unavailable: {}",
+                        child_path.display()
+                    )
+                })?;
+                if host_metadata_is_reparse(&child_metadata) {
+                    return Err(format!(
+                        "D32 Host audit rejected a reparse entry: {}",
+                        child_path.display()
+                    ));
+                }
+                if child_metadata.is_file() {
+                    projected_total_bytes = projected_total_bytes
+                        .checked_add(child_metadata.len())
+                        .ok_or_else(|| "D32 Host audit tree byte bound overflowed".to_string())?;
+                    if projected_total_bytes > D32_AUDIT_MAX_BYTES {
+                        return Err("D32 Host audit tree exceeded its byte bound".to_string());
+                    }
+                }
+                children.push((child_path, child_name, child_relative));
+            }
+            children.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+            for (child_path, _child_name, child_relative) in children {
+                d32_collect_tree_manifest(
+                    &child_path,
+                    &child_relative,
+                    entries,
+                    total_bytes,
+                    path_bytes,
+                    name_bytes,
+                    depth.saturating_add(1),
+                )?;
             }
         }
         Ok(())
@@ -10589,7 +10910,18 @@ mod windows {
         }
         let mut entries = Vec::new();
         let mut total_bytes = 0;
-        d32_collect_tree_manifest(path, ".", &mut entries, &mut total_bytes)?;
+        let mut path_bytes = 0_u64;
+        let mut name_bytes = 0_u64;
+        d32_audit_namespace_bytes_add(&mut path_bytes, d32_audit_path_bytes(path)?)?;
+        d32_collect_tree_manifest(
+            path,
+            ".",
+            &mut entries,
+            &mut total_bytes,
+            &mut path_bytes,
+            &mut name_bytes,
+            0,
+        )?;
         let encoded = serde_json::to_vec(&entries)
             .map_err(|_| "D32 Host audit manifest serialization failed".to_string())?;
         Ok(D32TreeManifest {
@@ -11609,6 +11941,209 @@ mod windows {
             assert_eq!(
                 fs::read(first.join("bin/cargo.exe")).unwrap(),
                 b"cargo-source"
+            );
+        }
+
+        struct GrowingReader {
+            prefix: Vec<u8>,
+            suffix: Vec<u8>,
+            offset: usize,
+        }
+
+        impl GrowingReader {
+            fn new(prefix: Vec<u8>, suffix: Vec<u8>) -> Self {
+                Self {
+                    prefix,
+                    suffix,
+                    offset: 0,
+                }
+            }
+        }
+
+        impl std::io::Read for GrowingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let total = self.prefix.len() + self.suffix.len();
+                if self.offset >= total {
+                    return Ok(0);
+                }
+                let (source, source_offset) = if self.offset < self.prefix.len() {
+                    (&self.prefix, self.offset)
+                } else {
+                    (&self.suffix, self.offset - self.prefix.len())
+                };
+                let read = (source.len() - source_offset).min(buffer.len());
+                buffer[..read].copy_from_slice(&source[source_offset..source_offset + read]);
+                self.offset += read;
+                Ok(read)
+            }
+        }
+
+        #[test]
+        fn d32_host_retained_bounded_reader_rejects_growth_without_delivering_extra() {
+            let max_bytes = 5_u64;
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let mut delivered = Vec::new();
+            let result = read_retained_bounded(
+                &mut GrowingReader::new(vec![0x11; max_bytes as usize], vec![0xee]),
+                max_bytes,
+                &mut buffer,
+                |chunk| {
+                    delivered.extend_from_slice(chunk);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "growth beyond the bound must fail closed");
+            assert_eq!(delivered.len(), max_bytes as usize);
+            assert!(delivered.iter().all(|byte| *byte == 0x11));
+
+            let mut exact_buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let mut exact = Vec::new();
+            let total = read_retained_bounded(
+                &mut GrowingReader::new(vec![0x22; max_bytes as usize], Vec::new()),
+                max_bytes,
+                &mut exact_buffer,
+                |chunk| {
+                    exact.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .expect("an exact-bound source must be accepted");
+            assert_eq!(total, max_bytes);
+            assert_eq!(exact.len(), max_bytes as usize);
+
+            let mut oversized_buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let mut oversized_delivered = Vec::new();
+            assert!(read_retained_bounded(
+                &mut GrowingReader::new(vec![0x33; max_bytes as usize + 1], Vec::new()),
+                max_bytes,
+                &mut oversized_buffer,
+                |chunk| {
+                    oversized_delivered.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .is_err());
+            assert!(oversized_delivered.is_empty());
+        }
+
+        #[test]
+        fn d32_retained_file_io_does_not_consume_default_stack_for_buffers() {
+            // Production Host/Vita workers use ordinary Windows thread
+            // stacks.  Run both retained streaming paths on a deliberately
+            // small stack so a regression to a 1 MiB stack array fails as a
+            // process-level STATUS_STACK_OVERFLOW instead of being hidden by
+            // the test harness's larger worker stack.
+            let worker = thread::Builder::new()
+                .name("d32-retained-io-stack-regression".to_string())
+                .stack_size(256 * 1024)
+                .spawn(|| {
+                    let source = tempfile::tempdir().expect("D32 stack source tempdir");
+                    let destination = tempfile::tempdir().expect("D32 stack destination tempdir");
+                    let payload = vec![0x5a_u8; 2 * 1024 * 1024];
+                    fs::write(source.path().join("cargo.exe"), &payload)
+                        .expect("D32 stack source payload");
+
+                    let source_retained = D32RetainedDirectory::open(source.path())
+                        .expect("D32 stack source retained root");
+                    let destination_retained = D32RetainedDirectory::open(destination.path())
+                        .expect("D32 stack destination retained root");
+                    let (source_identity, source_digest) = source_retained
+                        .hash_file_with_identity(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)
+                        .expect("D32 stack source hash");
+                    destination_retained
+                        .copy_file_from(
+                            &source_retained,
+                            OsStr::new("cargo.exe"),
+                            OsStr::new("cargo.exe"),
+                            D32_IMAGE_HASH_MAX_BYTES,
+                        )
+                        .expect("D32 stack retained copy");
+                    let (destination_identity, destination_digest) = destination_retained
+                        .hash_file_with_identity(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)
+                        .expect("D32 stack destination hash");
+                    assert_eq!(source_identity.file_size, payload.len() as u64);
+                    assert_eq!(destination_identity.file_size, payload.len() as u64);
+                    assert_eq!(source_digest, destination_digest);
+                })
+                .expect("D32 retained I/O regression worker");
+            worker
+                .join()
+                .expect("D32 retained I/O must not overflow its stack");
+        }
+
+        #[test]
+        fn d32_retained_file_read_bounded_rejects_oversize_and_accepts_boundary() {
+            let root = tempfile::tempdir().expect("D32 retained read root");
+            let path = root.path().join("config");
+            let payload = b"0123456789";
+            fs::write(&path, payload).expect("D32 retained read payload");
+            let retained = D32RetainedFile::open(&path).expect("D32 retained read file");
+
+            assert_eq!(
+                retained
+                    .read_bounded(payload.len())
+                    .expect("D32 retained read exact boundary"),
+                payload
+            );
+            let error = retained
+                .read_bounded(payload.len() - 1)
+                .expect_err("D32 retained read must reject oversize content");
+            assert!(
+                error.contains("exceeded its bound"),
+                "unexpected error: {error}"
+            );
+        }
+
+        #[test]
+        fn d32_host_no_reparse_tree_fails_closed_on_excess_entries() {
+            let root = tempfile::tempdir().expect("D32 no-reparse entry root");
+            fs::write(root.path().join("a"), b"a").expect("D32 no-reparse first entry");
+            fs::write(root.path().join("b"), b"b").expect("D32 no-reparse second entry");
+
+            // The production wrapper supplies the frozen 262,144-entry
+            // bound.  A smaller private limit keeps this regression focused
+            // without manufacturing hundreds of thousands of files.
+            let error = host_verify_no_reparse_tree_with_limits(
+                root.path(),
+                2,
+                D32_AUDIT_MAX_BYTES,
+                D32_TREE_MAX_DEPTH,
+            )
+            .expect_err("D32 no-reparse tree must reject excess entries");
+            assert!(error.contains("entry bound"), "unexpected error: {error}");
+        }
+
+        #[test]
+        fn d32_host_no_reparse_tree_fails_closed_on_excessive_depth() {
+            let root = tempfile::tempdir().expect("D32 no-reparse depth root");
+            let mut current = root.path().to_path_buf();
+            for index in 0..=D32_TREE_MAX_DEPTH {
+                current.push(format!("d{index:03}"));
+                fs::create_dir(&current).expect("D32 no-reparse depth directory");
+            }
+
+            let error = host_verify_no_reparse_tree(root.path())
+                .expect_err("D32 no-reparse tree must reject excessive depth");
+            assert!(
+                error.contains("path-depth"),
+                "unexpected depth-bound error: {error}"
+            );
+        }
+
+        #[test]
+        fn d32_host_manifest_fails_closed_on_excessive_depth() {
+            let root = tempfile::tempdir().expect("D32 depth-bound root");
+            let mut current = root.path().to_path_buf();
+            for index in 0..=D32_TREE_MAX_DEPTH {
+                current.push(format!("d{index:03}"));
+                fs::create_dir(&current).expect("D32 depth-bound directory");
+            }
+
+            let error = host_toolchain_manifest_hash(root.path())
+                .expect_err("D32 host manifest must reject excessive depth");
+            assert!(
+                error.contains("path-depth"),
+                "unexpected depth-bound error: {error}"
             );
         }
 

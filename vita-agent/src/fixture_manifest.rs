@@ -179,6 +179,19 @@ fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_candidate_sha(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 40
+        || value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    {
+        return Err(invalid(format!(
+            "{label} is not a 40-character lowercase Git SHA"
+        )));
+    }
+    Ok(())
+}
+
 fn current_candidate_sha(repo_root: &Path) -> Result<String, String> {
     let root = repo_root
         .to_str()
@@ -194,10 +207,8 @@ fn current_candidate_sha(repo_root: &Path) -> Result<String, String> {
     let sha = String::from_utf8(output.stdout)
         .map_err(|_| invalid("current candidate SHA was not UTF-8"))?
         .trim()
-        .to_ascii_lowercase();
-    if sha.len() != 40 || sha.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
-        return Err(invalid("current candidate SHA is not a full 40-hex commit"));
-    }
+        .to_string();
+    validate_candidate_sha(&sha, "current candidate SHA")?;
     Ok(sha)
 }
 
@@ -427,9 +438,9 @@ fn validate_manifest_common(manifest: &FixtureManifest, repo_root: &Path) -> Res
             manifest.schema_version, D32_FIXTURE_SCHEMA_VERSION
         )));
     }
-    validate_sha256(&manifest.candidate_sha, "candidate_sha")?;
+    validate_candidate_sha(&manifest.candidate_sha, "candidate_sha")?;
     let head = current_candidate_sha(repo_root)?;
-    if manifest.candidate_sha.to_ascii_lowercase() != head {
+    if manifest.candidate_sha != head {
         return Err(invalid(format!(
             "candidate_sha does not match current HEAD {head}"
         )));
@@ -548,5 +559,28 @@ mod tests {
             normalise_command(&command),
             normalise_command(&command.replace("d29-h1-host-fixture", "wrong-feature"))
         );
+    }
+
+    #[test]
+    fn candidate_sha_requires_exact_lowercase_git_shape() {
+        let valid = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(valid.len(), 40);
+        assert!(validate_candidate_sha(valid, "candidate_sha").is_ok());
+        assert!(validate_candidate_sha(&valid[..39], "candidate_sha").is_err());
+        assert!(validate_candidate_sha(
+            "0123456789abcdef0123456789abcdef012345678",
+            "candidate_sha"
+        )
+        .is_err());
+        assert!(validate_candidate_sha(
+            "0123456789ABCDEF0123456789abcdef01234567",
+            "candidate_sha"
+        )
+        .is_err());
+        assert!(validate_candidate_sha(
+            "0123456789abcdef0123456789abcdef0123456g",
+            "candidate_sha"
+        )
+        .is_err());
     }
 }

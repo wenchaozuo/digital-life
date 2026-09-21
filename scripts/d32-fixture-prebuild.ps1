@@ -295,8 +295,7 @@ function Test-D32CapturedProcessAlive {
 function Stop-D32ProcessTreeAndVerify {
     param(
         [Parameter(Mandatory = $true)][int]$RootPid,
-        [Parameter(Mandatory = $true)][int[]]$CapturedDescendants,
-        [Parameter(Mandatory = $true)][string]$ErrorLog
+        [Parameter(Mandatory = $true)][int[]]$CapturedDescendants
     )
 
     $captured = @($RootPid) + @($CapturedDescendants) | Select-Object -Unique
@@ -304,16 +303,11 @@ function Stop-D32ProcessTreeAndVerify {
     $records = @($snapshot | Where-Object { $captured -contains [int]$_.ProcessId })
     $rootRecord = @($records | Where-Object { [int]$_.ProcessId -eq $RootPid })
     $killOutput = if ($rootRecord.Count -eq 1) { @(& taskkill.exe /PID $RootPid /T /F 2>&1) } else { @('root process identity was already gone; per-PID verification continues') }
-    [IO.File]::AppendAllText(
-        $ErrorLog,
-        "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($CapturedDescendants -join ',')`n$($killOutput -join "`n")`n",
-        [Text.UTF8Encoding]::new($false)
-    )
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
     do {
         $alive = @($records | Where-Object { Test-D32CapturedProcessAlive -Record $_ })
         if ($alive.Count -eq 0) {
-            return [ordered]@{ ProcessIds = $captured; Residual = @() }
+            return [ordered]@{ ProcessIds = $captured; Residual = @(); KillOutput = @($killOutput) }
         }
         Start-Sleep -Milliseconds 100
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
@@ -323,7 +317,7 @@ function Stop-D32ProcessTreeAndVerify {
     # capture cannot be silently inherited by the next phase.
     foreach ($record in $records) {
         if (Test-D32CapturedProcessAlive -Record $record) {
-            [void](& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1)
+            $killOutput += @(& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1)
         }
     }
     Start-Sleep -Milliseconds 250
@@ -331,7 +325,7 @@ function Stop-D32ProcessTreeAndVerify {
     if ($residual.Count -gt 0) {
         throw "PROCESS_TREE_REAP_FAILED: captured process IDs remained alive after recursive and per-PID kill: $($residual -join ',')"
     }
-    return [ordered]@{ ProcessIds = $captured; Residual = @() }
+    return [ordered]@{ ProcessIds = $captured; Residual = @(); KillOutput = @($killOutput) }
 }
 
 function Test-D32NoOwnedCargoDescendants {
@@ -383,16 +377,55 @@ function Invoke-D32BoundedProcess {
     $stderrPath = "$PhaseLog.stderr.log"
     $started = [DateTimeOffset]::UtcNow
     $process = $null
+    $stdoutStream = $null
+    $stderrStream = $null
+    $stdoutCopy = $null
+    $stderrCopy = $null
     try {
-        $process = Start-Process -FilePath $FilePath `
-            -ArgumentList (ConvertTo-D32CommandLine $Arguments) `
-            -WorkingDirectory $WorkingDirectory `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath `
-            -WindowStyle Hidden `
-            -PassThru
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $FilePath
+        $startInfo.Arguments = ConvertTo-D32CommandLine $Arguments
+        $startInfo.WorkingDirectory = $WorkingDirectory
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $stdoutStream = [IO.File]::Open(
+            $stdoutPath,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read
+        )
+        $stderrStream = [IO.File]::Open(
+            $stderrPath,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read
+        )
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw "PROCESS_SPAWN_FAILED: process did not start: $FilePath"
+        }
+        $processId = [int]$process.Id
+        $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+        $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
     }
     catch {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) {
+                    [void](& taskkill.exe /PID $process.Id /T /F 2>&1)
+                }
+            }
+            catch {
+                # Preserve the original spawn/capture error.
+            }
+            $process.Dispose()
+        }
+        if ($null -ne $stdoutStream) { $stdoutStream.Flush(); $stdoutStream.Close(); $stdoutStream.Dispose() }
+        if ($null -ne $stderrStream) { $stderrStream.Flush(); $stderrStream.Close(); $stderrStream.Dispose() }
         return [ordered]@{
             status     = 'spawn_failed'
             exit_code  = $null
@@ -408,6 +441,8 @@ function Invoke-D32BoundedProcess {
     $deadline = $started.AddSeconds($TimeoutSeconds)
     $timedOut = $false
     $capturedDescendants = @()
+    $killOutput = @()
+    $treeError = $null
     while (-not $process.HasExited) {
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
             # Capture the complete tree before taskkill can remove the parent;
@@ -421,34 +456,69 @@ function Invoke-D32BoundedProcess {
     }
 
     if ($timedOut) {
-        $reap = Stop-D32ProcessTreeAndVerify `
-            -RootPid $process.Id `
-            -CapturedDescendants $capturedDescendants `
-            -ErrorLog $stderrPath
-        $process.Refresh()
+        try {
+            $reap = Stop-D32ProcessTreeAndVerify `
+                -RootPid $processId `
+                -CapturedDescendants $capturedDescendants
+            $killOutput = @($reap.KillOutput)
+        }
+        catch {
+            $treeError = $_.Exception.Message
+        }
+        if ($process.HasExited) { [void]$process.WaitForExit() }
         $exitCode = $null
     }
     else {
-        # HasExited is only a state observation.  WaitForExit + Refresh makes
-        # the exit code deterministic for rustup/cargo proxy processes; this
-        # closes the prior null-exit-code manifest regression.
+        # Wait on the retained native Process handle before reading ExitCode.
+        # Start-Process without -Wait can return a detached wrapper whose
+        # ExitCode reads as zero even when the child returned non-zero.
         [void]$process.WaitForExit()
-        $process.Refresh()
         try {
             $exitCode = [int]$process.ExitCode
         }
         catch {
-            throw "PROCESS_EXIT_CODE_UNAVAILABLE: pid $($process.Id) exited but its exit code could not be read: $($_.Exception.Message)"
+            throw "PROCESS_EXIT_CODE_UNAVAILABLE: pid $processId exited but its exit code could not be read: $($_.Exception.Message)"
         }
-        $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $process.Id)
+        $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $processId)
         if ($capturedDescendants.Count -gt 0) {
             $reap = Stop-D32ProcessTreeAndVerify `
-                -RootPid $process.Id `
-                -CapturedDescendants $capturedDescendants `
-                -ErrorLog $stderrPath
-            throw "PROCESS_TREE_REAP_FAILED: pid $($process.Id) exited with residual descendants: $($capturedDescendants -join ',')"
+                -RootPid $processId `
+                -CapturedDescendants $capturedDescendants
+            $killOutput = @($reap.KillOutput)
+            $treeError = "PROCESS_TREE_REAP_FAILED: pid $processId exited with residual descendants: $($capturedDescendants -join ',')"
         }
     }
+
+    try {
+        if ($null -eq $treeError) {
+            if ($null -ne $stdoutCopy) { $stdoutCopy.Wait() }
+            if ($null -ne $stderrCopy) { $stderrCopy.Wait() }
+        }
+        else {
+            # A failed tree reap must remain bounded; do not wait forever on
+            # a pipe that may still be held by an unverified descendant.
+            if ($null -ne $stdoutCopy) { [void]$stdoutCopy.Wait(1000) }
+            if ($null -ne $stderrCopy) { [void]$stderrCopy.Wait(1000) }
+        }
+    }
+    finally {
+        if ($null -ne $process) {
+            $process.StandardOutput.Close()
+            $process.StandardError.Close()
+        }
+        if ($null -ne $stdoutStream) { $stdoutStream.Flush(); $stdoutStream.Close(); $stdoutStream.Dispose() }
+        if ($null -ne $stderrStream) { $stderrStream.Flush(); $stderrStream.Close(); $stderrStream.Dispose() }
+        if ($null -ne $process) { $process.Dispose() }
+    }
+
+    if ($timedOut) {
+        [IO.File]::AppendAllText(
+            $stderrPath,
+            "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($capturedDescendants -join ',')`n$($killOutput -join "`n")`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
+    if ($null -ne $treeError) { throw $treeError }
 
     $finished = [DateTimeOffset]::UtcNow
     [IO.File]::AppendAllText(
@@ -459,7 +529,7 @@ function Invoke-D32BoundedProcess {
     return [ordered]@{
         status            = if ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
         exit_code         = $exitCode
-        pid               = $process.Id
+        pid               = $processId
         elapsed_ms        = ($finished - $started).TotalMilliseconds
         phase_log         = (Get-D32FullPath $PhaseLog)
         stdout_log        = (Get-D32FullPath $stdoutPath)
@@ -514,9 +584,26 @@ function Invoke-D32SelfTest {
         $passed++
 
         $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $encodedExitZero = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes('exit 0')
+        )
+        $zero = Invoke-D32BoundedProcess `
+            -FilePath $powershell `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) `
+            -WorkingDirectory $root `
+            -PhaseLog (Join-Path $root 'zero-phase') `
+            -TimeoutSeconds 5
+        if ($zero.status -ne 'succeeded' -or $zero.exit_code -ne 0) {
+            throw "SELFTEST_FAILED: zero exit code was not captured exactly (status=$($zero.status), exit=$($zero.exit_code))"
+        }
+        $passed++
+
+        $encodedExitSeven = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes('exit 7')
+        )
         $nonZero = Invoke-D32BoundedProcess `
             -FilePath $powershell `
-            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 7') `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitSeven) `
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'nonzero-phase') `
             -TimeoutSeconds 5

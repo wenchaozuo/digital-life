@@ -32,6 +32,8 @@ mod d29h6;
 mod d29h7;
 #[cfg(windows)]
 mod d32a;
+#[cfg(test)]
+mod fixture_manifest;
 mod provider_gateway;
 pub mod recovery_journal;
 mod runtime_composition;

@@ -25,10 +25,10 @@ use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 
 use crate::{
-    VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaAuthorityError, VitaAuthorityEvidenceSource,
-    VitaAuthorityFuture, VitaAuthorityOutcome, VitaAuthorityReason, VitaAuthorityVerdict,
-    VitaBrokerSnapshot, VitaExecutionContext, VitaToolAuthorityPort, VitaToolAuthorityRequest,
-    VitaToolBroker, VitaToolContributor, VITA_GOVERNED_ACTION_TOOL_NAME,
+    fixture_manifest, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaAuthorityError,
+    VitaAuthorityEvidenceSource, VitaAuthorityFuture, VitaAuthorityOutcome, VitaAuthorityReason,
+    VitaAuthorityVerdict, VitaBrokerSnapshot, VitaExecutionContext, VitaToolAuthorityPort,
+    VitaToolAuthorityRequest, VitaToolBroker, VitaToolContributor, VITA_GOVERNED_ACTION_TOOL_NAME,
 };
 
 use super::{ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy};
@@ -438,44 +438,7 @@ struct ProcessIsolatedCanonicalAuthority {
 }
 
 fn d29h1_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
-    let executable = repo_root
-        .join("src-tauri")
-        .join("target")
-        .join("debug")
-        .join(if cfg!(windows) {
-            "d29h1-authority-fixture.exe"
-        } else {
-            "d29h1-authority-fixture"
-        });
-    let source = repo_root
-        .join("src-tauri")
-        .join("src")
-        .join("bin")
-        .join("d29h1-authority-fixture.rs");
-    if !executable.is_file() {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H1 authority fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    let executable_is_fresh = executable
-        .metadata()
-        .and_then(|binary| binary.modified())
-        .and_then(|binary_time| {
-            source.metadata().and_then(|source| {
-                source
-                    .modified()
-                    .map(|source_time| (binary_time, source_time))
-            })
-        })
-        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if !executable_is_fresh {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H1 authority fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    Ok(executable)
+    fixture_manifest::existing_fixture(repo_root, "d29h1-authority-fixture")
 }
 
 impl ProcessIsolatedCanonicalAuthority {

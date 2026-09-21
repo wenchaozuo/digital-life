@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:OwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
-$script:SchemaVersion = 1
+$script:SchemaVersion = 2
 $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $script:FixtureSpecs = @(
@@ -239,6 +239,137 @@ function ConvertTo-D32CommandLine {
             }) -join ' ')
 }
 
+function Get-D32ProcessSnapshot {
+    try {
+        return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)
+    }
+    catch {
+        throw "PROCESS_TREE_ENUMERATION_FAILED: $($_.Exception.Message)"
+    }
+}
+
+function Get-D32DescendantProcessIds {
+    param([Parameter(Mandatory = $true)][int]$RootPid)
+
+    $snapshot = Get-D32ProcessSnapshot
+    $pending = [System.Collections.Generic.Queue[int]]::new()
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    $pending.Enqueue($RootPid)
+    [void]$seen.Add($RootPid)
+    $descendants = [System.Collections.Generic.List[int]]::new()
+    while ($pending.Count -gt 0) {
+        $parent = $pending.Dequeue()
+        foreach ($record in $snapshot | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
+            $child = [int]$record.ProcessId
+            if ($seen.Add($child)) {
+                $descendants.Add($child)
+                $pending.Enqueue($child)
+            }
+        }
+    }
+    return @($descendants)
+}
+
+function Test-D32ProcessIdsExited {
+    param([Parameter(Mandatory = $true)][int[]]$ProcessIds)
+
+    foreach ($processId in $ProcessIds) {
+        if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-D32CapturedProcessAlive {
+    param([Parameter(Mandatory = $true)][object]$Record)
+
+    $current = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$([int]$Record.ProcessId)" -ErrorAction Stop)
+    if ($current.Count -eq 0) { return $false }
+    $candidate = $current[0]
+    return ([string]$candidate.Name -ceq [string]$Record.Name -and
+        [string]$candidate.CreationDate -ceq [string]$Record.CreationDate)
+}
+
+function Stop-D32ProcessTreeAndVerify {
+    param(
+        [Parameter(Mandatory = $true)][int]$RootPid,
+        [Parameter(Mandatory = $true)][int[]]$CapturedDescendants,
+        [Parameter(Mandatory = $true)][string]$ErrorLog
+    )
+
+    $captured = @($RootPid) + @($CapturedDescendants) | Select-Object -Unique
+    $snapshot = Get-D32ProcessSnapshot
+    $records = @($snapshot | Where-Object { $captured -contains [int]$_.ProcessId })
+    $rootRecord = @($records | Where-Object { [int]$_.ProcessId -eq $RootPid })
+    $killOutput = if ($rootRecord.Count -eq 1) { @(& taskkill.exe /PID $RootPid /T /F 2>&1) } else { @('root process identity was already gone; per-PID verification continues') }
+    [IO.File]::AppendAllText(
+        $ErrorLog,
+        "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($CapturedDescendants -join ',')`n$($killOutput -join "`n")`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+    do {
+        $alive = @($records | Where-Object { Test-D32CapturedProcessAlive -Record $_ })
+        if ($alive.Count -eq 0) {
+            return [ordered]@{ ProcessIds = $captured; Residual = @() }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+    # The recursive taskkill is the first action.  Explicitly target every
+    # captured PID once more so a process that detached or raced the tree
+    # capture cannot be silently inherited by the next phase.
+    foreach ($record in $records) {
+        if (Test-D32CapturedProcessAlive -Record $record) {
+            [void](& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1)
+        }
+    }
+    Start-Sleep -Milliseconds 250
+    $residual = @($records | Where-Object { Test-D32CapturedProcessAlive -Record $_ })
+    if ($residual.Count -gt 0) {
+        throw "PROCESS_TREE_REAP_FAILED: captured process IDs remained alive after recursive and per-PID kill: $($residual -join ',')"
+    }
+    return [ordered]@{ ProcessIds = $captured; Residual = @() }
+}
+
+function Test-D32NoOwnedCargoDescendants {
+    param(
+        [Parameter(Mandatory = $true)][int[]]$RootPids,
+        [Parameter(Mandatory = $true)][string]$CheckName
+    )
+
+    $snapshot = Get-D32ProcessSnapshot
+    $byParent = @{}
+    foreach ($record in $snapshot) {
+        $parent = [int]$record.ParentProcessId
+        if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
+        $byParent[$parent] += $record
+    }
+    $pending = [System.Collections.Generic.Queue[int]]::new()
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($rootPid in $RootPids) { $pending.Enqueue($rootPid) }
+    $residual = [System.Collections.Generic.List[object]]::new()
+    while ($pending.Count -gt 0) {
+        $parent = $pending.Dequeue()
+        if (-not $byParent.ContainsKey($parent)) { continue }
+        foreach ($record in $byParent[$parent]) {
+            $child = [int]$record.ProcessId
+            if (-not $seen.Add($child)) { continue }
+            $pending.Enqueue($child)
+            if ([string]$record.Name -match '^(cargo|rustc)(\.exe)?$') {
+                $residual.Add($record)
+            }
+        }
+    }
+    if ($residual.Count -gt 0) {
+        $details = ($residual | ForEach-Object { "$($_.Name):$($_.ProcessId):parent=$($_.ParentProcessId)" }) -join ', '
+        throw "PROCESS_TREE_REAP_FAILED: $CheckName found owned Cargo/rustc descendants: $details"
+    }
+    return $true
+}
+
 function Invoke-D32BoundedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -276,8 +407,12 @@ function Invoke-D32BoundedProcess {
 
     $deadline = $started.AddSeconds($TimeoutSeconds)
     $timedOut = $false
+    $capturedDescendants = @()
     while (-not $process.HasExited) {
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
+            # Capture the complete tree before taskkill can remove the parent;
+            # the captured IDs are then checked individually after the kill.
+            $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $process.Id)
             $timedOut = $true
             break
         }
@@ -286,34 +421,51 @@ function Invoke-D32BoundedProcess {
     }
 
     if ($timedOut) {
-        $killOutput = @(& taskkill.exe /PID $process.Id /T /F 2>&1)
-        [IO.File]::AppendAllText(
-            $stderrPath,
-            "`nD32_FIXTURE_PHASE=timeout`n$($killOutput -join "`n")`n",
-            [Text.UTF8Encoding]::new($false)
-        )
+        $reap = Stop-D32ProcessTreeAndVerify `
+            -RootPid $process.Id `
+            -CapturedDescendants $capturedDescendants `
+            -ErrorLog $stderrPath
+        $process.Refresh()
+        $exitCode = $null
+    }
+    else {
+        # HasExited is only a state observation.  WaitForExit + Refresh makes
+        # the exit code deterministic for rustup/cargo proxy processes; this
+        # closes the prior null-exit-code manifest regression.
+        [void]$process.WaitForExit()
+        $process.Refresh()
         try {
-            [void]$process.WaitForExit(5000)
-            $process.Refresh()
+            $exitCode = [int]$process.ExitCode
         }
         catch {
-            $killOutput += $_.Exception.Message
+            throw "PROCESS_EXIT_CODE_UNAVAILABLE: pid $($process.Id) exited but its exit code could not be read: $($_.Exception.Message)"
         }
-        if (-not $process.HasExited) {
-            throw "PROCESS_TREE_REAP_FAILED: pid $($process.Id) remained alive after taskkill /T /F"
+        $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $process.Id)
+        if ($capturedDescendants.Count -gt 0) {
+            $reap = Stop-D32ProcessTreeAndVerify `
+                -RootPid $process.Id `
+                -CapturedDescendants $capturedDescendants `
+                -ErrorLog $stderrPath
+            throw "PROCESS_TREE_REAP_FAILED: pid $($process.Id) exited with residual descendants: $($capturedDescendants -join ',')"
         }
     }
 
     $finished = [DateTimeOffset]::UtcNow
+    [IO.File]::AppendAllText(
+        $stdoutPath,
+        "`nD32_FIXTURE_EXIT_CODE=$exitCode`nD32_FIXTURE_DESCENDANTS=$($capturedDescendants -join ',')`n",
+        [Text.UTF8Encoding]::new($false)
+    )
     return [ordered]@{
-        status     = if ($timedOut) { 'timeout' } elseif ($process.ExitCode -eq 0) { 'succeeded' } else { 'failed' }
-        exit_code  = $process.ExitCode
-        pid        = $process.Id
-        elapsed_ms = ($finished - $started).TotalMilliseconds
-        phase_log  = (Get-D32FullPath $PhaseLog)
-        stdout_log = (Get-D32FullPath $stdoutPath)
-        stderr_log = (Get-D32FullPath $stderrPath)
-        error      = if ($timedOut) { 'bounded timeout; process tree was killed and reaped' } else { $null }
+        status            = if ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
+        exit_code         = $exitCode
+        pid               = $process.Id
+        elapsed_ms        = ($finished - $started).TotalMilliseconds
+        phase_log         = (Get-D32FullPath $PhaseLog)
+        stdout_log        = (Get-D32FullPath $stdoutPath)
+        stderr_log        = (Get-D32FullPath $stderrPath)
+        descendant_pids   = @($capturedDescendants)
+        error             = if ($timedOut) { 'bounded timeout; process tree was killed and every captured PID was reaped' } else { $null }
     }
 }
 
@@ -361,6 +513,18 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
+        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $nonZero = Invoke-D32BoundedProcess `
+            -FilePath $powershell `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 7') `
+            -WorkingDirectory $root `
+            -PhaseLog (Join-Path $root 'nonzero-phase') `
+            -TimeoutSeconds 5
+        if ($nonZero.status -ne 'failed' -or $nonZero.exit_code -ne 7) {
+            throw "SELFTEST_FAILED: non-zero exit code was not captured exactly (status=$($nonZero.status), exit=$($nonZero.exit_code))"
+        }
+        $passed++
+
         $outside = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-outside-' + [Guid]::NewGuid().ToString('N') + '.json')
         try {
             [void](Assert-D32ManifestDestination -Path $outside -OwnedRoot $root)
@@ -382,14 +546,19 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
-        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $childScript = Join-Path $root 'descendant-timeout.ps1'
+        [IO.File]::WriteAllText(
+            $childScript,
+            "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null`nStart-Sleep -Seconds 5`n",
+            [Text.UTF8Encoding]::new($false)
+        )
         $bounded = Invoke-D32BoundedProcess `
             -FilePath $powershell `
-            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 5') `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childScript) `
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'timeout-phase') `
             -TimeoutSeconds 1
-        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*killed and reaped*') {
+        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured PID*reaped*' -or @($bounded.descendant_pids).Count -lt 1) {
             throw 'SELFTEST_FAILED: bounded timeout/tree reap'
         }
         $passed++
@@ -437,6 +606,7 @@ $gitStatus = Get-D32GitOutput -Root $RepoRoot -Arguments @('status', '--short')
 $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
 $savedEnvironment = Set-D32IsolatedEnvironment -Plan $environmentPlan -Jobs $BuildJobs
 $results = @()
+$phaseRootPids = @()
 $startedAt = [DateTimeOffset]::UtcNow
 try {
     $phase = 0
@@ -457,6 +627,9 @@ try {
                 -WorkingDirectory $RepoRoot `
                 -PhaseLog $phaseLog `
                 -TimeoutSeconds $TimeoutSeconds
+            if ($null -ne $processResult.pid) {
+                $phaseRootPids += [int]$processResult.pid
+            }
             $artifact = $null
             $artifactError = $null
             if ($processResult.status -eq 'succeeded') {
@@ -482,6 +655,7 @@ try {
                 status         = $status
                 exit_code      = $processResult.exit_code
                 pid            = $processResult.pid
+                descendant_pids = @($processResult.descendant_pids)
                 elapsed_ms     = $processResult.elapsed_ms
                 phase_log      = $processResult.phase_log
                 stdout_log     = $processResult.stdout_log
@@ -502,6 +676,7 @@ try {
                 status         = 'phase_error'
                 exit_code      = $null
                 pid            = $null
+                descendant_pids = @()
                 elapsed_ms     = $null
                 phase_log      = (Get-D32FullPath $phaseLog)
                 stdout_log     = (Get-D32FullPath "$phaseLog.stdout.log")
@@ -516,10 +691,18 @@ finally {
     Restore-D32Environment $savedEnvironment
 }
 
+$globalProcessError = $null
+try {
+    [void](Test-D32NoOwnedCargoDescendants -RootPids ([int[]]$phaseRootPids) -CheckName 'final fixture prebuild cleanup')
+}
+catch {
+    $globalProcessError = $_.Exception.Message
+}
+
 $manifestDocument = [ordered]@{
     schema_version = $script:SchemaVersion
     candidate_sha  = $candidateSha
-    repository_root = $RepoRoot
+    source_repo = $RepoRoot
     generated_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
     started_at_utc = $startedAt.ToString('o')
     elapsed_ms = ([DateTimeOffset]::UtcNow - $startedAt).TotalMilliseconds
@@ -528,14 +711,17 @@ $manifestDocument = [ordered]@{
         timeout_seconds = $TimeoutSeconds
         cargo_build_jobs = $BuildJobs
         nested_builds = $false
-        process_tree_timeout_action = 'taskkill /T /F then WaitForExit'
+        process_tree_timeout_action = 'taskkill /T /F then verify every captured descendant PID'
     }
     environment = $environmentPlan
+    process_tree_check = if ($null -eq $globalProcessError) { 'succeeded' } else { 'failed' }
+    process_tree_error = $globalProcessError
     fixtures = @($results)
 }
 Write-D32Manifest -Path $ManifestPath -Document $manifestDocument
 
 $failures = @($results | Where-Object { $_.status -ne 'succeeded' })
+$failures += @([pscustomobject]@{ name = 'global-process-tree'; status = 'failed' } | Where-Object { $null -ne $globalProcessError })
 Write-Host "D32_FIXTURE_PREBUILD_MANIFEST=$ManifestPath"
 if ($failures.Count -gt 0) {
     $summary = ($failures | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '

@@ -20,6 +20,9 @@ param(
     [Alias('BundleManifest')]
     [string]$BundleManifestPath,
 
+    [Alias('FixtureManifest')]
+    [string]$FixtureManifestPath,
+
     [Alias('CandidateSha', 'ExactSha')]
     [string]$ExpectedSha,
 
@@ -83,6 +86,55 @@ $script:D32BundleArtifactNames = @(
     'vita-agent.exe',
     'd32a-production-canary-host.exe',
     'digital_life_lib.dll'
+)
+$script:D32FixtureSchemaVersion = 2
+$script:D32FixtureProcessTreePolicy = 'taskkill /T /F then verify every captured descendant PID'
+$script:D32FixtureSpecs = @(
+    [ordered]@{
+        phase = 1
+        name = 'd29h1-authority-fixture'
+        project = 'src-tauri'
+        manifest = 'src-tauri\Cargo.toml'
+        binary = 'd29h1-authority-fixture'
+        features = @('d29-h1-host-fixture')
+        artifact = 'src-tauri\target\debug\d29h1-authority-fixture.exe'
+    },
+    [ordered]@{
+        phase = 2
+        name = 'd29h7-authority-fixture'
+        project = 'src-tauri'
+        manifest = 'src-tauri\Cargo.toml'
+        binary = 'd29h7-authority-fixture'
+        features = @('d29-h7-host-fixture')
+        artifact = 'src-tauri\target\debug\d29h7-authority-fixture.exe'
+    },
+    [ordered]@{
+        phase = 3
+        name = 'd29h7-process-fixture'
+        project = 'vita-agent'
+        manifest = 'vita-agent\Cargo.toml'
+        binary = 'd29h7-process-fixture'
+        features = @()
+        artifact = 'vita-agent\target\debug\d29h7-process-fixture.exe'
+    },
+    [ordered]@{
+        phase = 4
+        name = 'd29h7-git-helper-fixture'
+        project = 'vita-agent'
+        manifest = 'vita-agent\Cargo.toml'
+        binary = 'd29h7-git-helper-fixture'
+        features = @('d29-h7-test-helper')
+        artifact = 'vita-agent\target\debug\d29h7-git-helper-fixture.exe'
+    },
+    [ordered]@{
+        phase = 5
+        name = 'd32a-sandbox-fixture'
+        project = 'vita-agent'
+        manifest = 'vita-agent\Cargo.toml'
+        binary = 'd32a-sandbox-fixture'
+        features = @('d32-a-test-helper')
+        artifact = 'vita-agent\target\debug\d32a-sandbox-fixture.exe'
+    }
 )
 
 function New-D32FindingList {
@@ -1179,12 +1231,165 @@ function Test-D32BundleManifest {
     }
 }
 
+function ConvertTo-D32FixtureCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][hashtable]$Spec
+    )
+
+    $manifest = [System.IO.Path]::GetFullPath((Join-Path $Repository $Spec.manifest)).Replace('/', '\')
+    $command = "cargo build --quiet --locked --manifest-path $manifest --bin $($Spec.binary)"
+    if (@($Spec.features).Count -gt 0) {
+        $command += " --features $(@($Spec.features) -join ' ')"
+    }
+    return $command
+}
+
+function Test-D32FixtureManifest {
+    param(
+        [AllowNull()][object]$FixtureManifest,
+        [Parameter(Mandatory = $true)][string]$FixtureManifestPath,
+        [AllowNull()][string]$Head,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Findings
+    )
+
+    if ($null -eq $FixtureManifest) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.file' -Message "fixture manifest is missing or unreadable: $FixtureManifestPath"
+        return
+    }
+    foreach ($field in @('schema_version', 'candidate_sha', 'source_repo', 'build_policy', 'environment', 'process_tree_check', 'process_tree_error', 'fixtures')) {
+        if (-not (Test-D32JsonProperty -Object $FixtureManifest -Name $field)) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.schema' -Message "missing fixture manifest field: $field"
+        }
+    }
+    $schema = Get-D32JsonProperty -Object $FixtureManifest -Name 'schema_version'
+    if ($schema -ne $script:D32FixtureSchemaVersion) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.schema' -Message "schema_version=$schema expected $($script:D32FixtureSchemaVersion)"
+    }
+    $candidate = Get-D32JsonProperty -Object $FixtureManifest -Name 'candidate_sha'
+    if (-not (Test-D32Sha40 -Value $candidate)) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.candidate_sha' -Message 'fixture candidate_sha must be lowercase 40-hex'
+    }
+    elseif ($null -ne $Head -and $candidate -cne $Head) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.candidate_sha' -Message "fixture candidate_sha=$candidate does not equal exact HEAD=$Head"
+    }
+    else {
+        Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.candidate_sha' -Message "fixture candidate_sha=$candidate"
+    }
+    $sourceRepo = Get-D32JsonProperty -Object $FixtureManifest -Name 'source_repo'
+    try {
+        $expectedSource = Get-D32RustRepositoryPath -Path $Repository
+        if (-not ($sourceRepo -is [string]) -or -not (Test-D32PathEqual -Left ([string]$sourceRepo) -Right $expectedSource)) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.source_repo' -Message "source_repo does not match repository root: $sourceRepo"
+        }
+        else {
+            Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.source_repo' -Message 'source_repo matches repository root'
+        }
+    }
+    catch {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.source_repo' -Message $_.Exception.Message
+    }
+    $policy = Get-D32JsonProperty -Object $FixtureManifest -Name 'build_policy'
+    if ($null -eq $policy) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message 'build_policy is missing'
+    }
+    else {
+        $nested = Get-D32JsonProperty -Object $policy -Name 'nested_builds'
+        $action = Get-D32JsonProperty -Object $policy -Name 'process_tree_timeout_action'
+        $timeout = Get-D32JsonProperty -Object $policy -Name 'timeout_seconds'
+        $jobs = Get-D32JsonProperty -Object $policy -Name 'cargo_build_jobs'
+        if ($nested -ne $false -or $timeout -isnot [ValueType] -or [double]$timeout -le 0 -or $jobs -isnot [ValueType] -or [double]$jobs -le 0 -or $action -cne $script:D32FixtureProcessTreePolicy) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message 'bounded existing-only build policy is not exact'
+        }
+        else {
+            Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.policy' -Message 'bounded existing-only build policy validated'
+        }
+    }
+    $processCheck = Get-D32JsonProperty -Object $FixtureManifest -Name 'process_tree_check'
+    $processError = Get-D32JsonProperty -Object $FixtureManifest -Name 'process_tree_error'
+    if ($processCheck -cne 'succeeded' -or $null -ne $processError) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.cleanup' -Message 'global Cargo/rustc descendant cleanup did not succeed'
+    }
+    else {
+        Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.cleanup' -Message 'global Cargo/rustc descendant cleanup validated'
+    }
+    $environment = Get-D32JsonProperty -Object $FixtureManifest -Name 'environment'
+    if ($null -eq $environment) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.environment' -Message 'environment metadata is missing'
+    }
+    else {
+        $environmentInvalid = @(@('original_userprofile', 'codex_home', 'userprofile', 'cargo_home', 'rustup_home') | Where-Object {
+            $value = Get-D32JsonProperty -Object $environment -Name $_
+            -not ($value -is [string]) -or [String]::IsNullOrWhiteSpace($value)
+        })
+        if ($environmentInvalid.Count -gt 0) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.environment' -Message "environment fields are missing: $($environmentInvalid -join ',')"
+        }
+    }
+    $fixtures = Get-D32JsonProperty -Object $FixtureManifest -Name 'fixtures'
+    if ($null -eq $fixtures -or $fixtures -isnot [Array] -or $fixtures.Count -ne $script:D32FixtureSpecs.Count) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.fixtures' -Message "expected exactly $($script:D32FixtureSpecs.Count) fixture records"
+        return
+    }
+    $actualNames = @($fixtures | ForEach-Object { [string](Get-D32JsonProperty -Object $_ -Name 'name') })
+    $expectedNames = @($script:D32FixtureSpecs | ForEach-Object { $_.name })
+    if (($actualNames -join '|') -cne ($expectedNames -join '|')) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.fixtures' -Message "fixture names/order are not the canonical five: $($actualNames -join ',')"
+    }
+    foreach ($spec in $script:D32FixtureSpecs) {
+        $record = @($fixtures | Where-Object { (Get-D32JsonProperty -Object $_ -Name 'name') -ceq $spec.name })
+        $check = "fixture-manifest.$($spec.name)"
+        if ($record.Count -ne 1) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check $check -Message 'fixture record is missing or duplicated'
+            continue
+        }
+        $record = $record[0]
+        $recordErrors = [System.Collections.ArrayList]::new()
+        if ((Get-D32JsonProperty -Object $record -Name 'phase') -ne $spec.phase) { [void]$recordErrors.Add('phase') }
+        if ((Get-D32JsonProperty -Object $record -Name 'project') -cne $spec.project) { [void]$recordErrors.Add('project') }
+        if ((Get-D32JsonProperty -Object $record -Name 'binary') -cne $spec.binary) { [void]$recordErrors.Add('binary') }
+        $features = @((Get-D32JsonProperty -Object $record -Name 'features'))
+        if (($features -join '|') -cne (@($spec.features) -join '|')) { [void]$recordErrors.Add('features') }
+        if ((Get-D32JsonProperty -Object $record -Name 'status') -cne 'succeeded') { [void]$recordErrors.Add('status') }
+        if ((Get-D32JsonProperty -Object $record -Name 'exit_code') -ne 0) { [void]$recordErrors.Add('exit_code') }
+        if (@((Get-D32JsonProperty -Object $record -Name 'descendant_pids')).Count -ne 0) { [void]$recordErrors.Add('descendant_pids') }
+        $expectedManifestPath = [System.IO.Path]::GetFullPath((Join-Path $Repository $spec.manifest))
+        $declaredManifestPath = Get-D32JsonProperty -Object $record -Name 'manifest_path'
+        if (-not ($declaredManifestPath -is [string]) -or -not (Test-D32PathEqual -Left ([string]$declaredManifestPath) -Right $expectedManifestPath)) { [void]$recordErrors.Add('manifest_path') }
+        $expectedCommand = ConvertTo-D32FixtureCommand -Repository $Repository -Spec $spec
+        if (([string](Get-D32JsonProperty -Object $record -Name 'command')).Replace('/', '\') -cne $expectedCommand) { [void]$recordErrors.Add('command') }
+        $artifact = Get-D32JsonProperty -Object $record -Name 'artifact'
+        $artifactPath = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'path' } else { $null }
+        $artifactHash = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'sha256' } else { $null }
+        $artifactBytes = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'bytes' } else { $null }
+        $expectedArtifactPath = [System.IO.Path]::GetFullPath((Join-Path $Repository $spec.artifact))
+        if (-not ($artifactPath -is [string]) -or -not (Test-D32PathEqual -Left ([string]$artifactPath) -Right $expectedArtifactPath)) { [void]$recordErrors.Add('artifact.path') }
+        if (-not (Test-D32Sha64 -Value $artifactHash)) { [void]$recordErrors.Add('artifact.sha256') }
+        $digest = if ($artifactPath -is [string]) { Get-D32FileDigest -Path $artifactPath } else { $null }
+        if ($null -eq $digest) {
+            [void]$recordErrors.Add('artifact.missing')
+        }
+        else {
+            if ($artifactBytes -ne $digest.Length) { [void]$recordErrors.Add('artifact.bytes') }
+            if (([string]$artifactHash) -cne $digest.Hash) { [void]$recordErrors.Add('artifact.hash_current') }
+        }
+        if ($recordErrors.Count -gt 0) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check $check -Message "fixture metadata/artifact mismatch: $($recordErrors -join ',')"
+        }
+        else {
+            Add-D32Finding -Findings $Findings -Severity PASS -Check $check -Message 'fixture schema, build metadata, path, hash, and size validated'
+        }
+    }
+}
+
 function Invoke-D32Validation {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$Manifest,
         [Parameter(Mandatory = $true)][string]$Image,
         [Parameter(Mandatory = $true)][string]$BundleManifest,
+        [AllowNull()][string]$FixtureManifest,
         [AllowNull()][string]$TrustedGitPath,
         [AllowNull()][string]$TrustedGitSha256,
         [AllowNull()][string]$ExpectedCandidateSha,
@@ -1280,6 +1485,18 @@ function Invoke-D32Validation {
         $expectedSourceRepo = Get-D32AbsolutePath -Path $Repository
     }
     Test-D32ProvenanceManifest -Manifest $manifestObject -Head $head -ExpectedSourceRepo $expectedSourceRepo -ExpectedImagePath $expectedImagePath -ImageDigest $imageDigest -Findings $findings
+
+    $fixtureManifestObject = $null
+    if ([String]::IsNullOrWhiteSpace($FixtureManifest)) {
+        Add-D32Finding -Findings $findings -Severity ERROR -Check 'fixture-manifest.file' -Message 'fixture manifest path is mandatory for a complete local D32 gate'
+    }
+    elseif (-not (Test-Path -LiteralPath $FixtureManifest -PathType Leaf)) {
+        Add-D32Finding -Findings $findings -Severity ERROR -Check 'fixture-manifest.file' -Message "fixture manifest is missing: $FixtureManifest"
+    }
+    else {
+        $fixtureManifestObject = Read-D32Json -Path $FixtureManifest -Findings $findings -Check 'fixture-manifest.json'
+    }
+    Test-D32FixtureManifest -FixtureManifest $fixtureManifestObject -FixtureManifestPath $FixtureManifest -Head $head -Repository $Repository -Findings $findings
 
     $bundleObject = $null
     if (-not (Test-Path -LiteralPath $BundleManifest -PathType Leaf)) {
@@ -1436,6 +1653,7 @@ function Invoke-D32SelfTest {
     $bundleRoot = Join-Path $root 'bundle'
     $buildRoot = Join-Path $root 'build'
     $provenance = Join-Path $root 'provenance.json'
+    $fixtureManifest = Join-Path $root 'fixture-manifest.json'
     $generated = Join-Path $root 'generated.json'
     $existing = Join-Path $root 'existing.json'
     $image = Join-Path $fixture 'vita-agent\target\release\vita-agent.exe'
@@ -1458,6 +1676,12 @@ function Invoke-D32SelfTest {
         }
         [void](New-Item -ItemType Directory -Path (Split-Path -Parent $image) -Force)
         [System.IO.File]::WriteAllBytes($image, [Text.Encoding]::UTF8.GetBytes('d32-selftest-release-image'))
+        $selftestFixtureRecords = @()
+        foreach ($fixtureSpec in $script:D32FixtureSpecs) {
+            $fixtureArtifactPath = Join-Path $fixture $fixtureSpec.artifact
+            [void](New-Item -ItemType Directory -Path (Split-Path -Parent $fixtureArtifactPath) -Force)
+            [System.IO.File]::WriteAllBytes($fixtureArtifactPath, [Text.Encoding]::UTF8.GetBytes("fixture-$($fixtureSpec.name)"))
+        }
 
         $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $trustedGitPath = [string]$gitCommand.Source
@@ -1520,6 +1744,61 @@ function Invoke-D32SelfTest {
         $git = Invoke-D32Git -Repository $fixture -Arguments @('commit', '-q', '-m', 'selftest fixture') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         if ($git.ExitCode -ne 0) { throw 'trusted Git commit failed' }
         $head = (Invoke-D32Git -Repository $fixture -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash).Text.Trim()
+        foreach ($fixtureSpec in $script:D32FixtureSpecs) {
+            $fixtureManifestPath = [System.IO.Path]::GetFullPath((Join-Path $fixture $fixtureSpec.manifest))
+            $fixtureArtifactPath = [System.IO.Path]::GetFullPath((Join-Path $fixture $fixtureSpec.artifact))
+            $fixtureDigest = Get-D32FileDigest -Path $fixtureArtifactPath
+            $selftestFixtureRecords += [ordered]@{
+                phase = $fixtureSpec.phase
+                name = $fixtureSpec.name
+                project = $fixtureSpec.project
+                binary = $fixtureSpec.binary
+                manifest_path = $fixtureManifestPath
+                features = @($fixtureSpec.features)
+                command = ConvertTo-D32FixtureCommand -Repository $fixture -Spec $fixtureSpec
+                status = 'succeeded'
+                exit_code = 0
+                pid = 1
+                descendant_pids = @()
+                elapsed_ms = 1
+                phase_log = (Join-Path $root "logs\$($fixtureSpec.name)")
+                stdout_log = (Join-Path $root "logs\$($fixtureSpec.name).stdout.log")
+                stderr_log = (Join-Path $root "logs\$($fixtureSpec.name).stderr.log")
+                error = $null
+                artifact = [ordered]@{
+                    path = $fixtureArtifactPath
+                    bytes = $fixtureDigest.Length
+                    sha256 = $fixtureDigest.Hash
+                }
+            }
+        }
+        $fixtureDocument = [ordered]@{
+            schema_version = $script:D32FixtureSchemaVersion
+            candidate_sha = $head
+            source_repo = [System.IO.Path]::GetFullPath($fixture)
+            generated_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+            started_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+            elapsed_ms = 1
+            working_tree_status = ''
+            build_policy = [ordered]@{
+                timeout_seconds = 1
+                cargo_build_jobs = 1
+                nested_builds = $false
+                process_tree_timeout_action = $script:D32FixtureProcessTreePolicy
+            }
+            environment = [ordered]@{
+                original_userprofile = 'C:\selftest-user'
+                codex_home = 'C:\selftest-codex'
+                userprofile = 'C:\selftest-profile'
+                cargo_home = 'C:\selftest-cargo'
+                rustup_home = 'C:\selftest-rustup'
+                rustup_toolchain = $null
+            }
+            process_tree_check = 'succeeded'
+            process_tree_error = $null
+            fixtures = @($selftestFixtureRecords)
+        }
+        Write-D32Json -Path $fixtureManifest -Value $fixtureDocument
         $bundleDocument = [ordered]@{
             candidate_sha = $head
             source_clone = Get-D32AbsolutePath -Path $fixture
@@ -1540,44 +1819,81 @@ function Invoke-D32SelfTest {
         $sourceFormCorrect = $generatedObject.source_repo -ceq (Get-D32RustRepositoryPath -Path $fixture)
         $imageFormCorrect = -not (Test-D32Windows) -or $generatedObject.image_path.StartsWith('\\?\', [StringComparison]::Ordinal)
         Assert-D32SelfTest -Condition ($sourceFormCorrect -and $imageFormCorrect) -Name 'Host source_repo ordinary/image_path extended path asymmetry' -Failures $failures
-        $validResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run') -Modes $null
+        $validResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run') -Modes $null
         if (-not $validResult.Success) {
             foreach ($finding in $validResult.Findings) {
                 Write-Host ("  VALID FIXTURE [{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message)
             }
         }
         Assert-D32SelfTest -Condition $validResult.Success -Name 'valid fixture aggregate validation' -Failures $failures
-        $missingTrustResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-missing-trust') -Modes $null
+        $validFixtureJson = [System.IO.File]::ReadAllText($fixtureManifest)
+        $wrongFixtureSha = $validFixtureJson | ConvertFrom-Json
+        $wrongFixtureSha.candidate_sha = ('0' * 40)
+        Write-D32Json -Path $fixtureManifest -Value $wrongFixtureSha
+        $wrongFixtureShaFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixtureShaFindings -Check 'fixture-selftest.sha') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixtureShaFindings
+        Assert-D32SelfTest -Condition (@($wrongFixtureShaFindings | Where-Object { $_.Check -eq 'fixture-manifest.candidate_sha' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest wrong candidate SHA is reported' -Failures $failures
+
+        $wrongFixtureHash = $validFixtureJson | ConvertFrom-Json
+        $wrongFixtureHash.fixtures[0].artifact.sha256 = ('0' * 64)
+        Write-D32Json -Path $fixtureManifest -Value $wrongFixtureHash
+        $wrongFixtureHashFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixtureHashFindings -Check 'fixture-selftest.hash') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixtureHashFindings
+        Assert-D32SelfTest -Condition (@($wrongFixtureHashFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest wrong artifact hash is reported' -Failures $failures
+
+        $wrongFixturePath = $validFixtureJson | ConvertFrom-Json
+        $wrongFixturePath.fixtures[0].artifact.path = $image
+        Write-D32Json -Path $fixtureManifest -Value $wrongFixturePath
+        $wrongFixturePathFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixturePathFindings -Check 'fixture-selftest.path') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixturePathFindings
+        Assert-D32SelfTest -Condition (@($wrongFixturePathFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest wrong artifact path is reported' -Failures $failures
+
+        $wrongFixtureFeature = $validFixtureJson | ConvertFrom-Json
+        $wrongFixtureFeature.fixtures[0].features = @('wrong-feature')
+        Write-D32Json -Path $fixtureManifest -Value $wrongFixtureFeature
+        $wrongFixtureFeatureFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixtureFeatureFindings -Check 'fixture-selftest.feature') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixtureFeatureFindings
+        Assert-D32SelfTest -Condition (@($wrongFixtureFeatureFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest wrong feature is reported' -Failures $failures
+
+        $replacedArtifactPath = ($validFixtureJson | ConvertFrom-Json).fixtures[0].artifact.path
+        $replacedArtifactBytes = [System.IO.File]::ReadAllBytes($replacedArtifactPath)
+        [System.IO.File]::WriteAllBytes($replacedArtifactPath, [Text.Encoding]::UTF8.GetBytes('replaced-after-build'))
+        $replacedFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest ($validFixtureJson | ConvertFrom-Json) -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $replacedFindings
+        Assert-D32SelfTest -Condition (@($replacedFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'replaced or stale fixture artifact is reported' -Failures $failures
+        [System.IO.File]::WriteAllBytes($replacedArtifactPath, $replacedArtifactBytes)
+        Write-D32Json -Path $fixtureManifest -Value ($validFixtureJson | ConvertFrom-Json)
+        $missingTrustResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-missing-trust') -Modes $null
         Assert-D32SelfTest -Condition ((-not $missingTrustResult.Success) -and @($missingTrustResult.Findings | Where-Object { $_.Check -eq 'git.trusted-image' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'validation requires explicit trusted Git path and hash' -Failures $failures
 
         $validJson = [System.IO.File]::ReadAllText($provenance)
         $missingField = $validJson | ConvertFrom-Json
         [void]$missingField.PSObject.Properties.Remove('git_status')
         Write-D32Json -Path $provenance -Value $missingField
-        $missingResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-2') -Modes $null
+        $missingResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-2') -Modes $null
         Assert-D32SelfTest -Condition (-not $missingResult.Success) -Name 'missing provenance field is reported' -Failures $failures
 
         $wrongPath = $validJson | ConvertFrom-Json
         $wrongPath.image_path = [System.IO.Path]::GetFullPath($image)
         Write-D32Json -Path $provenance -Value $wrongPath
-        $wrongPathResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-3') -Modes $null
+        $wrongPathResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-3') -Modes $null
         Assert-D32SelfTest -Condition (-not $wrongPathResult.Success) -Name 'ordinary image path is rejected' -Failures $failures
 
         $wrongHash = $validJson | ConvertFrom-Json
         $wrongHash.image_sha256 = ('0' * 64)
         Write-D32Json -Path $provenance -Value $wrongHash
-        $wrongHashResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-4') -Modes $null
+        $wrongHashResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-4') -Modes $null
         Assert-D32SelfTest -Condition (-not $wrongHashResult.Success) -Name 'image hash mismatch is reported' -Failures $failures
 
         Write-D32Json -Path $provenance -Value ($validJson | ConvertFrom-Json)
         $dirtyMarker = Join-Path $fixture 'dirty-marker.txt'
         [System.IO.File]::WriteAllText($dirtyMarker, 'dirty')
-        $dirtyResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-5') -Modes $null
+        $dirtyResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-5') -Modes $null
         Assert-D32SelfTest -Condition (-not $dirtyResult.Success) -Name 'dirty repository is reported' -Failures $failures
         Remove-Item -LiteralPath $dirtyMarker -Force
 
         $unknownModes = @($script:D32CanonicalModes + @('unknown-mode'))
-        $unknownModeResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-6') -Modes $unknownModes
+        $unknownModeResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-6') -Modes $unknownModes
         Assert-D32SelfTest -Condition (-not $unknownModeResult.Success) -Name 'unknown mode is reported' -Failures $failures
 
         [System.IO.File]::WriteAllText($existing, 'sentinel')
@@ -1588,7 +1904,7 @@ function Invoke-D32SelfTest {
 
         $existingRunRoot = Join-Path $root 'existing-run'
         [void](New-Item -ItemType Directory -Path $existingRunRoot -Force)
-        $existingRunResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot $existingRunRoot -Modes $null
+        $existingRunResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot $existingRunRoot -Modes $null
         Assert-D32SelfTest -Condition (-not $existingRunResult.Success) -Name 'existing run output root is rejected' -Failures $failures
         # The existing-run fixture is deliberately inside the owned root; the
         # final exact-marker cleanup removes the one self-test root.
@@ -1643,7 +1959,7 @@ if ($GenerateManifest) {
     exit 1
 }
 
-$validation = Invoke-D32Validation -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath -BundleManifest $BundleManifestPath -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -ExpectedCandidateSha $ExpectedSha -Base $BaseSha -MergeBase $MergeBaseSha -RunRoot $RunOutputRoot -Modes $RequestedModes
+$validation = Invoke-D32Validation -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath -BundleManifest $BundleManifestPath -FixtureManifest $FixtureManifestPath -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -ExpectedCandidateSha $ExpectedSha -Base $BaseSha -MergeBase $MergeBaseSha -RunRoot $RunOutputRoot -Modes $RequestedModes
 Write-D32Result -Operation 'preflight' -Result $validation
 if ($validation.Success) { exit 0 }
 exit 1

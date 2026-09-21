@@ -110,7 +110,9 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED,
 };
 
-use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity};
+use crate::{
+    fixture_manifest, sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity,
+};
 
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
 pub(crate) const VITA_WORKSPACE_CARGO_CHECK_TOOL_NAME: &str = "vita_workspace_cargo_check";
@@ -6046,116 +6048,17 @@ impl Drop for H7PersistentHostProcess {
 
 #[cfg(test)]
 fn h7_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
-    let executable = repo_root
-        .join("src-tauri")
-        .join("target")
-        .join("debug")
-        .join("d29h7-authority-fixture.exe");
-    let source = repo_root
-        .join("src-tauri")
-        .join("src")
-        .join("capability")
-        .join("d29h7_host_fixture.rs");
-    let executable_is_fresh = executable
-        .metadata()
-        .and_then(|binary| binary.modified())
-        .and_then(|binary_time| {
-            source.metadata().and_then(|source| {
-                source
-                    .modified()
-                    .map(|source_time| (binary_time, source_time))
-            })
-        })
-        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if !executable.is_file() {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H7 authority fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    if !executable_is_fresh {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H7 authority fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    Ok(executable)
+    fixture_manifest::existing_fixture(repo_root, "d29h7-authority-fixture")
 }
 
 #[cfg(test)]
 fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
-    let executable = repo_root
-        .join("vita-agent")
-        .join("target")
-        .join("debug")
-        .join("d29h7-process-fixture.exe");
-    let source = repo_root
-        .join("vita-agent")
-        .join("src")
-        .join("bin")
-        .join("d29h7-process-fixture.rs");
-    let executable_is_fresh = executable
-        .metadata()
-        .and_then(|binary| binary.modified())
-        .and_then(|binary_time| {
-            source.metadata().and_then(|source| {
-                source
-                    .modified()
-                    .map(|source_time| (binary_time, source_time))
-            })
-        })
-        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if !executable.is_file() {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H7 process fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    if !executable_is_fresh {
-        return Err(format!(
-            "FIXTURE_MISSING: D29-H7 process fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    Ok(executable)
+    fixture_manifest::existing_fixture(repo_root, "d29h7-process-fixture")
 }
 
 #[cfg(test)]
 fn d32_sandbox_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
-    let executable = repo_root
-        .join("vita-agent")
-        .join("target")
-        .join("debug")
-        .join("d32a-sandbox-fixture.exe");
-    let source = repo_root
-        .join("vita-agent")
-        .join("src")
-        .join("bin")
-        .join("d32a-sandbox-fixture.rs");
-    let executable_is_fresh = executable
-        .metadata()
-        .and_then(|binary| binary.modified())
-        .and_then(|binary_time| {
-            source.metadata().and_then(|source| {
-                source
-                    .modified()
-                    .map(|source_time| (binary_time, source_time))
-            })
-        })
-        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if !executable.is_file() {
-        return Err(format!(
-            "FIXTURE_MISSING: D32-A sandbox fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    if !executable_is_fresh {
-        return Err(format!(
-            "FIXTURE_MISSING: D32-A sandbox fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
-            executable.display()
-        ));
-    }
-    Ok(executable)
+    fixture_manifest::existing_fixture(repo_root, "d32a-sandbox-fixture")
 }
 
 #[derive(Clone)]
@@ -10080,40 +9983,8 @@ mod tests {
     }
 
     fn h7c_helper_fixture_executable(repo_root: &Path) -> PathBuf {
-        let executable = repo_root
-            .join("vita-agent")
-            .join("target")
-            .join("debug")
-            .join("d29h7-git-helper-fixture.exe");
-        let source = repo_root
-            .join("vita-agent")
-            .join("src")
-            .join("bin")
-            .join("d29h7-git-helper-fixture.rs");
-        if !executable.is_file() {
-            panic!(
-                "FIXTURE_MISSING: D29-H7-C Git helper fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
-                executable.display()
-            );
-        }
-        let executable_is_fresh = executable
-            .metadata()
-            .and_then(|binary| binary.modified())
-            .and_then(|binary_time| {
-                source.metadata().and_then(|source| {
-                    source
-                        .modified()
-                        .map(|source_time| (binary_time, source_time))
-                })
-            })
-            .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-        if !executable_is_fresh {
-            panic!(
-                "FIXTURE_MISSING: D29-H7-C Git helper fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
-                executable.display()
-            );
-        }
-        executable
+        fixture_manifest::existing_fixture(repo_root, "d29h7-git-helper-fixture")
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     struct H7CDirectHarness {

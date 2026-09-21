@@ -11770,6 +11770,105 @@ mod windows {
         cleaned: bool,
     }
 
+    #[cfg(feature = "d32-a-host-canary")]
+    const D32_CANARY_GIT_CONFIG_BYTES: &[u8] =
+        b"[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n";
+
+    #[cfg(feature = "d32-a-host-canary")]
+    const D32_CANARY_GIT_HEAD_BYTES: &[u8] = b"ref: refs/heads/main\n";
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_create_new_fixture_directory(
+        root: &Path,
+        path: &Path,
+        description: &str,
+    ) -> Result<(), String> {
+        fs::create_dir(path)
+            .map_err(|_| d32_not_executable(format!("{description} could not be created")))?;
+        host_verify_no_reparse_path(root, path).map_err(|error| {
+            d32_not_executable(format!("{description} was not app-owned: {error}"))
+        })?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| d32_not_executable(format!("{description} metadata was unavailable")))?;
+        if !metadata.is_dir() || host_metadata_is_reparse(&metadata) {
+            return Err(d32_not_executable(format!(
+                "{description} was not a regular non-reparse directory"
+            )));
+        }
+        host_file_identity(path, true).map_err(|error| {
+            d32_not_executable(format!("{description} identity was unavailable: {error}"))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_create_new_fixture_file(
+        root: &Path,
+        path: &Path,
+        bytes: &[u8],
+        description: &str,
+    ) -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| d32_not_executable(format!("{description} could not be created")))?;
+        file.write_all(bytes)
+            .map_err(|_| d32_not_executable(format!("{description} could not be written")))?;
+        file.flush()
+            .map_err(|_| d32_not_executable(format!("{description} could not be flushed")))?;
+        file.sync_all()
+            .map_err(|_| d32_not_executable(format!("{description} could not be synced")))?;
+        drop(file);
+        host_verify_no_reparse_path(root, path).map_err(|error| {
+            d32_not_executable(format!("{description} was not app-owned: {error}"))
+        })?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| d32_not_executable(format!("{description} metadata was unavailable")))?;
+        if !metadata.is_file() || host_metadata_is_reparse(&metadata) {
+            return Err(d32_not_executable(format!(
+                "{description} was not a regular non-reparse file"
+            )));
+        }
+        let identity = host_file_identity(path, false).map_err(|error| {
+            d32_not_executable(format!("{description} identity was unavailable: {error}"))
+        })?;
+        if identity.file_size != bytes.len() as u64 {
+            return Err(d32_not_executable(format!(
+                "{description} size changed during creation"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_create_minimal_git_metadata(workspace: &Path) -> Result<(), String> {
+        let git = workspace.join(".git");
+        let objects = git.join("objects");
+        let refs = git.join("refs");
+        let heads = refs.join("heads");
+        d32_create_new_fixture_directory(workspace, &git, "canary Git metadata root")?;
+        d32_create_new_fixture_directory(workspace, &objects, "canary Git objects directory")?;
+        d32_create_new_fixture_directory(workspace, &refs, "canary Git refs directory")?;
+        d32_create_new_fixture_directory(workspace, &heads, "canary Git refs/heads directory")?;
+        d32_create_new_fixture_file(
+            workspace,
+            &git.join("HEAD"),
+            D32_CANARY_GIT_HEAD_BYTES,
+            "canary Git HEAD",
+        )?;
+        d32_create_new_fixture_file(
+            workspace,
+            &git.join("config"),
+            D32_CANARY_GIT_CONFIG_BYTES,
+            "canary Git config",
+        )?;
+        host_verify_no_reparse_tree(&git).map_err(|error| {
+            d32_not_executable(format!("canary Git metadata tree was unsafe: {error}"))
+        })?;
+        Ok(())
+    }
+
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     impl D32ProductionCanaryEnvironment {
         fn prepare<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
@@ -11806,6 +11905,7 @@ mod windows {
                 fs::create_dir(workspace.join("src")).map_err(|_| {
                     d32_not_executable("canary workspace source root could not be created")
                 })?;
+                d32_create_minimal_git_metadata(&workspace)?;
                 fs::write(
                     workspace.join("Cargo.toml"),
                     b"[package]\nname = \"d32_a_real_canary\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -12271,6 +12371,71 @@ mod windows {
         use std::process::Command;
         use std::sync::{mpsc, Arc, Barrier};
         use std::thread;
+
+        #[test]
+        fn d32_minimal_git_fixture_is_fixed_non_reparse_and_create_new() {
+            let fixture = tempfile::tempdir().expect("D32 minimal Git fixture");
+            let workspace = fixture.path().join("workspace");
+            fs::create_dir(&workspace).expect("D32 minimal Git workspace");
+
+            d32_create_minimal_git_metadata(&workspace)
+                .expect("D32 minimal Git metadata should be created");
+            host_verify_no_reparse_tree(&workspace).expect("D32 minimal Git tree is safe");
+
+            let git = D32RetainedDirectory::open(&workspace.join(".git"))
+                .expect("D32 minimal Git metadata root should be retained");
+            assert_eq!(
+                git.read_file(OsStr::new("HEAD"), 1024)
+                    .expect("D32 minimal Git HEAD should be readable"),
+                D32_CANARY_GIT_HEAD_BYTES
+            );
+            assert_eq!(
+                git.read_file(OsStr::new("config"), 1024)
+                    .expect("D32 minimal Git config should be readable"),
+                D32_CANARY_GIT_CONFIG_BYTES
+            );
+
+            let mut git_children = git
+                .enumerate_children()
+                .expect("D32 minimal Git metadata should enumerate");
+            git_children.sort();
+            assert_eq!(
+                git_children,
+                vec![
+                    OsString::from("HEAD"),
+                    OsString::from("config"),
+                    OsString::from("objects"),
+                    OsString::from("refs"),
+                ]
+            );
+            let objects = git
+                .open_existing_child(OsStr::new("objects"))
+                .expect("D32 minimal Git objects directory");
+            assert!(objects
+                .enumerate_children()
+                .expect("D32 minimal Git objects should enumerate")
+                .is_empty());
+            let refs = git
+                .open_existing_child(OsStr::new("refs"))
+                .expect("D32 minimal Git refs directory");
+            assert_eq!(
+                refs.enumerate_children()
+                    .expect("D32 minimal Git refs should enumerate"),
+                vec![OsString::from("heads")]
+            );
+            let heads = refs
+                .open_existing_child(OsStr::new("heads"))
+                .expect("D32 minimal Git refs/heads directory");
+            assert!(heads
+                .enumerate_children()
+                .expect("D32 minimal Git refs/heads should enumerate")
+                .is_empty());
+
+            assert!(
+                d32_create_minimal_git_metadata(&workspace).is_err(),
+                "recreating fixed metadata must fail closed"
+            );
+        }
 
         #[test]
         fn d32_stages_directory_indexes_before_full_identity_capture() {

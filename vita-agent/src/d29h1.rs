@@ -38,6 +38,10 @@ const D29_H1_MODEL: &str = "d29h1-local-responses-model";
 const D29_H1_PROMPT: &str = "Submit the bounded Vita operation.";
 const D29_H1_REPLY: &str = "VITA_D29H1_DENIED_OK";
 const D29_H1_CALL_ID: &str = "call-d29h1-governed";
+// The Host fixture must load the complete current canonical production
+// registry. This explicit snapshot catches a partial/empty registry while
+// remaining independent from the denied capability being exercised.
+const D29_H1_EXPECTED_PRODUCTION_REGISTRY_SIZE: usize = 5;
 const D29_H1_PROVIDER_ID: &str = "d29h1-loopback-responses";
 const D29_H1_TURN_TIMEOUT: Duration = Duration::from_secs(12);
 const D29_H1_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -509,7 +513,7 @@ impl VitaToolAuthorityPort for ProcessIsolatedCanonicalAuthority {
             });
             let response = invoke_host_fixture(&repo_root, &wire_request)?;
             if response.canonical_evaluations != 1
-                || response.production_registry_size != 1
+                || response.production_registry_size != D29_H1_EXPECTED_PRODUCTION_REGISTRY_SIZE
                 || response.authorization_row_reads != 0
                 || response.result != "UnknownCapability"
                 || response.life_id != context.life_id()
@@ -856,7 +860,10 @@ async fn d29h1_real_codex_tool_request_body() {
     assert_eq!(host_observations.len(), 1);
     let host = &host_observations[0];
     assert_eq!(host.canonical_evaluations, 1);
-    assert_eq!(host.production_registry_size, 1);
+    assert_eq!(
+        host.production_registry_size,
+        D29_H1_EXPECTED_PRODUCTION_REGISTRY_SIZE
+    );
     assert_eq!(host.authorization_row_reads, 0);
     assert_eq!(host.result, "UnknownCapability");
     assert_eq!(host.life_id, "life-d29h1");

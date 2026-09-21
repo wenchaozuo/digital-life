@@ -288,6 +288,49 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+const D32_CANARY_APP_DRAIN_ITERATIONS: usize = 32;
+
+#[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
+fn cleanup_d32_canary_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), String> {
+    let labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    for label in labels {
+        if let Some(window) = app.get_webview_window(&label) {
+            if let Err(error) = window.destroy() {
+                errors.push(format!(
+                    "D32_A_HOST_FAILURE: canary window '{label}' destroy failed: {error}"
+                ));
+            }
+        }
+    }
+
+    let mut drained = app.webview_windows().is_empty();
+    for _ in 0..D32_CANARY_APP_DRAIN_ITERATIONS {
+        if drained {
+            break;
+        }
+        #[allow(deprecated)]
+        app.run_iteration(|_, _| {});
+        drained = app.webview_windows().is_empty();
+    }
+    if !drained {
+        let remaining = app.webview_windows().keys().cloned().collect::<Vec<_>>();
+        errors.push(format!(
+            "D32_A_HOST_FAILURE: canary windows remained after bounded teardown: {remaining:?}"
+        ));
+    }
+
+    // `run_iteration` does not perform Tauri's normal exit cleanup.  Invoke it
+    // only after window destruction/drain, and do not use Tauri APIs after it.
+    app.cleanup_before_exit();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 #[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
 pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, String> {
     let context = tauri::generate_context!();
@@ -325,7 +368,17 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         #[allow(deprecated)]
         app.run_iteration(|_, _| {});
 
-        let report = vita_sidecar::run_d32_a_host_integration(app, mode)?;
+        let canary_result = vita_sidecar::run_d32_a_host_integration(&mut app, mode);
+        let app_cleanup = cleanup_d32_canary_app(&mut app);
+        drop(app);
+        let report = match (canary_result, app_cleanup) {
+            (Ok(report), Ok(())) => report,
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+            (Err(error), Err(cleanup_error)) => {
+                return Err(format!("{error}; {cleanup_error}"));
+            }
+        };
         serde_json::to_value(report).map_err(|error| {
             format!("D32_A_HOST_FAILURE: canary report serialization failed: {error}")
         })
@@ -341,6 +394,17 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         (_, Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Ok(()), Ok(())) => Err(error),
         (Ok(report), Ok(()), Ok(())) => Ok(report),
+    }
+}
+
+#[cfg(all(test, windows, feature = "d32-a-host-canary"))]
+mod d32_canary_lifecycle_tests {
+    use super::D32_CANARY_APP_DRAIN_ITERATIONS;
+
+    #[test]
+    fn app_teardown_drain_is_nonzero_and_bounded() {
+        assert!(D32_CANARY_APP_DRAIN_ITERATIONS > 0);
+        assert!(D32_CANARY_APP_DRAIN_ITERATIONS <= 64);
     }
 }
 

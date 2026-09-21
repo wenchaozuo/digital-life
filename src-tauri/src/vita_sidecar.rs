@@ -498,7 +498,7 @@ impl VitaSidecarCoordinator {
 
 #[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
 pub(crate) fn run_d32_a_host_integration(
-    app: tauri::App<tauri::Wry>,
+    app: &mut tauri::App<tauri::Wry>,
     mode: &str,
 ) -> Result<D32HostCanaryReport, String> {
     windows::run_d32_a_host_integration_impl(app, mode)
@@ -11517,7 +11517,7 @@ mod windows {
 
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     pub(super) fn run_d32_a_host_integration_impl(
-        app: tauri::App<tauri::Wry>,
+        app: &mut tauri::App<tauri::Wry>,
         mode: &str,
     ) -> Result<D32HostCanaryReport, String> {
         let mode = D32HostCanaryMode::parse(mode)?;

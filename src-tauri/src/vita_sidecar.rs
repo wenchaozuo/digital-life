@@ -642,7 +642,8 @@ mod windows {
     const D32_SOURCE_DIR_NAME: &str = "source";
     const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
     const D32_RUNS_DIR_NAME: &str = "runs";
-    const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v1";
+    const D32_NATIVE_EVIDENCE_VERSION: u32 = 2;
+    const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v2";
     const D32_NATIVE_EVIDENCE_MAX_BYTES: u64 = 64 * 1024;
     const D32_CARGO_SELECTION_FILE_NAME: &str = ".d32-cargo-selection-v1.json";
     const D32_TOOLCHAIN_FILE_MAX_BYTES: u64 = protocol::D32_MANIFEST_MAX_FILE_BYTES;
@@ -729,7 +730,7 @@ mod windows {
         Ok(total)
     }
 
-    #[cfg(all(feature = "d32-a-host-canary", not(test)))]
+    #[cfg(feature = "d32-a-host-canary")]
     #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct D32NativeEvidenceRecord {
@@ -753,12 +754,66 @@ mod windows {
         process_exit: bool,
         process_exit_verified: bool,
         process_exit_count: u64,
+        exit_code: Option<u32>,
         process_tree_observed: bool,
         process_tree_observation_count: u64,
         process_tree_remaining: u64,
         process_tree_observer_failed: bool,
         job_termination_attempted: bool,
         job_terminated: bool,
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn validate_d32_native_evidence_record(
+        record: &D32NativeEvidenceRecord,
+        mode: D32HostCanaryMode,
+    ) -> Result<(), String> {
+        if record.version != D32_NATIVE_EVIDENCE_VERSION {
+            return Err("D32 native evidence version was not supported".to_string());
+        }
+        let bool_counts = [
+            (record.process_created, record.process_created_count),
+            (record.thread_resumed, record.thread_resumed_count),
+            (record.user_code_started, record.user_code_started_count),
+            (record.process_exit_verified, record.process_exit_count),
+        ];
+        if bool_counts
+            .iter()
+            .any(|(value, count)| *count != u64::from(*value))
+            || record.process_exit != record.process_exit_verified
+            || record.process_tree_observed != (record.process_tree_observation_count != 0)
+            || record.process_tree_remaining != 0
+            || record.process_tree_observer_failed
+        {
+            return Err("D32 native evidence lifecycle counters were inconsistent".to_string());
+        }
+        let positive = mode == D32HostCanaryMode::Positive;
+        if positive {
+            if record.status != "started_and_exited"
+                || !record.process_created
+                || !record.thread_resumed
+                || !record.user_code_started
+                || record.exit_code != Some(0)
+                || !record.process_exit_verified
+                || !record.process_tree_observed
+                || record.process_tree_observation_count == 0
+            {
+                return Err("D32 native evidence positive lifecycle was incomplete".to_string());
+            }
+        } else if record.status != "denied"
+            || record.process_created
+            || record.thread_resumed
+            || record.user_code_started
+            || record.exit_code.is_some()
+            || record.process_exit_verified
+            || record.process_tree_observed
+            || record.process_tree_observation_count != 0
+            || record.job_termination_attempted
+            || record.job_terminated
+        {
+            return Err("D32 native evidence negative lane was not pre-native denied".to_string());
+        }
+        Ok(())
     }
     // Active grants are bounded, but successful single-use grants are removed
     // immediately after final revalidation, so this is not a session lifetime
@@ -2793,8 +2848,7 @@ mod windows {
         }
         let record: D32NativeEvidenceRecord = serde_json::from_slice(&bytes)
             .map_err(|_| "D32 native evidence JSON was invalid or had extra fields".to_string())?;
-        if record.version != 1
-            || record.run_id != expected_run_id
+        if record.run_id != expected_run_id
             || record.session_id != expected_session_id
             || record.life_id != expected_life_id
             || record.task_id != expected_task_id
@@ -2806,46 +2860,7 @@ mod windows {
         {
             return Err("D32 native evidence binding did not match Host authority".to_string());
         }
-        let bool_counts = [
-            (record.process_created, record.process_created_count),
-            (record.thread_resumed, record.thread_resumed_count),
-            (record.user_code_started, record.user_code_started_count),
-            (record.process_exit_verified, record.process_exit_count),
-        ];
-        if bool_counts
-            .iter()
-            .any(|(value, count)| *count != u64::from(*value))
-            || record.process_exit != record.process_exit_verified
-            || record.process_tree_observed != (record.process_tree_observation_count != 0)
-            || record.process_tree_remaining != 0
-            || record.process_tree_observer_failed
-        {
-            return Err("D32 native evidence lifecycle counters were inconsistent".to_string());
-        }
-        let positive = mode == D32HostCanaryMode::Positive;
-        if positive {
-            if record.status != "started_and_exited"
-                || !record.process_created
-                || !record.thread_resumed
-                || !record.user_code_started
-                || !record.process_exit_verified
-                || !record.process_tree_observed
-                || record.process_tree_observation_count == 0
-            {
-                return Err("D32 native evidence positive lifecycle was incomplete".to_string());
-            }
-        } else if record.status != "denied"
-            || record.process_created
-            || record.thread_resumed
-            || record.user_code_started
-            || record.process_exit_verified
-            || record.process_tree_observed
-            || record.process_tree_observation_count != 0
-            || record.job_termination_attempted
-            || record.job_terminated
-        {
-            return Err("D32 native evidence negative lane was not pre-native denied".to_string());
-        }
+        validate_d32_native_evidence_record(&record, mode)?;
         directory.revalidate("D32 native evidence directory after read")?;
         Ok(D32NativeEvidenceReport {
             record: serde_json::to_value(record)
@@ -11204,18 +11219,20 @@ mod windows {
         if mode.expects_deny() {
             if trace.grant_revalidated_allowed != 0
                 || trace.grant_revalidated_denied != 1
-                || trace.turn_completed != 0
-                || trace.turn_failed + trace.action_cancelled != 1
+                || trace.turn_completed + trace.turn_failed + trace.action_cancelled != 1
                 || trace.grant_denial_code.as_deref().is_none()
-                || turn_error.is_none()
                 || !matches!(
                     terminal_phase,
                     Some(
-                        protocol::TurnPhase::Failed
+                        protocol::TurnPhase::Completed
+                            | protocol::TurnPhase::Failed
                             | protocol::TurnPhase::Cancelled
                             | protocol::TurnPhase::TimedOut
                     )
                 )
+                || (mode == D32HostCanaryMode::CancelBeforeRevalidation
+                    && (trace.action_cancelled != 1
+                        || terminal_phase != Some(protocol::TurnPhase::Cancelled)))
             {
                 return Err(format!(
                     "D32_A_HOST_FAILURE: negative Host trace was not fail-closed: {trace:?}"
@@ -12352,7 +12369,8 @@ mod windows {
                 if !matches!(
                     terminal.turn_phase,
                     Some(
-                        protocol::TurnPhase::Failed
+                        protocol::TurnPhase::Completed
+                            | protocol::TurnPhase::Failed
                             | protocol::TurnPhase::Cancelled
                             | protocol::TurnPhase::TimedOut
                     )
@@ -17153,6 +17171,163 @@ mod windows {
                     error.starts_with("D32_A_NOT_EXECUTABLE:"),
                     "mode {mode} returned non-structured preflight error: {error}"
                 );
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        fn d32_contract_trace(
+            mode: D32HostCanaryMode,
+        ) -> (
+            D32HostCanaryTraceSnapshot,
+            protocol::TurnPhase,
+            Option<&'static str>,
+        ) {
+            let mut trace = D32HostCanaryTraceSnapshot {
+                authority_evaluate: 1,
+                confirmation_required: 1,
+                issue_grant: 1,
+                revalidate_grant: if mode == D32HostCanaryMode::GrantReplay {
+                    2
+                } else {
+                    1
+                },
+                replay_wire_responses: 1,
+                exact_capability: true,
+                exact_tool: true,
+                exact_profile: true,
+                exact_cargo_check: true,
+                binding_fields_validated: true,
+                ..Default::default()
+            };
+            if mode == D32HostCanaryMode::Positive {
+                trace.grant_revalidated_allowed = 1;
+                trace.turn_completed = 1;
+                return (trace, protocol::TurnPhase::Completed, None);
+            }
+
+            trace.grant_denial_code = Some("D32_TEST_DENIED".to_string());
+            trace.revoke_applied = mode == D32HostCanaryMode::RevokeBeforeRevalidation;
+            trace.life_switch_applied = mode == D32HostCanaryMode::LifeBeforeRevalidation;
+            trace.isolated_migration_applied =
+                mode == D32HostCanaryMode::MigrationBeforeRevalidation;
+            trace.tamper_denied = matches!(
+                mode,
+                D32HostCanaryMode::ExecutableIdentityTamper
+                    | D32HostCanaryMode::EnvironmentProfileTamper
+            );
+            if mode == D32HostCanaryMode::GrantReplay {
+                trace.replay_checked = true;
+                trace.replay_denied = true;
+                trace.replay_exact_request_count = 2;
+                trace.replay_exact_session_count = 2;
+                trace.replay_first_allowed = 1;
+                trace.replay_second_denied = 1;
+                trace.grant_revalidated_denied = 1;
+                // A provider may summarize after a canonical replay denial;
+                // native denial remains the security evidence.
+                trace.turn_completed = 1;
+                (trace, protocol::TurnPhase::Completed, None)
+            } else if mode == D32HostCanaryMode::CancelBeforeRevalidation {
+                trace.grant_revalidated_denied = 1;
+                trace.action_cancelled = 1;
+                (trace, protocol::TurnPhase::Cancelled, None)
+            } else {
+                trace.grant_revalidated_denied = 1;
+                trace.turn_failed = 1;
+                (trace, protocol::TurnPhase::Failed, None)
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        fn d32_contract_native_record(mode: D32HostCanaryMode) -> D32NativeEvidenceRecord {
+            let positive = mode == D32HostCanaryMode::Positive;
+            D32NativeEvidenceRecord {
+                version: D32_NATIVE_EVIDENCE_VERSION,
+                run_id: "run".to_string(),
+                session_id: "session".to_string(),
+                life_id: "life".to_string(),
+                task_id: "task".to_string(),
+                turn_id: "turn".to_string(),
+                tool_call_id: "call".to_string(),
+                capability_id: PRODUCTION_CARGO_CHECK_CAPABILITY_ID.to_string(),
+                program_id: CARGO_PROGRAM_ID.to_string(),
+                profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
+                status: if positive {
+                    "started_and_exited"
+                } else {
+                    "denied"
+                }
+                .to_string(),
+                process_created: positive,
+                process_created_count: u64::from(positive),
+                thread_resumed: positive,
+                thread_resumed_count: u64::from(positive),
+                user_code_started: positive,
+                user_code_started_count: u64::from(positive),
+                process_exit: positive,
+                process_exit_verified: positive,
+                process_exit_count: u64::from(positive),
+                exit_code: positive.then_some(0),
+                process_tree_observed: positive,
+                process_tree_observation_count: u64::from(positive),
+                process_tree_remaining: 0,
+                process_tree_observer_failed: false,
+                job_termination_attempted: false,
+                job_terminated: false,
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        #[test]
+        fn d32_all_eight_modes_satisfy_the_pure_trace_contract() {
+            for mode in [
+                D32HostCanaryMode::Positive,
+                D32HostCanaryMode::GrantReplay,
+                D32HostCanaryMode::RevokeBeforeRevalidation,
+                D32HostCanaryMode::LifeBeforeRevalidation,
+                D32HostCanaryMode::CancelBeforeRevalidation,
+                D32HostCanaryMode::MigrationBeforeRevalidation,
+                D32HostCanaryMode::ExecutableIdentityTamper,
+                D32HostCanaryMode::EnvironmentProfileTamper,
+            ] {
+                let (trace, phase, error) = d32_contract_trace(mode);
+                d32_validate_trace(mode, &trace, Some(phase), error)
+                    .unwrap_or_else(|failure| panic!("{mode:?} trace contract failed: {failure}"));
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        #[test]
+        fn d32_native_evidence_requires_zero_exit_for_positive_and_none_for_denial() {
+            let positive = d32_contract_native_record(D32HostCanaryMode::Positive);
+            assert!(
+                validate_d32_native_evidence_record(&positive, D32HostCanaryMode::Positive).is_ok()
+            );
+
+            let mut nonzero = positive.clone();
+            nonzero.exit_code = Some(1);
+            assert!(
+                validate_d32_native_evidence_record(&nonzero, D32HostCanaryMode::Positive).is_err()
+            );
+
+            for mode in [
+                D32HostCanaryMode::GrantReplay,
+                D32HostCanaryMode::RevokeBeforeRevalidation,
+                D32HostCanaryMode::LifeBeforeRevalidation,
+                D32HostCanaryMode::CancelBeforeRevalidation,
+                D32HostCanaryMode::MigrationBeforeRevalidation,
+                D32HostCanaryMode::ExecutableIdentityTamper,
+                D32HostCanaryMode::EnvironmentProfileTamper,
+            ] {
+                let denied = d32_contract_native_record(mode);
+                assert!(!denied.process_created);
+                assert!(!denied.thread_resumed);
+                assert!(!denied.user_code_started);
+                assert!(denied.exit_code.is_none());
+                assert!(validate_d32_native_evidence_record(&denied, mode).is_ok());
+                let mut false_positive = denied.clone();
+                false_positive.exit_code = Some(0);
+                assert!(validate_d32_native_evidence_record(&false_positive, mode).is_err());
             }
         }
 

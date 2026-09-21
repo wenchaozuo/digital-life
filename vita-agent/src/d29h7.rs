@@ -7366,6 +7366,7 @@ impl H7ToolResult {
             "process_tree_observer_failed": self.process_tree_observer_failed,
             "job_termination_attempted": self.job_termination_attempted,
             "job_terminated": self.job_terminated,
+            "exit_code": self.exit_code,
         })
     }
 }
@@ -7493,6 +7494,29 @@ pub(crate) struct H7ProcessBroker {
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
     output_terminality_gate: Option<Arc<H7TerminalityGate>>,
+}
+
+/// Process-local proof that the Host has evaluated the workspace scope for a
+/// specific Cargo action.  The binding is retained in full so the proof cannot
+/// be applied to another action, capability, or workspace.  The proof is never
+/// serialized or sent over the Vita/Host wire; the Host remains the sole owner
+/// of the authority decision and the revision is provenance only.
+pub(crate) struct H7WorkspaceScopeProof {
+    binding: H7ProcessBinding,
+    authorization_revision: i64,
+}
+
+impl H7WorkspaceScopeProof {
+    fn validate_binding(&self, action_binding: &H7ProcessBinding) -> Result<(), String> {
+        if self.authorization_revision <= 0
+            || self.binding.capability_id() != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+            || action_binding.capability_id() != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+            || self.binding != *action_binding
+        {
+            return Err("D32 workspace scope proof did not match the Cargo action".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl H7ProcessBroker {
@@ -7639,9 +7663,76 @@ impl H7ProcessBroker {
         self.execute_tool_action(action).await
     }
 
+    /// Performs the one initial Host workspace-scope evaluation required by
+    /// D32, before the caller is allowed to populate the governed workspace
+    /// projection.  The resulting proof is intentionally opaque outside this
+    /// module and is consumed exactly once by `execute_with_prevalidated_scope`.
+    pub(crate) fn preauthorize_workspace_scope(
+        self: &Arc<Self>,
+        action: &Arc<PreparedProcessAction>,
+    ) -> Result<H7WorkspaceScopeProof, String> {
+        if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+            || action.workspace_root.is_none()
+            || action.workspace_root_identity.is_none()
+        {
+            return Err(
+                "D32 workspace scope proof was requested for a non-Cargo action".to_string(),
+            );
+        }
+        verify_workspace_root_binding(action)?;
+        let authorization_revision = self.authority.evaluate_workspace_scope(action)?;
+        if authorization_revision <= 0 {
+            return Err("D32 workspace scope authority revision was not positive".to_string());
+        }
+        Ok(H7WorkspaceScopeProof {
+            binding: action.binding(),
+            authorization_revision,
+        })
+    }
+
+    /// Executes a D32 action after its initial workspace scope was evaluated
+    /// and before projection population.  This consumes the process-local
+    /// proof, validates its action binding, and preserves the normal
+    /// confirmation, grant, and final revalidation sequence without issuing a
+    /// duplicate Host `AuthorityEvaluate` request.
+    pub(crate) async fn execute_with_prevalidated_scope(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+        proof: H7WorkspaceScopeProof,
+    ) -> H7ToolResult {
+        if self.validate_prevalidated_scope(&action, &proof).is_err() {
+            return H7ToolResult::denied();
+        }
+        self.execute_tool_action_with_scope(action, Some(proof))
+            .await
+    }
+
+    fn validate_prevalidated_scope(
+        &self,
+        action: &PreparedProcessAction,
+        proof: &H7WorkspaceScopeProof,
+    ) -> Result<(), String> {
+        if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
+            || action.workspace_root.is_none()
+            || action.workspace_root_identity.is_none()
+        {
+            return Err("D32 workspace scope proof did not match the Cargo action".to_string());
+        }
+        proof.validate_binding(&action.binding())?;
+        Ok(())
+    }
+
     async fn execute_tool_action(
         self: &Arc<Self>,
         action: Arc<PreparedProcessAction>,
+    ) -> H7ToolResult {
+        self.execute_tool_action_with_scope(action, None).await
+    }
+
+    async fn execute_tool_action_with_scope(
+        self: &Arc<Self>,
+        action: Arc<PreparedProcessAction>,
+        prevalidated_scope: Option<H7WorkspaceScopeProof>,
     ) -> H7ToolResult {
         let admission = match self.admission.try_acquire() {
             Some(admission) => admission,
@@ -7655,7 +7746,13 @@ impl H7ProcessBroker {
             Arc::clone(&cancellation_notify),
         );
         let result = self
-            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
+            .execute_with_cancellation(
+                action,
+                cancellation,
+                cancellation_notify,
+                admission,
+                prevalidated_scope,
+            )
             .await;
         guard.disarm();
         result
@@ -7667,14 +7764,21 @@ impl H7ProcessBroker {
         cancellation: Arc<AtomicBool>,
         cancellation_notify: Arc<Notify>,
         admission: H7ProcessAdmissionLease,
+        prevalidated_scope: Option<H7WorkspaceScopeProof>,
     ) -> H7ToolResult {
         if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
-            if action.workspace_root.is_none() {
+            if action.workspace_root.is_none() || action.workspace_root_identity.is_none() {
                 return H7ToolResult::denied();
             }
-            if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
+            if let Some(proof) = prevalidated_scope {
+                if self.validate_prevalidated_scope(&action, &proof).is_err() {
+                    return H7ToolResult::denied();
+                }
+            } else if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
                 return H7ToolResult::denied();
             }
+        } else if prevalidated_scope.is_some() {
+            return H7ToolResult::denied();
         }
         let authorization_revision = match self
             .bridge
@@ -7919,7 +8023,7 @@ impl VitaProcessTool {
         );
         let result = self
             .broker
-            .execute_with_cancellation(action, cancellation, cancellation_notify, admission)
+            .execute_with_cancellation(action, cancellation, cancellation_notify, admission, None)
             .await;
         // This disarm is reached only after the action and its blocking worker
         // have completed; dropping the ToolExecutorFuture earlier runs Drop.
@@ -11102,6 +11206,54 @@ mod tests {
         assert_eq!(harness.authority.workspace_scope_provenance(), (1, 0));
         assert_eq!(harness.authority.provenance(), (0, 0));
         assert!(harness.authority.shutdown());
+    }
+
+    fn d32_test_binding(capability_id: &str) -> H7ProcessBinding {
+        H7ProcessBinding::from_host_wire(
+            "life".to_string(),
+            "task".to_string(),
+            capability_id.to_string(),
+            "cargo-check-v1".to_string(),
+            "image".to_string(),
+            "image-sha256".to_string(),
+            "argv-sha256".to_string(),
+            2,
+            "working-directory".to_string(),
+            "environment-policy".to_string(),
+            65_536,
+            65_536,
+            120_000,
+            "call".to_string(),
+            "turn".to_string(),
+            Some("workspace".to_string()),
+            Some(VITA_WORKSPACE_CARGO_CHECK_PROFILE_ID.to_string()),
+            Some(D32_CARGO_NO_GIT_METADATA_FENCE.to_string()),
+        )
+    }
+
+    #[test]
+    fn d32_scope_proof_rejects_wrong_capability_and_binding_without_launch() {
+        let binding = d32_test_binding(VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID);
+        let proof = H7WorkspaceScopeProof {
+            binding: binding.clone(),
+            authorization_revision: 2,
+        };
+        assert!(proof.validate_binding(&binding).is_ok());
+
+        let wrong_capability = d32_test_binding(H7B_CAPABILITY_ID);
+        assert!(proof.validate_binding(&wrong_capability).is_err());
+
+        let mut wrong_binding = binding.clone();
+        wrong_binding.tool_call_id = "different-call".to_string();
+        assert!(proof.validate_binding(&wrong_binding).is_err());
+
+        let zero_revision = H7WorkspaceScopeProof {
+            binding,
+            authorization_revision: 0,
+        };
+        assert!(zero_revision
+            .validate_binding(&d32_test_binding(VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID))
+            .is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -54,7 +54,8 @@ const D32_MAX_TREE_DEPTH: usize = 256;
 
 pub(crate) const D32_TOOLCHAIN_MIRROR_ROOT_NAME: &str = "d32-toolchains";
 pub(crate) const D32_RUNS_DIR_NAME: &str = "runs";
-const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v1";
+const D32_NATIVE_EVIDENCE_VERSION: u32 = 2;
+const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v2";
 const D32_NATIVE_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "d32-a-test-helper")]
@@ -524,7 +525,7 @@ impl D32NativeEvidenceSink {
         let object = record
             .as_object_mut()
             .ok_or_else(|| "D32 native evidence was not an object".to_string())?;
-        object.insert("version".to_string(), json!(1));
+        object.insert("version".to_string(), json!(D32_NATIVE_EVIDENCE_VERSION));
         object.insert("run_id".to_string(), json!(run_id));
         object.insert("session_id".to_string(), json!(session_id));
         object.insert("life_id".to_string(), json!(context.life_id()));
@@ -1129,9 +1130,13 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     ) {
                         Ok(action) => {
                             // D28 scope evaluation is the first Host-owned
-                            // operation.  Only after it completes may the
-                            // projection read the governed workspace.
-                            if inner.authority.evaluate_workspace_scope(&action).is_err()
+                            // operation.  Only after its process-local proof
+                            // is established may the projection read the
+                            // governed workspace.  The proof is consumed by
+                            // the broker so the same scope is not evaluated a
+                            // second time over the Host wire.
+                            let scope_proof = broker.preauthorize_workspace_scope(&action);
+                            if scope_proof.is_err()
                                 || projection.populate(&inner.workspace_root).is_err()
                             {
                                 denied_value()
@@ -1139,7 +1144,12 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                                 if let Ok(mut active) = inner.active_broker.lock() {
                                     *active = Some(Arc::clone(&broker));
                                 }
-                                let result = broker.execute(action).await;
+                                let result = broker
+                                    .execute_with_prevalidated_scope(
+                                        action,
+                                        scope_proof.expect("checked D32 scope proof"),
+                                    )
+                                    .await;
                                 if let Ok(mut active) = inner.active_broker.lock() {
                                     if active
                                         .as_ref()

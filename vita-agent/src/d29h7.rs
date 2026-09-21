@@ -6067,26 +6067,17 @@ fn h7_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> 
             })
         })
         .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if executable.is_file() && executable_is_fresh {
-        return Ok(executable);
+    if !executable.is_file() {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H7 authority fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
     }
-    let status = Command::new("cargo")
-        .current_dir(repo_root)
-        .args(["build", "--quiet", "--locked", "--manifest-path"])
-        .arg(repo_root.join("src-tauri").join("Cargo.toml"))
-        .args([
-            "--bin",
-            "d29h7-authority-fixture",
-            "--features",
-            "d29-h7-host-fixture",
-        ])
-        .env("CARGO_BUILD_JOBS", "1")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_TERM_COLOR", "never")
-        .status()
-        .map_err(|error| format!("build D29-H7 Host fixture: {error}"))?;
-    if !status.success() || !executable.is_file() {
-        return Err("D29-H7 Host fixture executable was not produced".to_string());
+    if !executable_is_fresh {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H7 authority fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
     }
     Ok(executable)
 }
@@ -6114,21 +6105,17 @@ fn h7_process_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
             })
         })
         .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if executable.is_file() && executable_is_fresh {
-        return Ok(executable);
+    if !executable.is_file() {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H7 process fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
     }
-    let status = Command::new("cargo")
-        .current_dir(repo_root)
-        .args(["build", "--quiet", "--locked", "--manifest-path"])
-        .arg(repo_root.join("vita-agent").join("Cargo.toml"))
-        .args(["--bin", "d29h7-process-fixture"])
-        .env("CARGO_BUILD_JOBS", "1")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_TERM_COLOR", "never")
-        .status()
-        .map_err(|error| format!("build D29-H7 process fixture: {error}"))?;
-    if !status.success() || !executable.is_file() {
-        return Err("D29-H7 process fixture executable was not produced".to_string());
+    if !executable_is_fresh {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H7 process fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
     }
     Ok(executable)
 }
@@ -6156,14 +6143,19 @@ fn d32_sandbox_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
             })
         })
         .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
-    if executable.is_file() && executable_is_fresh {
-        return Ok(executable);
+    if !executable.is_file() {
+        return Err(format!(
+            "FIXTURE_MISSING: D32-A sandbox fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
     }
-    Err(format!(
-        "D32-A sandbox fixture is missing or stale: {}; prebuild with `cargo build --locked --manifest-path {} --bin d32a-sandbox-fixture --features d32-a-test-helper`",
-        executable.display(),
-        repo_root.join("vita-agent").join("Cargo.toml").display()
-    ))
+    if !executable_is_fresh {
+        return Err(format!(
+            "FIXTURE_MISSING: D32-A sandbox fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
+    }
+    Ok(executable)
 }
 
 #[derive(Clone)]
@@ -9587,12 +9579,48 @@ mod tests {
     use tempfile::{Builder, TempDir};
 
     static H7_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    const H7_TEST_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn lock_h7_tests() -> MutexGuard<'static, ()> {
-        H7_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    struct H7TestLockGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for H7TestLockGuard {
+        fn drop(&mut self) {
+            eprintln!("D29_H7_TEST_PHASE=lock_release");
+        }
+    }
+
+    fn lock_h7_tests() -> H7TestLockGuard {
+        let lock = H7_TEST_LOCK.get_or_init(|| Mutex::new(()));
+        let started = Instant::now();
+        eprintln!(
+            "D29_H7_TEST_PHASE=lock_wait timeout_ms={}",
+            H7_TEST_LOCK_TIMEOUT.as_millis()
+        );
+        loop {
+            match lock.try_lock() {
+                Ok(guard) => {
+                    eprintln!("D29_H7_TEST_PHASE=lock_acquired");
+                    return H7TestLockGuard { _guard: guard };
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    eprintln!("D29_H7_TEST_PHASE=lock_acquired_poison_recovered");
+                    return H7TestLockGuard {
+                        _guard: poisoned.into_inner(),
+                    };
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= H7_TEST_LOCK_TIMEOUT {
+                        panic!(
+                            "H7_TEST_LOCK_TIMEOUT phase=lock_wait timeout_ms={}",
+                            H7_TEST_LOCK_TIMEOUT.as_millis()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
     }
 
     #[test]
@@ -10057,26 +10085,34 @@ mod tests {
             .join("target")
             .join("debug")
             .join("d29h7-git-helper-fixture.exe");
-        if executable.is_file() {
-            return executable;
+        let source = repo_root
+            .join("vita-agent")
+            .join("src")
+            .join("bin")
+            .join("d29h7-git-helper-fixture.rs");
+        if !executable.is_file() {
+            panic!(
+                "FIXTURE_MISSING: D29-H7-C Git helper fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
+                executable.display()
+            );
         }
-        let status = Command::new("cargo")
-            .current_dir(repo_root)
-            .args([
-                "build",
-                "--manifest-path",
-                "vita-agent/Cargo.toml",
-                "--bin",
-                "d29h7-git-helper-fixture",
-                "--features",
-                "d29-h7-test-helper",
-            ])
-            .env("CARGO_BUILD_JOBS", "1")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TERM_COLOR", "never")
-            .status()
-            .expect("D29-H7-C helper fixture build");
-        assert!(status.success() && executable.is_file());
+        let executable_is_fresh = executable
+            .metadata()
+            .and_then(|binary| binary.modified())
+            .and_then(|binary_time| {
+                source.metadata().and_then(|source| {
+                    source
+                        .modified()
+                        .map(|source_time| (binary_time, source_time))
+                })
+            })
+            .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
+        if !executable_is_fresh {
+            panic!(
+                "FIXTURE_MISSING: D29-H7-C Git helper fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
+                executable.display()
+            );
+        }
         executable
     }
 

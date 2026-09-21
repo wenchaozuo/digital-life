@@ -43,7 +43,9 @@ const D29_H1_TURN_TIMEOUT: Duration = Duration::from_secs(12);
 const D29_H1_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const D29_H1_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const D29_H1_HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
-const D29_H1_HOST_IPC_TIMEOUT: Duration = Duration::from_secs(600);
+// Host fixture bootstrap is an explicit prebuild phase.  The test must never
+// turn a missing fixture into an unbounded nested cargo invocation.
+const D29_H1_HOST_IPC_TIMEOUT: Duration = Duration::from_secs(15);
 const D29_H1_HOST_IPC_MAX_BODY: usize = 8 * 1024;
 const D29_H1_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -431,6 +433,47 @@ struct ProcessIsolatedCanonicalAuthority {
     observations: Arc<Mutex<Vec<HostAuthorityResponse>>>,
 }
 
+fn d29h1_authority_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
+    let executable = repo_root
+        .join("src-tauri")
+        .join("target")
+        .join("debug")
+        .join(if cfg!(windows) {
+            "d29h1-authority-fixture.exe"
+        } else {
+            "d29h1-authority-fixture"
+        });
+    let source = repo_root
+        .join("src-tauri")
+        .join("src")
+        .join("bin")
+        .join("d29h1-authority-fixture.rs");
+    if !executable.is_file() {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H1 authority fixture is absent: {}; run scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
+    }
+    let executable_is_fresh = executable
+        .metadata()
+        .and_then(|binary| binary.modified())
+        .and_then(|binary_time| {
+            source.metadata().and_then(|source| {
+                source
+                    .modified()
+                    .map(|source_time| (binary_time, source_time))
+            })
+        })
+        .is_ok_and(|(binary_time, source_time)| binary_time >= source_time);
+    if !executable_is_fresh {
+        return Err(format!(
+            "FIXTURE_MISSING: D29-H1 authority fixture is stale: {}; rerun scripts/d32-fixture-prebuild.ps1",
+            executable.display()
+        ));
+    }
+    Ok(executable)
+}
+
 impl ProcessIsolatedCanonicalAuthority {
     fn new() -> Self {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -494,39 +537,10 @@ fn invoke_host_fixture(
     repo_root: &Path,
     request: &Value,
 ) -> Result<HostAuthorityResponse, VitaAuthorityError> {
-    let manifest = repo_root.join("src-tauri").join("Cargo.toml");
-    let fixture_executable = repo_root
-        .join("src-tauri")
-        .join("target")
-        .join("debug")
-        .join(if cfg!(windows) {
-            "d29h1-authority-fixture.exe"
-        } else {
-            "d29h1-authority-fixture"
-        });
-    let mut command = if fixture_executable.is_file() {
-        Command::new(&fixture_executable)
-    } else {
-        let mut command = Command::new("cargo");
-        command
-            .current_dir(repo_root)
-            .args(["run", "--quiet", "--locked", "--manifest-path"])
-            .arg(&manifest)
-            .args([
-                "--bin",
-                "d29h1-authority-fixture",
-                "--features",
-                "d29-h1-host-fixture",
-            ]);
-        command
-    };
-    let mut child = command
+    let fixture_executable = d29h1_authority_fixture_executable(repo_root)
+        .map_err(|_| VitaAuthorityError::Unavailable)?;
+    let mut child = Command::new(fixture_executable)
         .current_dir(repo_root)
-        .env("CARGO_BUILD_JOBS", "1")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_PROFILE_TEST_DEBUG", "0")
-        .env("RUSTFLAGS", "-C debuginfo=0")
-        .env("CARGO_TERM_COLOR", "never")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -654,6 +668,11 @@ async fn start_runtime() -> Result<
     ),
     String,
 > {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("D29-H1 repository root")
+        .to_path_buf();
+    d29h1_authority_fixture_executable(&repo_root).unwrap_or_else(|error| panic!("{error}"));
     let before = host_canary();
     let app_data = tempdir().map_err(|_| "create D29-H1 app data failed".to_string())?;
     let workspace = tempdir().map_err(|_| "create D29-H1 workspace failed".to_string())?;

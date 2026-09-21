@@ -110,9 +110,9 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED,
 };
 
-use crate::{
-    fixture_manifest, sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity,
-};
+#[cfg(test)]
+use crate::fixture_manifest;
+use crate::{sha256_hex, TrustedWorkspaceRoot, VitaExecutionContext, WorkspaceRootIdentity};
 
 pub(crate) const VITA_PROCESS_RUN_TOOL_NAME: &str = "vita_run_process";
 pub(crate) const VITA_WORKSPACE_CARGO_CHECK_TOOL_NAME: &str = "vita_workspace_cargo_check";

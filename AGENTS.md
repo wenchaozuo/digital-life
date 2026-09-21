@@ -30,6 +30,19 @@
 - 修改后运行相关测试或编译检查，并输出修改文件、结果和遗留问题。
 - 详细设计中的代码、DDL、目录是契约或建议，不代表提前实现未来功能。
 
+## 批量诊断与修复规则
+
+阶段级、包含多个门禁、昂贵 build/real canary 或连续 repair 的任务，必须按以下顺序执行：
+
+`Blocker Census -> Common-root clustering -> Batch Repair -> Full affected matrix -> Expensive build/real canary`
+
+- 先盘点当前阶段、相邻阶段、validator 与跨提交契约中的全部 blocker，再按共同根因建立 repair batch。
+- 禁止按 `gate fail -> fix one -> rerun expensive gate` 逐点试错；仅当安全或数据风险要求立即停止时例外，并记录停止原因。
+- 启动昂贵 build/real canary 前，必须完成一次聚合 preflight：governance 状态、exact SHA/clean、provenance schema/canonical paths、bundle hashes、provider/tool two-turn contract、mode matrix、cleanup/resource lifecycle。
+- 每次 repair 必须检查相邻阶段及 validator、evidence schema、fixture 断言之间的跨提交契约；局部修复或单项测试通过不等于受影响链路已恢复。
+
+完整执行协议见：`docs/governance/CODEX_DEVELOPMENT_PROTOCOL.md`。
+
 ## 版本顺序
 
 V0.1 基础生命体 → V0.2 记忆与内在状态 → V0.3 语音视觉与角色兼容 → V0.4 Agent 执行 → V0.5 多 Agent 与技能 → V0.6 插件与多形态 → V1.0 稳定整合。

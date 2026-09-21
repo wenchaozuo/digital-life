@@ -369,14 +369,40 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         app.run_iteration(|_, _| {});
 
         let canary_result = vita_sidecar::run_d32_a_host_integration(&mut app, mode);
+        let primary_storage = app.handle().state::<storage::StorageService>();
+        let coordinator = app.handle().state::<vita_sidecar::VitaSidecarCoordinator>();
+        let primary_storage_cleanup = primary_storage.inner().d32_a_close_for_canary();
+        let authority_storage_cleanup = coordinator.d32_a_close_authority_storage_for_canary();
+        drop(coordinator);
+        drop(primary_storage);
         let app_cleanup = cleanup_d32_canary_app(&mut app);
         drop(app);
-        let report = match (canary_result, app_cleanup) {
-            (Ok(report), Ok(())) => report,
-            (Err(error), Ok(())) => return Err(error),
-            (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
-            (Err(error), Err(cleanup_error)) => {
-                return Err(format!("{error}; {cleanup_error}"));
+        let report = match (
+            canary_result,
+            primary_storage_cleanup,
+            authority_storage_cleanup,
+            app_cleanup,
+        ) {
+            (Ok(report), Ok(()), Ok(()), Ok(())) => report,
+            (canary, primary, authority, app) => {
+                let mut errors = Vec::new();
+                if let Err(error) = canary {
+                    errors.push(error);
+                }
+                if let Err(error) = primary {
+                    errors.push(format!(
+                        "D32_A_HOST_FAILURE: primary storage cleanup failed: {error}"
+                    ));
+                }
+                if let Err(error) = authority {
+                    errors.push(format!(
+                        "D32_A_HOST_FAILURE: authority storage cleanup failed: {error}"
+                    ));
+                }
+                if let Err(error) = app {
+                    errors.push(error);
+                }
+                return Err(errors.join("; "));
             }
         };
         serde_json::to_value(report).map_err(|error| {

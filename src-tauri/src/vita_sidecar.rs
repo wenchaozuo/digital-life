@@ -494,6 +494,11 @@ impl VitaSidecarCoordinator {
         configured.take();
         Ok(())
     }
+
+    #[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+    pub(crate) fn d32_a_close_authority_storage_for_canary(&self) -> Result<(), String> {
+        self.authority_storage.d32_a_close_for_canary()
+    }
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]

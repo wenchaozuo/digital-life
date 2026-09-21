@@ -631,6 +631,18 @@ impl StorageService {
         self.state.lock().map_err(StorageError::database)
     }
 
+    #[cfg(all(windows, feature = "d32-a-host-canary"))]
+    pub(crate) fn d32_a_close_for_canary(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| "D32 canary storage state was still in use".to_string())?;
+        let replacement = Connection::open_in_memory()
+            .map_err(|error| format!("D32 canary in-memory storage replacement failed: {error}"))?;
+        drop(std::mem::replace(&mut state.connection, replacement));
+        Ok(())
+    }
+
     /// Acquire the explicit Host capability-authorization linearization
     /// boundary.  Lock order for the release authority path is
     /// `turn_authority -> capability_authorization_gate

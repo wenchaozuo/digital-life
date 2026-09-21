@@ -1314,6 +1314,29 @@ mod windows {
             self.open_child(name, FILE_OPEN_IF)
         }
 
+        fn open_or_create_mutable_child(
+            &self,
+            name: &OsStr,
+        ) -> Result<D32MutableStagingDirectory, String> {
+            d32_validate_child_name(name)?;
+            self.revalidate("D32 retained parent before mutable staging child create")?;
+            let handle = self
+                .open_child_result(
+                    name,
+                    FILE_OPEN_IF,
+                    FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+                )
+                .map_err(d32_namespace_error)?;
+            let child = D32MutableStagingDirectory::from_parent(
+                Arc::clone(&self.namespace.leaf),
+                self.raw_path.clone(),
+                name,
+                handle,
+            )?;
+            self.revalidate("D32 retained parent after mutable staging child create")?;
+            Ok(child)
+        }
+
         fn open_existing_child(&self, name: &OsStr) -> Result<Self, String> {
             self.open_child(name, FILE_OPEN)
         }
@@ -2021,6 +2044,338 @@ mod windows {
         }
     }
 
+    /// A sealed mirror directory deliberately exposes only retained read
+    /// operations.  Mutating operations stay on `D32RetainedDirectory` for
+    /// app-owned state and on `D32MutableStagingDirectory` for the bounded
+    /// pre-seal copy phase; callers cannot write through this mirror view.
+    #[derive(Clone)]
+    struct D32SealedDirectory {
+        retained: D32RetainedDirectory,
+    }
+
+    impl D32SealedDirectory {
+        fn from_retained(retained: D32RetainedDirectory) -> Result<Self, String> {
+            retained.revalidate("D32 sealed mirror before publication")?;
+            Ok(Self { retained })
+        }
+
+        fn into_retained_for_cleanup(self) -> D32RetainedDirectory {
+            self.retained
+        }
+
+        fn path(&self) -> &Path {
+            self.retained.path()
+        }
+
+        fn identity(&self) -> HostFileIdentity {
+            self.retained.identity()
+        }
+    }
+
+    trait D32ReadDirectory: Sized {
+        fn revalidate(&self, description: &str) -> Result<(), String>;
+        fn open_existing_child(&self, name: &OsStr) -> Result<Self, String>;
+        fn probe_file(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<Option<HostFileIdentity>, String>;
+        fn read_file(&self, name: &OsStr, max_bytes: usize) -> Result<Vec<u8>, String>;
+        fn hash_file(&self, name: &OsStr, max_bytes: usize) -> Result<String, String>;
+        fn hash_file_with_identity(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(HostFileIdentity, [u8; 32]), String>;
+        fn enumerate_children(&self) -> Result<Vec<OsString>, String>;
+    }
+
+    impl D32ReadDirectory for D32RetainedDirectory {
+        fn revalidate(&self, description: &str) -> Result<(), String> {
+            D32RetainedDirectory::revalidate(self, description)
+        }
+
+        fn open_existing_child(&self, name: &OsStr) -> Result<Self, String> {
+            D32RetainedDirectory::open_existing_child(self, name)
+        }
+
+        fn probe_file(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<Option<HostFileIdentity>, String> {
+            D32RetainedDirectory::probe_file(self, name, max_bytes)
+        }
+
+        fn read_file(&self, name: &OsStr, max_bytes: usize) -> Result<Vec<u8>, String> {
+            D32RetainedDirectory::read_file(self, name, max_bytes)
+        }
+
+        fn hash_file(&self, name: &OsStr, max_bytes: usize) -> Result<String, String> {
+            D32RetainedDirectory::hash_file(self, name, max_bytes)
+        }
+
+        fn hash_file_with_identity(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(HostFileIdentity, [u8; 32]), String> {
+            D32RetainedDirectory::hash_file_with_identity(self, name, max_bytes)
+        }
+
+        fn enumerate_children(&self) -> Result<Vec<OsString>, String> {
+            D32RetainedDirectory::enumerate_children(self)
+        }
+    }
+
+    impl D32ReadDirectory for D32SealedDirectory {
+        fn revalidate(&self, description: &str) -> Result<(), String> {
+            self.retained.revalidate(description)
+        }
+
+        fn open_existing_child(&self, name: &OsStr) -> Result<Self, String> {
+            D32SealedDirectory::from_retained(self.retained.open_existing_child(name)?)
+        }
+
+        fn probe_file(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<Option<HostFileIdentity>, String> {
+            self.retained.probe_file(name, max_bytes)
+        }
+
+        fn read_file(&self, name: &OsStr, max_bytes: usize) -> Result<Vec<u8>, String> {
+            self.retained.read_file(name, max_bytes)
+        }
+
+        fn hash_file(&self, name: &OsStr, max_bytes: usize) -> Result<String, String> {
+            self.retained.hash_file(name, max_bytes)
+        }
+
+        fn hash_file_with_identity(
+            &self,
+            name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(HostFileIdentity, [u8; 32]), String> {
+            self.retained.hash_file_with_identity(name, max_bytes)
+        }
+
+        fn enumerate_children(&self) -> Result<Vec<OsString>, String> {
+            self.retained.enumerate_children()
+        }
+    }
+
+    /// A destination directory during mirror construction.  Its handle is
+    /// handle-relative and its namespace anchor is checked for volume/file
+    /// continuity, while directory allocation size is intentionally allowed
+    /// to grow until `seal` captures the final full identity.  No mutable
+    /// staging value is ever exposed after sealing.
+    #[derive(Clone)]
+    struct D32MutableStagingDirectory {
+        parent: Arc<D32RetainedHandle>,
+        leaf: Arc<D32RetainedHandle>,
+        leaf_name: OsString,
+        raw_path: PathBuf,
+        namespace_anchor: HostFileIdentity,
+    }
+
+    impl D32MutableStagingDirectory {
+        fn from_parent(
+            parent: Arc<D32RetainedHandle>,
+            parent_path: PathBuf,
+            leaf_name: &OsStr,
+            handle: D32RetainedHandle,
+        ) -> Result<Self, String> {
+            let identity = d32_handle_identity(handle.raw())?;
+            if !identity.directory || identity.reparse {
+                return Err("D32 mutable staging child was not a non-reparse directory".to_string());
+            }
+            Ok(Self {
+                parent,
+                raw_path: parent_path.join(leaf_name),
+                leaf: Arc::new(handle),
+                leaf_name: leaf_name.to_os_string(),
+                namespace_anchor: identity,
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.raw_path
+        }
+
+        fn ensure_namespace(&self, description: &str) -> Result<(), String> {
+            let identity = d32_handle_identity(self.leaf.raw())?;
+            if identity.volume_serial != self.namespace_anchor.volume_serial
+                || identity.file_index != self.namespace_anchor.file_index
+                || !identity.directory
+                || identity.reparse
+            {
+                return Err(format!(
+                    "{description} mutable staging namespace changed: {}",
+                    self.raw_path.display()
+                ));
+            }
+            Ok(())
+        }
+
+        fn open_or_create_child(&self, name: &OsStr) -> Result<Self, String> {
+            d32_validate_child_name(name)?;
+            self.ensure_namespace("D32 mutable staging parent before child create")?;
+            let handle = d32_open_namespace_relative_with_options(
+                &self.leaf,
+                name,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN_IF,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | D32_FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            )
+            .map_err(d32_namespace_error)?;
+            let child =
+                Self::from_parent(Arc::clone(&self.leaf), self.raw_path.clone(), name, handle)?;
+            self.ensure_namespace("D32 mutable staging parent after child create")?;
+            Ok(child)
+        }
+
+        fn copy_file_from(
+            &self,
+            source: &D32RetainedDirectory,
+            source_name: &OsStr,
+            destination_name: &OsStr,
+            max_bytes: u64,
+        ) -> Result<(), String> {
+            d32_validate_child_name(source_name)?;
+            d32_validate_child_name(destination_name)?;
+            source.revalidate("D32 retained source before mutable staging copy")?;
+            self.ensure_namespace("D32 mutable staging destination before copy")?;
+            let source_handle = source
+                .open_file(
+                    source_name,
+                    FILE_OPEN,
+                    FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                )
+                .map_err(|error| match error {
+                    D32NamespaceOpenError::Missing(status)
+                    | D32NamespaceOpenError::Failed(status) => {
+                        format!("D32 mutable staging source copy open failed: {status}")
+                    }
+                })?;
+            let source_identity = d32_handle_identity(source_handle.raw())?;
+            if source_identity.directory
+                || source_identity.reparse
+                || source_identity.file_size > max_bytes
+            {
+                return Err(
+                    "D32 mutable staging source copy target was unsafe or exceeded its bound"
+                        .to_string(),
+                );
+            }
+            let destination_handle = d32_open_namespace_relative_with_options(
+                &self.leaf,
+                destination_name,
+                false,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | FILE_READ_ATTRIBUTES
+                    | DELETE
+                    | SYNCHRONIZE,
+            )
+            .map_err(|error| match error {
+                D32NamespaceOpenError::Missing(status) | D32NamespaceOpenError::Failed(status) => {
+                    format!("D32 mutable staging destination copy create failed: {status}")
+                }
+            })?;
+            let destination_identity = d32_handle_identity(destination_handle.raw())?;
+            if destination_identity.directory
+                || destination_identity.reparse
+                || destination_identity.file_size != 0
+            {
+                return Err(
+                    "D32 mutable staging destination file was unexpectedly reused".to_string(),
+                );
+            }
+            let mut source_file =
+                unsafe { File::from_raw_handle(source_handle.into_raw() as RawHandle) };
+            let mut destination_file =
+                unsafe { File::from_raw_handle(destination_handle.into_raw() as RawHandle) };
+            let mut buffer = vec![0_u8; D32_RETAINED_READ_CHUNK_BYTES];
+            let copied =
+                read_retained_bounded(&mut source_file, max_bytes, &mut buffer, |chunk| {
+                    destination_file
+                        .write_all(chunk)
+                        .map_err(|_| "D32 mutable staging destination write failed".to_string())
+                })?;
+            if copied != source_identity.file_size {
+                return Err("D32 mutable staging source changed during copy".to_string());
+            }
+            destination_file
+                .flush()
+                .map_err(|_| "D32 mutable staging destination flush failed".to_string())?;
+            destination_file
+                .sync_all()
+                .map_err(|_| "D32 mutable staging destination sync failed".to_string())?;
+            let source_after = d32_handle_identity(source_file.as_raw_handle() as HANDLE)?;
+            let destination_after =
+                d32_handle_identity(destination_file.as_raw_handle() as HANDLE)?;
+            if source_after != source_identity
+                || destination_after.file_index != destination_identity.file_index
+                || destination_after.file_size != copied
+            {
+                return Err(
+                    "D32 mutable staging source or destination changed during copy".to_string(),
+                );
+            }
+            drop(source_file);
+            drop(destination_file);
+            source.revalidate("D32 retained source after mutable staging copy")?;
+            self.ensure_namespace("D32 mutable staging destination after copy")
+        }
+
+        fn seal(self) -> Result<D32SealedDirectory, String> {
+            self.ensure_namespace("D32 mutable staging before seal")?;
+            let handle = d32_open_namespace_relative_with_options(
+                &self.parent,
+                &self.leaf_name,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE | D32_FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            )
+            .map_err(d32_namespace_error)?;
+            let identity = d32_handle_identity(handle.raw())?;
+            if identity.volume_serial != self.namespace_anchor.volume_serial
+                || identity.file_index != self.namespace_anchor.file_index
+                || !identity.directory
+                || identity.reparse
+            {
+                return Err(format!(
+                    "D32 mutable staging namespace changed before seal: {}",
+                    self.raw_path.display()
+                ));
+            }
+            let retained = D32RetainedDirectory::from_retained_namespace(
+                self.raw_path,
+                D32PreparedNamespace {
+                    parent: self.parent,
+                    leaf: Arc::new(handle),
+                    leaf_name: self.leaf_name,
+                    leaf_share_access: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    identity,
+                },
+            )?;
+            D32SealedDirectory::from_retained(retained)
+        }
+
+        fn remove_for_cleanup(self) -> Result<(), String> {
+            self.seal()?.into_retained_for_cleanup().remove_self()
+        }
+    }
+
     fn parse_host_directory_names(
         buffer: &[u8],
         returned: usize,
@@ -2719,11 +3074,11 @@ mod windows {
         Ok(())
     }
 
-    fn host_validate_existing_tree_without_reparse_retained(
-        root: &D32RetainedDirectory,
+    fn host_validate_existing_tree_without_reparse_retained<D: D32ReadDirectory>(
+        root: &D,
     ) -> Result<(), String> {
-        fn visit(
-            current: &D32RetainedDirectory,
+        fn visit<D: D32ReadDirectory>(
+            current: &D,
             depth: usize,
             entries: &mut usize,
         ) -> Result<(), String> {
@@ -2750,7 +3105,7 @@ mod windows {
         root.revalidate("D32 Host stale tree after validation")
     }
 
-    fn host_retained_has_toolchain_images(root: &D32RetainedDirectory) -> bool {
+    fn host_retained_has_toolchain_images<D: D32ReadDirectory>(root: &D) -> bool {
         let Ok(bin) = root.open_existing_child(OsStr::new("bin")) else {
             return false;
         };
@@ -2769,8 +3124,8 @@ mod windows {
     // the same retained directory capability.
     type HostToolchainManifestEntry = (Vec<u8>, [u8; 32]);
 
-    fn host_collect_toolchain_manifest(
-        retained: &D32RetainedDirectory,
+    fn host_collect_toolchain_manifest<D: D32ReadDirectory>(
+        retained: &D,
         relative_prefix: PathBuf,
         entries: &mut Vec<HostToolchainManifestEntry>,
         file_count: &mut usize,
@@ -2813,8 +3168,8 @@ mod windows {
         retained.revalidate("D32 Host manifest directory after enumeration")
     }
 
-    fn host_toolchain_manifest_hash_retained(
-        retained: &D32RetainedDirectory,
+    fn host_toolchain_manifest_hash_retained<D: D32ReadDirectory>(
+        retained: &D,
     ) -> Result<String, String> {
         retained.revalidate("D32 Host toolchain root before manifest")?;
         let mut entries = Vec::new();
@@ -2842,20 +3197,20 @@ mod windows {
 
     fn host_copy_toolchain_tree(
         source: &D32RetainedDirectory,
-        destination: &D32RetainedDirectory,
+        destination: &D32MutableStagingDirectory,
         files: &mut usize,
         bytes: &mut u64,
         depth: usize,
-    ) -> Result<(), String> {
+    ) -> Result<D32SealedDirectory, String> {
         if depth > D32_TREE_MAX_DEPTH {
             return Err("D32 Host toolchain mirror exceeded its path-depth bound".to_string());
         }
         source.revalidate("D32 Host source before toolchain copy")?;
-        destination.revalidate("D32 Host destination before toolchain copy")?;
+        destination.ensure_namespace("D32 Host mutable destination before toolchain copy")?;
         for name in source.enumerate_children()? {
             if let Ok(source_child) = source.open_existing_child(&name) {
                 let destination_child = destination.open_or_create_child(&name)?;
-                host_copy_toolchain_tree(
+                let _sealed_child = host_copy_toolchain_tree(
                     &source_child,
                     &destination_child,
                     files,
@@ -2877,7 +3232,15 @@ mod windows {
             }
         }
         source.revalidate("D32 Host source after toolchain copy")?;
-        destination.revalidate("D32 Host destination after toolchain copy")
+        destination.ensure_namespace("D32 Host mutable destination after toolchain copy")?;
+        destination.clone().seal()
+    }
+
+    fn host_staging_error(error: String, cleanup: Result<(), String>) -> String {
+        match cleanup {
+            Ok(()) => format!("{error}; D32 staging cleanup validated and removed"),
+            Err(cleanup_error) => format!("{error}; D32 staging cleanup failed: {cleanup_error}"),
+        }
     }
 
     fn host_prepare_toolchain_mirror_retained(
@@ -2896,7 +3259,8 @@ mod windows {
         let mirror = mirror_parent.join(&selection.toolchain_manifest_sha256);
         let existing_mirror = mirror_parent_retained
             .open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))
-            .ok();
+            .ok()
+            .and_then(|retained| D32SealedDirectory::from_retained(retained).ok());
         let valid = match existing_mirror.as_ref() {
             Some(retained) => {
                 retained.revalidate("D32 Host mirror cache hit")?;
@@ -2955,53 +3319,77 @@ mod windows {
             let staging_name =
                 OsString::from(format!(".{}.staging", selection.toolchain_manifest_sha256));
             mirror_parent_retained.remove_child_tree_if_present(&staging_name)?;
-            let staging_retained = mirror_parent_retained.open_or_create_child(&staging_name)?;
+            let staging_mut = mirror_parent_retained.open_or_create_mutable_child(&staging_name)?;
             let mut files = 0usize;
             let mut bytes = 0u64;
-            app_data_root_retained.revalidate("D32 Host app-data root before mirror copy")?;
-            selected_root_retained.revalidate("D32 Host toolchain root before mirror copy")?;
-            host_copy_toolchain_tree(
-                &selected_root_retained,
-                &staging_retained,
-                &mut files,
-                &mut bytes,
-                0,
-            )?;
-            app_data_root_retained.revalidate("D32 Host app-data root after mirror copy")?;
-            selected_root_retained.revalidate("D32 Host toolchain root after mirror copy")?;
-            if selected_root_retained.identity() != selected_root_identity
-                || selected_bin_retained
-                    .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
-                    != Some(selected_cargo_identity)
-            {
-                let _ = staging_retained.remove_self();
-                return Err("D32 Host toolchain source changed during mirror copy".to_string());
+            let copy_result = (|| {
+                app_data_root_retained.revalidate("D32 Host app-data root before mirror copy")?;
+                selected_root_retained.revalidate("D32 Host toolchain root before mirror copy")?;
+                host_copy_toolchain_tree(
+                    &selected_root_retained,
+                    &staging_mut,
+                    &mut files,
+                    &mut bytes,
+                    0,
+                )
+            })();
+            let staging_sealed = match copy_result {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    return Err(host_staging_error(error, staging_mut.remove_for_cleanup()));
+                }
+            };
+            drop(staging_mut);
+            let post_copy_result = (|| {
+                app_data_root_retained.revalidate("D32 Host app-data root after mirror copy")?;
+                selected_root_retained.revalidate("D32 Host toolchain root after mirror copy")?;
+                if selected_root_retained.identity() != selected_root_identity
+                    || selected_bin_retained
+                        .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
+                        != Some(selected_cargo_identity)
+                {
+                    return Err("D32 Host toolchain source changed during mirror copy".to_string());
+                }
+                let manifest = host_toolchain_manifest_hash_retained(&staging_sealed)?;
+                if manifest != selection.toolchain_manifest_sha256 {
+                    return Err(
+                        "D32 Host toolchain mirror manifest did not match selection".to_string()
+                    );
+                }
+                app_data_root_retained
+                    .revalidate("D32 Host app-data root before mirror finalize")?;
+                mirror_parent_retained.revalidate("D32 Host mirror parent before finalize")?;
+                Ok(())
+            })();
+            if let Err(error) = post_copy_result {
+                return Err(host_staging_error(
+                    error,
+                    staging_sealed.into_retained_for_cleanup().remove_self(),
+                ));
             }
-            let manifest = host_toolchain_manifest_hash_retained(&staging_retained)?;
-            if manifest != selection.toolchain_manifest_sha256 {
-                let _ = staging_retained.remove_self();
-                return Err(
-                    "D32 Host toolchain mirror manifest did not match selection".to_string()
-                );
-            }
-            app_data_root_retained.revalidate("D32 Host app-data root before mirror finalize")?;
-            mirror_parent_retained.revalidate("D32 Host mirror parent before finalize")?;
+            let staging_retained = staging_sealed.into_retained_for_cleanup();
             drop(staging_retained);
-            mirror_parent_retained.rename_directory(
+            if let Err(error) = mirror_parent_retained.rename_directory(
                 &staging_name,
                 OsStr::new(&selection.toolchain_manifest_sha256),
                 false,
-            )?;
+            ) {
+                let cleanup = mirror_parent_retained
+                    .open_existing_child(&staging_name)
+                    .and_then(|orphan| orphan.remove_self());
+                return Err(host_staging_error(error, cleanup));
+            }
             app_data_root_retained.revalidate("D32 Host app-data root after mirror finalize")?;
         }
         app_data_root_retained.revalidate("D32 Host app-data root after mirror preparation")?;
         let mirror_retained = mirror_parent_retained
             .open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))?;
-        mirror_retained.revalidate("D32 Host final toolchain mirror")?;
+        let mirror_sealed = D32SealedDirectory::from_retained(mirror_retained)?;
+        mirror_sealed.revalidate("D32 Host final toolchain mirror")?;
         if mirror_parent_retained.identity() != mirror_parent_identity {
             return Err("D32 Host toolchain mirror parent changed during preparation".to_string());
         }
-        if host_toolchain_manifest_hash_retained(&mirror_retained)?
+        if host_toolchain_manifest_hash_retained(&mirror_sealed)?
             != selection.toolchain_manifest_sha256
         {
             return Err("D32 Host toolchain mirror changed after finalization".to_string());
@@ -3275,8 +3663,9 @@ mod windows {
             .open_existing_child(OsStr::new(D32_TOOLCHAIN_MIRROR_ROOT_NAME))?;
         let toolchain_retained =
             mirror_parent.open_existing_child(OsStr::new(&selection.toolchain_manifest_sha256))?;
-        toolchain_retained.revalidate("D32 Host toolchain mirror before profile evidence")?;
-        let toolchain_bin_retained = toolchain_retained.open_existing_child(OsStr::new("bin"))?;
+        let toolchain_sealed = D32SealedDirectory::from_retained(toolchain_retained)?;
+        toolchain_sealed.revalidate("D32 Host toolchain mirror before profile evidence")?;
+        let toolchain_bin_retained = toolchain_sealed.open_existing_child(OsStr::new("bin"))?;
         let cargo_identity = toolchain_bin_retained
             .probe_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES)?
             .ok_or_else(|| "D32 Host mirror Cargo image was unavailable".to_string())?;
@@ -3286,8 +3675,8 @@ mod windows {
         let rustdoc_identity = toolchain_bin_retained
             .probe_file(OsStr::new("rustdoc.exe"), D32_TOOLCHAIN_FILE_MAX_BYTES)?
             .ok_or_else(|| "D32 Host mirror rustdoc image was unavailable".to_string())?;
-        let toolchain_identity = toolchain_retained.identity();
-        let toolchain_manifest_hash = host_toolchain_manifest_hash_retained(&toolchain_retained)?;
+        let toolchain_identity = toolchain_sealed.identity();
+        let toolchain_manifest_hash = host_toolchain_manifest_hash_retained(&toolchain_sealed)?;
         if toolchain_manifest_hash != selection.toolchain_manifest_sha256
             || toolchain_bin_retained
                 .hash_file(OsStr::new("cargo.exe"), D32_IMAGE_HASH_MAX_BYTES as usize)?
@@ -3316,7 +3705,7 @@ mod windows {
             environment_policy_hash: CARGO_ENVIRONMENT_POLICY_HASH.to_string(),
             profile_id: PRODUCTION_CARGO_CHECK_PROFILE_ID.to_string(),
         };
-        toolchain_retained.revalidate("D32 Host toolchain mirror after profile evidence")?;
+        toolchain_sealed.revalidate("D32 Host toolchain mirror after profile evidence")?;
         toolchain_bin_retained.revalidate("D32 Host toolchain bin after profile evidence")?;
         app_data_root_retained.revalidate("D32 Host app-data root after profile evidence")?;
         Ok(evidence)
@@ -11918,6 +12307,97 @@ mod windows {
             assert!(retained.revalidate("D32 namespace replacement").is_err());
             drop(retained);
             fs::remove_dir_all(replacement).expect("D32 namespace replacement cleanup");
+        }
+
+        #[test]
+        fn d32_mutable_mirror_seals_after_writes_and_denies_tamper_or_replacement() {
+            let fixture = tempfile::tempdir().expect("D32 mutable mirror fixture");
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("destination");
+            let source_bin = source.join("bin");
+            fs::create_dir_all(&source_bin).expect("D32 mutable mirror source bin");
+            fs::create_dir(&destination).expect("D32 mutable mirror destination");
+            fs::write(source_bin.join("cargo.exe"), b"cargo").expect("D32 mutable mirror cargo");
+            fs::write(source_bin.join("rustc.exe"), b"rustc").expect("D32 mutable mirror rustc");
+
+            let source_retained =
+                D32RetainedDirectory::open(&source).expect("D32 mutable mirror source retained");
+            let destination_retained = D32RetainedDirectory::open(&destination)
+                .expect("D32 mutable mirror destination retained");
+            let staging = destination_retained
+                .open_or_create_mutable_child(OsStr::new("staging"))
+                .expect("D32 mutable mirror staging child");
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            let sealed =
+                host_copy_toolchain_tree(&source_retained, &staging, &mut files, &mut bytes, 0)
+                    .expect("D32 mutable mirror seal");
+            drop(staging);
+            assert_eq!(files, 2);
+            assert_eq!(bytes, (b"cargo".len() + b"rustc".len()) as u64);
+
+            let sealed_bin = sealed
+                .open_existing_child(OsStr::new("bin"))
+                .expect("D32 sealed mirror bin");
+            let sealed_bin_identity = sealed_bin.identity();
+            sealed_bin
+                .enumerate_children()
+                .expect("D32 sealed mirror enumeration");
+            assert_eq!(sealed_bin.identity(), sealed_bin_identity);
+            let expected_manifest =
+                host_toolchain_manifest_hash_retained(&sealed).expect("D32 sealed mirror manifest");
+
+            fs::write(sealed.path().join("bin/cargo.exe"), b"cargo-tampered")
+                .expect("D32 sealed mirror tamper");
+            let tampered_manifest = host_toolchain_manifest_hash_retained(&sealed)
+                .expect("D32 sealed mirror tampered manifest");
+            assert_ne!(
+                tampered_manifest, expected_manifest,
+                "sealed mirror tamper must fail the expected manifest comparison"
+            );
+            drop(sealed_bin);
+
+            let sealed_path = sealed.path().to_path_buf();
+            let replacement = fixture.path().join("replacement");
+            fs::rename(&sealed_path, &replacement).expect("D32 sealed mirror replacement rename");
+            fs::create_dir(&sealed_path).expect("D32 sealed mirror replacement root");
+            assert!(sealed.revalidate("D32 sealed mirror replacement").is_err());
+        }
+
+        #[test]
+        fn d32_mutable_mirror_failure_cleanup_is_validated_and_bounded() {
+            let fixture = tempfile::tempdir().expect("D32 mutable mirror cleanup fixture");
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("destination");
+            fs::create_dir(&source).expect("D32 mutable cleanup source");
+            fs::create_dir(&destination).expect("D32 mutable cleanup destination");
+            let source_retained =
+                D32RetainedDirectory::open(&source).expect("D32 mutable cleanup source retained");
+            let destination_retained = D32RetainedDirectory::open(&destination)
+                .expect("D32 mutable cleanup destination retained");
+            let staging = destination_retained
+                .open_or_create_mutable_child(OsStr::new("failed-staging"))
+                .expect("D32 mutable cleanup staging child");
+            let staging_path = staging.path().to_path_buf();
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            let copy_result = host_copy_toolchain_tree(
+                &source_retained,
+                &staging,
+                &mut files,
+                &mut bytes,
+                D32_TREE_MAX_DEPTH + 1,
+            );
+            let copy_error = match copy_result {
+                Ok(_) => panic!("D32 mutable cleanup depth bound must fail"),
+                Err(error) => error,
+            };
+            let rendered = host_staging_error(copy_error, staging.remove_for_cleanup());
+            assert!(rendered.contains("D32 staging cleanup validated and removed"));
+            assert!(
+                !staging_path.exists(),
+                "failed staging root must be removed"
+            );
         }
 
         fn test_binding(session_id: &str) -> ProcessBinding {

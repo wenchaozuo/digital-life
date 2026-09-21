@@ -10368,6 +10368,136 @@ mod windows {
         format!("D32_A_NOT_EXECUTABLE: {}", message.into())
     }
 
+    #[cfg(feature = "d32-a-host-canary")]
+    const D32_CANARY_CARGO_PROMPT: &str = "Do not answer with text. Your first and only action must be call vita_workspace_cargo_check exactly once with {} now; wait for its result, then summarize.";
+
+    #[cfg(feature = "d32-a-host-canary")]
+    const D32_CANARY_DIAGNOSTIC_MAX_TEXT_CHARS: usize = 512;
+
+    #[cfg(feature = "d32-a-host-canary")]
+    const D32_CANARY_DIAGNOSTIC_MAX_ERROR_CODE_CHARS: usize = 64;
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_canary_contains_sensitive_marker(value: &str) -> bool {
+        let lower = value.to_ascii_lowercase();
+        [
+            "authorization",
+            "bearer",
+            "token",
+            "secret",
+            "credential",
+            "password",
+            "api_key",
+            "api-key",
+            "apikey",
+            "cookie",
+            "set-cookie",
+            "client_secret",
+            "access_key",
+            "private_key",
+            "provider",
+            "base_url",
+            "base url",
+            "endpoint",
+            "request",
+            "response",
+            "body",
+            "header",
+            "environment",
+            " env",
+            "http://",
+            "https://",
+            "://",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_canary_contains_secret_like_token(value: &str) -> bool {
+        value.split_whitespace().any(|token| {
+            let token = token.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric()
+                    && !matches!(character, '_' | '-' | '.' | '/' | '+' | '=')
+            });
+            let length = token.chars().count();
+            length >= 24
+                && token.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '-' | '.' | '/' | '+' | '=')
+                })
+        })
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_canary_sanitize_assistant_text(text: &str) -> String {
+        let mut sanitized = String::new();
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty()
+                || d32_canary_contains_sensitive_marker(line)
+                || d32_canary_contains_secret_like_token(line)
+            {
+                continue;
+            }
+            let line = line
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>();
+            if line.is_empty() {
+                continue;
+            }
+            if !sanitized.is_empty() {
+                sanitized.push('\n');
+            }
+            sanitized.push_str(&line);
+            if sanitized.chars().count() >= D32_CANARY_DIAGNOSTIC_MAX_TEXT_CHARS {
+                break;
+            }
+        }
+        sanitized
+            .chars()
+            .take(D32_CANARY_DIAGNOSTIC_MAX_TEXT_CHARS)
+            .collect()
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_canary_sanitize_error_code(error_code: Option<&str>) -> String {
+        let Some(error_code) = error_code else {
+            return "<none>".to_string();
+        };
+        let error_code = error_code.trim();
+        if error_code.is_empty()
+            || error_code.chars().count() > D32_CANARY_DIAGNOSTIC_MAX_ERROR_CODE_CHARS
+            || d32_canary_contains_sensitive_marker(error_code)
+            || error_code.chars().any(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+            })
+        {
+            return "<redacted>".to_string();
+        }
+        error_code.to_string()
+    }
+
+    #[cfg(feature = "d32-a-host-canary")]
+    fn d32_canary_no_confirmation_diagnostic(
+        assistant_text: Option<&str>,
+        turn_phase: Option<protocol::TurnPhase>,
+        turn_error: Option<&str>,
+    ) -> String {
+        let assistant_text_length = assistant_text.map_or(0, |text| text.chars().count());
+        let assistant_text_preview = assistant_text
+            .map(d32_canary_sanitize_assistant_text)
+            .unwrap_or_default();
+        let terminal_phase = turn_phase
+            .map(|phase| format!("{phase:?}"))
+            .unwrap_or_else(|| "<none>".to_string());
+        let turn_error_code = d32_canary_sanitize_error_code(turn_error);
+        format!(
+            "provider produced no governed cargo confirmation; terminal_phase={terminal_phase}; turn_error_code={turn_error_code}; assistant_text_len_chars={assistant_text_length}; assistant_text_preview={assistant_text_preview:?}"
+        )
+    }
+
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     fn d32_require_cargo_root(storage: &StorageService, life_id: &str) -> Result<(), String> {
         let capability_id = CapabilityId::try_from(PRODUCTION_CARGO_CHECK_CAPABILITY_ID)
@@ -12177,7 +12307,7 @@ mod windows {
             d32_prepare_native_evidence(&retained)?;
             app_data_root_retained = Some(retained);
             coordinator.start_turn(VitaTurnStartRequest {
-                prompt: "Use the provided vita_workspace_cargo_check tool exactly once on the current workspace, wait for its result, and then report the result.".to_string(),
+                prompt: D32_CANARY_CARGO_PROMPT.to_string(),
             })?;
 
             let deadline = std::time::Instant::now() + Duration::from_secs(360);
@@ -12212,9 +12342,11 @@ mod windows {
                 thread::sleep(Duration::from_millis(100));
             };
             if !confirmation_seen {
-                return Err(d32_not_executable(
-                    "provider produced no governed cargo confirmation",
-                ));
+                return Err(d32_not_executable(d32_canary_no_confirmation_diagnostic(
+                    terminal.assistant_text.as_deref(),
+                    terminal.turn_phase,
+                    terminal.turn_error.as_deref(),
+                )));
             }
             if mode.expects_deny() {
                 if !matches!(
@@ -12434,6 +12566,46 @@ mod windows {
             assert!(
                 d32_create_minimal_git_metadata(&workspace).is_err(),
                 "recreating fixed metadata must fail closed"
+            );
+        }
+
+        #[test]
+        fn d32_canary_prompt_and_no_confirmation_diagnostic_are_bounded_and_redacted() {
+            assert_eq!(
+                D32_CANARY_CARGO_PROMPT
+                    .matches("vita_workspace_cargo_check")
+                    .count(),
+                1
+            );
+            assert!(D32_CANARY_CARGO_PROMPT.starts_with("Do not answer with text."));
+            assert!(D32_CANARY_CARGO_PROMPT.contains(
+                "first and only action must be call vita_workspace_cargo_check exactly once with {} now"
+            ));
+            assert!(D32_CANARY_CARGO_PROMPT.contains("wait for its result, then summarize"));
+
+            let long_safe_line = "safe cargo result ".repeat(64);
+            let assistant_text = format!(
+                "safe result: cargo check completed\nAuthorization: Bearer should-not-appear\nbody={{\"secret\":\"should-not-appear\"}}\n{long_safe_line}"
+            );
+            let diagnostic = d32_canary_no_confirmation_diagnostic(
+                Some(&assistant_text),
+                Some(protocol::TurnPhase::Completed),
+                Some("TURN_FAILED"),
+            );
+            assert!(diagnostic.contains("terminal_phase=Completed"));
+            assert!(diagnostic.contains("turn_error_code=TURN_FAILED"));
+            assert!(diagnostic.contains("assistant_text_len_chars="));
+            assert!(diagnostic.contains("safe result: cargo check completed"));
+            assert!(!diagnostic.contains("should-not-appear"));
+            assert!(
+                d32_canary_sanitize_assistant_text(&assistant_text)
+                    .chars()
+                    .count()
+                    <= D32_CANARY_DIAGNOSTIC_MAX_TEXT_CHARS
+            );
+            assert_eq!(
+                d32_canary_sanitize_error_code(Some("provider_token=should-not-appear")),
+                "<redacted>"
             );
         }
 

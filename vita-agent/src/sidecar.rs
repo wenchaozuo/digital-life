@@ -143,21 +143,12 @@ impl D32ForcedToolLatch {
                 if !request.tool_calls.is_empty()
                     || !request.tool_outputs.is_empty()
                     || request.options.forced_tool.is_some()
+                    || request.options.tools.len() != 1
+                    || request.options.tools[0].name != D32_CARGO_TOOL_NAME
                 {
                     *phase = D32ForcedToolPhase::Failed;
                     return Err(
-                        "D32 first provider request must not contain prior tool state".to_string(),
-                    );
-                }
-                if !request
-                    .options
-                    .tools
-                    .iter()
-                    .any(|tool| tool.name == D32_CARGO_TOOL_NAME)
-                {
-                    *phase = D32ForcedToolPhase::Failed;
-                    return Err(
-                        "D32 first provider request did not advertise Cargo tool".to_string()
+                        "D32 first provider request must advertise exactly one Cargo tool with no prior tool state".to_string(),
                     );
                 }
                 request.options.forced_tool = Some(D32_CARGO_TOOL_NAME.to_string());
@@ -166,6 +157,8 @@ impl D32ForcedToolLatch {
             }
             D32ForcedToolPhase::AwaitingToolOutput { call_id } => {
                 if request.options.forced_tool.is_some()
+                    || request.options.tools.len() != 1
+                    || request.options.tools[0].name != D32_CARGO_TOOL_NAME
                     || request.tool_calls.len() != 1
                     || request.tool_outputs.len() != 1
                 {
@@ -179,6 +172,9 @@ impl D32ForcedToolLatch {
                 let output = &request.tool_outputs[0];
                 if call.name != D32_CARGO_TOOL_NAME
                     || call.id != *call_id
+                    || !crate::provider_gateway::d32_arguments_are_strict_empty_object(
+                        &call.arguments,
+                    )
                     || output.call_id != *call_id
                 {
                     *phase = D32ForcedToolPhase::Failed;
@@ -211,6 +207,9 @@ impl D32ForcedToolLatch {
                 if request.options.forced_tool.as_deref() != Some(D32_CARGO_TOOL_NAME)
                     || result.function_calls.len() != 1
                     || result.function_calls[0].name != D32_CARGO_TOOL_NAME
+                    || !crate::provider_gateway::d32_arguments_are_strict_empty_object(
+                        &result.function_calls[0].arguments,
+                    )
                     || result.finish_reason.as_deref() != Some("tool_calls")
                 {
                     *phase = D32ForcedToolPhase::Failed;
@@ -270,6 +269,11 @@ struct ActiveTurnTask {
     join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
 }
 
+struct TurnOwnerInstallError {
+    task: ActiveTurnTask,
+    message: String,
+}
+
 enum SidecarLoopEvent {
     Command(Result<Result<Option<HostMessage>, String>, tokio::task::JoinError>),
     Recovery(Result<Result<(), String>, tokio::task::JoinError>),
@@ -281,14 +285,21 @@ struct TurnOwner {
 }
 
 impl TurnOwner {
-    fn install(&self, task: ActiveTurnTask) -> Result<(), String> {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "Vita turn owner was poisoned".to_string())?;
+    fn install(&self, task: ActiveTurnTask) -> Result<(), TurnOwnerInstallError> {
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                return Err(TurnOwnerInstallError {
+                    task,
+                    message: "Vita turn owner was poisoned".to_string(),
+                });
+            }
+        };
         if active.is_some() {
-            task.join.abort();
-            return Err("Vita turn owner is already occupied".to_string());
+            return Err(TurnOwnerInstallError {
+                task,
+                message: "Vita turn owner is already occupied".to_string(),
+            });
         }
         *active = Some(task);
         Ok(())
@@ -2157,6 +2168,7 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
             recovery_store.clone(),
         ),
         cargo: cargo_production.contributor(),
+        cargo_only: d32_canary,
     };
     let (entrypoint, mut gateway_server) = if let Some(provider_config) = init.provider.as_ref() {
         provider_config.validate().map_err(protocol_error)?;
@@ -2430,7 +2442,8 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
                     Arc::clone(&turn_owner),
-                );
+                )
+                .await;
             }
             HostMessage::CancelTurn(message) if message.session_id == init.session_id => {
                 handle_cancel_turn(
@@ -2440,7 +2453,9 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
                     Arc::clone(&production),
                     Arc::clone(&cargo_production),
                     Arc::clone(&read_broker),
+                    Arc::clone(&read_authority),
                     Arc::clone(&replace_broker),
+                    Arc::clone(&replace_authority),
                     router.clone(),
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
@@ -2625,7 +2640,7 @@ async fn handle_execute_recovery(
     router.send(&VitaMessage::RecoveryResult(message))
 }
 
-fn handle_start_turn(
+async fn handle_start_turn(
     message: StartTurn,
     init: &InitializeSession,
     provider_config: Option<&ProviderConfiguration>,
@@ -2800,17 +2815,34 @@ fn handle_start_turn(
         cancel_notify,
         join,
     }) {
+        // The task was started before the owner lock was acquired.  An old
+        // task may still occupy the owner after its Host identity was
+        // cleared, so this cleanup must fence only the newly-started
+        // generation and contributors.  It must not interrupt the old
+        // runtime task that owns the shared Codex runtime.
+        production.cancel_turn();
+        cargo_production.cancel_turn();
+        read_broker.cancel_turn();
+        read_authority.cancel_turn();
+        replace_broker.cancel_turn();
+        replace_authority.cancel_turn();
         gateway_authority.deactivate_generation(&gateway_for_install_error);
         if let Ok(mut active) = active_identity_for_error.lock() {
-            active.take();
+            if active.as_ref() == Some(&identity) {
+                active.take();
+            }
         }
+        error.task.cancelled.store(true, Ordering::Release);
+        error.task.cancel_notify.notify_waiters();
+        error.task.join.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
         let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
             request_id,
             session_id: init.session_id.clone(),
             turn_id,
             phase: TurnPhase::Failed,
             error_code: "TURN_OWNER_UNAVAILABLE".to_string(),
-            message: bounded_protocol_text(&error, 256),
+            message: bounded_protocol_text(&error.message, 256),
         }));
     }
 }
@@ -2822,7 +2854,9 @@ async fn handle_cancel_turn(
     production: Arc<VitaGitStatusProduction>,
     cargo_production: Arc<VitaCargoCheckProduction>,
     read_broker: Arc<VitaWorkspaceReadBroker>,
+    read_authority: Arc<SidecarWorkspaceReadAuthority>,
     replace_broker: Arc<VitaWorkspaceReplaceBroker>,
+    replace_authority: Arc<SidecarWorkspaceReplaceAuthority>,
     router: SidecarRouter,
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
@@ -2846,7 +2880,9 @@ async fn handle_cancel_turn(
     production.cancel_turn();
     cargo_production.cancel_turn();
     read_broker.cancel_turn();
+    read_authority.cancel_turn();
     replace_broker.cancel_turn();
+    replace_authority.cancel_turn();
     let Some(task) = turn_owner.take(&identity) else {
         gateway_authority.deactivate(&identity);
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
@@ -3100,6 +3136,12 @@ impl SidecarWorkspaceReadAuthority {
     }
 
     fn begin_turn(&self) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.clear();
+        }
+    }
+
+    fn cancel_turn(&self) {
         if let Ok(mut grants) = self.grants.lock() {
             grants.clear();
         }
@@ -3541,6 +3583,12 @@ impl SidecarWorkspaceReplaceAuthority {
     }
 
     fn begin_turn(&self) {
+        if let Ok(mut grants) = self.grants.lock() {
+            grants.clear();
+        }
+    }
+
+    fn cancel_turn(&self) {
         if let Ok(mut grants) = self.grants.lock() {
             grants.clear();
         }
@@ -4097,6 +4145,10 @@ struct VitaProductionContributors {
     replace: VitaWorkspaceReplaceH5ToolContributor,
     patch: VitaWorkspacePatchToolContributor,
     cargo: VitaCargoCheckToolContributor,
+    /// The D32 canary has a deliberately closed provider/tool contract: the
+    /// provider must see exactly one advertised Cargo tool.  Other sidecar
+    /// modes retain the normal five-tool composition.
+    cargo_only: bool,
 }
 
 impl ToolContributor for VitaProductionContributors {
@@ -4107,6 +4159,9 @@ impl ToolContributor for VitaProductionContributors {
     ) -> Vec<
         Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
     > {
+        if self.cargo_only {
+            return self.cargo.tools(session_store, thread_store);
+        }
         let mut tools = self.git.tools(session_store, thread_store);
         tools.extend(self.read.tools(session_store, thread_store));
         tools.extend(self.replace.tools(session_store, thread_store));
@@ -4585,6 +4640,80 @@ mod tests {
     }
 
     #[test]
+    fn turn_owner_occupied_install_returns_new_task_for_bounded_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("owner race test runtime");
+        runtime.block_on(async {
+            let owner = TurnOwner::default();
+            let authority = GatewayAuthority::new();
+            let identity_a = ProviderRequestIdentity {
+                turn_id: "turn-a".to_string(),
+                binding_hash: "binding-a".to_string(),
+            };
+            let gateway_a = authority
+                .activate(identity_a.clone())
+                .expect("turn A gateway");
+            let old_cancelled = Arc::new(AtomicBool::new(false));
+            let old_notify = Arc::new(tokio::sync::Notify::new());
+            let old_join = tokio::spawn(async {
+                std::future::pending::<Result<String, crate::VitaAgentError>>().await
+            });
+            assert!(owner
+                .install(ActiveTurnTask {
+                    identity: identity_a.clone(),
+                    gateway: gateway_a,
+                    cancelled: old_cancelled,
+                    cancel_notify: old_notify,
+                    join: old_join,
+                })
+                .is_ok());
+
+            let identity_b = ProviderRequestIdentity {
+                turn_id: "turn-b".to_string(),
+                binding_hash: "binding-b".to_string(),
+            };
+            let gateway_b = GatewayAuthority::new()
+                .activate(identity_b.clone())
+                .expect("turn B gateway");
+            let new_cancelled = Arc::new(AtomicBool::new(false));
+            let new_notify = Arc::new(tokio::sync::Notify::new());
+            let new_join = tokio::spawn(async {
+                std::future::pending::<Result<String, crate::VitaAgentError>>().await
+            });
+            let failure = owner
+                .install(ActiveTurnTask {
+                    identity: identity_b.clone(),
+                    gateway: gateway_b,
+                    cancelled: Arc::clone(&new_cancelled),
+                    cancel_notify: Arc::clone(&new_notify),
+                    join: new_join,
+                })
+                .expect_err("owner occupancy must reject the new task");
+            assert_eq!(failure.message, "Vita turn owner is already occupied");
+            assert!(owner.take(&identity_b).is_none());
+
+            // The caller owns the rejected task and can now apply the same
+            // bounded cancel/abort/join sequence used by the production
+            // owner-install failure path without touching turn A.
+            new_cancelled.store(true, Ordering::Release);
+            new_notify.notify_waiters();
+            failure.task.join.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), failure.task.join)
+                .await
+                .expect("rejected task must be bounded");
+            let old_task = owner
+                .take(&identity_a)
+                .expect("old owner task remains installed");
+            old_task.join.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), old_task.join)
+                .await
+                .expect("old task cleanup must be bounded");
+        });
+    }
+
+    #[test]
     fn responses_request_parser_keeps_multiline_text_and_only_fixed_tool() {
         let body = serde_json::to_vec(&json!({
             "model": "model",
@@ -4743,6 +4872,101 @@ mod tests {
         missing.options.forced_tool = None;
         missing.tool_calls = result.function_calls.clone();
         assert!(latch.admit_request(&mut missing).is_err());
+        assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
+    }
+
+    #[test]
+    fn d32_forced_tool_latch_rejects_extra_advertised_tools_and_nonempty_arguments() {
+        let make_request = |tools| {
+            VitaResponsesRequest::new(
+                "model",
+                vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
+                VitaResponsesRequestOptions {
+                    tools,
+                    ..VitaResponsesRequestOptions::default()
+                },
+            )
+        };
+        let cargo = GatewayToolDefinition {
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            description: None,
+            parameters: json!({"type":"object"}),
+        };
+        let other = GatewayToolDefinition {
+            name: TOOL_NAME.to_string(),
+            description: None,
+            parameters: json!({"type":"object"}),
+        };
+
+        let extra_tool_latch = D32ForcedToolLatch::new();
+        let mut extra_tool = make_request(vec![cargo.clone(), other]);
+        assert!(extra_tool_latch.admit_request(&mut extra_tool).is_err());
+        assert_eq!(extra_tool_latch.phase(), D32ForcedToolPhase::Failed);
+
+        for arguments in ["{\"unexpected\":true}", "[]", "null", "malformed"] {
+            let latch = D32ForcedToolLatch::new();
+            let mut first = make_request(vec![cargo.clone()]);
+            latch.admit_request(&mut first).unwrap();
+            let result = crate::provider_gateway::VitaResponsesResult {
+                id: "first".to_string(),
+                model: "model".to_string(),
+                output_text: String::new(),
+                finish_reason: Some("tool_calls".to_string()),
+                usage: None,
+                function_calls: vec![VitaFunctionCall {
+                    id: "call-1".to_string(),
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    arguments: arguments.to_string(),
+                }],
+            };
+            assert!(latch.admit_response(&first, &result).is_err());
+            assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
+        }
+    }
+
+    #[test]
+    fn d32_forced_tool_latch_rejects_second_round_shape_drift() {
+        let latch = D32ForcedToolLatch::new();
+        let cargo = GatewayToolDefinition {
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            description: None,
+            parameters: json!({"type":"object"}),
+        };
+        let mut first = VitaResponsesRequest::new(
+            "model",
+            vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![cargo.clone()],
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        latch.admit_request(&mut first).unwrap();
+        let first_result = crate::provider_gateway::VitaResponsesResult {
+            id: "first".to_string(),
+            model: "model".to_string(),
+            output_text: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            function_calls: vec![VitaFunctionCall {
+                id: "call-1".to_string(),
+                name: D32_CARGO_TOOL_NAME.to_string(),
+                arguments: "{}".to_string(),
+            }],
+        };
+        latch.admit_response(&first, &first_result).unwrap();
+
+        let mut second = first;
+        second.options.forced_tool = None;
+        second.tool_calls.push(VitaFunctionCall {
+            id: "call-1".to_string(),
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            arguments: "{\"extra\":1}".to_string(),
+        });
+        second.tool_outputs.push(VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "{}".to_string(),
+        });
+        assert!(latch.admit_request(&mut second).is_err());
         assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
     }
 }

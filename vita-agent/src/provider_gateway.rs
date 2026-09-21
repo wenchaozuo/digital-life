@@ -1242,6 +1242,12 @@ fn validate_d32_request_response_contract(
     result: &VitaResponsesResult,
 ) -> Result<(), VitaAgentError> {
     if request.options.forced_tool.as_deref() == Some(D32_CARGO_TOOL_NAME) {
+        if request.options.tools.len() != 1 || request.options.tools[0].name != D32_CARGO_TOOL_NAME
+        {
+            return Err(VitaAgentError::GatewayProtocol(
+                "D32 first provider request must advertise exactly the Cargo tool".to_string(),
+            ));
+        }
         let Some(call) = result.function_calls.first() else {
             return Err(VitaAgentError::GatewayProtocol(
                 "D32 forced Cargo request did not return a tool call".to_string(),
@@ -1249,10 +1255,11 @@ fn validate_d32_request_response_contract(
         };
         if result.function_calls.len() != 1
             || call.name != D32_CARGO_TOOL_NAME
+            || !d32_arguments_are_strict_empty_object(&call.arguments)
             || result.finish_reason.as_deref() != Some("tool_calls")
         {
             return Err(VitaAgentError::GatewayProtocol(
-                "D32 first provider response must contain exactly one Cargo tool call".to_string(),
+                "D32 first provider response must contain exactly one Cargo tool call with empty arguments".to_string(),
             ));
         }
     }
@@ -1261,14 +1268,26 @@ fn validate_d32_request_response_contract(
         && request.tool_outputs.len() == 1
         && request.tool_calls[0].name == D32_CARGO_TOOL_NAME
         && request.tool_calls[0].id == request.tool_outputs[0].call_id;
-    if is_d32_tool_round
-        && (!result.function_calls.is_empty() || result.finish_reason.as_deref() != Some("stop"))
-    {
-        return Err(VitaAgentError::GatewayProtocol(
-            "D32 second provider response must stop without a tool call".to_string(),
-        ));
+    if is_d32_tool_round {
+        if request.options.tools.len() != 1
+            || request.options.tools[0].name != D32_CARGO_TOOL_NAME
+            || !d32_arguments_are_strict_empty_object(&request.tool_calls[0].arguments)
+            || !result.function_calls.is_empty()
+            || result.finish_reason.as_deref() != Some("stop")
+        {
+            return Err(VitaAgentError::GatewayProtocol(
+                "D32 second provider request/response did not satisfy the exact Cargo two-turn contract".to_string(),
+            ));
+        }
     }
     Ok(())
+}
+
+pub(crate) fn d32_arguments_are_strict_empty_object(arguments: &str) -> bool {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.is_empty()))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1587,17 +1606,18 @@ fn map_responses_request_to_chat(
         })
         .collect();
     // DeepSeek-compatible Chat Completions providers reject a named
-    // `tool_choice` while their default thinking mode is active.  The only
-    // runtime path that may set `forced_tool` is the D32 canary's first
-    // request, and both the exact Cargo tool and the exact currently
-    // supported DeepSeek model are required here as a second fail-closed
-    // fence.  Generic OpenAI-compatible providers must not receive this
-    // vendor extension.  Do not carry either field onto tool-output turns
-    // or ordinary production requests.
-    let thinking = d32_forced_cargo_tool(request.options.forced_tool.as_deref(), &request.model)
-        .then(|| ChatCompletionsThinking {
-            thinking_type: "disabled".to_string(),
-        });
+    // `tool_choice` while their default thinking mode is active.  This is a
+    // provider contract, not a model-name property: only the verified
+    // CommandCode endpoint is allowed to receive the vendor extension for
+    // the exact D32 model.  A generic endpoint using the same model fails
+    // closed rather than receiving a request whose named tool semantics are
+    // unverified.  Do not carry either field onto tool-output turns or
+    // ordinary production requests.
+    let thinking = d32_forced_cargo_tool(
+        request.options.forced_tool.as_deref(),
+        &request.model,
+        profile,
+    )?;
 
     Ok(ChatCompletionsRequest {
         model: request.model.clone(),
@@ -1615,17 +1635,38 @@ fn map_responses_request_to_chat(
 }
 
 const D32_DEEPSEEK_THINKING_MODEL: &str = "deepseek/deepseek-v4-flash";
+const D32_COMMANDCODE_ENDPOINT_HOST: &str = "api.commandcode.ai";
 
-fn d32_forced_cargo_tool(forced_tool: Option<&str>, model: &str) -> bool {
+fn d32_forced_cargo_tool(
+    forced_tool: Option<&str>,
+    model: &str,
+    profile: &ProviderProfile,
+) -> Result<Option<ChatCompletionsThinking>, VitaAgentError> {
+    if forced_tool != Some(D32_CARGO_TOOL_NAME) {
+        return Ok(None);
+    }
     #[cfg(windows)]
     {
-        forced_tool == Some(D32_CARGO_TOOL_NAME) && model == D32_DEEPSEEK_THINKING_MODEL
+        if model != D32_DEEPSEEK_THINKING_MODEL
+            || profile.endpoint.scheme != "https"
+            || profile.endpoint.host != D32_COMMANDCODE_ENDPOINT_HOST
+        {
+            return Err(VitaAgentError::GatewayProtocol(
+                "D32 forced Cargo requires the verified CommandCode endpoint and exact DeepSeek model"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(ChatCompletionsThinking {
+            thinking_type: "disabled".to_string(),
+        }))
     }
     #[cfg(not(windows))]
     {
-        let _ = forced_tool;
         let _ = model;
-        false
+        let _ = profile;
+        Err(VitaAgentError::GatewayProtocol(
+            "D32 forced Cargo is unavailable on this platform".to_string(),
+        ))
     }
 }
 
@@ -1743,6 +1784,11 @@ fn map_chat_response_to_responses_with_tools(
     }
     let function_calls =
         parse_chat_tool_calls_with_tools(&choice.message.tool_calls, advertised_tool_names)?;
+    if !function_calls.is_empty() && choice.message.content.is_some() {
+        return Err(VitaAgentError::GatewayProtocol(
+            "assistant tool-call response content must be JSON null".to_string(),
+        ));
+    }
     match (function_calls.is_empty(), choice.finish_reason.as_deref()) {
         (false, Some("tool_calls")) | (true, Some("stop")) => {}
         (false, _) => {
@@ -1820,7 +1866,8 @@ fn parse_chat_tool_calls_with_tools(
                 .any(|advertised| advertised == &name);
         if !is_vita_tool_name(&name) || !advertised {
             return Err(VitaAgentError::GatewayProtocol(
-                "provider returned an unadvertised Vita tool call".to_string(),
+                "provider returned an unadvertised Vita tool call (tools contract violation)"
+                    .to_string(),
             ));
         }
         let arguments = bounded_tool_string(
@@ -2329,7 +2376,7 @@ mod tests {
     #[test]
     fn d32_forced_tool_choice_maps_to_exact_chat_json() {
         let profile = profile_with_model(
-            "https://provider.example/v1",
+            "https://api.commandcode.ai/v1",
             None,
             all_mapping_capabilities(),
             D32_DEEPSEEK_THINKING_MODEL,
@@ -2363,14 +2410,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn d32_forced_cargo_tool_generic_model_preserves_model_and_omits_thinking() {
-        let profile = profile(
+    fn d32_forced_cargo_tool_generic_endpoint_fails_closed_without_thinking_extension() {
+        let profile = profile_with_model(
             "https://provider.example/v1",
             None,
             all_mapping_capabilities(),
+            D32_DEEPSEEK_THINKING_MODEL,
         );
         let request = VitaResponsesRequest::new(
-            "mock-model",
+            D32_DEEPSEEK_THINKING_MODEL,
             vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
             VitaResponsesRequestOptions {
                 tools: vec![GatewayToolDefinition {
@@ -2382,13 +2430,30 @@ mod tests {
                 ..VitaResponsesRequestOptions::default()
             },
         );
-        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
-        assert_eq!(mapped.model, "mock-model");
-        assert!(mapped.thinking.is_none());
-        assert_eq!(
-            serde_json::to_value(&mapped).unwrap()["thinking"],
-            Value::Null
+        assert!(matches!(
+            map_responses_request_to_chat(&request, &profile),
+            Err(VitaAgentError::GatewayProtocol(message))
+                if message.contains("verified CommandCode endpoint")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_exact_model_is_preserved_for_generic_non_forced_requests() {
+        let profile = profile_with_model(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+            D32_DEEPSEEK_THINKING_MODEL,
         );
+        let request = VitaResponsesRequest::new(
+            D32_DEEPSEEK_THINKING_MODEL,
+            vec![VitaMessage::text(VitaMessageRole::User, "hello")],
+            VitaResponsesRequestOptions::default(),
+        );
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert_eq!(mapped.model, D32_DEEPSEEK_THINKING_MODEL);
+        assert!(mapped.thinking.is_none());
     }
 
     #[cfg(windows)]
@@ -2613,6 +2678,38 @@ mod tests {
         ];
         assert!(parse_chat_tool_calls(&malformed).is_err());
         assert!(parse_chat_tool_calls(&[json!({"id":"call-1","type":"shell"})]).is_err());
+        assert!(d32_arguments_are_strict_empty_object("{}"));
+        assert!(d32_arguments_are_strict_empty_object(" { } "));
+        for arguments in ["{\"unexpected\":true}", "[]", "null", "not-json"] {
+            assert!(!d32_arguments_are_strict_empty_object(arguments));
+        }
+    }
+
+    #[test]
+    fn assistant_tool_call_content_must_be_null() {
+        let response = ChatCompletionsResponse {
+            id: "response".to_string(),
+            model: "mock-model".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: Some("unexpected text".to_string()),
+                    tool_calls: vec![json!({
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": TOOL_NAME, "arguments": "{}"}
+                    })],
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+        assert!(matches!(
+            map_chat_response_to_responses(response),
+            Err(VitaAgentError::GatewayProtocol(message))
+                if message.contains("content must be JSON null")
+        ));
     }
 
     #[test]

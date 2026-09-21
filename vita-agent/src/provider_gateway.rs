@@ -1283,6 +1283,10 @@ pub(crate) struct VitaResponsesRequestOptions {
     pub(crate) tools: Vec<GatewayToolDefinition>,
     pub(crate) parallel_tools: bool,
     pub(crate) required_capabilities: Vec<ProviderCapability>,
+    /// A canary-only first-request constraint.  The sidecar sets this only
+    /// after validating the exact advertised tool; ordinary production and
+    /// test requests leave it as `None`.
+    pub(crate) forced_tool: Option<String>,
 }
 
 impl Default for VitaResponsesRequestOptions {
@@ -1292,6 +1296,7 @@ impl Default for VitaResponsesRequestOptions {
             tools: Vec::new(),
             parallel_tools: false,
             required_capabilities: Vec::new(),
+            forced_tool: None,
         }
     }
 }
@@ -1338,6 +1343,8 @@ struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     tools: Vec<ChatCompletionsTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ChatCompletionsToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
 }
 
@@ -1356,6 +1363,18 @@ struct ChatCompletionsTool {
     #[serde(rename = "type")]
     tool_type: String,
     function: ChatCompletionsFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ChatCompletionsToolChoice {
+    #[serde(rename = "type")]
+    choice_type: String,
+    function: ChatCompletionsToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ChatCompletionsToolChoiceFunction {
+    name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1429,6 +1448,31 @@ fn map_responses_request_to_chat(
         require_capability(profile.capabilities, ProviderCapability::ParallelTools)?;
         require_gateway_capability(ProviderCapability::ParallelTools)?;
     }
+    let tool_choice = request
+        .options
+        .forced_tool
+        .as_deref()
+        .map(|name| {
+            if !request.tool_calls.is_empty() || !request.tool_outputs.is_empty() {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "forced tool choice is only valid on the first request".to_string(),
+                ));
+            }
+            if !is_vita_tool_name(name)
+                || !request.options.tools.iter().any(|tool| tool.name == name)
+            {
+                return Err(VitaAgentError::GatewayProtocol(
+                    "request contained an unadvertised forced Vita tool choice".to_string(),
+                ));
+            }
+            Ok(ChatCompletionsToolChoice {
+                choice_type: "function".to_string(),
+                function: ChatCompletionsToolChoiceFunction {
+                    name: name.to_string(),
+                },
+            })
+        })
+        .transpose()?;
 
     let mut messages = request
         .messages
@@ -1487,6 +1531,7 @@ fn map_responses_request_to_chat(
         messages,
         stream: request.options.stream,
         tools,
+        tool_choice,
         // A parallel-tool flag has no meaning when there are no tools.  Do
         // not leak that Responses-only control to broad Chat Completions
         // providers on the ordinary no-tools path.
@@ -2161,6 +2206,98 @@ mod tests {
             serde_json::to_string(&mapped).unwrap(),
             r#"{"model":"mock-model","messages":[{"role":"user","content":"use the tool"}],"stream":false,"tools":[{"type":"function","function":{"name":"lookup","description":"Look up a value","parameters":{"properties":{},"type":"object"}}}],"parallel_tool_calls":true}"#
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_forced_tool_choice_maps_to_exact_chat_json() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: Some("Run cargo".to_string()),
+                    parameters: json!({"type":"object","properties":{}}),
+                }],
+                forced_tool: Some(D32_CARGO_TOOL_NAME.to_string()),
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert_eq!(
+            serde_json::to_string(&mapped).unwrap(),
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"run cargo"}],"stream":false,"tools":[{"type":"function","function":{"name":"vita_workspace_cargo_check","description":"Run cargo","parameters":{"properties":{},"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"vita_workspace_cargo_check"}}}"#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_forced_tool_choice_rejects_an_unadvertised_name() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                }],
+                forced_tool: Some("not-advertised".to_string()),
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        assert!(matches!(
+            map_responses_request_to_chat(&request, &profile),
+            Err(VitaAgentError::GatewayProtocol(message))
+                if message.contains("unadvertised forced Vita tool choice")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_second_turn_omits_forced_tool_choice() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let mut request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                }],
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        request.tool_calls.push(VitaFunctionCall {
+            id: "call-1".to_string(),
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            arguments: "{}".to_string(),
+        });
+        request.tool_outputs.push(VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "{}".to_string(),
+        });
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert!(mapped.tool_choice.is_none());
+        assert!(!serde_json::to_string(&mapped)
+            .unwrap()
+            .contains("tool_choice"));
     }
 
     #[test]

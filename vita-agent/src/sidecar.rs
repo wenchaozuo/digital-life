@@ -821,6 +821,7 @@ impl VitaGatewayServer {
         active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
         gateway_authority: Arc<GatewayAuthority>,
         transport: SidecarGatewayTransport,
+        force_d32_cargo_tool: bool,
     ) -> Result<Self, crate::VitaAgentError> {
         listener
             .set_nonblocking(true)
@@ -846,6 +847,7 @@ impl VitaGatewayServer {
                                 &active_identity,
                                 &gateway_authority_for_thread,
                                 &transport_for_thread,
+                                force_d32_cargo_tool,
                             );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -889,6 +891,7 @@ fn handle_gateway_connection(
     active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: &Arc<GatewayAuthority>,
     transport: &SidecarGatewayTransport,
+    force_d32_cargo_tool: bool,
 ) -> Result<(), String> {
     if !peer.ip().is_loopback() {
         return write_gateway_error(&mut stream, "403 Forbidden", "GATEWAY_PEER_DENIED");
@@ -936,6 +939,8 @@ fn handle_gateway_connection(
             return write_gateway_error(&mut stream, "400 Bad Request", "REQUEST_INVALID");
         }
     };
+    let mut request = request;
+    apply_d32_canary_forced_tool_choice(&mut request, force_d32_cargo_tool);
     let resolver = SidecarCredentialResolver {
         router: router.clone(),
         session_id: session_id.to_string(),
@@ -1350,6 +1355,23 @@ fn parse_gateway_responses_request(
         tool_calls,
         tool_outputs,
     })
+}
+
+fn apply_d32_canary_forced_tool_choice(
+    request: &mut VitaResponsesRequest,
+    force_d32_cargo_tool: bool,
+) {
+    if force_d32_cargo_tool
+        && request.tool_calls.is_empty()
+        && request.tool_outputs.is_empty()
+        && request
+            .options
+            .tools
+            .iter()
+            .any(|tool| tool.name == D32_CARGO_TOOL_NAME)
+    {
+        request.options.forced_tool = Some(D32_CARGO_TOOL_NAME.to_string());
+    }
 }
 
 fn bounded_gateway_text(value: &str) -> Result<String, String> {
@@ -1949,6 +1971,7 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
             } else {
                 SidecarGatewayTransport::Production
             },
+            d32_canary,
         )
         .map_err(|error| format!("Vita local gateway startup failed: {error}"))?;
         let entrypoint =
@@ -4269,5 +4292,48 @@ mod tests {
         }))
         .unwrap();
         assert!(parse_gateway_responses_request(&invalid_id, "model").is_err());
+    }
+
+    #[test]
+    fn d32_forced_tool_choice_is_only_for_the_first_canary_request() {
+        let mut request = VitaResponsesRequest::new(
+            "model",
+            vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                }],
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+
+        apply_d32_canary_forced_tool_choice(&mut request, false);
+        assert!(request.options.forced_tool.is_none());
+        apply_d32_canary_forced_tool_choice(&mut request, true);
+        assert_eq!(
+            request.options.forced_tool.as_deref(),
+            Some(D32_CARGO_TOOL_NAME)
+        );
+
+        request.options.forced_tool = None;
+        request.tool_calls.push(VitaFunctionCall {
+            id: "call-1".to_string(),
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            arguments: "{}".to_string(),
+        });
+        request.tool_outputs.push(VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "{}".to_string(),
+        });
+        apply_d32_canary_forced_tool_choice(&mut request, true);
+        assert!(request.options.forced_tool.is_none());
+
+        request.tool_calls.clear();
+        request.tool_outputs.clear();
+        request.options.tools.clear();
+        apply_d32_canary_forced_tool_choice(&mut request, true);
+        assert!(request.options.forced_tool.is_none());
     }
 }

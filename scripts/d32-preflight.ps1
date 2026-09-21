@@ -32,6 +32,14 @@ param(
     [Alias('OutputRoot', 'LogRoot')]
     [string]$RunOutputRoot,
 
+    # Git is never resolved from PATH for a validation run.  The caller must
+    # supply the exact local executable and its expected SHA-256.  This script
+    # performs only advisory path/hash/identity checks; Host's retained-handle
+    # Git parser remains the security authority.
+    [string]$TrustedGitPath,
+
+    [string]$TrustedGitSha256,
+
     [string[]]$RequestedModes
 )
 
@@ -63,6 +71,14 @@ $script:D32RequiredProvenanceFields = @(
 )
 
 $script:D32BuildCommand = 'cargo build --manifest-path vita-agent/Cargo.toml --release --locked --bin vita-agent'
+$script:D32GitOutputLimit = 4096
+$script:D32GitTimeoutMilliseconds = 120000
+$script:D32SecurityClassification = [ordered]@{
+    advisory_only                   = $true
+    host_official_preflight_required = $true
+    git_image_validation             = 'path/hash/identity revalidation; not equivalent to a retained handle'
+    host_security_authority         = 'Host official preflight and retained-handle Git parser'
+}
 $script:D32BundleArtifactNames = @(
     'vita-agent.exe',
     'd32a-production-canary-host.exe',
@@ -274,26 +290,360 @@ function Get-D32FileDigest {
     }
 }
 
+function Get-D32SecurityClassification {
+    return [PSCustomObject]$script:D32SecurityClassification
+}
+
+function Test-D32AbsoluteFilesystemPath {
+    param([AllowNull()][string]$Path)
+
+    if ([String]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    # Path.IsPathRooted also accepts a drive-relative `C:foo` path.  Git image
+    # trust requires a fully-qualified drive or UNC path, including \\?\ paths.
+    return $Path -match '^(?:[A-Za-z]:[\\/]|\\\\)'
+}
+
+function Get-D32FileIdentity {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo]$Item)
+
+    return [PSCustomObject]@{
+        FullName             = [string]$Item.FullName
+        Length               = [Int64]$Item.Length
+        CreationTimeUtcTicks = [Int64]$Item.CreationTimeUtc.Ticks
+        LastWriteUtcTicks    = [Int64]$Item.LastWriteTimeUtc.Ticks
+        Attributes           = [int]$Item.Attributes
+    }
+}
+
+function Test-D32FileIdentityEqual {
+    param(
+        [AllowNull()][object]$Left,
+        [AllowNull()][object]$Right
+    )
+
+    if ($null -eq $Left -or $null -eq $Right) {
+        return $false
+    }
+    return [String]::Equals($Left.FullName, $Right.FullName, [StringComparison]::OrdinalIgnoreCase) -and
+        [Int64]$Left.Length -eq [Int64]$Right.Length -and
+        [Int64]$Left.CreationTimeUtcTicks -eq [Int64]$Right.CreationTimeUtcTicks -and
+        [Int64]$Left.LastWriteUtcTicks -eq [Int64]$Right.LastWriteUtcTicks -and
+        [int]$Left.Attributes -eq [int]$Right.Attributes
+}
+
+function Test-D32TrustedGitImage {
+    param(
+        [AllowNull()][string]$Path,
+        [AllowNull()][string]$ExpectedSha256
+    )
+
+    $result = [ordered]@{
+        IsValid        = $false
+        Path           = $null
+        ExpectedSha256 = $ExpectedSha256
+        ActualSha256   = $null
+        Identity       = $null
+        Failure        = 'trusted Git path/hash were not supplied'
+    }
+    if (-not (Test-D32AbsoluteFilesystemPath -Path $Path)) {
+        $result.Failure = 'trusted Git path must be an absolute drive or UNC path'
+        return [PSCustomObject]$result
+    }
+    if (-not (Test-D32Sha64 -Value $ExpectedSha256)) {
+        $result.Failure = 'trusted Git SHA-256 must be lowercase 64-hex'
+        return [PSCustomObject]$result
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer) {
+            $result.Failure = 'trusted Git path is a directory, not a regular file'
+            return [PSCustomObject]$result
+        }
+        if (([System.IO.FileAttributes]$item.Attributes).HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+            $result.Failure = 'trusted Git path is a reparse point'
+            return [PSCustomObject]$result
+        }
+        $identity = Get-D32FileIdentity -Item $item
+        $actual = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $result.Path = [string]$item.FullName
+        $result.ActualSha256 = $actual
+        $result.Identity = $identity
+        if ($actual -cne $ExpectedSha256) {
+            $result.Failure = 'trusted Git SHA-256 does not match the supplied digest'
+            return [PSCustomObject]$result
+        }
+        $result.IsValid = $true
+        $result.Failure = $null
+        return [PSCustomObject]$result
+    }
+    catch {
+        # Never echo an exception from Git/image inspection: it can contain
+        # config-derived paths or provider output.
+        $result.Failure = 'trusted Git path could not be inspected'
+        return [PSCustomObject]$result
+    }
+}
+
+function ConvertTo-D32ProcessArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $slashes++
+            continue
+        }
+        if ($character -eq '"') {
+            for ($index = 0; $index -lt (($slashes * 2) + 1); $index++) {
+                [void]$builder.Append('\')
+            }
+            [void]$builder.Append('"')
+            $slashes = 0
+            continue
+        }
+        for ($index = 0; $index -lt $slashes; $index++) {
+            [void]$builder.Append('\')
+        }
+        [void]$builder.Append($character)
+        $slashes = 0
+    }
+    for ($index = 0; $index -lt ($slashes * 2); $index++) {
+        [void]$builder.Append('\')
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-D32ProcessArguments {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    return (($Arguments | ForEach-Object { ConvertTo-D32ProcessArgument -Value ([string]$_) }) -join ' ')
+}
+
+function ConvertTo-D32GitOutput {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$StdOut,
+        [AllowNull()][string]$StdErr
+    )
+
+    # Only return data whose grammar is fixed by the command.  Status paths,
+    # stderr, config text, and all other Git output are deliberately discarded.
+    # The source strings are bounded before parsing so a noisy process cannot
+    # become a diagnostic/logging channel.
+    $stdoutValue = if ($null -eq $StdOut) { '' } else { $StdOut }
+    $stderrValue = if ($null -eq $StdErr) { '' } else { $StdErr }
+    $stdoutBounded = if ($stdoutValue.Length -gt $script:D32GitOutputLimit) {
+        $stdoutValue.Substring(0, $script:D32GitOutputLimit)
+    }
+    else {
+        $stdoutValue
+    }
+    $command = if ($Arguments.Count -gt 0) { [string]$Arguments[0] } else { '' }
+    $safeText = ''
+    if ($command -eq 'rev-parse' -or $command -eq 'merge-base') {
+        foreach ($line in ($stdoutBounded -split "`r?`n")) {
+            if ($line -cmatch '^\s*([0-9a-f]{40})\s*$') {
+                $safeText = $Matches[1]
+                break
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        Text            = $safeText
+        HasOutput       = -not [String]::IsNullOrWhiteSpace($stdoutValue)
+        HasErrorOutput  = -not [String]::IsNullOrWhiteSpace($stderrValue)
+        OutputTruncated = $stdoutValue.Length -gt $script:D32GitOutputLimit
+    }
+}
+
+function New-D32OwnedTempRoot {
+    param([Parameter(Mandatory = $true)][string]$Purpose)
+
+    $base = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $root = Join-Path $base ('d32-preflight-owned-' + $Purpose + '-' + [Guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop)
+    $token = [Guid]::NewGuid().ToString('N')
+    $marker = Join-Path $root 'd32-owned.marker'
+    [System.IO.File]::WriteAllText($marker, $token, (New-Object System.Text.UTF8Encoding($false)))
+    return [PSCustomObject]@{ Root = $root; Marker = $marker; Token = $token }
+}
+
+function Remove-D32OwnedTempRoot {
+    param(
+        [AllowNull()][string]$Root,
+        [AllowNull()][string]$Marker,
+        [AllowNull()][string]$Token
+    )
+
+    if ([String]::IsNullOrWhiteSpace($Root) -or [String]::IsNullOrWhiteSpace($Marker) -or [String]::IsNullOrWhiteSpace($Token)) {
+        return $false
+    }
+    try {
+        $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+        $markerItem = Get-Item -LiteralPath $Marker -Force -ErrorAction Stop
+        if (-not $rootItem.PSIsContainer -or $markerItem.PSIsContainer) {
+            return $false
+        }
+        if (([System.IO.FileAttributes]$rootItem.Attributes).HasFlag([System.IO.FileAttributes]::ReparsePoint) -or
+            ([System.IO.FileAttributes]$markerItem.Attributes).HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+            return $false
+        }
+        $rootFull = [System.IO.Path]::GetFullPath($rootItem.FullName).TrimEnd('\')
+        $markerFull = [System.IO.Path]::GetFullPath($markerItem.FullName)
+        if (-not [String]::Equals((Split-Path -Parent $markerFull).TrimEnd('\'), $rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        if (-not [String]::Equals([System.IO.File]::ReadAllText($markerFull), $Token, [StringComparison]::Ordinal)) {
+            return $false
+        }
+        Remove-Item -LiteralPath $rootItem.FullName -Recurse -Force -ErrorAction Stop
+        return -not (Test-Path -LiteralPath $rootItem.FullName)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-D32Git {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][string]$TrustedGitPath,
+        [AllowNull()][string]$TrustedGitSha256
     )
 
-    $exitCode = -1
-    $text = ''
+    $result = [ordered]@{
+        ExitCode         = -1
+        Text             = ''
+        HasOutput        = $false
+        HasErrorOutput   = $false
+        OutputTruncated  = $false
+        Failure          = $null
+        TrustedGitBefore = $null
+        TrustedGitAfter  = $null
+    }
+    $before = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
+    $result.TrustedGitBefore = $before
+    if (-not $before.IsValid) {
+        $result.Failure = $before.Failure
+        return [PSCustomObject]$result
+    }
+    $owned = $null
+    $process = $null
     try {
-        $output = @(& git -C $Repository @Arguments 2>&1)
-        $exitCode = $LASTEXITCODE
-        $text = (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
+        $owned = New-D32OwnedTempRoot -Purpose 'git'
+        $hooks = Join-Path $owned.Root 'hooks'
+        [void](New-Item -ItemType Directory -Path $hooks -Force -ErrorAction Stop)
+
+        $processArguments = @(
+            '--no-optional-locks',
+            '-c', 'core.fsmonitor=false',
+            '-c', 'core.untrackedCache=false',
+            '-c', "core.hooksPath=$hooks",
+            '-C', $Repository
+        ) + @($Arguments)
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $before.Path
+        $startInfo.Arguments = ConvertTo-D32ProcessArguments -Arguments $processArguments
+        $startInfo.WorkingDirectory = $Repository
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        # Remove ambient Git/credential/SSH controls before adding only the
+        # fixed isolated values.  The executable itself is still the explicit
+        # hash-checked path, never PATH lookup.
+        $environmentKeys = @($startInfo.EnvironmentVariables.Keys)
+        foreach ($key in $environmentKeys) {
+            if ($key -like 'GIT_*' -or $key -like 'GCM_*' -or $key -like 'SSH_*' -or
+                $key -in @('BASH_ENV', 'ENV', 'CDPATH', 'PROMPT_COMMAND', 'MSYS2_PATH_TYPE')) {
+                [void]$startInfo.EnvironmentVariables.Remove($key)
+            }
+        }
+        $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+        $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'
+        $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
+        $startInfo.EnvironmentVariables['GIT_CONFIG_COUNT'] = '0'
+        $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+        $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = 'Never'
+        $startInfo.EnvironmentVariables['GIT_ASKPASS'] = ''
+        $startInfo.EnvironmentVariables['GIT_EDITOR'] = 'd32-disabled-editor'
+        $startInfo.EnvironmentVariables['GIT_PAGER'] = 'cat'
+        $startInfo.EnvironmentVariables['PAGER'] = 'cat'
+        $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
+        $startInfo.EnvironmentVariables['HOME'] = $owned.Root
+        $startInfo.EnvironmentVariables['USERPROFILE'] = $owned.Root
+        $startInfo.EnvironmentVariables['APPDATA'] = $owned.Root
+        $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $owned.Root
+        $startInfo.EnvironmentVariables['XDG_CONFIG_HOME'] = $owned.Root
+        $startInfo.EnvironmentVariables['TMP'] = $owned.Root
+        $startInfo.EnvironmentVariables['TEMP'] = $owned.Root
+        if ($env:SystemRoot) { $startInfo.EnvironmentVariables['SystemRoot'] = $env:SystemRoot }
+        if ($env:WINDIR) { $startInfo.EnvironmentVariables['WINDIR'] = $env:WINDIR }
+        if ($env:ComSpec) { $startInfo.EnvironmentVariables['ComSpec'] = $env:ComSpec }
+        $gitDirectory = Split-Path -Parent $before.Path
+        $startInfo.EnvironmentVariables['Path'] = $gitDirectory
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'process did not start'
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($script:D32GitTimeoutMilliseconds)) {
+            try { $process.Kill() } catch { }
+            [void]$process.WaitForExit(5000)
+            $result.Failure = 'trusted Git process timed out'
+        }
+        else {
+            $stdout = ''
+            $stderr = ''
+            try { $stdout = $stdoutTask.Result } catch { }
+            try { $stderr = $stderrTask.Result } catch { }
+            $safeOutput = ConvertTo-D32GitOutput -Arguments $Arguments -StdOut $stdout -StdErr $stderr
+            $result.ExitCode = $process.ExitCode
+            $result.Text = $safeOutput.Text
+            $result.HasOutput = $safeOutput.HasOutput
+            $result.HasErrorOutput = $safeOutput.HasErrorOutput
+            $result.OutputTruncated = $safeOutput.OutputTruncated
+            if ($result.ExitCode -ne 0) {
+                $result.Failure = 'trusted Git command returned a non-zero exit code'
+            }
+        }
     }
     catch {
-        $text = $_.Exception.Message
+        if ($null -eq $result.Failure) {
+            $result.Failure = 'trusted Git process invocation failed'
+        }
     }
-    return [PSCustomObject]@{
-        ExitCode = $exitCode
-        Text     = $text
+    finally {
+        $after = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
+        $result.TrustedGitAfter = $after
+        if (-not $after.IsValid) {
+            $result.ExitCode = -1
+            $result.Failure = 'trusted Git image failed post-execution revalidation'
+        }
+        elseif (-not (Test-D32FileIdentityEqual -Left $before.Identity -Right $after.Identity)) {
+            $result.ExitCode = -1
+            $result.Failure = 'trusted Git image identity changed during execution'
+        }
+        if ($null -ne $owned -and -not (Remove-D32OwnedTempRoot -Root $owned.Root -Marker $owned.Marker -Token $owned.Token)) {
+            $result.ExitCode = -1
+            $result.Failure = 'owned Git environment cleanup failed'
+        }
     }
+    return [PSCustomObject]$result
 }
 
 function Test-D32Sha40 {
@@ -336,13 +686,15 @@ function Test-D32NonNegativeInt64 {
 function Get-D32Head {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$TrustedGitPath,
+        [Parameter(Mandatory = $true)][string]$TrustedGitSha256,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Findings
     )
 
-    $result = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', 'HEAD')
+    $result = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
     $head = $result.Text.Trim()
     if ($result.ExitCode -ne 0 -or -not (Test-D32Sha40 -Value $head)) {
-        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.head' -Message "exact HEAD could not be read: $($result.Text)"
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.head' -Message 'exact HEAD could not be read from the trusted Git image'
         return $null
     }
     Add-D32Finding -Findings $Findings -Severity PASS -Check 'git.head' -Message "HEAD=$head"
@@ -352,17 +704,18 @@ function Get-D32Head {
 function Test-D32GitClean {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$TrustedGitPath,
+        [Parameter(Mandatory = $true)][string]$TrustedGitSha256,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Findings
     )
 
-    $result = Invoke-D32Git -Repository $Repository -Arguments @('status', '--porcelain=v1', '--untracked-files=all')
+    $result = Invoke-D32Git -Repository $Repository -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
     if ($result.ExitCode -ne 0) {
-        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.clean' -Message "git status failed: $($result.Text)"
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.clean' -Message 'trusted Git status failed; raw Git output is suppressed'
         return $false
     }
-    if (-not [String]::IsNullOrWhiteSpace($result.Text)) {
-        $short = $result.Text.Replace([Environment]::NewLine, '; ')
-        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.clean' -Message "working tree is dirty: $short"
+    if ($result.HasOutput) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.clean' -Message 'working tree is dirty (path details suppressed)'
         return $false
     }
     Add-D32Finding -Findings $Findings -Severity PASS -Check 'git.clean' -Message 'working tree is clean'
@@ -372,6 +725,8 @@ function Test-D32GitClean {
 function Test-D32BaseInputs {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$TrustedGitPath,
+        [Parameter(Mandatory = $true)][string]$TrustedGitSha256,
         [AllowNull()][string]$Head,
         [AllowNull()][string]$Base,
         [AllowNull()][string]$MergeBase,
@@ -388,7 +743,7 @@ function Test-D32BaseInputs {
             Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.base' -Message "base is not a lowercase 40-hex commit: $Base"
         }
         elseif ($null -ne $Head) {
-            $ancestor = Invoke-D32Git -Repository $Repository -Arguments @('merge-base', '--is-ancestor', $Base, $Head)
+            $ancestor = Invoke-D32Git -Repository $Repository -Arguments @('merge-base', '--is-ancestor', $Base, $Head) -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
             if ($ancestor.ExitCode -ne 0) {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.base' -Message "base $Base is not an ancestor of HEAD $Head"
             }
@@ -403,7 +758,7 @@ function Test-D32BaseInputs {
             Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.merge-base' -Message "merge-base is not a lowercase 40-hex commit: $MergeBase"
         }
         elseif ($null -ne $Head -and -not [String]::IsNullOrWhiteSpace($Base) -and (Test-D32Sha40 -Value $Base)) {
-            $computed = Invoke-D32Git -Repository $Repository -Arguments @('merge-base', $Head, $Base)
+            $computed = Invoke-D32Git -Repository $Repository -Arguments @('merge-base', $Head, $Base) -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
             $computedValue = $computed.Text.Trim()
             if ($computed.ExitCode -ne 0 -or $computedValue -cne $MergeBase) {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.merge-base' -Message "expected $MergeBase but computed $computedValue"
@@ -413,7 +768,7 @@ function Test-D32BaseInputs {
             }
         }
         elseif ($null -ne $Head) {
-            $resolved = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', "$MergeBase^{commit}")
+            $resolved = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', "$MergeBase^{commit}") -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
             if ($resolved.ExitCode -ne 0 -or $resolved.Text.Trim() -cne $MergeBase) {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check 'git.merge-base' -Message "merge-base commit could not be resolved exactly: $MergeBase"
             }
@@ -830,6 +1185,8 @@ function Invoke-D32Validation {
         [Parameter(Mandatory = $true)][string]$Manifest,
         [Parameter(Mandatory = $true)][string]$Image,
         [Parameter(Mandatory = $true)][string]$BundleManifest,
+        [AllowNull()][string]$TrustedGitPath,
+        [AllowNull()][string]$TrustedGitSha256,
         [AllowNull()][string]$ExpectedCandidateSha,
         [AllowNull()][string]$Base,
         [AllowNull()][string]$MergeBase,
@@ -838,14 +1195,23 @@ function Invoke-D32Validation {
     )
 
     $findings = New-D32FindingList
+    $classification = Get-D32SecurityClassification
+    Add-D32Finding -Findings $findings -Severity INFO -Check 'security.classification' -Message 'advisory_only=true; host_official_preflight_required=true; path/hash Git checks are not retained-handle authority'
+    $trustedGit = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
+    if (-not $trustedGit.IsValid) {
+        Add-D32Finding -Findings $findings -Severity ERROR -Check 'git.trusted-image' -Message "explicit trusted Git image is required and failed validation: $($trustedGit.Failure)"
+    }
+    else {
+        Add-D32Finding -Findings $findings -Severity PASS -Check 'git.trusted-image' -Message 'explicit trusted Git regular/non-reparse image and SHA-256 validated (advisory only)'
+    }
     $head = $null
     if (-not (Test-Path -LiteralPath $Repository -PathType Container)) {
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'repository' -Message "repository root is not an existing directory: $Repository"
     }
-    else {
-        $head = Get-D32Head -Repository $Repository -Findings $findings
-        [void](Test-D32GitClean -Repository $Repository -Findings $findings)
-        Test-D32BaseInputs -Repository $Repository -Head $head -Base $Base -MergeBase $MergeBase -Findings $findings
+    elseif ($trustedGit.IsValid) {
+        $head = Get-D32Head -Repository $Repository -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -Findings $findings
+        [void](Test-D32GitClean -Repository $Repository -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -Findings $findings)
+        Test-D32BaseInputs -Repository $Repository -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -Head $head -Base $Base -MergeBase $MergeBase -Findings $findings
         if (-not [String]::IsNullOrWhiteSpace($ExpectedCandidateSha)) {
             if (-not (Test-D32Sha40 -Value $ExpectedCandidateSha)) {
                 Add-D32Finding -Findings $findings -Severity ERROR -Check 'git.expected-sha' -Message "expected SHA is not lowercase 40-hex: $ExpectedCandidateSha"
@@ -933,6 +1299,7 @@ function Invoke-D32Validation {
         Success        = $errors.Count -eq 0
         Findings       = $findings
         ValidatedModes  = if ($modeResult.IsValid) { [string[]]$modeResult.Modes } else { [string[]]@() }
+        SecurityClassification = $classification
     }
 }
 
@@ -940,21 +1307,32 @@ function Invoke-D32GenerateManifest {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$Manifest,
-        [Parameter(Mandatory = $true)][string]$Image
+        [Parameter(Mandatory = $true)][string]$Image,
+        [AllowNull()][string]$TrustedGitPath,
+        [AllowNull()][string]$TrustedGitSha256
     )
 
     $findings = New-D32FindingList
+    $classification = Get-D32SecurityClassification
+    Add-D32Finding -Findings $findings -Severity INFO -Check 'security.classification' -Message 'advisory_only=true; host_official_preflight_required=true; path/hash Git checks are not retained-handle authority'
+    $trustedGit = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
+    if (-not $trustedGit.IsValid) {
+        Add-D32Finding -Findings $findings -Severity ERROR -Check 'git.trusted-image' -Message "explicit trusted Git image is required and failed validation: $($trustedGit.Failure)"
+    }
+    else {
+        Add-D32Finding -Findings $findings -Severity PASS -Check 'git.trusted-image' -Message 'explicit trusted Git regular/non-reparse image and SHA-256 validated (advisory only)'
+    }
     if (Test-Path -LiteralPath $Manifest) {
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'provenance.generate' -Message "refusing to overwrite existing target manifest: $Manifest"
-        return [PSCustomObject]@{ Success = $false; Findings = $findings }
+        return [PSCustomObject]@{ Success = $false; Findings = $findings; SecurityClassification = $classification }
     }
     if (-not (Test-Path -LiteralPath $Repository -PathType Container)) {
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'repository' -Message "repository root is not an existing directory: $Repository"
     }
     $head = $null
-    if (Test-Path -LiteralPath $Repository -PathType Container) {
-        $head = Get-D32Head -Repository $Repository -Findings $findings
-        [void](Test-D32GitClean -Repository $Repository -Findings $findings)
+    if ((Test-Path -LiteralPath $Repository -PathType Container) -and $trustedGit.IsValid) {
+        $head = Get-D32Head -Repository $Repository -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -Findings $findings
+        [void](Test-D32GitClean -Repository $Repository -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -Findings $findings)
     }
     $releaseImageInput = Join-Path $Repository 'vita-agent\target\release\vita-agent.exe'
     if (-not (Test-D32PathEqual -Left (Get-D32AbsolutePath -Path $Image) -Right (Get-D32AbsolutePath -Path $releaseImageInput))) {
@@ -969,7 +1347,7 @@ function Invoke-D32GenerateManifest {
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'image.file' -Message "release image is missing or unreadable: $Image"
     }
     if ($null -eq $head -or $null -eq $source -or $null -eq $imageCanonical -or $null -eq $digest -or @($findings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) {
-        return [PSCustomObject]@{ Success = $false; Findings = $findings }
+        return [PSCustomObject]@{ Success = $false; Findings = $findings; SecurityClassification = $classification }
     }
     $document = [ordered]@{
         candidate_sha = $head
@@ -1001,9 +1379,9 @@ function Invoke-D32GenerateManifest {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         }
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'provenance.generate' -Message $_.Exception.Message
-        return [PSCustomObject]@{ Success = $false; Findings = $findings }
+        return [PSCustomObject]@{ Success = $false; Findings = $findings; SecurityClassification = $classification }
     }
-    return [PSCustomObject]@{ Success = $true; Findings = $findings; Manifest = $Manifest }
+    return [PSCustomObject]@{ Success = $true; Findings = $findings; Manifest = $Manifest; SecurityClassification = $classification }
 }
 
 function Write-D32Result {
@@ -1014,6 +1392,12 @@ function Write-D32Result {
 
     $status = if ($Result.Success) { 'PASS' } else { 'BLOCKED' }
     Write-Output ("D32 aggregate {0}: {1}" -f $Operation, $status)
+    if ($null -ne $Result.PSObject.Properties['SecurityClassification']) {
+        $classification = $Result.SecurityClassification
+        Write-Output ("security_classification.advisory_only={0}" -f ([bool]$classification.advisory_only).ToString().ToLowerInvariant())
+        Write-Output ("security_classification.host_official_preflight_required={0}" -f ([bool]$classification.host_official_preflight_required).ToString().ToLowerInvariant())
+        Write-Output ("security_classification.git_image_validation={0}" -f $classification.git_image_validation)
+    }
     foreach ($finding in $Result.Findings) {
         Write-Output ("[{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message)
     }
@@ -1045,6 +1429,9 @@ function Assert-D32SelfTest {
 function Invoke-D32SelfTest {
     $failures = New-D32FindingList
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ('d32-preflight-selftest-' + [Guid]::NewGuid().ToString('N'))
+    $rootToken = [Guid]::NewGuid().ToString('N')
+    $rootMarker = Join-Path $root 'd32-selftest-owned.marker'
+    $rootOwned = $false
     $fixture = Join-Path $root 'repo'
     $bundleRoot = Join-Path $root 'bundle'
     $buildRoot = Join-Path $root 'build'
@@ -1054,6 +1441,8 @@ function Invoke-D32SelfTest {
     $image = Join-Path $fixture 'vita-agent\target\release\vita-agent.exe'
     try {
         [void](New-Item -ItemType Directory -Path $fixture -Force)
+        [System.IO.File]::WriteAllText($rootMarker, $rootToken, (New-Object System.Text.UTF8Encoding($false)))
+        $rootOwned = $true
         [void](New-Item -ItemType Directory -Path $bundleRoot -Force)
         [void](New-Item -ItemType Directory -Path $buildRoot -Force)
         foreach ($relative in @(
@@ -1069,6 +1458,35 @@ function Invoke-D32SelfTest {
         }
         [void](New-Item -ItemType Directory -Path (Split-Path -Parent $image) -Force)
         [System.IO.File]::WriteAllBytes($image, [Text.Encoding]::UTF8.GetBytes('d32-selftest-release-image'))
+
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $trustedGitPath = [string]$gitCommand.Source
+        if ([String]::IsNullOrWhiteSpace($trustedGitPath)) {
+            $trustedGitPath = [string]$gitCommand.Path
+        }
+        $trustedGitHash = (Get-FileHash -LiteralPath $trustedGitPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $validTrustedGit = Test-D32TrustedGitImage -Path $trustedGitPath -ExpectedSha256 $trustedGitHash
+        Assert-D32SelfTest -Condition $validTrustedGit.IsValid -Name 'explicit fixed trusted Git image is accepted' -Failures $failures
+        Assert-D32SelfTest -Condition (-not (Test-D32TrustedGitImage -Path $null -ExpectedSha256 $trustedGitHash).IsValid) -Name 'missing trusted Git path is rejected' -Failures $failures
+        Assert-D32SelfTest -Condition (-not (Test-D32TrustedGitImage -Path $trustedGitPath -ExpectedSha256 ('0' * 64)).IsValid) -Name 'wrong trusted Git hash is rejected' -Failures $failures
+        $classification = Get-D32SecurityClassification
+        Assert-D32SelfTest -Condition ([bool]$classification.advisory_only -and [bool]$classification.host_official_preflight_required) -Name 'Host-required advisory security classification is explicit' -Failures $failures
+        $secret = 'D32-SECRET-CONFIG-OUTPUT'
+        $safeOutput = ConvertTo-D32GitOutput -Arguments @('status', '--porcelain=v1') -StdOut ("?? $secret`n") -StdErr $secret
+        Assert-D32SelfTest -Condition ((-not $safeOutput.Text.Contains($secret)) -and $safeOutput.HasOutput) -Name 'malicious Git output is bounded and not echoed' -Failures $failures
+
+        $reparseGitPath = Join-Path $root 'reparse-git.exe'
+        $reparseCreated = $false
+        try {
+            [void](New-Item -ItemType SymbolicLink -LiteralPath $reparseGitPath -Target $trustedGitPath -ErrorAction Stop)
+            $reparseCreated = $true
+        }
+        catch {
+            Write-Host 'SELFTEST INFO: reparse fixture unavailable; platform privilege did not allow a file symlink'
+        }
+        if ($reparseCreated) {
+            Assert-D32SelfTest -Condition (-not (Test-D32TrustedGitImage -Path $reparseGitPath -ExpectedSha256 $trustedGitHash).IsValid) -Name 'reparse trusted Git image is rejected' -Failures $failures
+        }
         $artifactSpecs = @(
             @{ Name = 'vita-agent.exe'; Build = (Join-Path $buildRoot 'vita\release\vita-agent.exe'); Content = 'vita-artifact' },
             @{ Name = 'd32a-production-canary-host.exe'; Build = (Join-Path $buildRoot 'host\release\d32a-production-canary-host.exe'); Content = 'host-artifact' },
@@ -1093,15 +1511,15 @@ function Invoke-D32SelfTest {
                 exact_match = $true
             }
         }
-        $git = Invoke-D32Git -Repository $fixture -Arguments @('init', '-q')
-        if ($git.ExitCode -ne 0) { throw "git init failed: $($git.Text)" }
-        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.email', 'd32-selftest@example.invalid'))
-        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.name', 'D32 Selftest'))
-        $git = Invoke-D32Git -Repository $fixture -Arguments @('add', '.')
-        if ($git.ExitCode -ne 0) { throw "git add failed: $($git.Text)" }
-        $git = Invoke-D32Git -Repository $fixture -Arguments @('commit', '-q', '-m', 'selftest fixture')
-        if ($git.ExitCode -ne 0) { throw "git commit failed: $($git.Text)" }
-        $head = (Invoke-D32Git -Repository $fixture -Arguments @('rev-parse', '--verify', 'HEAD')).Text.Trim()
+        $git = Invoke-D32Git -Repository $fixture -Arguments @('init', '-q') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
+        if ($git.ExitCode -ne 0) { throw 'trusted Git init failed' }
+        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.email', 'd32-selftest@example.invalid') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash)
+        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.name', 'D32 Selftest') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash)
+        $git = Invoke-D32Git -Repository $fixture -Arguments @('add', '.') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
+        if ($git.ExitCode -ne 0) { throw 'trusted Git add failed' }
+        $git = Invoke-D32Git -Repository $fixture -Arguments @('commit', '-q', '-m', 'selftest fixture') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
+        if ($git.ExitCode -ne 0) { throw 'trusted Git commit failed' }
+        $head = (Invoke-D32Git -Repository $fixture -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash).Text.Trim()
         $bundleDocument = [ordered]@{
             candidate_sha = $head
             source_clone = Get-D32AbsolutePath -Path $fixture
@@ -1116,69 +1534,73 @@ function Invoke-D32SelfTest {
         }
         $bundleManifest = Join-Path $bundleRoot 'BUNDLE-MANIFEST.json'
         Write-D32Json -Path $bundleManifest -Value $bundleDocument
-        $generatedResult = Invoke-D32GenerateManifest -Repository $fixture -Manifest $provenance -Image $image
+        $generatedResult = Invoke-D32GenerateManifest -Repository $fixture -Manifest $provenance -Image $image -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         Assert-D32SelfTest -Condition $generatedResult.Success -Name 'atomic generation on a missing target' -Failures $failures
         $generatedObject = [System.IO.File]::ReadAllText($provenance) | ConvertFrom-Json
         $sourceFormCorrect = $generatedObject.source_repo -ceq (Get-D32RustRepositoryPath -Path $fixture)
         $imageFormCorrect = -not (Test-D32Windows) -or $generatedObject.image_path.StartsWith('\\?\', [StringComparison]::Ordinal)
         Assert-D32SelfTest -Condition ($sourceFormCorrect -and $imageFormCorrect) -Name 'Host source_repo ordinary/image_path extended path asymmetry' -Failures $failures
-        $validResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run') -Modes $null
+        $validResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run') -Modes $null
         if (-not $validResult.Success) {
             foreach ($finding in $validResult.Findings) {
                 Write-Host ("  VALID FIXTURE [{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message)
             }
         }
         Assert-D32SelfTest -Condition $validResult.Success -Name 'valid fixture aggregate validation' -Failures $failures
+        $missingTrustResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-missing-trust') -Modes $null
+        Assert-D32SelfTest -Condition ((-not $missingTrustResult.Success) -and @($missingTrustResult.Findings | Where-Object { $_.Check -eq 'git.trusted-image' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'validation requires explicit trusted Git path and hash' -Failures $failures
 
         $validJson = [System.IO.File]::ReadAllText($provenance)
         $missingField = $validJson | ConvertFrom-Json
         [void]$missingField.PSObject.Properties.Remove('git_status')
         Write-D32Json -Path $provenance -Value $missingField
-        $missingResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-2') -Modes $null
+        $missingResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-2') -Modes $null
         Assert-D32SelfTest -Condition (-not $missingResult.Success) -Name 'missing provenance field is reported' -Failures $failures
 
         $wrongPath = $validJson | ConvertFrom-Json
         $wrongPath.image_path = [System.IO.Path]::GetFullPath($image)
         Write-D32Json -Path $provenance -Value $wrongPath
-        $wrongPathResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-3') -Modes $null
+        $wrongPathResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-3') -Modes $null
         Assert-D32SelfTest -Condition (-not $wrongPathResult.Success) -Name 'ordinary image path is rejected' -Failures $failures
 
         $wrongHash = $validJson | ConvertFrom-Json
         $wrongHash.image_sha256 = ('0' * 64)
         Write-D32Json -Path $provenance -Value $wrongHash
-        $wrongHashResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-4') -Modes $null
+        $wrongHashResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-4') -Modes $null
         Assert-D32SelfTest -Condition (-not $wrongHashResult.Success) -Name 'image hash mismatch is reported' -Failures $failures
 
         Write-D32Json -Path $provenance -Value ($validJson | ConvertFrom-Json)
         $dirtyMarker = Join-Path $fixture 'dirty-marker.txt'
         [System.IO.File]::WriteAllText($dirtyMarker, 'dirty')
-        $dirtyResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-5') -Modes $null
+        $dirtyResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-5') -Modes $null
         Assert-D32SelfTest -Condition (-not $dirtyResult.Success) -Name 'dirty repository is reported' -Failures $failures
         Remove-Item -LiteralPath $dirtyMarker -Force
 
         $unknownModes = @($script:D32CanonicalModes + @('unknown-mode'))
-        $unknownModeResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-6') -Modes $unknownModes
+        $unknownModeResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-6') -Modes $unknownModes
         Assert-D32SelfTest -Condition (-not $unknownModeResult.Success) -Name 'unknown mode is reported' -Failures $failures
 
         [System.IO.File]::WriteAllText($existing, 'sentinel')
         $before = [System.IO.File]::ReadAllText($existing)
-        $existingResult = Invoke-D32GenerateManifest -Repository $fixture -Manifest $existing -Image $image
+        $existingResult = Invoke-D32GenerateManifest -Repository $fixture -Manifest $existing -Image $image -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         $after = [System.IO.File]::ReadAllText($existing)
         Assert-D32SelfTest -Condition ((-not $existingResult.Success) -and $before -ceq $after) -Name 'existing target is never overwritten' -Failures $failures
 
         $existingRunRoot = Join-Path $root 'existing-run'
         [void](New-Item -ItemType Directory -Path $existingRunRoot -Force)
-        $existingRunResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot $existingRunRoot -Modes $null
+        $existingRunResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot $existingRunRoot -Modes $null
         Assert-D32SelfTest -Condition (-not $existingRunResult.Success) -Name 'existing run output root is rejected' -Failures $failures
-        Remove-Item -LiteralPath $existingRunRoot -Recurse -Force
+        # The existing-run fixture is deliberately inside the owned root; the
+        # final exact-marker cleanup removes the one self-test root.
     }
     catch {
-        Write-Host "SELFTEST ERROR: $($_.Exception.Message)"
-        [void]$failures.Add($_.Exception.Message)
+        Write-Host 'SELFTEST ERROR: setup or assertion failed'
+        [void]$failures.Add('setup or assertion failed')
     }
     finally {
-        if (Test-Path -LiteralPath $root) {
-            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        if ($rootOwned -and -not (Remove-D32OwnedTempRoot -Root $root -Marker $rootMarker -Token $rootToken)) {
+            Write-Host 'SELFTEST ERROR: owned temp root failed exact-marker/reparse cleanup'
+            [void]$failures.Add('owned temp root cleanup failed')
         }
     }
     if ($failures.Count -eq 0) {
@@ -1215,13 +1637,13 @@ if ($GenerateManifest -and $ValidateOnly) {
 }
 
 if ($GenerateManifest) {
-    $generation = Invoke-D32GenerateManifest -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath
+    $generation = Invoke-D32GenerateManifest -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256
     Write-D32Result -Operation 'manifest generation' -Result $generation
     if ($generation.Success) { exit 0 }
     exit 1
 }
 
-$validation = Invoke-D32Validation -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath -BundleManifest $BundleManifestPath -ExpectedCandidateSha $ExpectedSha -Base $BaseSha -MergeBase $MergeBaseSha -RunRoot $RunOutputRoot -Modes $RequestedModes
+$validation = Invoke-D32Validation -Repository $RepoRoot -Manifest $ManifestPath -Image $ImagePath -BundleManifest $BundleManifestPath -TrustedGitPath $TrustedGitPath -TrustedGitSha256 $TrustedGitSha256 -ExpectedCandidateSha $ExpectedSha -Base $BaseSha -MergeBase $MergeBaseSha -RunRoot $RunOutputRoot -Modes $RequestedModes
 Write-D32Result -Operation 'preflight' -Result $validation
 if ($validation.Success) { exit 0 }
 exit 1

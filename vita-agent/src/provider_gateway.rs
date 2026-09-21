@@ -1345,6 +1345,8 @@ struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ChatCompletionsToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ChatCompletionsThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
 }
 
@@ -1375,6 +1377,12 @@ struct ChatCompletionsToolChoice {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ChatCompletionsToolChoiceFunction {
     name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ChatCompletionsThinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1525,6 +1533,17 @@ fn map_responses_request_to_chat(
             },
         })
         .collect();
+    // DeepSeek-compatible Chat Completions providers reject a named
+    // `tool_choice` while their default thinking mode is active.  The only
+    // runtime path that may set `forced_tool` is the D32 canary's first
+    // request, and the exact Cargo tool name is required here as a second
+    // fail-closed fence.  Do not carry this field onto tool-output turns or
+    // ordinary production requests.
+    let thinking = d32_forced_cargo_tool(request.options.forced_tool.as_deref()).then(|| {
+        ChatCompletionsThinking {
+            thinking_type: "disabled".to_string(),
+        }
+    });
 
     Ok(ChatCompletionsRequest {
         model: request.model.clone(),
@@ -1532,12 +1551,25 @@ fn map_responses_request_to_chat(
         stream: request.options.stream,
         tools,
         tool_choice,
+        thinking,
         // A parallel-tool flag has no meaning when there are no tools.  Do
         // not leak that Responses-only control to broad Chat Completions
         // providers on the ordinary no-tools path.
         parallel_tool_calls: (!request.options.tools.is_empty() && request.options.parallel_tools)
             .then_some(true),
     })
+}
+
+fn d32_forced_cargo_tool(forced_tool: Option<&str>) -> bool {
+    #[cfg(windows)]
+    {
+        forced_tool == Some(D32_CARGO_TOOL_NAME)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = forced_tool;
+        false
+    }
 }
 
 fn require_capability(
@@ -2232,8 +2264,35 @@ mod tests {
         let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
         assert_eq!(
             serde_json::to_string(&mapped).unwrap(),
-            r#"{"model":"mock-model","messages":[{"role":"user","content":"run cargo"}],"stream":false,"tools":[{"type":"function","function":{"name":"vita_workspace_cargo_check","description":"Run cargo","parameters":{"properties":{},"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"vita_workspace_cargo_check"}}}"#
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"run cargo"}],"stream":false,"tools":[{"type":"function","function":{"name":"vita_workspace_cargo_check","description":"Run cargo","parameters":{"properties":{},"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"vita_workspace_cargo_check"}},"thinking":{"type":"disabled"}}"#
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_thinking_is_not_emitted_for_a_non_d32_forced_tool() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "run git status")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: TOOL_NAME.to_string(),
+                    description: Some("Run Git status".to_string()),
+                    parameters: json!({"type":"object","properties":{}}),
+                }],
+                forced_tool: Some(TOOL_NAME.to_string()),
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert!(mapped.thinking.is_none());
+        assert!(mapped.tool_choice.is_some());
+        assert!(!serde_json::to_string(&mapped).unwrap().contains("thinking"));
     }
 
     #[cfg(windows)]
@@ -2295,9 +2354,11 @@ mod tests {
         });
         let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
         assert!(mapped.tool_choice.is_none());
+        assert!(mapped.thinking.is_none());
         assert!(!serde_json::to_string(&mapped)
             .unwrap()
             .contains("tool_choice"));
+        assert!(!serde_json::to_string(&mapped).unwrap().contains("thinking"));
     }
 
     #[test]

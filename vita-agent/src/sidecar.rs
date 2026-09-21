@@ -1603,6 +1603,30 @@ fn vita_request_id(message: &VitaMessage) -> &str {
     }
 }
 
+fn initialize_recovery_store(
+    profile: &VitaAgentRuntimeProfile,
+    app_data_root_retained: &H7RetainedDirectory,
+) -> Result<RecoveryJournalStore, String> {
+    initialize_recovery_store_with_revalidation(profile, || app_data_root_retained.revalidate())
+}
+
+fn initialize_recovery_store_with_revalidation<F>(
+    profile: &VitaAgentRuntimeProfile,
+    revalidate: F,
+) -> Result<RecoveryJournalStore, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    profile
+        .ensure_private_runtime_layout()
+        .map_err(|error| format!("Vita private runtime layout setup failed: {error}"))?;
+    revalidate().map_err(|error| {
+        format!("Vita app-data authority changed before recovery store: {error}")
+    })?;
+    RecoveryJournalStore::from_runtime_profile(profile)
+        .map_err(|error| format!("Vita recovery journal store setup failed: {error}"))
+}
+
 pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
     // Preserve the legacy production fail-closed contract.  This environment
     // variable is a guard against accidentally starting the ordinary IPC
@@ -1664,13 +1688,12 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
     app_data_root_retained
         .revalidate()
         .map_err(|error| format!("Vita app-data authority was not current: {error}"))?;
+    let recovery_store = initialize_recovery_store(&profile, &app_data_root_retained)?;
     let workspace = profile
         .workspace_authority()
         .ok_or_else(|| "Vita workspace authority is unavailable".to_string())?
         .clone();
     let workspace_identity = workspace.identity().wire();
-    let recovery_store = RecoveryJournalStore::from_runtime_profile(&profile)
-        .map_err(|error| format!("Vita recovery journal store setup failed: {error}"))?;
     let context = VitaExecutionContext::try_new(init.life_id.clone(), init.task_id.clone())
         .map_err(|error| format!("Vita execution identity was invalid: {error:?}"))?;
     let active_identity = Arc::new(Mutex::new(None::<ProviderRequestIdentity>));
@@ -4041,6 +4064,81 @@ fn unix_millis() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
+
+    fn startup_profile_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        VitaAgentRuntimeProfile,
+    ) {
+        let app_data = tempdir().expect("sidecar app-data root");
+        let workspace = tempdir().expect("sidecar workspace root");
+        let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
+            app_data.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+        )
+        .expect("sidecar startup profile");
+        (app_data, workspace, profile)
+    }
+
+    #[test]
+    fn fresh_startup_creates_marker_before_recovery_store() {
+        let (_app_data, _workspace, profile) = startup_profile_fixture();
+        let retained =
+            H7RetainedDirectory::open(profile.app_data_root()).expect("retained app-data root");
+        retained.revalidate().expect("initial retained root");
+        assert!(!profile.ownership_marker_path().exists());
+
+        let store = initialize_recovery_store(&profile, &retained).expect("recovery store");
+        assert_eq!(
+            std::fs::read(profile.ownership_marker_path()).expect("fresh marker"),
+            crate::ownership_marker_contents()
+        );
+        assert_eq!(store.recovery_root(), &profile.vita_root().join("recovery"));
+    }
+
+    #[test]
+    fn corrupt_or_reparse_marker_is_denied_without_recovery_store() {
+        let (_app_data, _workspace, profile) = startup_profile_fixture();
+        let retained =
+            H7RetainedDirectory::open(profile.app_data_root()).expect("retained app-data root");
+        retained.revalidate().expect("initial retained root");
+        profile
+            .ensure_private_runtime_layout()
+            .expect("initial owned layout");
+        let marker = profile.ownership_marker_path();
+        std::fs::write(&marker, b"runtime_id=other\n").expect("corrupt marker");
+        let corrupt = initialize_recovery_store(&profile, &retained)
+            .expect_err("corrupt marker must be denied");
+        assert!(corrupt.contains("private runtime layout setup failed"));
+        assert_eq!(
+            std::fs::read(&marker).expect("corrupt marker remains"),
+            b"runtime_id=other\n"
+        );
+
+        std::fs::write(&marker, crate::ownership_marker_contents()).expect("restore marker");
+        let target = profile.app_data_root().join("marker-target");
+        std::fs::write(&target, crate::ownership_marker_contents()).expect("marker target");
+        std::fs::remove_file(&marker).expect("remove marker");
+        std::os::windows::fs::symlink_file(&target, &marker).expect("reparse marker");
+        let reparse = initialize_recovery_store(&profile, &retained)
+            .expect_err("reparse marker must be denied");
+        assert!(reparse.contains("private runtime layout setup failed"));
+    }
+
+    #[test]
+    fn recovery_store_requires_retained_root_revalidation() {
+        let (_app_data, _workspace, profile) = startup_profile_fixture();
+        let error = initialize_recovery_store_with_revalidation(&profile, || {
+            Err("synthetic retained root identity change".to_string())
+        })
+        .expect_err("startup must stop when retained root revalidation fails");
+        assert_eq!(
+            error,
+            "Vita app-data authority changed before recovery store: synthetic retained root identity change"
+        );
+        assert!(profile.ownership_marker_path().is_file());
+    }
 
     #[test]
     fn idle_command_receiver_blocks_until_command_without_timeout() {

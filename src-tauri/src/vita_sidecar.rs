@@ -2235,6 +2235,89 @@ mod windows {
         })
     }
 
+    /// Materialize the read-only source directory indexes before any retained
+    /// namespace baseline is captured.  Windows may report a directory's
+    /// allocation size changing from zero to one cluster on its first full
+    /// enumeration; that is mutable directory metadata, not a replacement of
+    /// the namespace leaf.  The later retained handles still enforce the
+    /// complete identity (including regular-file size) and all revalidations
+    /// remain fail-closed.
+    fn d32_stage_directory_tree_before_capture(
+        path: &Path,
+        depth: usize,
+        entries: &mut usize,
+        bytes: &mut u64,
+    ) -> Result<(), String> {
+        if depth > D32_TREE_MAX_DEPTH {
+            return Err("D32 Host source directory exceeded its depth bound".to_string());
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|_| {
+            format!(
+                "D32 Host source directory metadata unavailable: {}",
+                path.display()
+            )
+        })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+            return Err(format!(
+                "D32 Host source directory was not a non-reparse directory: {}",
+                path.display()
+            ));
+        }
+        for entry in fs::read_dir(path).map_err(|_| {
+            format!(
+                "D32 Host source directory could not be enumerated: {}",
+                path.display()
+            )
+        })? {
+            let entry = entry.map_err(|_| {
+                format!(
+                    "D32 Host source directory entry could not be read: {}",
+                    path.display()
+                )
+            })?;
+            let entry_path = entry.path();
+            let entry_metadata = fs::symlink_metadata(&entry_path).map_err(|_| {
+                format!(
+                    "D32 Host source directory entry metadata unavailable: {}",
+                    entry_path.display()
+                )
+            })?;
+            if entry_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "D32 Host source directory contained a reparse entry: {}",
+                    entry_path.display()
+                ));
+            }
+            *entries = entries
+                .checked_add(1)
+                .ok_or_else(|| "D32 Host source directory entry bound overflowed".to_string())?;
+            if *entries > D32_TOOLCHAIN_MAX_FILES {
+                return Err("D32 Host source directory exceeded its entry bound".to_string());
+            }
+            if entry_metadata.is_dir() {
+                d32_stage_directory_tree_before_capture(
+                    &entry_path,
+                    depth.saturating_add(1),
+                    entries,
+                    bytes,
+                )?;
+            } else if entry_metadata.is_file() {
+                *bytes = bytes
+                    .checked_add(entry_metadata.len())
+                    .ok_or_else(|| "D32 Host source directory byte bound overflowed".to_string())?;
+                if *bytes > D32_TOOLCHAIN_TOTAL_MAX_BYTES {
+                    return Err("D32 Host source directory exceeded its byte bound".to_string());
+                }
+            } else {
+                return Err(format!(
+                    "D32 Host source directory contained an unsupported entry: {}",
+                    entry_path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn host_hash_file(path: &Path, max_bytes: u64) -> Result<String, String> {
         let mut file = File::open(path)
             .map_err(|_| format!("D32 Host executable hash could not open {}", path.display()))?;
@@ -2949,6 +3032,14 @@ mod windows {
             .map(PathBuf::from)
             .ok_or_else(|| "D32 Host Rust toolchain root was unavailable".to_string())?;
         let toolchains = user_profile.join(".rustup").join("toolchains");
+        let mut staged_entries = 0usize;
+        let mut staged_bytes = 0u64;
+        d32_stage_directory_tree_before_capture(
+            &toolchains,
+            0,
+            &mut staged_entries,
+            &mut staged_bytes,
+        )?;
         let toolchains_retained = D32RetainedDirectory::open(&toolchains)?;
         toolchains_retained.revalidate("D32 Host toolchain root before selection")?;
         let mut candidates = Vec::new();
@@ -11783,6 +11874,51 @@ mod windows {
         use std::process::Command;
         use std::sync::{mpsc, Arc, Barrier};
         use std::thread;
+
+        #[test]
+        fn d32_stages_directory_indexes_before_full_identity_capture() {
+            let fixture = tempfile::tempdir().expect("D32 namespace staging fixture");
+            let root = fixture.path().join("runtime");
+            fs::create_dir(&root).expect("D32 namespace staging root");
+            fs::create_dir(root.join("bin")).expect("D32 namespace staging bin");
+            fs::write(root.join("bin/cargo.exe"), b"cargo").expect("D32 namespace staging cargo");
+            fs::write(root.join("runtime.dll"), b"runtime").expect("D32 namespace staging runtime");
+
+            let mut entries = 0usize;
+            let mut bytes = 0u64;
+            d32_stage_directory_tree_before_capture(&root, 0, &mut entries, &mut bytes)
+                .expect("D32 namespace staging must complete before capture");
+            assert_eq!(entries, 3);
+            assert_eq!(bytes, b"cargo".len() as u64 + b"runtime".len() as u64);
+
+            let retained = D32RetainedDirectory::open(&root).expect("D32 retained fixture root");
+            let identity = retained.identity();
+            retained
+                .enumerate_children()
+                .expect("D32 retained fixture enumeration");
+            assert_eq!(retained.identity(), identity);
+            assert_eq!(identity, retained.identity());
+
+            let retained_file = retained
+                .open_existing_file(OsStr::new("runtime.dll"))
+                .expect("D32 retained fixture file");
+            let file_identity = retained_file.identity();
+            fs::write(root.join("runtime.dll"), b"tampered").expect("D32 retained fixture tamper");
+            let tampered_identity =
+                host_file_identity(&root.join("runtime.dll"), false).expect("D32 tampered file");
+            assert_ne!(tampered_identity, file_identity);
+            assert!(retained_file
+                .revalidate("D32 retained fixture tamper")
+                .is_err());
+            drop(retained_file);
+
+            let replacement = fixture.path().join("replacement");
+            fs::rename(&root, &replacement).expect("D32 namespace replacement rename");
+            fs::create_dir(&root).expect("D32 namespace replacement root");
+            assert!(retained.revalidate("D32 namespace replacement").is_err());
+            drop(retained);
+            fs::remove_dir_all(replacement).expect("D32 namespace replacement cleanup");
+        }
 
         fn test_binding(session_id: &str) -> ProcessBinding {
             test_binding_for(session_id, "turn", "call")

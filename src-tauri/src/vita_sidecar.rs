@@ -617,12 +617,12 @@ mod windows {
         STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileDispositionInfo, FileRenameInfo, GetDriveTypeW,
-        GetFileInformationByHandle, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING, SYNCHRONIZE,
+        CreateFileW, FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle,
+        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+        SYNCHRONIZE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
@@ -1828,29 +1828,37 @@ mod windows {
                     }
                 })?;
             let name = destination.encode_wide().collect::<Vec<_>>();
-            let bytes = size_of::<FILE_RENAME_INFO>()
-                .saturating_add(name.len().saturating_sub(1).saturating_mul(2));
+            let file_name_length = name
+                .len()
+                .checked_mul(size_of::<u16>())
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or_else(|| "D32 retained file rename name was too long".to_string())?;
+            let bytes = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)
+                .checked_add(file_name_length as usize)
+                .ok_or_else(|| "D32 retained file rename buffer was too large".to_string())?;
             let mut buffer = vec![0_u8; bytes];
-            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            let mut status_block = IO_STATUS_BLOCK::default();
             unsafe {
                 (*info).Anonymous.ReplaceIfExists = replace_if_exists;
                 (*info).RootDirectory = self.namespace.leaf.raw();
-                (*info).FileNameLength = (name.len() * 2) as u32;
+                (*info).FileNameLength = file_name_length;
                 std::ptr::copy_nonoverlapping(
                     name.as_ptr(),
                     (*info).FileName.as_mut_ptr(),
                     name.len(),
                 );
-                if SetFileInformationByHandle(
+                let status = NtSetInformationFile(
                     handle.raw(),
-                    FileRenameInfo,
+                    &mut status_block,
                     info.cast(),
                     buffer.len() as u32,
-                ) == 0
-                {
+                    FileRenameInformation,
+                );
+                if status < 0 {
                     return Err(format!(
-                        "D32 retained handle-relative rename failed: {}",
-                        windows_sys::Win32::Foundation::GetLastError()
+                        "D32 retained handle-relative rename failed: NTSTATUS 0x{:08X}",
+                        status as u32
                     ));
                 }
             }
@@ -12397,6 +12405,92 @@ mod windows {
             assert!(
                 !staging_path.exists(),
                 "failed staging root must be removed"
+            );
+        }
+
+        #[test]
+        fn d32_selection_marker_publishes_and_atomically_replaces_handle_relative() {
+            let fixture = tempfile::tempdir().expect("D32 selection marker fixture");
+            let first_source = fixture.path().join("first-selection.tmp");
+            let second_source = fixture.path().join("second-selection.tmp");
+            let marker = fixture.path().join(D32_CARGO_SELECTION_FILE_NAME);
+            fs::write(&first_source, b"first-selection")
+                .expect("D32 selection marker first source");
+            fs::write(&second_source, b"replacement-selection")
+                .expect("D32 selection marker second source");
+            fs::write(&marker, b"stale-selection").expect("D32 selection marker stale target");
+            let retained = D32RetainedDirectory::open(fixture.path())
+                .expect("D32 selection marker retained root");
+
+            retained
+                .rename_file(
+                    OsStr::new("first-selection.tmp"),
+                    OsStr::new(D32_CARGO_SELECTION_FILE_NAME),
+                    true,
+                )
+                .expect("D32 selection marker initial publication");
+            assert_eq!(
+                retained
+                    .read_file(OsStr::new(D32_CARGO_SELECTION_FILE_NAME), 16 * 1024)
+                    .expect("D32 selection marker initial read"),
+                b"first-selection"
+            );
+
+            retained
+                .rename_file(
+                    OsStr::new("second-selection.tmp"),
+                    OsStr::new(D32_CARGO_SELECTION_FILE_NAME),
+                    true,
+                )
+                .expect("D32 selection marker replacement");
+            assert_eq!(
+                retained
+                    .read_file(OsStr::new(D32_CARGO_SELECTION_FILE_NAME), 16 * 1024)
+                    .expect("D32 selection marker replacement read"),
+                b"replacement-selection"
+            );
+            retained
+                .revalidate("D32 selection marker after replacement")
+                .expect("D32 selection marker root must remain stable");
+        }
+
+        #[test]
+        fn d32_selection_marker_rejects_reparse_destination_before_replace() {
+            use std::os::windows::fs::symlink_file;
+
+            let fixture = tempfile::tempdir().expect("D32 selection reparse fixture");
+            let source = fixture.path().join("reparse-source.tmp");
+            let outside = fixture.path().join("outside-selection");
+            let marker = fixture.path().join(D32_CARGO_SELECTION_FILE_NAME);
+            fs::write(&source, b"must-not-publish").expect("D32 selection reparse source");
+            fs::write(&outside, b"outside-selection").expect("D32 selection reparse target");
+            if let Err(error) = symlink_file(&outside, &marker) {
+                panic!("D32 selection reparse fixture could not be created: {error}");
+            }
+            let retained = D32RetainedDirectory::open(fixture.path())
+                .expect("D32 selection reparse retained root");
+
+            let error = retained
+                .rename_file(
+                    OsStr::new("reparse-source.tmp"),
+                    OsStr::new(D32_CARGO_SELECTION_FILE_NAME),
+                    true,
+                )
+                .expect_err("D32 selection marker must reject reparse destination");
+            assert!(
+                error.contains("reparse") || error.contains("bounded regular file"),
+                "unexpected reparse rejection: {error}"
+            );
+            assert_eq!(
+                fs::read(&outside).expect("D32 selection reparse target read"),
+                b"outside-selection"
+            );
+            assert!(
+                fs::symlink_metadata(&marker)
+                    .expect("D32 selection reparse metadata")
+                    .file_type()
+                    .is_symlink(),
+                "reparse destination must remain untouched"
             );
         }
 

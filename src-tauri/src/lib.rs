@@ -69,6 +69,17 @@ mod vita_sidecar;
 #[cfg(not(test))]
 use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn prepare_d32_a_host_config(config: &mut tauri::utils::config::Config) {
+    // The D32 Host runner exercises the production App/state/command
+    // composition, but does not need a UI surface.  Clearing the configured
+    // windows before Builder::build prevents Tauri from constructing a
+    // WebView that the standalone canary cannot own through its teardown
+    // path.  This is deliberately limited to the canary feature; the normal
+    // application configuration remains unchanged.
+    config.app.windows.clear();
+}
+
 #[cfg(not(test))]
 fn production_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
@@ -169,8 +180,7 @@ fn production_builder() -> tauri::Builder<tauri::Wry> {
             );
             app.manage(memory::vector_sync_worker::MemoryVectorSyncWorkerCoordinator::default());
             app.manage(memory::candidate_service::CandidateConfirmationCoordinator::default());
-            create_configured_windows(app)?;
-            configure_window_lifecycle(app)?;
+            initialize_configured_windows(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -281,6 +291,17 @@ fn production_builder() -> tauri::Builder<tauri::Wry> {
 }
 
 #[cfg(not(test))]
+fn initialize_configured_windows(app: &mut tauri::App) -> Result<(), std::io::Error> {
+    #[cfg(all(windows, feature = "d32-a-host-canary"))]
+    if app.config().app.windows.is_empty() {
+        return Ok(());
+    }
+
+    create_configured_windows(app)?;
+    configure_window_lifecycle(app)
+}
+
+#[cfg(not(test))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     production_builder()
@@ -333,7 +354,11 @@ fn cleanup_d32_canary_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), String
 
 #[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
 pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, String> {
-    let context = tauri::generate_context!();
+    let mut context = tauri::generate_context!();
+    #[cfg(all(windows, feature = "d32-a-host-canary"))]
+    prepare_d32_a_host_config(context.config_mut());
+    #[cfg(all(windows, feature = "d32-a-host-canary"))]
+    debug_assert!(context.config().app.windows.is_empty());
     let mut environment =
         vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier)?;
     let result = (|| {
@@ -426,6 +451,24 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
 #[cfg(all(test, windows, feature = "d32-a-host-canary"))]
 mod d32_canary_lifecycle_tests {
     use super::D32_CANARY_APP_DRAIN_ITERATIONS;
+
+    #[test]
+    fn canary_context_has_no_ui_windows_but_keeps_app_identity() {
+        let mut config = tauri::utils::config::Config {
+            identifier: "com.digital-life.d32-canary-test".to_string(),
+            ..Default::default()
+        };
+        config.app.windows = serde_json::from_value(serde_json::json!([
+            {"label": "main"},
+            {"label": "settings", "create": false}
+        ]))
+        .expect("test window configuration should deserialize");
+
+        super::prepare_d32_a_host_config(&mut config);
+
+        assert!(config.app.windows.is_empty());
+        assert_eq!(config.identifier, "com.digital-life.d32-canary-test");
+    }
 
     #[test]
     fn app_teardown_drain_is_nonzero_and_bounded() {

@@ -2217,14 +2217,13 @@ mod tests {
 
     #[test]
     fn request_mapping_is_deterministic_and_preserves_roles_and_streaming() {
-        let profile = profile_with_model(
+        let profile = profile(
             "https://provider.example/v1",
             None,
             all_mapping_capabilities(),
-            D32_DEEPSEEK_THINKING_MODEL,
         );
         let request = VitaResponsesRequest::new(
-            D32_DEEPSEEK_THINKING_MODEL,
+            "mock-model",
             vec![
                 VitaMessage::text(VitaMessageRole::System, "system"),
                 VitaMessage::text(VitaMessageRole::Developer, "developer"),
@@ -2240,6 +2239,7 @@ mod tests {
         let second = map_responses_request_to_chat(&request, &profile).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.model, "mock-model");
+        assert!(first.thinking.is_none());
         assert!(first.stream);
         assert_eq!(
             first
@@ -2348,9 +2348,46 @@ mod tests {
             },
         );
         let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert_eq!(mapped.model, D32_DEEPSEEK_THINKING_MODEL);
+        assert_eq!(
+            mapped.thinking,
+            Some(ChatCompletionsThinking {
+                thinking_type: "disabled".to_string(),
+            })
+        );
         assert_eq!(
             serde_json::to_string(&mapped).unwrap(),
-            r#"{"model":"mock-model","messages":[{"role":"user","content":"run cargo"}],"stream":false,"tools":[{"type":"function","function":{"name":"vita_workspace_cargo_check","description":"Run cargo","parameters":{"properties":{},"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"vita_workspace_cargo_check"}},"thinking":{"type":"disabled"}}"#
+            r#"{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"run cargo"}],"stream":false,"tools":[{"type":"function","function":{"name":"vita_workspace_cargo_check","description":"Run cargo","parameters":{"properties":{},"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"vita_workspace_cargo_check"}},"thinking":{"type":"disabled"}}"#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_forced_cargo_tool_generic_model_preserves_model_and_omits_thinking() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            all_mapping_capabilities(),
+        );
+        let request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: Some("Run cargo".to_string()),
+                    parameters: json!({"type":"object","properties":{}}),
+                }],
+                forced_tool: Some(D32_CARGO_TOOL_NAME.to_string()),
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
+        assert_eq!(mapped.model, "mock-model");
+        assert!(mapped.thinking.is_none());
+        assert_eq!(
+            serde_json::to_value(&mapped).unwrap()["thinking"],
+            Value::Null
         );
     }
 

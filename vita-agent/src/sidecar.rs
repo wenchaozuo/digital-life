@@ -105,11 +105,161 @@ struct GatewayGeneration {
     generation: u64,
     identity: ProviderRequestIdentity,
     token: TurnGatewayToken,
+    d32_forced_tool: Option<Arc<D32ForcedToolLatch>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum D32ForcedToolPhase {
+    InitialRequest,
+    InitialRequestInFlight,
+    AwaitingToolOutput { call_id: String },
+    FinalRequestInFlight,
+    Completed,
+    Failed,
+}
+
+/// The forced Cargo contract belongs to exactly one gateway generation.  It
+/// is deliberately in-memory and turn-scoped: a new Host turn receives a new
+/// latch, while a repeated/late request for the old generation remains
+/// rejected even if it reuses an otherwise valid HTTP shape.
+struct D32ForcedToolLatch {
+    phase: Mutex<D32ForcedToolPhase>,
+}
+
+impl D32ForcedToolLatch {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(D32ForcedToolPhase::InitialRequest),
+        }
+    }
+
+    fn admit_request(&self, request: &mut VitaResponsesRequest) -> Result<(), String> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| "D32 forced Cargo latch was poisoned".to_string())?;
+        match &*phase {
+            D32ForcedToolPhase::InitialRequest => {
+                if !request.tool_calls.is_empty()
+                    || !request.tool_outputs.is_empty()
+                    || request.options.forced_tool.is_some()
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 first provider request must not contain prior tool state".to_string(),
+                    );
+                }
+                if !request
+                    .options
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == D32_CARGO_TOOL_NAME)
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 first provider request did not advertise Cargo tool".to_string()
+                    );
+                }
+                request.options.forced_tool = Some(D32_CARGO_TOOL_NAME.to_string());
+                *phase = D32ForcedToolPhase::InitialRequestInFlight;
+                Ok(())
+            }
+            D32ForcedToolPhase::AwaitingToolOutput { call_id } => {
+                if request.options.forced_tool.is_some()
+                    || request.tool_calls.len() != 1
+                    || request.tool_outputs.len() != 1
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 second provider request must contain one tool call and one output"
+                            .to_string(),
+                    );
+                }
+                let call = &request.tool_calls[0];
+                let output = &request.tool_outputs[0];
+                if call.name != D32_CARGO_TOOL_NAME
+                    || call.id != *call_id
+                    || output.call_id != *call_id
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 second provider request tool call/output pairing was invalid"
+                            .to_string(),
+                    );
+                }
+                *phase = D32ForcedToolPhase::FinalRequestInFlight;
+                Ok(())
+            }
+            _ => {
+                *phase = D32ForcedToolPhase::Failed;
+                Err("D32 forced Cargo turn received an out-of-sequence request".to_string())
+            }
+        }
+    }
+
+    fn admit_response(
+        &self,
+        request: &VitaResponsesRequest,
+        result: &crate::provider_gateway::VitaResponsesResult,
+    ) -> Result<(), String> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| "D32 forced Cargo latch was poisoned".to_string())?;
+        match &*phase {
+            D32ForcedToolPhase::InitialRequestInFlight => {
+                if request.options.forced_tool.as_deref() != Some(D32_CARGO_TOOL_NAME)
+                    || result.function_calls.len() != 1
+                    || result.function_calls[0].name != D32_CARGO_TOOL_NAME
+                    || result.finish_reason.as_deref() != Some("tool_calls")
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 first provider response must be one Cargo tool call with tool_calls finish reason"
+                            .to_string(),
+                    );
+                }
+                *phase = D32ForcedToolPhase::AwaitingToolOutput {
+                    call_id: result.function_calls[0].id.clone(),
+                };
+                Ok(())
+            }
+            D32ForcedToolPhase::FinalRequestInFlight => {
+                if request.options.forced_tool.is_some()
+                    || !result.function_calls.is_empty()
+                    || result.finish_reason.as_deref() != Some("stop")
+                {
+                    *phase = D32ForcedToolPhase::Failed;
+                    return Err(
+                        "D32 second provider response must stop without a tool call".to_string()
+                    );
+                }
+                *phase = D32ForcedToolPhase::Completed;
+                Ok(())
+            }
+            _ => {
+                *phase = D32ForcedToolPhase::Failed;
+                Err("D32 forced Cargo turn response was out of sequence".to_string())
+            }
+        }
+    }
+
+    fn fail(&self) {
+        if let Ok(mut phase) = self.phase.lock() {
+            *phase = D32ForcedToolPhase::Failed;
+        }
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> D32ForcedToolPhase {
+        self.phase.lock().expect("D32 latch lock").clone()
+    }
 }
 
 struct GatewayAuthority {
     next_generation: AtomicU64,
     active: Mutex<Option<GatewayGeneration>>,
+    d32_forced_tool: bool,
 }
 
 struct ActiveTurnTask {
@@ -165,9 +315,14 @@ impl TurnOwner {
 
 impl GatewayAuthority {
     fn new() -> Self {
+        Self::new_with_d32_forced_tool(false)
+    }
+
+    fn new_with_d32_forced_tool(d32_forced_tool: bool) -> Self {
         Self {
             next_generation: AtomicU64::new(0),
             active: Mutex::new(None),
+            d32_forced_tool,
         }
     }
 
@@ -177,6 +332,9 @@ impl GatewayAuthority {
             generation,
             identity,
             token: TurnGatewayToken::generate()?,
+            d32_forced_tool: self
+                .d32_forced_tool
+                .then(|| Arc::new(D32ForcedToolLatch::new())),
         };
         let mut active = self
             .active
@@ -390,6 +548,17 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                     "H9 canary provider request omitted messages".to_string(),
                 )
             })?;
+        let expected_tool_name = if self.cargo_mode {
+            D32_CARGO_TOOL_NAME
+        } else if self.patch_mode {
+            VITA_WORKSPACE_PATCH_TOOL_NAME
+        } else if self.replace_mode {
+            VITA_WORKSPACE_REPLACE_TOOL_NAME
+        } else if self.read_mode {
+            VITA_WORKSPACE_READ_TOOL_NAME
+        } else {
+            VITA_WORKSPACE_GIT_STATUS_TOOL_NAME
+        };
         match request_number {
             1 => {
                 let tools = request
@@ -426,13 +595,92 @@ impl crate::provider_gateway::ProviderRequestTransport for H9CanaryTransport {
                         "H9 canary first request advertised an unexpected tool set".to_string(),
                     ));
                 }
+                let forced_tool_name = request
+                    .get("tool_choice")
+                    .and_then(|choice| choice.get("function"))
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str);
+                if self.cargo_mode {
+                    if forced_tool_name != Some(D32_CARGO_TOOL_NAME) {
+                        return Err(crate::VitaAgentError::GatewayProtocol(
+                            "D32 canary first request did not force exactly Cargo".to_string(),
+                        ));
+                    }
+                } else if forced_tool_name.is_some() {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary non-Cargo request unexpectedly forced a tool".to_string(),
+                    ));
+                }
+                let thinking_present = request.get("thinking").is_some();
+                let deepseek_compatibility =
+                    self.response_model == "deepseek/deepseek-v4-flash" && self.cargo_mode;
+                if thinking_present != deepseek_compatibility {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary first request had unexpected thinking compatibility".to_string(),
+                    ));
+                }
             }
             2 => {
-                let tool_output = messages
+                if request.get("tool_choice").is_some() || request.get("thinking").is_some() {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary second request must omit tool_choice and thinking".to_string(),
+                    ));
+                }
+                let assistant_tool_calls = messages
                     .iter()
-                    .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+                    .filter(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("assistant")
+                            && message.get("tool_calls").is_some()
+                    })
+                    .collect::<Vec<_>>();
+                if assistant_tool_calls.len() != 1
+                    || assistant_tool_calls[0]
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_none_or(|calls| calls.len() != 1)
+                {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary second request must contain one assistant tool call".to_string(),
+                    ));
+                }
+                let tool_call = &assistant_tool_calls[0]
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .expect("assistant tool call was checked above")[0];
+                let tool_call_id =
+                    tool_call.get("id").and_then(Value::as_str).ok_or_else(|| {
+                        crate::VitaAgentError::GatewayProtocol(
+                            "H9 canary assistant tool call omitted id".to_string(),
+                        )
+                    })?;
+                let tool_call_name = tool_call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str);
+                if tool_call_id != "h9-canary-call-1" || tool_call_name != Some(expected_tool_name)
+                {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary second request contained the wrong tool call".to_string(),
+                    ));
+                }
+                let tool_messages = messages
+                    .iter()
+                    .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+                    .collect::<Vec<_>>();
+                if tool_messages.len() != 1
+                    || tool_messages[0].get("tool_call_id").and_then(Value::as_str)
+                        != Some(tool_call_id)
+                {
+                    return Err(crate::VitaAgentError::GatewayProtocol(
+                        "H9 canary second request must contain one paired tool output".to_string(),
+                    ));
+                }
+                let tool_output = tool_messages
+                    .into_iter()
+                    .next()
+                    .expect("tool output was checked above");
                 let output = tool_output
-                    .and_then(|message| message.get("content"))
+                    .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         crate::VitaAgentError::GatewayProtocol(
@@ -821,7 +1069,6 @@ impl VitaGatewayServer {
         active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
         gateway_authority: Arc<GatewayAuthority>,
         transport: SidecarGatewayTransport,
-        force_d32_cargo_tool: bool,
     ) -> Result<Self, crate::VitaAgentError> {
         listener
             .set_nonblocking(true)
@@ -847,7 +1094,6 @@ impl VitaGatewayServer {
                                 &active_identity,
                                 &gateway_authority_for_thread,
                                 &transport_for_thread,
-                                force_d32_cargo_tool,
                             );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -891,7 +1137,6 @@ fn handle_gateway_connection(
     active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: &Arc<GatewayAuthority>,
     transport: &SidecarGatewayTransport,
-    force_d32_cargo_tool: bool,
 ) -> Result<(), String> {
     if !peer.ip().is_loopback() {
         return write_gateway_error(&mut stream, "403 Forbidden", "GATEWAY_PEER_DENIED");
@@ -940,7 +1185,11 @@ fn handle_gateway_connection(
         }
     };
     let mut request = request;
-    apply_d32_canary_forced_tool_choice(&mut request, force_d32_cargo_tool);
+    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+        if let Err(error) = latch.admit_request(&mut request) {
+            return write_gateway_failure(&mut stream, ready.profile().model(), &error);
+        }
+    }
     let resolver = SidecarCredentialResolver {
         router: router.clone(),
         session_id: session_id.to_string(),
@@ -950,8 +1199,19 @@ fn handle_gateway_connection(
     };
     let result = match transport {
         SidecarGatewayTransport::Production => {
-            let transport = crate::provider_gateway::new_production_provider_transport()
-                .map_err(|_| "provider transport unavailable".to_string())?;
+            let transport = match crate::provider_gateway::new_production_provider_transport() {
+                Ok(transport) => transport,
+                Err(error) => {
+                    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+                        latch.fail();
+                    }
+                    return write_gateway_failure(
+                        &mut stream,
+                        ready.profile().model(),
+                        &bounded_protocol_text(&error.to_string(), 256),
+                    );
+                }
+            };
             let guarded = ActiveIdentityTransport {
                 inner: &transport,
                 active_identity: Arc::clone(active_identity),
@@ -977,11 +1237,32 @@ fn handle_gateway_connection(
             let gateway = ProviderGateway::new(ready.clone(), resolver, guarded);
             gateway.execute_responses_request_with_identity(&request, Some(&identity))
         }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+                latch.fail();
+            }
+            return write_gateway_failure(
+                &mut stream,
+                ready.profile().model(),
+                &bounded_protocol_text(&error.to_string(), 256),
+            );
+        }
+    };
+    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+        if let Err(error) = latch.admit_response(&request, &result) {
+            latch.fail();
+            return write_gateway_failure(&mut stream, ready.profile().model(), &error);
+        }
     }
-    .map_err(|_| "provider request failed".to_string())?;
     if !active_identity_matches(active_identity, &identity)
         || !gateway_authority.is_current(&gateway)
     {
+        if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+            latch.fail();
+        }
         return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
     }
     write_gateway_success(&mut stream, &result)
@@ -1078,6 +1359,53 @@ fn read_gateway_http_request(stream: &mut TcpStream) -> Result<GatewayHttpReques
 fn write_gateway_error(stream: &mut TcpStream, status: &str, code: &str) -> Result<(), String> {
     let body = serde_json::json!({"error": {"code": code}}).to_string();
     write_gateway_http_response(stream, status, "application/json", body.as_bytes())
+}
+
+fn write_gateway_failure(stream: &mut TcpStream, model: &str, message: &str) -> Result<(), String> {
+    let response_id = format!("resp-vita-failed-{}", next_request_id("gateway"));
+    let message = bounded_protocol_text(message, 256);
+    let events = [
+        serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id.clone(),
+                "object": "response",
+                "status": "in_progress",
+                "model": model
+            }
+        }),
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "provider_request_failed",
+                    "message": message
+                }
+            }
+        }),
+    ];
+    let mut body = String::new();
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "gateway failure SSE event omitted type".to_string())?;
+        body.push_str("event: ");
+        body.push_str(event_type);
+        body.push_str("\ndata: ");
+        body.push_str(
+            &serde_json::to_string(&event)
+                .map_err(|_| "gateway failure SSE serialization failed".to_string())?,
+        );
+        body.push_str("\n\n");
+    }
+    if body.len() > LOCAL_GATEWAY_BODY_LIMIT {
+        return write_gateway_error(stream, "502 Bad Gateway", "RESPONSE_TOO_LARGE");
+    }
+    write_gateway_http_response(stream, "200 OK", "text/event-stream", body.as_bytes())
 }
 
 fn write_gateway_success(
@@ -1355,23 +1683,6 @@ fn parse_gateway_responses_request(
         tool_calls,
         tool_outputs,
     })
-}
-
-fn apply_d32_canary_forced_tool_choice(
-    request: &mut VitaResponsesRequest,
-    force_d32_cargo_tool: bool,
-) {
-    if force_d32_cargo_tool
-        && request.tool_calls.is_empty()
-        && request.tool_outputs.is_empty()
-        && request
-            .options
-            .tools
-            .iter()
-            .any(|tool| tool.name == D32_CARGO_TOOL_NAME)
-    {
-        request.options.forced_tool = Some(D32_CARGO_TOOL_NAME.to_string());
-    }
 }
 
 fn bounded_gateway_text(value: &str) -> Result<String, String> {
@@ -1719,7 +2030,7 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
     let context = VitaExecutionContext::try_new(init.life_id.clone(), init.task_id.clone())
         .map_err(|error| format!("Vita execution identity was invalid: {error:?}"))?;
     let active_identity = Arc::new(Mutex::new(None::<ProviderRequestIdentity>));
-    let gateway_authority = Arc::new(GatewayAuthority::new());
+    let gateway_authority = Arc::new(GatewayAuthority::new_with_d32_forced_tool(d32_canary));
     let turn_owner = Arc::new(TurnOwner::default());
     let authority = Arc::new(SidecarHostAuthority {
         router: router.clone(),
@@ -1971,7 +2282,6 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
             } else {
                 SidecarGatewayTransport::Production
             },
-            d32_canary,
         )
         .map_err(|error| format!("Vita local gateway startup failed: {error}"))?;
         let entrypoint =
@@ -4223,6 +4533,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_failure_is_a_single_created_then_failed_sse_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failure fixture listener");
+        let address = listener.local_addr().expect("failure fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("failure fixture accept");
+            write_gateway_failure(&mut stream, "fixture-model", "provider rejected request")
+                .expect("failure fixture write");
+        });
+        let mut client = TcpStream::connect(address).expect("failure fixture connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("failure fixture timeout");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("failure fixture read");
+        server.join().expect("failure fixture join");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(response.matches("event: response.created").count(), 1);
+        assert_eq!(response.matches("event: response.failed").count(), 1);
+        assert!(!response.contains("response.completed"));
+        assert!(response.contains("provider rejected request"));
+    }
+
+    #[test]
     fn gateway_generation_rejects_old_turn_token_after_new_turn_activation() {
         let authority = GatewayAuthority::new();
         let identity_a = ProviderRequestIdentity {
@@ -4295,8 +4630,9 @@ mod tests {
     }
 
     #[test]
-    fn d32_forced_tool_choice_is_only_for_the_first_canary_request() {
-        let mut request = VitaResponsesRequest::new(
+    fn d32_forced_tool_latch_requires_exact_two_round_contract() {
+        let latch = D32ForcedToolLatch::new();
+        let mut first = VitaResponsesRequest::new(
             "model",
             vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
             VitaResponsesRequestOptions {
@@ -4308,32 +4644,105 @@ mod tests {
                 ..VitaResponsesRequestOptions::default()
             },
         );
-
-        apply_d32_canary_forced_tool_choice(&mut request, false);
-        assert!(request.options.forced_tool.is_none());
-        apply_d32_canary_forced_tool_choice(&mut request, true);
+        latch
+            .admit_request(&mut first)
+            .expect("first request admitted");
         assert_eq!(
-            request.options.forced_tool.as_deref(),
+            first.options.forced_tool.as_deref(),
             Some(D32_CARGO_TOOL_NAME)
         );
+        assert_eq!(latch.phase(), D32ForcedToolPhase::InitialRequestInFlight);
 
-        request.options.forced_tool = None;
-        request.tool_calls.push(VitaFunctionCall {
+        let first_result = crate::provider_gateway::VitaResponsesResult {
+            id: "first".to_string(),
+            model: "model".to_string(),
+            output_text: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            function_calls: vec![VitaFunctionCall {
+                id: "call-1".to_string(),
+                name: D32_CARGO_TOOL_NAME.to_string(),
+                arguments: "{}".to_string(),
+            }],
+        };
+        latch
+            .admit_response(&first, &first_result)
+            .expect("first response admitted");
+        assert_eq!(
+            latch.phase(),
+            D32ForcedToolPhase::AwaitingToolOutput {
+                call_id: "call-1".to_string()
+            }
+        );
+
+        let mut second = first.clone();
+        second.options.forced_tool = None;
+        second.tool_calls.push(VitaFunctionCall {
             id: "call-1".to_string(),
             name: D32_CARGO_TOOL_NAME.to_string(),
             arguments: "{}".to_string(),
         });
-        request.tool_outputs.push(VitaToolOutput {
+        second.tool_outputs.push(VitaToolOutput {
             call_id: "call-1".to_string(),
             output: "{}".to_string(),
         });
-        apply_d32_canary_forced_tool_choice(&mut request, true);
-        assert!(request.options.forced_tool.is_none());
+        latch
+            .admit_request(&mut second)
+            .expect("second request admitted");
+        assert_eq!(latch.phase(), D32ForcedToolPhase::FinalRequestInFlight);
 
-        request.tool_calls.clear();
-        request.tool_outputs.clear();
-        request.options.tools.clear();
-        apply_d32_canary_forced_tool_choice(&mut request, true);
-        assert!(request.options.forced_tool.is_none());
+        let second_result = crate::provider_gateway::VitaResponsesResult {
+            id: "second".to_string(),
+            model: "model".to_string(),
+            output_text: "done".to_string(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            function_calls: Vec::new(),
+        };
+        latch
+            .admit_response(&second, &second_result)
+            .expect("second response admitted");
+        assert_eq!(latch.phase(), D32ForcedToolPhase::Completed);
+
+        let mut repeated = first.clone();
+        assert!(latch.admit_request(&mut repeated).is_err());
+        assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
+    }
+
+    #[test]
+    fn d32_forced_tool_latch_rejects_missing_or_mismatched_output() {
+        let latch = D32ForcedToolLatch::new();
+        let mut first = VitaResponsesRequest::new(
+            "model",
+            vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                }],
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        latch.admit_request(&mut first).unwrap();
+        let result = crate::provider_gateway::VitaResponsesResult {
+            id: "first".to_string(),
+            model: "model".to_string(),
+            output_text: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            function_calls: vec![VitaFunctionCall {
+                id: "call-1".to_string(),
+                name: D32_CARGO_TOOL_NAME.to_string(),
+                arguments: "{}".to_string(),
+            }],
+        };
+        latch.admit_response(&first, &result).unwrap();
+
+        let mut missing = first.clone();
+        missing.options.forced_tool = None;
+        missing.tool_calls = result.function_calls.clone();
+        assert!(latch.admit_request(&mut missing).is_err());
+        assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
     }
 }

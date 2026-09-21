@@ -20,6 +20,8 @@ use crate::d29h3::VITA_WORKSPACE_READ_TOOL_NAME;
 use crate::d29h4::VITA_WORKSPACE_REPLACE_TOOL_NAME;
 #[cfg(windows)]
 use crate::d32a::D32_CARGO_TOOL_NAME;
+#[cfg(not(windows))]
+const D32_CARGO_TOOL_NAME: &str = "";
 use zeroize::Zeroizing;
 
 use super::{VitaAgentError, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID};
@@ -1229,8 +1231,44 @@ where
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
-        map_chat_response_to_responses_with_tools(response, &advertised_tool_names)
+        let result = map_chat_response_to_responses_with_tools(response, &advertised_tool_names)?;
+        validate_d32_request_response_contract(request, &result)?;
+        Ok(result)
     }
+}
+
+fn validate_d32_request_response_contract(
+    request: &VitaResponsesRequest,
+    result: &VitaResponsesResult,
+) -> Result<(), VitaAgentError> {
+    if request.options.forced_tool.as_deref() == Some(D32_CARGO_TOOL_NAME) {
+        let Some(call) = result.function_calls.first() else {
+            return Err(VitaAgentError::GatewayProtocol(
+                "D32 forced Cargo request did not return a tool call".to_string(),
+            ));
+        };
+        if result.function_calls.len() != 1
+            || call.name != D32_CARGO_TOOL_NAME
+            || result.finish_reason.as_deref() != Some("tool_calls")
+        {
+            return Err(VitaAgentError::GatewayProtocol(
+                "D32 first provider response must contain exactly one Cargo tool call".to_string(),
+            ));
+        }
+    }
+
+    let is_d32_tool_round = request.tool_calls.len() == 1
+        && request.tool_outputs.len() == 1
+        && request.tool_calls[0].name == D32_CARGO_TOOL_NAME
+        && request.tool_calls[0].id == request.tool_outputs[0].call_id;
+    if is_d32_tool_round
+        && (!result.function_calls.is_empty() || result.finish_reason.as_deref() != Some("stop"))
+    {
+        return Err(VitaAgentError::GatewayProtocol(
+            "D32 second provider response must stop without a tool call".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,7 +1391,11 @@ struct ChatCompletionsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ChatCompletionsMessage {
     role: String,
-    content: String,
+    // Chat Completions requires an explicit JSON null for an assistant
+    // message that contains tool calls.  Ordinary messages remain JSON
+    // strings through `Some`; using Option keeps that distinction on the
+    // wire instead of silently turning null into an empty string.
+    content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     tool_calls: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1452,6 +1494,11 @@ fn map_responses_request_to_chat(
             ));
         }
     }
+    if request.tool_calls.len() != request.tool_outputs.len() {
+        return Err(VitaAgentError::GatewayProtocol(
+            "request tool calls and tool outputs must pair exactly".to_string(),
+        ));
+    }
     if request.options.parallel_tools && !request.options.tools.is_empty() {
         require_capability(profile.capabilities, ProviderCapability::ParallelTools)?;
         require_gateway_capability(ProviderCapability::ParallelTools)?;
@@ -1490,7 +1537,7 @@ fn map_responses_request_to_chat(
                 .role
                 .as_chat_role(profile.instruction_role_policy)
                 .to_string(),
-            content: message.content.clone(),
+            content: Some(message.content.clone()),
             tool_calls: Vec::new(),
             tool_call_id: None,
         })
@@ -1498,7 +1545,7 @@ fn map_responses_request_to_chat(
     for call in &request.tool_calls {
         messages.push(ChatCompletionsMessage {
             role: "assistant".to_string(),
-            content: String::new(),
+            content: None,
             tool_calls: vec![serde_json::json!({
                 "id": call.id,
                 "type": "function",
@@ -1507,15 +1554,21 @@ fn map_responses_request_to_chat(
             tool_call_id: None,
         });
     }
+    let mut tool_output_ids = std::collections::HashSet::new();
     for output in &request.tool_outputs {
         if !tool_call_ids.contains(output.call_id.as_str()) {
             return Err(VitaAgentError::GatewayProtocol(
                 "request contained an unpaired Vita tool output".to_string(),
             ));
         }
+        if !tool_output_ids.insert(output.call_id.as_str()) {
+            return Err(VitaAgentError::GatewayProtocol(
+                "request contained duplicate Vita tool output ids".to_string(),
+            ));
+        }
         messages.push(ChatCompletionsMessage {
             role: "tool".to_string(),
-            content: output.output.clone(),
+            content: Some(output.output.clone()),
             tool_calls: Vec::new(),
             tool_call_id: Some(output.call_id.clone()),
         });
@@ -1536,14 +1589,15 @@ fn map_responses_request_to_chat(
     // DeepSeek-compatible Chat Completions providers reject a named
     // `tool_choice` while their default thinking mode is active.  The only
     // runtime path that may set `forced_tool` is the D32 canary's first
-    // request, and the exact Cargo tool name is required here as a second
-    // fail-closed fence.  Do not carry this field onto tool-output turns or
-    // ordinary production requests.
-    let thinking = d32_forced_cargo_tool(request.options.forced_tool.as_deref()).then(|| {
-        ChatCompletionsThinking {
+    // request, and both the exact Cargo tool and the exact currently
+    // supported DeepSeek model are required here as a second fail-closed
+    // fence.  Generic OpenAI-compatible providers must not receive this
+    // vendor extension.  Do not carry either field onto tool-output turns
+    // or ordinary production requests.
+    let thinking = d32_forced_cargo_tool(request.options.forced_tool.as_deref(), &request.model)
+        .then(|| ChatCompletionsThinking {
             thinking_type: "disabled".to_string(),
-        }
-    });
+        });
 
     Ok(ChatCompletionsRequest {
         model: request.model.clone(),
@@ -1560,14 +1614,17 @@ fn map_responses_request_to_chat(
     })
 }
 
-fn d32_forced_cargo_tool(forced_tool: Option<&str>) -> bool {
+const D32_DEEPSEEK_THINKING_MODEL: &str = "deepseek/deepseek-v4-flash";
+
+fn d32_forced_cargo_tool(forced_tool: Option<&str>, model: &str) -> bool {
     #[cfg(windows)]
     {
-        forced_tool == Some(D32_CARGO_TOOL_NAME)
+        forced_tool == Some(D32_CARGO_TOOL_NAME) && model == D32_DEEPSEEK_THINKING_MODEL
     }
     #[cfg(not(windows))]
     {
         let _ = forced_tool;
+        let _ = model;
         false
     }
 }
@@ -1674,6 +1731,11 @@ fn map_chat_response_to_responses_with_tools(
         ));
     }
     let choice = response.choices.into_iter().next().expect("length checked");
+    if choice.index != 0 {
+        return Err(VitaAgentError::GatewayProtocol(
+            "chat completion response choice index must be zero".to_string(),
+        ));
+    }
     if choice.message.role != "assistant" {
         return Err(VitaAgentError::GatewayProtocol(
             "chat completion response message role must be assistant".to_string(),
@@ -1681,6 +1743,19 @@ fn map_chat_response_to_responses_with_tools(
     }
     let function_calls =
         parse_chat_tool_calls_with_tools(&choice.message.tool_calls, advertised_tool_names)?;
+    match (function_calls.is_empty(), choice.finish_reason.as_deref()) {
+        (false, Some("tool_calls")) | (true, Some("stop")) => {}
+        (false, _) => {
+            return Err(VitaAgentError::GatewayProtocol(
+                "chat completion tool calls require finish_reason=tool_calls".to_string(),
+            ));
+        }
+        (true, _) => {
+            return Err(VitaAgentError::GatewayProtocol(
+                "chat completion text requires finish_reason=stop".to_string(),
+            ));
+        }
+    }
     let usage = response.usage.map(|usage| VitaUsage {
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,
@@ -1926,12 +2001,21 @@ mod tests {
         credential_ref: Option<CredentialRef>,
         capabilities: ProviderCapabilities,
     ) -> ProviderProfile {
+        profile_with_model(base_url, credential_ref, capabilities, "mock-model")
+    }
+
+    fn profile_with_model(
+        base_url: &str,
+        credential_ref: Option<CredentialRef>,
+        capabilities: ProviderCapabilities,
+        model: &str,
+    ) -> ProviderProfile {
         ProviderProfile::new(
             "provider-one",
             "Provider One",
             ProviderProtocol::OpenAiChatCompletions,
             base_url,
-            "mock-model",
+            model,
             credential_ref,
             Duration::from_secs(10),
             ProviderRetryPolicy::default(),
@@ -2133,13 +2217,14 @@ mod tests {
 
     #[test]
     fn request_mapping_is_deterministic_and_preserves_roles_and_streaming() {
-        let profile = profile(
+        let profile = profile_with_model(
             "https://provider.example/v1",
             None,
             all_mapping_capabilities(),
+            D32_DEEPSEEK_THINKING_MODEL,
         );
         let request = VitaResponsesRequest::new(
-            "mock-model",
+            D32_DEEPSEEK_THINKING_MODEL,
             vec![
                 VitaMessage::text(VitaMessageRole::System, "system"),
                 VitaMessage::text(VitaMessageRole::Developer, "developer"),
@@ -2160,13 +2245,13 @@ mod tests {
             first
                 .messages
                 .iter()
-                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .map(|message| (message.role.as_str(), message.content.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                ("system", "system"),
-                ("developer", "developer"),
-                ("user", "user"),
-                ("assistant", "assistant"),
+                ("system", Some("system")),
+                ("developer", Some("developer")),
+                ("user", Some("user")),
+                ("assistant", Some("assistant")),
             ]
         );
         assert_eq!(
@@ -2199,12 +2284,12 @@ mod tests {
             mapped
                 .messages
                 .iter()
-                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .map(|message| (message.role.as_str(), message.content.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                ("system", "system"),
-                ("system", "developer"),
-                ("user", "user"),
+                ("system", Some("system")),
+                ("system", Some("developer")),
+                ("user", Some("user")),
             ]
         );
     }
@@ -2243,13 +2328,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn d32_forced_tool_choice_maps_to_exact_chat_json() {
-        let profile = profile(
+        let profile = profile_with_model(
             "https://provider.example/v1",
             None,
             all_mapping_capabilities(),
+            D32_DEEPSEEK_THINKING_MODEL,
         );
         let request = VitaResponsesRequest::new(
-            "mock-model",
+            D32_DEEPSEEK_THINKING_MODEL,
             vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
             VitaResponsesRequestOptions {
                 tools: vec![GatewayToolDefinition {
@@ -2466,8 +2552,12 @@ mod tests {
         }];
         let mapped = map_responses_request_to_chat(&request, &profile).unwrap();
         assert_eq!(mapped.messages[1].role, "assistant");
+        assert!(mapped.messages[1].content.is_none());
         assert_eq!(mapped.messages[2].role, "tool");
         assert_eq!(mapped.messages[2].tool_call_id.as_deref(), Some("call-1"));
+        let mapped_json = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(mapped_json["messages"][1]["content"], Value::Null);
+        assert_eq!(mapped_json["messages"][2]["content"], json!("status"));
     }
 
     #[test]
@@ -2486,6 +2576,87 @@ mod tests {
         ];
         assert!(parse_chat_tool_calls(&malformed).is_err());
         assert!(parse_chat_tool_calls(&[json!({"id":"call-1","type":"shell"})]).is_err());
+    }
+
+    #[test]
+    fn tool_output_pairing_requires_one_unique_output_for_each_call() {
+        let profile = profile(
+            "https://provider.example/v1",
+            None,
+            ProviderCapabilities {
+                tools: true,
+                ..ProviderCapabilities::none()
+            },
+        );
+        let mut request = VitaResponsesRequest::new(
+            "mock-model",
+            vec![VitaMessage::text(VitaMessageRole::User, "tool")],
+            VitaResponsesRequestOptions {
+                tools: vec![GatewayToolDefinition {
+                    name: TOOL_NAME.to_string(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                }],
+                ..VitaResponsesRequestOptions::default()
+            },
+        );
+        request.tool_calls.push(VitaFunctionCall {
+            id: "call-1".to_string(),
+            name: TOOL_NAME.to_string(),
+            arguments: "{}".to_string(),
+        });
+        assert!(map_responses_request_to_chat(&request, &profile).is_err());
+        request.tool_outputs.push(VitaToolOutput {
+            call_id: "call-2".to_string(),
+            output: "{}".to_string(),
+        });
+        assert!(map_responses_request_to_chat(&request, &profile).is_err());
+        request.tool_outputs[0].call_id = "call-1".to_string();
+        request.tool_outputs.push(VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "duplicate".to_string(),
+        });
+        assert!(map_responses_request_to_chat(&request, &profile).is_err());
+    }
+
+    #[test]
+    fn response_finish_reason_must_match_tool_adherence() {
+        let response_with_tool = |finish_reason: &str| ChatCompletionsResponse {
+            id: "response".to_string(),
+            model: "mock-model".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: vec![json!({
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": TOOL_NAME, "arguments": "{}"}
+                    })],
+                },
+                finish_reason: Some(finish_reason.to_string()),
+            }],
+            usage: None,
+        };
+        assert!(map_chat_response_to_responses(response_with_tool("tool_calls")).is_ok());
+        assert!(map_chat_response_to_responses(response_with_tool("stop")).is_err());
+
+        let text_response = ChatCompletionsResponse {
+            id: "response".to_string(),
+            model: "mock-model".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+        assert!(map_chat_response_to_responses(text_response).is_ok());
     }
 
     #[test]

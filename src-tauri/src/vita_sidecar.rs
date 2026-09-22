@@ -263,6 +263,23 @@ impl D32HostCanaryStage {
             Self::Cleanup => "cleanup",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "layout" => Some(Self::Layout),
+            "catalog" => Some(Self::Catalog),
+            "sandbox" => Some(Self::Sandbox),
+            "action_prepare" => Some(Self::ActionPrepare),
+            "scope_authority" => Some(Self::ScopeAuthority),
+            "populate" => Some(Self::Populate),
+            "confirmation_bridge" => Some(Self::ConfirmationBridge),
+            "grant" => Some(Self::Grant),
+            "revalidate" => Some(Self::Revalidate),
+            "evidence" => Some(Self::Evidence),
+            "cleanup" => Some(Self::Cleanup),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -272,6 +289,11 @@ enum D32StageFailureCode {
     NotObserved,
     Fixture,
     LedgerCapacity,
+    NativeDenied,
+    WorkerJoin,
+    ReplayMetric,
+    Cancellation,
+    InvalidCall,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -282,6 +304,11 @@ impl D32StageFailureCode {
             Self::NotObserved => "not_observed",
             Self::Fixture => "fixture",
             Self::LedgerCapacity => "ledger_capacity",
+            Self::NativeDenied => "native_denied",
+            Self::WorkerJoin => "worker_join",
+            Self::ReplayMetric => "replay_metric",
+            Self::Cancellation => "cancellation",
+            Self::InvalidCall => "invalid_call",
         }
     }
 
@@ -291,6 +318,11 @@ impl D32StageFailureCode {
             "not_observed" => Some(Self::NotObserved),
             "fixture" => Some(Self::Fixture),
             "ledger_capacity" => Some(Self::LedgerCapacity),
+            "native_denied" => Some(Self::NativeDenied),
+            "worker_join" => Some(Self::WorkerJoin),
+            "replay_metric" => Some(Self::ReplayMetric),
+            "cancellation" => Some(Self::Cancellation),
+            "invalid_call" => Some(Self::InvalidCall),
             _ => None,
         }
     }
@@ -405,13 +437,53 @@ impl D32StageTelemetrySnapshot {
         counters.last_failure_code = Some(code.as_str().to_string());
     }
 
-    fn mark_vita_failure(&mut self, diagnostic: &D32VitaSafeStageDiagnostic) {
-        if diagnostic.code == D32StageFailureCode::OperationFailed
-            || diagnostic.code == D32StageFailureCode::LedgerCapacity
-        {
-            self.mark_failed(diagnostic.stage, diagnostic.code);
+    fn mark_failed_at_least(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
+        let counters = self.counters_mut(stage);
+        counters.failed = counters.failed.max(1).min(D32_STAGE_COUNTER_MAX);
+        counters.last_failure_code = Some(code.as_str().to_string());
+    }
+
+    fn mark_denied_at_least(&mut self, stage: D32HostCanaryStage) {
+        let counters = self.counters_mut(stage);
+        counters.denied = counters.denied.max(1).min(D32_STAGE_COUNTER_MAX);
+    }
+
+    fn merge_vita_stage_trace(&mut self, trace: &[D32VitaStageTrace]) {
+        for entry in trace {
+            let counters = self.counters_mut(entry.stage);
+            counters.started = counters
+                .started
+                .max(entry.started)
+                .min(D32_STAGE_COUNTER_MAX);
+            counters.passed = counters.passed.max(entry.passed).min(D32_STAGE_COUNTER_MAX);
+            counters.failed = counters.failed.max(entry.failed).min(D32_STAGE_COUNTER_MAX);
+        }
+    }
+
+    fn mark_vita_failure_event(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
+        if matches!(
+            code,
+            D32StageFailureCode::NotObserved | D32StageFailureCode::Fixture
+        ) {
+            self.mark_denied_at_least(stage);
         } else {
-            self.mark_denied(diagnostic.stage);
+            self.mark_failed_at_least(stage, code);
+        }
+    }
+
+    fn mark_vita_failure(&mut self, diagnostic: &D32VitaSafeStageDiagnostic) {
+        self.merge_vita_stage_trace(&diagnostic.stage_trace);
+        let mut marked = false;
+        if let (Some(stage), Some(code)) = (diagnostic.primary_stage, diagnostic.primary_code) {
+            self.mark_vita_failure_event(stage, code);
+            marked = true;
+        }
+        if let (Some(stage), Some(code)) = (diagnostic.secondary_stage, diagnostic.secondary_code) {
+            self.mark_vita_failure_event(stage, code);
+            marked = true;
+        }
+        if !marked {
+            self.mark_vita_failure_event(diagnostic.stage, diagnostic.code);
         }
         self.merge_vita_bridge(
             diagnostic.bridge_sent,
@@ -783,9 +855,23 @@ fn parse_d32_native_safe_diagnostic(message: &str) -> Option<D32NativeSafeDiagno
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct D32VitaStageTrace {
+    stage: D32HostCanaryStage,
+    started: u8,
+    passed: u8,
+    failed: u8,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct D32VitaSafeStageDiagnostic {
     stage: D32HostCanaryStage,
     code: D32StageFailureCode,
+    primary_stage: Option<D32HostCanaryStage>,
+    primary_code: Option<D32StageFailureCode>,
+    secondary_stage: Option<D32HostCanaryStage>,
+    secondary_code: Option<D32StageFailureCode>,
+    stage_trace: Vec<D32VitaStageTrace>,
     bridge_sent: u8,
     bridge_pending: u8,
     bridge_replied: u8,
@@ -799,6 +885,46 @@ struct D32VitaSafeStageDiagnostic {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn parse_d32_vita_stage_trace(value: &str) -> Option<Vec<D32VitaStageTrace>> {
+    if value == "none" {
+        return Some(Vec::new());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut trace = Vec::new();
+    for item in value.split(',') {
+        let (stage, counters) = item.split_once(':')?;
+        let stage = D32HostCanaryStage::parse(stage)?;
+        if !seen.insert(stage.as_str()) {
+            return None;
+        }
+        let values = counters.split('/').collect::<Vec<_>>();
+        if values.len() != 3 {
+            return None;
+        }
+        let parse_counter = |value: &str| {
+            value
+                .parse::<u8>()
+                .ok()
+                .filter(|value| *value <= D32_STAGE_COUNTER_MAX)
+        };
+        trace.push(D32VitaStageTrace {
+            stage,
+            started: parse_counter(values[0])?,
+            passed: parse_counter(values[1])?,
+            failed: parse_counter(values[2])?,
+        });
+    }
+    if trace.len() != D32HostCanaryStage::ALL.len()
+        || D32HostCanaryStage::ALL
+            .iter()
+            .any(|stage| !seen.contains(stage.as_str()))
+    {
+        return None;
+    }
+    Some(trace)
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStageDiagnostic> {
     const PREFIX: &str = "D32 Vita stage failure";
     let start = message.find(PREFIX)? + PREFIX.len();
@@ -809,6 +935,11 @@ fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStag
             key,
             "stage"
                 | "code"
+                | "primary_stage"
+                | "primary_code"
+                | "secondary_stage"
+                | "secondary_code"
+                | "stage_trace"
                 | "bridge_sent"
                 | "bridge_pending"
                 | "bridge_replied"
@@ -824,21 +955,33 @@ fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStag
             return None;
         }
     }
-    let stage = match fields.get("stage").copied()? {
-        "layout" => D32HostCanaryStage::Layout,
-        "catalog" => D32HostCanaryStage::Catalog,
-        "sandbox" => D32HostCanaryStage::Sandbox,
-        "action_prepare" => D32HostCanaryStage::ActionPrepare,
-        "scope_authority" => D32HostCanaryStage::ScopeAuthority,
-        "populate" => D32HostCanaryStage::Populate,
-        "confirmation_bridge" => D32HostCanaryStage::ConfirmationBridge,
-        "grant" => D32HostCanaryStage::Grant,
-        "revalidate" => D32HostCanaryStage::Revalidate,
-        "evidence" => D32HostCanaryStage::Evidence,
-        "cleanup" => D32HostCanaryStage::Cleanup,
+    let stage = D32HostCanaryStage::parse(fields.get("stage").copied()?)?;
+    let code = D32StageFailureCode::parse(fields.get("code").copied()?)?;
+    let primary_stage = match (
+        fields.get("primary_stage").copied(),
+        fields.get("primary_code").copied(),
+    ) {
+        (None, None) => (Some(stage), Some(code)),
+        (Some("none"), Some("none")) => (None, None),
+        (Some(stage), Some(code)) => (
+            Some(D32HostCanaryStage::parse(stage)?),
+            Some(D32StageFailureCode::parse(code)?),
+        ),
         _ => return None,
     };
-    let code = D32StageFailureCode::parse(fields.get("code").copied()?)?;
+    let secondary_stage = match (
+        fields.get("secondary_stage").copied(),
+        fields.get("secondary_code").copied(),
+    ) {
+        (None, None) | (Some("none"), Some("none")) => (None, None),
+        (Some(stage), Some(code)) => (
+            Some(D32HostCanaryStage::parse(stage)?),
+            Some(D32StageFailureCode::parse(code)?),
+        ),
+        _ => return None,
+    };
+    let stage_trace =
+        parse_d32_vita_stage_trace(fields.get("stage_trace").copied().unwrap_or("none"))?;
     let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
         "true" => true,
         "false" => false,
@@ -862,6 +1005,11 @@ fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStag
     Some(D32VitaSafeStageDiagnostic {
         stage,
         code,
+        primary_stage: primary_stage.0,
+        primary_code: primary_stage.1,
+        secondary_stage: secondary_stage.0,
+        secondary_code: secondary_stage.1,
+        stage_trace,
         bridge_sent: bounded("bridge_sent")?,
         bridge_pending: bounded("bridge_pending")?,
         bridge_replied: bounded("bridge_replied")?,
@@ -1182,15 +1330,21 @@ impl D32HostIntegrationEnvironment {
     }
 
     pub(crate) fn verify_real_roots_unchanged(&self) -> Result<(), String> {
-        self.inner.verify_real_roots_unchanged()
+        self.inner
+            .verify_real_roots_unchanged()
+            .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())
     }
 
     pub(crate) fn establish_stable_baseline(&mut self) -> Result<(), String> {
-        self.inner.establish_stable_baseline()
+        self.inner
+            .establish_stable_baseline()
+            .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), String> {
-        self.inner.cleanup()
+        self.inner
+            .cleanup()
+            .map_err(|_| "D32_A_HOST_FAILURE: cleanup_failed".to_string())
     }
 }
 
@@ -11281,7 +11435,27 @@ mod windows {
 
     #[cfg(feature = "d32-a-host-canary")]
     fn d32_not_executable(message: impl Into<String>) -> String {
-        format!("D32_A_NOT_EXECUTABLE: {}", message.into())
+        let message = message.into().to_ascii_lowercase();
+        let code = if message.contains("cleanup") {
+            "cleanup_failed"
+        } else if message.contains("git") || message.contains("metadata") {
+            "git_boundary"
+        } else if message.contains("life") || message.contains("migration") {
+            "life_state"
+        } else if message.contains("cargo") || message.contains("toolchain") {
+            "toolchain"
+        } else if message.contains("credential") || message.contains("profile") {
+            "auth_state"
+        } else if message.contains("path")
+            || message.contains("root")
+            || message.contains("directory")
+            || message.contains("resource")
+        {
+            "host_layout"
+        } else {
+            "preflight_failed"
+        };
+        format!("D32_A_NOT_EXECUTABLE: {code}")
     }
 
     #[cfg(feature = "d32-a-host-canary")]
@@ -12717,43 +12891,43 @@ mod windows {
 
         pub(super) fn establish_stable_baseline(&mut self) -> Result<(), String> {
             if self.real_tree_manifests.is_some() {
-                return Err(
-                    "D32_A_HOST_FAILURE: real Host tree baseline was already established"
-                        .to_string(),
-                );
+                return Err("D32_A_HOST_FAILURE: real_host_audit_failed".to_string());
             }
             for fence in &self.real_root_fences {
-                fence.revalidate("real Host root")?;
+                fence
+                    .revalidate("real Host root")
+                    .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())?;
             }
             let manifests = self
                 .real_roots
                 .iter()
                 .map(|root| d32_tree_manifest(root).map(|manifest| (root.clone(), manifest)))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())?;
             self.real_tree_manifests = Some(manifests);
             Ok(())
         }
 
         pub(super) fn verify_real_roots_unchanged(&self) -> Result<(), String> {
             let Some(expected_manifests) = self.real_tree_manifests.as_ref() else {
-                return Err(
-                    "D32_A_HOST_FAILURE: real Host tree baseline was not established".to_string(),
-                );
+                return Err("D32_A_HOST_FAILURE: real_host_audit_failed".to_string());
             };
             for fence in &self.real_root_fences {
-                fence.revalidate("real Host root")?;
+                fence
+                    .revalidate("real Host root")
+                    .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())?;
             }
             for (path, expected) in expected_manifests {
-                let current = d32_tree_manifest(path)?;
+                let current = d32_tree_manifest(path)
+                    .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())?;
                 if &current != expected {
-                    return Err(format!(
-                        "D32_A_HOST_FAILURE: real Host tree manifest changed during canary: {}",
-                        path.display()
-                    ));
+                    return Err("D32_A_HOST_FAILURE: real_host_audit_failed".to_string());
                 }
             }
             for fence in &self.real_root_fences {
-                fence.revalidate("real Host root")?;
+                fence
+                    .revalidate("real Host root")
+                    .map_err(|_| "D32_A_HOST_FAILURE: real_host_audit_failed".to_string())?;
             }
             Ok(())
         }
@@ -12767,25 +12941,17 @@ mod windows {
                     self.cleaned = true;
                     Ok(())
                 }
-                Err(error) => Err(format!(
-                    "D32_A_HOST_FAILURE: canary isolation cleanup metadata failed: {error}"
-                )),
+                Err(_) => Err("D32_A_HOST_FAILURE: cleanup_failed".to_string()),
                 Ok(metadata) => {
                     if host_metadata_is_reparse(&metadata) {
-                        return Err(
-                            "D32_A_HOST_FAILURE: canary isolation root became a reparse point"
-                                .to_string(),
-                        );
+                        return Err("D32_A_HOST_FAILURE: cleanup_unsafe_state".to_string());
                     }
-                    host_verify_no_reparse_tree(&self.root)?;
-                    fs::remove_dir_all(&self.root).map_err(|error| {
-                        format!("D32_A_HOST_FAILURE: canary isolation cleanup failed: {error}")
-                    })?;
+                    host_verify_no_reparse_tree(&self.root)
+                        .map_err(|_| "D32_A_HOST_FAILURE: cleanup_unsafe_state".to_string())?;
+                    fs::remove_dir_all(&self.root)
+                        .map_err(|_| "D32_A_HOST_FAILURE: cleanup_failed".to_string())?;
                     if fs::symlink_metadata(&self.root).is_ok() {
-                        return Err(
-                            "D32_A_HOST_FAILURE: canary isolation cleanup left unsafe state"
-                                .to_string(),
-                        );
+                        return Err("D32_A_HOST_FAILURE: cleanup_unsafe_state".to_string());
                     }
                     self.cleaned = true;
                     Ok(())
@@ -13838,6 +14004,37 @@ mod windows {
 
         #[cfg(all(windows, feature = "d32-a-host-canary"))]
         #[test]
+        fn d32_vita_stage_parser_preserves_primary_cleanup_and_success_trace() {
+            let stage_trace = "layout:1/1/0,catalog:1/0/1,sandbox:1/1/0,action_prepare:1/1/0,scope_authority:1/1/0,populate:1/1/0,confirmation_bridge:1/1/0,grant:1/1/0,revalidate:1/1/0,evidence:1/1/0,cleanup:1/0/1";
+            let message = format!(
+                "D32 Vita stage failure stage=cleanup code=operation_failed primary_stage=catalog primary_code=operation_failed secondary_stage=cleanup secondary_code=operation_failed stage_trace={stage_trace} bridge_sent=1 bridge_pending=1 bridge_replied=1 bridge_pending_active=false bridge_decision=confirm bridge_confirmed=1 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0"
+            );
+            let diagnostic =
+                parse_d32_vita_safe_stage_diagnostic(&message).expect("combined Vita failure");
+            let trace = D32HostCanaryTrace::default();
+            trace.update(|snapshot| snapshot.stage_telemetry.mark_vita_failure(&diagnostic));
+            let snapshot = trace.snapshot();
+            assert_eq!(snapshot.stage_telemetry.catalog.failed, 1);
+            assert_eq!(
+                snapshot
+                    .stage_telemetry
+                    .catalog
+                    .last_failure_code
+                    .as_deref(),
+                Some("operation_failed")
+            );
+            assert_eq!(snapshot.stage_telemetry.cleanup.failed, 1);
+            assert_eq!(snapshot.stage_telemetry.layout.started, 1);
+            assert_eq!(snapshot.stage_telemetry.layout.passed, 1);
+            assert_eq!(snapshot.stage_telemetry.bridge_confirmed, 1);
+            assert!(parse_d32_vita_safe_stage_diagnostic(
+                &message.replace("catalog:1/0/1", "catalog:1/0/1,catalog:1/0/1")
+            )
+            .is_none());
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
         fn d32_failure_context_redacts_cleanup_and_transport_details() {
             let control = D32HostCanaryControl::new(D32HostCanaryMode::Positive);
             let cleanup = D32CleanupOutcome {
@@ -13870,6 +14067,17 @@ mod windows {
                     "failure context leaked {marker:?}"
                 );
             }
+        }
+
+        #[test]
+        fn d32_precontrol_error_codes_never_echo_raw_paths_or_credentials() {
+            let error = d32_not_executable(
+                "cleanup failed for C:\\Users\\secret\\workspace; credential token=secret-value",
+            );
+            assert_eq!(error, "D32_A_NOT_EXECUTABLE: cleanup_failed");
+            assert!(!error.contains("Users"));
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("token"));
         }
 
         #[test]

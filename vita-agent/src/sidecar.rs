@@ -199,7 +199,7 @@ impl D32ForcedToolLatch {
         if let Ok(mut last_failure) = self.last_failure.lock() {
             if last_failure
                 .as_ref()
-                .is_none_or(|record| specificity >= record.specificity)
+                .is_none_or(|record| specificity > record.specificity)
             {
                 *last_failure = Some(D32FailureRecord {
                     message,
@@ -223,15 +223,15 @@ impl D32ForcedToolLatch {
         };
         let specificity = d32_failure_specificity(&message);
         if let Ok(mut last_failure) = self.last_failure.lock() {
-            if last_failure
-                .as_ref()
-                .is_none_or(|record| specificity >= record.specificity)
-            {
-                *last_failure = Some(D32FailureRecord {
-                    message: message.clone(),
-                    specificity,
-                });
+            if let Some(record) = last_failure.as_ref() {
+                if specificity <= record.specificity {
+                    return record.message.clone();
+                }
             }
+            *last_failure = Some(D32FailureRecord {
+                message: message.clone(),
+                specificity,
+            });
         }
         message
     }
@@ -249,7 +249,7 @@ impl D32ForcedToolLatch {
         let candidate_specificity = d32_failure_specificity(&candidate);
         if let Ok(last_failure) = self.last_failure.lock() {
             if let Some(record) = last_failure.as_ref() {
-                if record.specificity > candidate_specificity {
+                if record.specificity >= candidate_specificity {
                     return record.message.clone();
                 }
             }
@@ -413,7 +413,50 @@ fn d32_allowlisted_vita_stage(value: &str) -> bool {
 }
 
 fn d32_allowlisted_vita_failure_code(value: &str) -> bool {
-    matches!(value, "operation_failed" | "ledger_capacity")
+    matches!(
+        value,
+        "operation_failed"
+            | "ledger_capacity"
+            | "native_denied"
+            | "worker_join"
+            | "replay_metric"
+            | "cancellation"
+            | "invalid_call"
+    )
+}
+
+fn d32_allowlisted_vita_stage_or_none(value: &str) -> bool {
+    value == "none" || d32_allowlisted_vita_stage(value)
+}
+
+fn d32_allowlisted_vita_failure_code_or_none(value: &str) -> bool {
+    value == "none" || d32_allowlisted_vita_failure_code(value)
+}
+
+fn d32_validate_vita_stage_trace(value: &str) -> bool {
+    if value == "none" {
+        return true;
+    }
+    let mut seen = HashSet::new();
+    let mut count = 0usize;
+    for entry in value.split(',') {
+        let Some((stage, counters)) = entry.split_once(':') else {
+            return false;
+        };
+        if !d32_allowlisted_vita_stage(stage) || !seen.insert(stage) {
+            return false;
+        }
+        let parts = counters.split('/').collect::<Vec<_>>();
+        if parts.len() != 3
+            || parts
+                .iter()
+                .any(|part| part.parse::<u8>().ok().is_none_or(|value| value > 16))
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count == 11 && seen.len() == 11
 }
 
 fn d32_allowlisted_bridge_decision(value: &str) -> bool {
@@ -439,6 +482,11 @@ fn d32_safe_vita_stage_failure(raw: &str, counters: D32TurnCounters) -> Option<S
             key,
             "stage"
                 | "code"
+                | "primary_stage"
+                | "primary_code"
+                | "secondary_stage"
+                | "secondary_code"
+                | "stage_trace"
                 | "bridge_sent"
                 | "bridge_pending"
                 | "bridge_replied"
@@ -462,6 +510,32 @@ fn d32_safe_vita_stage_failure(raw: &str, counters: D32TurnCounters) -> Option<S
         .get("code")
         .copied()
         .filter(|value| d32_allowlisted_vita_failure_code(value))?;
+    let primary_stage = fields.get("primary_stage").copied().unwrap_or(stage);
+    if !d32_allowlisted_vita_stage_or_none(primary_stage) {
+        return None;
+    }
+    let primary_code = fields.get("primary_code").copied().unwrap_or(code);
+    if !d32_allowlisted_vita_failure_code_or_none(primary_code) {
+        return None;
+    }
+    if (primary_stage == "none") != (primary_code == "none") {
+        return None;
+    }
+    let secondary_stage = fields.get("secondary_stage").copied().unwrap_or("none");
+    if !d32_allowlisted_vita_stage_or_none(secondary_stage) {
+        return None;
+    }
+    let secondary_code = fields.get("secondary_code").copied().unwrap_or("none");
+    if !d32_allowlisted_vita_failure_code_or_none(secondary_code) {
+        return None;
+    }
+    if (secondary_stage == "none") != (secondary_code == "none") {
+        return None;
+    }
+    let stage_trace = fields.get("stage_trace").copied().unwrap_or("none");
+    if !d32_validate_vita_stage_trace(stage_trace) {
+        return None;
+    }
     let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
         "true" => true,
         "false" => false,
@@ -480,7 +554,7 @@ fn d32_safe_vita_stage_failure(raw: &str, counters: D32TurnCounters) -> Option<S
             .filter(|value| *value <= 16)
     };
     Some(format!(
-        "{D32_VITA_STAGE_FAILURE_PREFIX} stage={stage} code={code} bridge_sent={} bridge_pending={} bridge_replied={} bridge_pending_active={bridge_pending_active} bridge_decision={decision} bridge_confirmed={} bridge_denied={} bridge_cancelled={} bridge_timed_out={} bridge_failed={} {}",
+        "{D32_VITA_STAGE_FAILURE_PREFIX} stage={stage} code={code} primary_stage={primary_stage} primary_code={primary_code} secondary_stage={secondary_stage} secondary_code={secondary_code} stage_trace={stage_trace} bridge_sent={} bridge_pending={} bridge_replied={} bridge_pending_active={bridge_pending_active} bridge_decision={decision} bridge_confirmed={} bridge_denied={} bridge_cancelled={} bridge_timed_out={} bridge_failed={} {}",
         bounded("bridge_sent")?,
         bounded("bridge_pending")?,
         bounded("bridge_replied")?,
@@ -5207,6 +5281,20 @@ mod tests {
 
         let generic = latch.safe_turn_failure("generic turn terminal failure");
         assert!(generic.contains("phase=finish_reason"));
+    }
+
+    #[test]
+    fn d32_same_specificity_failure_retains_first_safe_diagnostic() {
+        let latch = D32ForcedToolLatch::new();
+        let first = latch.safe_failure(
+            "D32 Vita stage failure stage=catalog code=operation_failed bridge_sent=0 bridge_pending=0 bridge_replied=0 bridge_pending_active=false bridge_decision=none bridge_confirmed=0 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0",
+        );
+        assert!(first.contains("stage=catalog"));
+        let retained = latch.safe_failure(
+            "D32 Vita stage failure stage=cleanup code=operation_failed bridge_sent=0 bridge_pending=0 bridge_replied=0 bridge_pending_active=false bridge_decision=none bridge_confirmed=0 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0",
+        );
+        assert!(retained.contains("stage=catalog"));
+        assert!(!retained.contains("stage=cleanup"));
     }
 
     #[test]

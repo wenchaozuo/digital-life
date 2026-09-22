@@ -11,7 +11,8 @@ use std::fmt::{self, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 use vita_agent_protocol::TOOL_NAME;
@@ -1836,7 +1837,7 @@ fn parse_d32_native_response(
     http_status: Option<u16>,
     content_type_is_json: bool,
 ) -> Result<VitaResponsesResult, VitaAgentError> {
-    let value = serde_json::from_slice::<Value>(body).map_err(|_| {
+    let value = parse_json_reject_duplicate_keys(body).map_err(|_| {
         d32_native_failure(
             phase,
             attempts,
@@ -2168,10 +2169,133 @@ fn validate_d32_request_response_contract(
 }
 
 pub(crate) fn d32_arguments_are_strict_empty_object(arguments: &str) -> bool {
-    serde_json::from_str::<Value>(arguments)
+    parse_json_reject_duplicate_keys(arguments.as_bytes())
         .ok()
         .and_then(|value| value.as_object().map(|object| object.is_empty()))
         .unwrap_or(false)
+}
+
+/// Deserialize provider JSON while rejecting duplicate object keys at every
+/// depth.  `serde_json::Value` otherwise implements last-write-wins for a
+/// duplicate key, which would make a native D32 response ambiguous before the
+/// strict shape checks run.
+pub(crate) fn parse_json_reject_duplicate_keys(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = DuplicateKeyValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
+
+struct DuplicateKeyValue(Value);
+
+impl<'de> Deserialize<'de> for DuplicateKeyValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DuplicateKeyVisitor;
+
+        impl<'de> Visitor<'de> for DuplicateKeyVisitor {
+            type Value = DuplicateKeyValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON value with unique object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let number = serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))?;
+                Ok(DuplicateKeyValue(Value::Number(number)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::String(value.to_string())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::Null))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateKeyValue(Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                DuplicateKeyValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<DuplicateKeyValue>()? {
+                    values.push(value.0);
+                }
+                Ok(DuplicateKeyValue(Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(de::Error::custom("duplicate JSON object key"));
+                    }
+                    let value = map.next_value::<DuplicateKeyValue>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(DuplicateKeyValue(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(DuplicateKeyVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4297,6 +4421,24 @@ mod tests {
         for arguments in ["{\"unexpected\":true}", "[]", "null", "not-json"] {
             assert!(!d32_arguments_are_strict_empty_object(arguments));
         }
+    }
+
+    #[test]
+    fn d32_native_json_duplicate_keys_fail_closed_at_every_depth() {
+        for body in [
+            br#"{"id":"response","id":"ambiguous"}"#.as_slice(),
+            br#"{"output":[{"type":"function_call","type":"message"}]}"#.as_slice(),
+            br#"{"outer":{"inner":1,"inner":2}}"#.as_slice(),
+            br#"{"items":[{"name":"cargo","name":"other"}]}"#.as_slice(),
+        ] {
+            assert!(
+                parse_json_reject_duplicate_keys(body).is_err(),
+                "duplicate JSON object keys must be rejected"
+            );
+        }
+        assert!(!d32_arguments_are_strict_empty_object(
+            r#"{"unexpected":{},"unexpected":{}}"#
+        ));
     }
 
     #[test]

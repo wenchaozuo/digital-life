@@ -889,7 +889,7 @@ fn parse_provider_error_detail(
     body: &[u8],
     credential: Option<&ResolvedCredential>,
 ) -> Option<ProviderErrorDetail> {
-    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let value = super::parse_json_reject_duplicate_keys(body).ok()?;
     let root = value.as_object()?;
     let nested_error = root.get("error").and_then(Value::as_object);
     let code = extract_error_scalar(nested_error, root, &["code", "error_code", "errorCode"]);
@@ -2324,6 +2324,12 @@ mod tests {
         assert!(!display.contains("xxxxxxxx"));
         assert!(!debug.contains("arbitrary"));
         assert!(parse_provider_error_detail(400, b"not-json", None).is_none());
+        assert!(parse_provider_error_detail(
+            400,
+            br#"{"error":{"code":"first","code":"second"}}"#,
+            None
+        )
+        .is_none());
     }
 
     #[test]

@@ -6846,7 +6846,7 @@ impl H7PendingConfirmationBridge {
             if let Some(telemetry) = &self.d32_telemetry {
                 telemetry.failed(
                     D32VitaStage::ConfirmationBridge,
-                    D32VitaFailureCode::OperationFailed,
+                    D32VitaFailureCode::Cancellation,
                 );
                 telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
             }
@@ -6856,7 +6856,7 @@ impl H7PendingConfirmationBridge {
             if let Some(telemetry) = &self.d32_telemetry {
                 telemetry.failed(
                     D32VitaStage::ConfirmationBridge,
-                    D32VitaFailureCode::OperationFailed,
+                    D32VitaFailureCode::Cancellation,
                 );
                 telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
             }
@@ -6875,14 +6875,14 @@ impl H7PendingConfirmationBridge {
             result = &mut send => result,
             _ = cancellation_notify.notified() => {
                 if let Some(telemetry) = &self.d32_telemetry {
-                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::Cancellation);
                     telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
                 }
                 return Err("D29-H7 process action cancelled".to_string());
             }
             _ = self.cancelled_notify.notified() => {
                 if let Some(telemetry) = &self.d32_telemetry {
-                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::Cancellation);
                     telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
                 }
                 return Err("D29-H7 process action cancelled".to_string());
@@ -6921,7 +6921,7 @@ impl H7PendingConfirmationBridge {
                     }
                     Err(_) => {
                         if let Some(telemetry) = &self.d32_telemetry {
-                            telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                            telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::LedgerCapacity);
                             telemetry.bridge_result(D32VitaBridgeDecision::Timeout);
                         }
                         Err("D29-H7 confirmation timed out".to_string())
@@ -6930,14 +6930,14 @@ impl H7PendingConfirmationBridge {
             }
             _ = cancellation_notify.notified() => {
                 if let Some(telemetry) = &self.d32_telemetry {
-                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::Cancellation);
                     telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
                 }
                 Err("D29-H7 process action cancelled".to_string())
             }
             _ = self.cancelled_notify.notified() => {
                 if let Some(telemetry) = &self.d32_telemetry {
-                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::Cancellation);
                     telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
                 }
                 Err("D29-H7 process action cancelled".to_string())
@@ -6957,9 +6957,20 @@ impl H7PendingProcessAction {
     }
 
     pub fn confirm(self, authorization_revision: i64) -> Result<(), String> {
-        self.response
-            .send(authorization_revision)
-            .map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
+        let result = self.response.send(authorization_revision);
+        if result.is_ok() {
+            if let Some(telemetry) = &self.d32_telemetry {
+                telemetry.bridge_result(D32VitaBridgeDecision::Confirm);
+                telemetry.stage_passed(D32VitaStage::ConfirmationBridge);
+            }
+        } else if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.failed(
+                D32VitaStage::ConfirmationBridge,
+                D32VitaFailureCode::OperationFailed,
+            );
+            telemetry.bridge_result(D32VitaBridgeDecision::Error);
+        }
+        result.map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
     }
 
     pub fn mark_pending(&self) {
@@ -6977,6 +6988,12 @@ impl H7PendingProcessAction {
         if result.is_ok() {
             if let Some(telemetry) = &self.d32_telemetry {
                 telemetry.bridge_result(decision);
+                if matches!(
+                    decision,
+                    D32VitaBridgeDecision::Confirm | D32VitaBridgeDecision::Deny
+                ) {
+                    telemetry.stage_passed(D32VitaStage::ConfirmationBridge);
+                }
             }
         } else if let Some(telemetry) = &self.d32_telemetry {
             telemetry.failed(
@@ -7680,6 +7697,86 @@ impl H7ProcessBroker {
         }
     }
 
+    fn d32_stage_started(&self, stage: D32VitaStage) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.stage_started(stage);
+        }
+    }
+
+    fn d32_stage_passed(&self, stage: D32VitaStage) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.stage_passed(stage);
+        }
+    }
+
+    fn d32_failed_current(&self, code: D32VitaFailureCode) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.failed_current(code);
+        }
+    }
+
+    fn d32_record_native_outcome(telemetry: &D32VitaStageTelemetry, native: &H7NativeResult) {
+        match native.kind {
+            H7NativeOutcomeKind::StartedAndExited if native.exit_code == Some(0) => {
+                telemetry.stage_passed(D32VitaStage::ActionPrepare);
+            }
+            H7NativeOutcomeKind::StartedAndCancelled => {
+                telemetry.failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::Cancellation,
+                );
+            }
+            H7NativeOutcomeKind::StartedAndTimedOut
+            | H7NativeOutcomeKind::StartedAndOutputLimited
+            | H7NativeOutcomeKind::StartedOutcomeUnknown => {
+                telemetry.failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::OperationFailed,
+                );
+            }
+            H7NativeOutcomeKind::Denied => {
+                if native.process_tree_observer_failed {
+                    telemetry.failed(
+                        D32VitaStage::ActionPrepare,
+                        D32VitaFailureCode::NativeDenied,
+                    );
+                    telemetry.failed(D32VitaStage::Cleanup, D32VitaFailureCode::NativeDenied);
+                } else {
+                    let category = native
+                        .diagnostics
+                        .final_local_fence_error_category
+                        .as_deref();
+                    let stage = match category {
+                        Some("cancellation")
+                        | Some("grant_binding")
+                        | Some("workspace_binding")
+                        | Some("d32_environment")
+                        | Some("metadata_fence") => D32VitaStage::Revalidate,
+                        _ => D32VitaStage::ActionPrepare,
+                    };
+                    let code = if category == Some("cancellation") {
+                        D32VitaFailureCode::Cancellation
+                    } else {
+                        D32VitaFailureCode::NativeDenied
+                    };
+                    telemetry.failed(stage, code);
+                }
+            }
+            H7NativeOutcomeKind::LaunchFailed => {
+                telemetry.failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::NativeDenied,
+                );
+            }
+            H7NativeOutcomeKind::StartedAndExited => {
+                telemetry.failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::OperationFailed,
+                );
+            }
+        }
+    }
+
     pub(crate) async fn execute(
         self: &Arc<Self>,
         action: Arc<PreparedProcessAction>,
@@ -7695,6 +7792,7 @@ impl H7ProcessBroker {
         self: &Arc<Self>,
         action: &Arc<PreparedProcessAction>,
     ) -> Result<H7WorkspaceScopeProof, String> {
+        self.d32_stage_started(D32VitaStage::ScopeAuthority);
         if action.capability_id != VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID
             || action.workspace_root.is_none()
             || action.workspace_root_identity.is_none()
@@ -7731,6 +7829,7 @@ impl H7ProcessBroker {
             );
             return Err("D32 workspace scope authority revision was not positive".to_string());
         }
+        self.d32_stage_passed(D32VitaStage::ScopeAuthority);
         Ok(H7WorkspaceScopeProof {
             binding: action.binding(),
             authorization_revision,
@@ -7785,6 +7884,7 @@ impl H7ProcessBroker {
         action: Arc<PreparedProcessAction>,
         prevalidated_scope: Option<H7WorkspaceScopeProof>,
     ) -> H7ToolResult {
+        self.d32_stage_started(D32VitaStage::ActionPrepare);
         let admission = match self.admission.try_acquire() {
             Some(admission) => admission,
             None => {
@@ -7824,6 +7924,7 @@ impl H7ProcessBroker {
         prevalidated_scope: Option<H7WorkspaceScopeProof>,
     ) -> H7ToolResult {
         if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
+            self.d32_stage_started(D32VitaStage::ScopeAuthority);
             if action.workspace_root.is_none() || action.workspace_root_identity.is_none() {
                 self.d32_failed(
                     D32VitaStage::ScopeAuthority,
@@ -7839,12 +7940,15 @@ impl H7ProcessBroker {
                     );
                     return H7ToolResult::denied();
                 }
+                self.d32_stage_passed(D32VitaStage::ScopeAuthority);
             } else if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
                 self.d32_failed(
                     D32VitaStage::ScopeAuthority,
                     D32VitaFailureCode::OperationFailed,
                 );
                 return H7ToolResult::denied();
+            } else {
+                self.d32_stage_passed(D32VitaStage::ScopeAuthority);
             }
         } else if prevalidated_scope.is_some() {
             self.d32_failed(
@@ -7864,16 +7968,22 @@ impl H7ProcessBroker {
         {
             Ok(revision) => revision,
             Err(_) => {
+                self.d32_failed(
+                    D32VitaStage::ConfirmationBridge,
+                    D32VitaFailureCode::Cancellation,
+                );
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
                     H7ToolResult::denied()
-                }
+                };
             }
         };
         if cancellation.load(Ordering::Acquire) {
+            self.d32_failed(D32VitaStage::Grant, D32VitaFailureCode::Cancellation);
             return H7ToolResult::cancelled_before_start();
         }
+        self.d32_stage_started(D32VitaStage::Grant);
         let authority = Arc::clone(&self.authority);
         let action_for_grant = Arc::clone(&action);
         let grant_admission = admission.clone();
@@ -7893,7 +8003,7 @@ impl H7ProcessBroker {
                 };
             }
             _ => {
-                self.d32_failed(D32VitaStage::Grant, D32VitaFailureCode::OperationFailed);
+                self.d32_failed(D32VitaStage::Grant, D32VitaFailureCode::WorkerJoin);
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
@@ -7901,6 +8011,8 @@ impl H7ProcessBroker {
                 };
             }
         };
+        self.d32_stage_passed(D32VitaStage::Grant);
+        self.d32_stage_started(D32VitaStage::ActionPrepare);
         let preparation_action = Arc::clone(&action);
         let unlisted_inheritable_handle = self.unlisted_inheritable_handle;
         let output_terminality_gate = self.output_terminality_gate.clone();
@@ -7916,7 +8028,7 @@ impl H7ProcessBroker {
         .await
         {
             Ok(Ok(preparation)) => preparation,
-            _ => {
+            Ok(Err(_error)) => {
                 self.d32_failed(
                     D32VitaStage::ActionPrepare,
                     D32VitaFailureCode::OperationFailed,
@@ -7927,7 +8039,16 @@ impl H7ProcessBroker {
                     H7ToolResult::denied()
                 };
             }
+            Err(_join_error) => {
+                self.d32_failed(D32VitaStage::ActionPrepare, D32VitaFailureCode::WorkerJoin);
+                return if cancellation.load(Ordering::Acquire) {
+                    H7ToolResult::cancelled_before_start()
+                } else {
+                    H7ToolResult::denied()
+                };
+            }
         };
+        self.d32_stage_passed(D32VitaStage::ActionPrepare);
         if let Some(gate) = &self.final_fence_gate {
             gate.wait_if_armed().await;
         }
@@ -7949,7 +8070,13 @@ impl H7ProcessBroker {
         match tokio::task::spawn_blocking(move || {
             let _admission = worker_admission;
             let _worker = H7NativeWorkerGuard::new(worker_metrics);
+            if let Some(telemetry) = &d32_telemetry {
+                telemetry.stage_started(D32VitaStage::Revalidate);
+            }
             if worker_cancellation.load(Ordering::Acquire) {
+                if let Some(telemetry) = &d32_telemetry {
+                    telemetry.failed(D32VitaStage::Revalidate, D32VitaFailureCode::Cancellation);
+                }
                 return H7ToolResult::cancelled_before_start();
             }
             let mut grant = grant;
@@ -7967,6 +8094,9 @@ impl H7ProcessBroker {
                     H7ToolResult::denied()
                 };
             }
+            if let Some(telemetry) = &d32_telemetry {
+                telemetry.stage_passed(D32VitaStage::Revalidate);
+            }
             let mut d32_replay_checked = false;
             let mut d32_replay_denied = false;
             let mut d32_replay_process_created_before = 0usize;
@@ -7979,6 +8109,10 @@ impl H7ProcessBroker {
                 d32_replay_process_created_before = metrics.process_created.load(Ordering::Acquire);
                 d32_replay_thread_resumed_before = metrics.thread_resumed.load(Ordering::Acquire);
                 if d32_replay_process_created_before != 0 || d32_replay_thread_resumed_before != 0 {
+                    if let Some(telemetry) = &d32_telemetry {
+                        telemetry
+                            .failed(D32VitaStage::Revalidate, D32VitaFailureCode::ReplayMetric);
+                    }
                     return H7ToolResult::denied();
                 }
                 let replay_result =
@@ -7988,16 +8122,18 @@ impl H7ProcessBroker {
                 if d32_replay_process_created_after != d32_replay_process_created_before
                     || d32_replay_thread_resumed_after != d32_replay_thread_resumed_before
                 {
+                    if let Some(telemetry) = &d32_telemetry {
+                        telemetry
+                            .failed(D32VitaStage::Revalidate, D32VitaFailureCode::ReplayMetric);
+                    }
                     return H7ToolResult::denied();
                 }
                 if replay_result.is_err() {
                     d32_replay_denied = true;
                 } else {
                     if let Some(telemetry) = &d32_telemetry {
-                        telemetry.failed(
-                            D32VitaStage::Revalidate,
-                            D32VitaFailureCode::OperationFailed,
-                        );
+                        telemetry
+                            .failed(D32VitaStage::Revalidate, D32VitaFailureCode::ReplayMetric);
                     }
                     return H7ToolResult::denied();
                 }
@@ -8022,6 +8158,20 @@ impl H7ProcessBroker {
                 preparation,
                 Some(grant),
             );
+            if let Some(telemetry) = &d32_telemetry {
+                telemetry.stage_started(D32VitaStage::ActionPrepare);
+            }
+            if native.kind == H7NativeOutcomeKind::StartedAndExited && native.exit_code == Some(0) {
+                if let Some(telemetry) = &d32_telemetry {
+                    telemetry.stage_passed(D32VitaStage::ActionPrepare);
+                }
+            } else if let Some(telemetry) = &d32_telemetry {
+                // The broker owns this native boundary; classify every
+                // supervisor outcome before it becomes a model-visible tool
+                // result.  `d32_record_native_outcome` keeps cleanup as a
+                // secondary failure and never overwrites a primary stage.
+                Self::d32_record_native_outcome(telemetry, &native);
+            }
             let mut tool_result = if native.kind == H7NativeOutcomeKind::Denied
                 && worker_cancellation.load(Ordering::Acquire)
             {
@@ -8048,7 +8198,9 @@ impl H7ProcessBroker {
         {
             Ok(result) => result,
             Err(_) => {
+                self.d32_failed_current(D32VitaFailureCode::WorkerJoin);
                 if cancellation.load(Ordering::Acquire) {
+                    self.d32_failed_current(D32VitaFailureCode::Cancellation);
                     H7ToolResult::cancelled_before_start()
                 } else {
                     H7ToolResult::denied()

@@ -118,19 +118,100 @@ enum D32ForcedToolPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct D32TurnCounters {
+    gateway_requests: u8,
+    provider_results: u8,
+    sse_created: u8,
+    sse_failed: u8,
+    sse_completed: u8,
+}
+
+impl D32TurnCounters {
+    fn as_suffix(self) -> String {
+        format!(
+            "gateway_requests={} provider_results={} sse_created={} sse_failed={} sse_completed={}",
+            self.gateway_requests,
+            self.provider_results,
+            self.sse_created,
+            self.sse_failed,
+            self.sse_completed,
+        )
+    }
+}
+
 /// The forced Cargo contract belongs to exactly one gateway generation.  It
 /// is deliberately in-memory and turn-scoped: a new Host turn receives a new
 /// latch, while a repeated/late request for the old generation remains
 /// rejected even if it reuses an otherwise valid HTTP shape.
 struct D32ForcedToolLatch {
     phase: Mutex<D32ForcedToolPhase>,
+    counters: Mutex<D32TurnCounters>,
+    last_failure: Mutex<Option<String>>,
 }
 
 impl D32ForcedToolLatch {
     fn new() -> Self {
         Self {
             phase: Mutex::new(D32ForcedToolPhase::InitialRequest),
+            counters: Mutex::new(D32TurnCounters::default()),
+            last_failure: Mutex::new(None),
         }
+    }
+
+    fn record_gateway_request(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.gateway_requests = counters.gateway_requests.saturating_add(1);
+        }
+    }
+
+    fn record_provider_result(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.provider_results = counters.provider_results.saturating_add(1);
+        }
+    }
+
+    fn record_success(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.sse_created = counters.sse_created.saturating_add(1);
+            counters.sse_completed = counters.sse_completed.saturating_add(1);
+        }
+    }
+
+    fn safe_failure(&self, raw: &str) -> String {
+        self.fail();
+        let message = {
+            let mut counters = self
+                .counters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            counters.sse_created = counters.sse_created.saturating_add(1);
+            counters.sse_failed = counters.sse_failed.saturating_add(1);
+            format_d32_safe_failure(raw, *counters)
+        };
+        if let Ok(mut last_failure) = self.last_failure.lock() {
+            *last_failure = Some(message.clone());
+        }
+        message
+    }
+
+    fn safe_turn_failure(&self, raw: &str) -> String {
+        if let Ok(last_failure) = self.last_failure.lock() {
+            if let Some(message) = last_failure.as_ref() {
+                return message.clone();
+            }
+        }
+        let counters = self
+            .counters
+            .lock()
+            .map(|counters| *counters)
+            .unwrap_or_default();
+        format_d32_safe_failure(raw, counters)
+    }
+
+    #[cfg(test)]
+    fn counters(&self) -> D32TurnCounters {
+        self.counters.lock().expect("D32 counter lock").to_owned()
     }
 
     fn admit_request(&self, request: &mut VitaResponsesRequest) -> Result<(), String> {
@@ -255,6 +336,144 @@ impl D32ForcedToolLatch {
     fn phase(&self) -> D32ForcedToolPhase {
         self.phase.lock().expect("D32 latch lock").clone()
     }
+}
+
+const D32_SAFE_DIAGNOSTIC_PREFIX: &str = "D32 native Responses rejected";
+
+fn d32_allowlisted_phase(value: &str) -> bool {
+    matches!(
+        value,
+        "policy_gate"
+            | "request_contract"
+            | "second_round_request"
+            | "credential_resolution"
+            | "dns"
+            | "connect"
+            | "transport"
+            | "http_status"
+            | "response_headers"
+            | "response_json"
+            | "response_model"
+            | "expected_tool"
+            | "finish_reason"
+            | "turn_terminal"
+    )
+}
+
+fn d32_allowlisted_error_code(value: &str) -> bool {
+    matches!(
+        value,
+        "policy_mismatch"
+            | "capability"
+            | "request_invalid"
+            | "credential"
+            | "dns"
+            | "connect"
+            | "transport"
+            | "http_status"
+            | "content_type"
+            | "invalid_json"
+            | "response_shape"
+            | "response_identity"
+            | "output_shape"
+            | "usage_shape"
+            | "output_kind"
+            | "output_contract"
+            | "request_contract"
+            | "output_text"
+            | "expected_tool"
+            | "finish_reason"
+            | "turn_failed"
+    )
+}
+
+fn d32_allowlisted_output_kind(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "unknown" | "function_call" | "message" | "output_text"
+    )
+}
+
+fn d32_allowlisted_round(value: &str) -> bool {
+    matches!(value, "initial_request" | "final_request" | "unknown")
+}
+
+fn d32_bounded_counter(value: Option<&str>) -> String {
+    value
+        .and_then(|value| value.parse::<u8>().ok())
+        .map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn format_d32_safe_failure(raw: &str, counters: D32TurnCounters) -> String {
+    let mut fields = HashMap::new();
+    let marker = raw
+        .find(D32_SAFE_DIAGNOSTIC_PREFIX)
+        .map(|index| &raw[index + D32_SAFE_DIAGNOSTIC_PREFIX.len()..]);
+    if let Some(rest) = marker {
+        for token in rest.split_ascii_whitespace() {
+            let Some((key, value)) = token.split_once('=') else {
+                continue;
+            };
+            fields.insert(key, value);
+        }
+    }
+    let default_phase = if raw.contains("finish reason") {
+        "finish_reason"
+    } else if raw.contains("second provider request") {
+        "second_round_request"
+    } else if raw.contains("provider response") {
+        "expected_tool"
+    } else {
+        "turn_terminal"
+    };
+    let default_round = if raw.contains("second provider") {
+        "final_request"
+    } else if raw.contains("first provider") {
+        "initial_request"
+    } else {
+        "unknown"
+    };
+    let phase = fields
+        .get("phase")
+        .copied()
+        .filter(|value| d32_allowlisted_phase(value))
+        .unwrap_or(default_phase);
+    let round = fields
+        .get("round")
+        .copied()
+        .filter(|value| d32_allowlisted_round(value))
+        .unwrap_or(default_round);
+    let error_code = fields
+        .get("error_code")
+        .copied()
+        .filter(|value| d32_allowlisted_error_code(value))
+        .unwrap_or_else(|| {
+            if raw.contains("finish reason") {
+                "finish_reason"
+            } else if raw.contains("second provider request") {
+                "request_contract"
+            } else if raw.contains("provider response") {
+                "expected_tool"
+            } else {
+                "turn_failed"
+            }
+        });
+    let output_kind = fields
+        .get("output_kind")
+        .copied()
+        .filter(|value| d32_allowlisted_output_kind(value))
+        .unwrap_or("none");
+    let attempts = d32_bounded_counter(fields.get("attempts").copied());
+    let http_status = fields
+        .get("http_status")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|status| (100..=599).contains(status))
+        .map_or_else(|| "none".to_string(), |status| status.to_string());
+    let content_type_is_json = matches!(fields.get("content_type_is_json"), Some(&"true"));
+    format!(
+        "{D32_SAFE_DIAGNOSTIC_PREFIX} phase={phase} round={round} attempts={attempts} http_status={http_status} error_code={error_code} output_kind={output_kind} content_type_is_json={content_type_is_json} {}",
+        counters.as_suffix()
+    )
 }
 
 struct GatewayAuthority {
@@ -1235,8 +1454,10 @@ fn handle_gateway_connection(
     };
     let mut request = request;
     if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+        latch.record_gateway_request();
         if let Err(error) = latch.admit_request(&mut request) {
-            return write_gateway_failure(&mut stream, ready.profile().model(), &error);
+            let diagnostic = latch.safe_failure(&error);
+            return write_gateway_failure(&mut stream, ready.profile().model(), &diagnostic);
         }
     }
     let resolver = SidecarCredentialResolver {
@@ -1251,13 +1472,15 @@ fn handle_gateway_connection(
             let transport = match crate::provider_gateway::new_production_provider_transport() {
                 Ok(transport) => transport,
                 Err(error) => {
-                    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
-                        latch.fail();
-                    }
+                    let diagnostic = gateway
+                        .d32_forced_tool
+                        .as_ref()
+                        .map(|latch| latch.safe_failure(&error.to_string()))
+                        .unwrap_or_else(|| bounded_protocol_text(&error.to_string(), 256));
                     return write_gateway_failure(
                         &mut stream,
                         ready.profile().model(),
-                        &bounded_protocol_text(&error.to_string(), 256),
+                        &diagnostic,
                     );
                 }
             };
@@ -1295,20 +1518,21 @@ fn handle_gateway_connection(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            if let Some(latch) = gateway.d32_forced_tool.as_ref() {
-                latch.fail();
-            }
-            return write_gateway_failure(
-                &mut stream,
-                ready.profile().model(),
-                &bounded_protocol_text(&error.to_string(), 256),
-            );
+            let diagnostic = gateway
+                .d32_forced_tool
+                .as_ref()
+                .map(|latch| latch.safe_failure(&error.to_string()))
+                .unwrap_or_else(|| bounded_protocol_text(&error.to_string(), 256));
+            return write_gateway_failure(&mut stream, ready.profile().model(), &diagnostic);
         }
     };
     if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+        latch.record_provider_result();
+    }
+    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
         if let Err(error) = latch.admit_response(&request, &result) {
-            latch.fail();
-            return write_gateway_failure(&mut stream, ready.profile().model(), &error);
+            let diagnostic = latch.safe_failure(&error);
+            return write_gateway_failure(&mut stream, ready.profile().model(), &diagnostic);
         }
     }
     if !active_identity_matches(active_identity, &identity)
@@ -1318,6 +1542,9 @@ fn handle_gateway_connection(
             latch.fail();
         }
         return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
+    }
+    if let Some(latch) = gateway.d32_forced_tool.as_ref() {
+        latch.record_success();
     }
     write_gateway_success(&mut stream, &result)
 }
@@ -2798,6 +3025,7 @@ async fn handle_start_turn(
     let cancelled_for_task = Arc::clone(&cancelled);
     let cancel_notify_for_task = Arc::clone(&cancel_notify);
     let router_for_task = router.clone();
+    let d32_latch_for_task = gateway.d32_forced_tool.clone();
     let join = tokio::spawn(async move {
         let result = runtime
             .run_turn(
@@ -2837,6 +3065,10 @@ async fn handle_start_turn(
             Err(error) => {
                 let error_text = error.to_string();
                 let cancelled = error_text.to_ascii_lowercase().contains("cancel");
+                let message = d32_latch_for_task.as_ref().map_or_else(
+                    || bounded_protocol_text(&error_text, 256),
+                    |latch| latch.safe_turn_failure(&error_text),
+                );
                 let _ = router_for_task.send(&VitaMessage::TurnFailed(TurnFailed {
                     request_id: next_request_id("vita-turn-failed"),
                     session_id,
@@ -2852,7 +3084,7 @@ async fn handle_start_turn(
                         "TURN_FAILED"
                     }
                     .to_string(),
-                    message: bounded_protocol_text(&error_text, 256),
+                    message,
                 }));
             }
         }
@@ -2886,13 +3118,20 @@ async fn handle_start_turn(
         error.task.cancel_notify.notify_waiters();
         error.task.join.abort();
         let _ = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
+        let message = gateway_for_install_error
+            .d32_forced_tool
+            .as_ref()
+            .map_or_else(
+                || bounded_protocol_text(&error.message, 256),
+                |latch| latch.safe_turn_failure(&error.message),
+            );
         let _ = router.send(&VitaMessage::TurnFailed(TurnFailed {
             request_id,
             session_id: init.session_id.clone(),
             turn_id,
             phase: TurnPhase::Failed,
             error_code: "TURN_OWNER_UNAVAILABLE".to_string(),
-            message: bounded_protocol_text(&error.message, 256),
+            message,
         }));
     }
 }
@@ -4660,6 +4899,62 @@ mod tests {
         assert_eq!(response.matches("event: response.failed").count(), 1);
         assert!(!response.contains("response.completed"));
         assert!(response.contains("provider rejected request"));
+    }
+
+    #[test]
+    fn d32_native_failure_diagnostic_is_static_and_turn_scoped() {
+        let latch = D32ForcedToolLatch::new();
+        latch.record_gateway_request();
+        let raw = "provider gateway protocol error: D32 native Responses rejected phase=http_status round=initial_request attempts=1 http_status=400 error_code=http_status output_kind=unknown content_type_is_json=true code=https://evil.example/token message=Authorization: Bearer provider-token";
+        let diagnostic = latch.safe_failure(raw);
+        assert!(diagnostic.contains("phase=http_status"));
+        assert!(diagnostic.contains("round=initial_request"));
+        assert!(diagnostic.contains("http_status=400"));
+        assert!(diagnostic.contains("gateway_requests=1"));
+        assert!(diagnostic.contains("sse_created=1"));
+        assert!(diagnostic.contains("sse_failed=1"));
+        for marker in [
+            "evil.example",
+            "Authorization",
+            "Bearer",
+            "provider-token",
+            "message=",
+        ] {
+            assert!(!diagnostic.contains(marker), "diagnostic leaked {marker:?}");
+        }
+        assert_eq!(latch.counters().provider_results, 0);
+        assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
+    }
+
+    #[test]
+    fn d32_native_failure_sse_has_one_failed_and_zero_completed() {
+        let latch = D32ForcedToolLatch::new();
+        latch.record_gateway_request();
+        let diagnostic = latch.safe_failure(
+            "provider gateway protocol error: D32 native Responses rejected phase=response_json round=initial_request attempts=1 http_status=200 error_code=invalid_json output_kind=unknown content_type_is_json=true provider-body=Authorization: Bearer provider-token",
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("D32 failure SSE listener");
+        let address = listener.local_addr().expect("D32 failure SSE address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("D32 failure SSE accept");
+            write_gateway_failure(&mut stream, "fixture-model", &diagnostic)
+                .expect("D32 failure SSE write");
+        });
+        let mut client = TcpStream::connect(address).expect("D32 failure SSE connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("D32 failure SSE timeout");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("D32 failure SSE read");
+        server.join().expect("D32 failure SSE join");
+        assert_eq!(response.matches("event: response.created").count(), 1);
+        assert_eq!(response.matches("event: response.failed").count(), 1);
+        assert_eq!(response.matches("event: response.completed").count(), 0);
+        assert!(response.contains("phase=response_json"));
+        assert!(!response.contains("Authorization"));
+        assert!(!response.contains("provider-token"));
     }
 
     #[test]

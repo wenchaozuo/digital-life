@@ -1157,6 +1157,10 @@ impl ProviderRequestPath {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProviderTransportResponse {
     pub(crate) status: u16,
+    /// Number of bounded HTTP attempts used for this response.  This is a
+    /// Vita-owned counter; it is never derived from or exposed with provider
+    /// response content.
+    pub(crate) attempts: u8,
     pub(crate) content_type: Option<String>,
     pub(crate) body: Vec<u8>,
 }
@@ -1168,6 +1172,7 @@ impl fmt::Debug for ProviderTransportResponse {
         // a future log/trace to copy provider-controlled content into it.
         f.debug_struct("ProviderTransportResponse")
             .field("status", &self.status)
+            .field("attempts", &self.attempts)
             .field("body_len", &self.body.len())
             .field(
                 "content_type_is_json",
@@ -1423,7 +1428,7 @@ where
         if status != 200 {
             return Err(d32_native_failure(
                 phase,
-                Some(1),
+                Some(response.attempts),
                 Some(status),
                 D32NativeErrorCode::HttpStatus,
                 D32NativeOutputKind::Unknown,
@@ -1445,7 +1450,7 @@ where
             &response.body,
             &self.ready.profile.model,
             phase,
-            Some(1),
+            Some(response.attempts),
             Some(status),
             content_type_is_json,
         )
@@ -1491,6 +1496,8 @@ enum D32NativeErrorCode {
     Capability,
     RequestInvalid,
     Credential,
+    Dns,
+    Connect,
     Transport,
     HttpStatus,
     ContentType,
@@ -1503,6 +1510,8 @@ enum D32NativeErrorCode {
     OutputContract,
     RequestContract,
     OutputText,
+    ExpectedTool,
+    FinishReason,
 }
 
 impl D32NativeErrorCode {
@@ -1512,6 +1521,8 @@ impl D32NativeErrorCode {
             Self::Capability => "capability",
             Self::RequestInvalid => "request_invalid",
             Self::Credential => "credential",
+            Self::Dns => "dns",
+            Self::Connect => "connect",
             Self::Transport => "transport",
             Self::HttpStatus => "http_status",
             Self::ContentType => "content_type",
@@ -1524,6 +1535,45 @@ impl D32NativeErrorCode {
             Self::OutputContract => "output_contract",
             Self::RequestContract => "request_contract",
             Self::OutputText => "output_text",
+            Self::ExpectedTool => "expected_tool",
+            Self::FinishReason => "finish_reason",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D32NativeFailurePhase {
+    PolicyGate,
+    RequestContract,
+    SecondRoundRequest,
+    CredentialResolution,
+    Dns,
+    Connect,
+    Transport,
+    HttpStatus,
+    ResponseHeaders,
+    ResponseJson,
+    ResponseModel,
+    ExpectedTool,
+    FinishReason,
+}
+
+impl D32NativeFailurePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyGate => "policy_gate",
+            Self::RequestContract => "request_contract",
+            Self::SecondRoundRequest => "second_round_request",
+            Self::CredentialResolution => "credential_resolution",
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Transport => "transport",
+            Self::HttpStatus => "http_status",
+            Self::ResponseHeaders => "response_headers",
+            Self::ResponseJson => "response_json",
+            Self::ResponseModel => "response_model",
+            Self::ExpectedTool => "expected_tool",
+            Self::FinishReason => "finish_reason",
         }
     }
 }
@@ -1576,13 +1626,64 @@ fn d32_native_error_code(error: &VitaAgentError) -> D32NativeErrorCode {
         // available to the transport's internal status classifier, but none
         // of its provider-controlled fields may enter the D32 string.
         VitaAgentError::ProviderHttpStatus { .. } => D32NativeErrorCode::HttpStatus,
+        VitaAgentError::ProviderTransportTimeout { phase } if *phase == "DNS resolution" => {
+            D32NativeErrorCode::Dns
+        }
+        VitaAgentError::ProviderTransportTimeout { phase } if *phase == "request" => {
+            D32NativeErrorCode::Connect
+        }
         VitaAgentError::ProviderTransportTimeout { .. } => D32NativeErrorCode::Transport,
         VitaAgentError::ProviderRequestTooLarge { .. }
-        | VitaAgentError::ProviderResponseTooLarge { .. }
-        | VitaAgentError::ProviderTransportRejected { .. } => D32NativeErrorCode::Transport,
+        | VitaAgentError::ProviderResponseTooLarge { .. } => D32NativeErrorCode::Transport,
+        VitaAgentError::ProviderTransportRejected { reason }
+            if matches!(
+                *reason,
+                "provider DNS returned no destination addresses"
+                    | "provider DNS returned an unexpected destination port"
+                    | "provider DNS resolved to loopback, private, link-local, CGNAT, multicast, documentation, or other special-use address"
+            ) => D32NativeErrorCode::Dns,
+        VitaAgentError::ProviderTransportRejected {
+            reason: "provider HTTPS request failed",
+        } => D32NativeErrorCode::Connect,
+        VitaAgentError::ProviderTransportRejected { .. } => D32NativeErrorCode::Transport,
         VitaAgentError::CredentialResolution(_) => D32NativeErrorCode::Credential,
         VitaAgentError::GatewayProtocol(_) => D32NativeErrorCode::RequestInvalid,
         _ => D32NativeErrorCode::Transport,
+    }
+}
+
+fn d32_native_failure_phase(
+    round: D32NativePhase,
+    error_code: D32NativeErrorCode,
+) -> D32NativeFailurePhase {
+    match error_code {
+        D32NativeErrorCode::PolicyMismatch | D32NativeErrorCode::Capability => {
+            D32NativeFailurePhase::PolicyGate
+        }
+        D32NativeErrorCode::RequestInvalid => {
+            if round == D32NativePhase::FinalRequest {
+                D32NativeFailurePhase::SecondRoundRequest
+            } else {
+                D32NativeFailurePhase::RequestContract
+            }
+        }
+        D32NativeErrorCode::Credential => D32NativeFailurePhase::CredentialResolution,
+        D32NativeErrorCode::Dns => D32NativeFailurePhase::Dns,
+        D32NativeErrorCode::Connect => D32NativeFailurePhase::Connect,
+        D32NativeErrorCode::Transport => D32NativeFailurePhase::Transport,
+        D32NativeErrorCode::HttpStatus => D32NativeFailurePhase::HttpStatus,
+        D32NativeErrorCode::ContentType => D32NativeFailurePhase::ResponseHeaders,
+        D32NativeErrorCode::InvalidJson
+        | D32NativeErrorCode::ResponseShape
+        | D32NativeErrorCode::OutputShape
+        | D32NativeErrorCode::UsageShape
+        | D32NativeErrorCode::OutputText => D32NativeFailurePhase::ResponseJson,
+        D32NativeErrorCode::ResponseIdentity => D32NativeFailurePhase::ResponseModel,
+        D32NativeErrorCode::OutputKind
+        | D32NativeErrorCode::OutputContract
+        | D32NativeErrorCode::ExpectedTool
+        | D32NativeErrorCode::RequestContract => D32NativeFailurePhase::ExpectedTool,
+        D32NativeErrorCode::FinishReason => D32NativeFailurePhase::FinishReason,
     }
 }
 
@@ -1595,7 +1696,8 @@ fn d32_native_failure(
     content_type_is_json: bool,
 ) -> VitaAgentError {
     VitaAgentError::GatewayProtocol(format!(
-        "D32 native Responses rejected phase={} attempts={} http_status={} error_code={} output_kind={} content_type_is_json={}",
+        "D32 native Responses rejected phase={} round={} attempts={} http_status={} error_code={} output_kind={} content_type_is_json={}",
+        d32_native_failure_phase(phase, error_code).as_str(),
         phase.as_str(),
         attempts.map_or_else(|| "none".to_string(), |value| value.to_string()),
         http_status.map_or_else(|| "none".to_string(), |value| value.to_string()),
@@ -1753,14 +1855,31 @@ fn parse_d32_native_response(
                 content_type_is_json,
             )
         })?;
-    if object.get("model").and_then(Value::as_str) != Some(expected_model)
-        || object.get("status").and_then(Value::as_str) != Some("completed")
-    {
+    if object.get("model").and_then(Value::as_str) != Some(expected_model) {
         return Err(d32_native_failure(
             phase,
             attempts,
             http_status,
             D32NativeErrorCode::ResponseIdentity,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
+        ));
+    }
+    let expected_finish_reason = match phase {
+        D32NativePhase::InitialRequest => "tool_calls",
+        D32NativePhase::FinalRequest => "stop",
+    };
+    if object.get("status").and_then(Value::as_str) != Some("completed")
+        || object
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != expected_finish_reason)
+    {
+        return Err(d32_native_failure(
+            phase,
+            attempts,
+            http_status,
+            D32NativeErrorCode::FinishReason,
             D32NativeOutputKind::Unknown,
             content_type_is_json,
         ));
@@ -1808,7 +1927,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::OutputKind,
+                    D32NativeErrorCode::ExpectedTool,
                     D32NativeOutputKind::FunctionCall,
                     content_type_is_json,
                 ));
@@ -1842,7 +1961,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::OutputContract,
+                    D32NativeErrorCode::ExpectedTool,
                     D32NativeOutputKind::FunctionCall,
                     content_type_is_json,
                 ));
@@ -1854,7 +1973,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::RequestContract,
+                    D32NativeErrorCode::ExpectedTool,
                     D32NativeOutputKind::FunctionCall,
                     content_type_is_json,
                 ));
@@ -1888,7 +2007,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::OutputKind,
+                    D32NativeErrorCode::ExpectedTool,
                     D32NativeOutputKind::Message,
                     content_type_is_json,
                 ));
@@ -1902,7 +2021,7 @@ fn parse_d32_native_response(
                         phase,
                         attempts,
                         http_status,
-                        D32NativeErrorCode::OutputText,
+                        D32NativeErrorCode::ResponseShape,
                         D32NativeOutputKind::OutputText,
                         content_type_is_json,
                     )
@@ -1912,7 +2031,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::OutputText,
+                    D32NativeErrorCode::ResponseShape,
                     D32NativeOutputKind::OutputText,
                     content_type_is_json,
                 )
@@ -1922,7 +2041,7 @@ fn parse_d32_native_response(
                     phase,
                     attempts,
                     http_status,
-                    D32NativeErrorCode::OutputText,
+                    D32NativeErrorCode::ExpectedTool,
                     D32NativeOutputKind::OutputText,
                     content_type_is_json,
                 ));
@@ -1936,7 +2055,7 @@ fn parse_d32_native_response(
                         phase,
                         attempts,
                         http_status,
-                        D32NativeErrorCode::OutputText,
+                        D32NativeErrorCode::ResponseShape,
                         D32NativeOutputKind::OutputText,
                         content_type_is_json,
                     )
@@ -3534,11 +3653,13 @@ mod tests {
         let transport = Arc::new(D32NativeTestTransport::new(vec![
             ProviderTransportResponse {
                 status: 200,
+                attempts: 1,
                 content_type: Some("application/json; charset=utf-8".to_string()),
                 body: first_response,
             },
             ProviderTransportResponse {
                 status: 200,
+                attempts: 1,
                 content_type: Some("application/json".to_string()),
                 body: second_response,
             },
@@ -3649,6 +3770,12 @@ mod tests {
                 "output":[{"type":"function_call","id":"i","call_id":"c","name":D32_CARGO_TOOL_NAME,"arguments":"{\"x\":1}","status":"completed"}]
             }))
             .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "finish_reason":"stop",
+                "output":[{"type":"function_call","id":"i","call_id":"c","name":D32_CARGO_TOOL_NAME,"arguments":"{}","status":"completed"}]
+            }))
+            .unwrap(),
             b"not-json".to_vec(),
         ];
         for body in bad_bodies {
@@ -3717,6 +3844,7 @@ mod tests {
         let fixtures = [
             ProviderTransportResponse {
                 status: 400,
+                attempts: 1,
                 content_type: Some(format!(
                     "application/json; error={provider_type}; url=https://evil.example"
                 )),
@@ -3732,6 +3860,7 @@ mod tests {
             },
             ProviderTransportResponse {
                 status: 200,
+                attempts: 1,
                 content_type: Some(format!(
                     "text/event-stream; url=https://evil.example; auth=Bearer {provider_code}"
                 )),
@@ -3757,7 +3886,7 @@ mod tests {
                 .execute_responses_request(&first_request)
                 .expect_err("status/content type must fail closed");
             let text = error.to_string();
-            assert!(text.contains("phase=initial_request"));
+            assert!(text.contains("round=initial_request"));
             assert!(text.contains("attempts=1"));
             assert!(text.contains("content_type_is_json="));
             assert!(!text.contains(provider_code));
@@ -3835,10 +3964,45 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_responses_http_status_fixture_matrix_is_enumerable() {
+        let first_request = d32_native_first_request();
+        for status in [400_u16, 401, 429, 500] {
+            let transport = Arc::new(D32NativeTestTransport::new(vec![
+                ProviderTransportResponse {
+                    status,
+                    attempts: 1,
+                    content_type: Some("application/json".to_string()),
+                    body: br#"{"error":{"message":"provider secret must not escape"}}"#.to_vec(),
+                },
+            ]));
+            let (ready, credential) = d32_native_profile();
+            let gateway = ProviderGateway::new_with_d32_native(
+                ready,
+                InMemoryTestCredential {
+                    reference: credential,
+                    value: "native-test-credential".to_string(),
+                },
+                Arc::clone(&transport),
+                true,
+            );
+            let diagnostic = gateway
+                .execute_responses_request(&first_request)
+                .expect_err("HTTP status fixture must fail")
+                .to_string();
+            assert!(diagnostic.contains("phase=http_status"));
+            assert!(diagnostic.contains(&format!("http_status={status}")));
+            assert!(diagnostic.contains("attempts=1"));
+            assert!(!diagnostic.contains("provider secret"));
+        }
+    }
+
     #[test]
     fn provider_transport_response_debug_redacts_provider_content() {
         let response = ProviderTransportResponse {
             status: 400,
+            attempts: 1,
             content_type: Some(
                 "text/plain; url=https://evil.example; Authorization=Bearer secret-token"
                     .to_string(),

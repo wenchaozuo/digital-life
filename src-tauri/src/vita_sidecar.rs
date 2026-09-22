@@ -250,6 +250,25 @@ pub(crate) struct D32HostCanaryTraceSnapshot {
     pub native_evidence_task_id: Option<String>,
     pub native_evidence_turn_id: Option<String>,
     pub native_evidence_tool_call_id: Option<String>,
+    pub native_diagnostic: Option<D32NativeSafeDiagnostic>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32NativeSafeDiagnostic {
+    pub phase: String,
+    pub round: String,
+    pub attempts: Option<u8>,
+    pub http_status: Option<u16>,
+    pub error_code: String,
+    pub output_kind: String,
+    pub content_type_is_json: bool,
+    pub gateway_requests: u8,
+    pub provider_results: u8,
+    pub sse_created: u8,
+    pub sse_failed: u8,
+    pub sse_completed: u8,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -273,6 +292,7 @@ pub(crate) struct D32HostCanaryReport {
     pub native_evidence: D32NativeEvidenceReport,
     pub terminal_phase: Option<protocol::TurnPhase>,
     pub turn_error: Option<String>,
+    pub native_diagnostic: Option<D32NativeSafeDiagnostic>,
     pub cleanup: D32CleanupOutcome,
 }
 
@@ -284,6 +304,157 @@ pub(crate) struct D32NativeEvidenceReport {
     pub sha256: String,
     pub identity: String,
     pub bytes: u64,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn parse_d32_native_safe_diagnostic(message: &str) -> Option<D32NativeSafeDiagnostic> {
+    const PREFIX: &str = "D32 native Responses rejected";
+    let start = message.find(PREFIX)? + PREFIX.len();
+    let mut fields = std::collections::HashMap::new();
+    for token in message[start..].split_ascii_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        fields.insert(key, value);
+    }
+    let allowed_phase = |value: &str| {
+        matches!(
+            value,
+            "policy_gate"
+                | "request_contract"
+                | "second_round_request"
+                | "credential_resolution"
+                | "dns"
+                | "connect"
+                | "transport"
+                | "http_status"
+                | "response_headers"
+                | "response_json"
+                | "response_model"
+                | "expected_tool"
+                | "finish_reason"
+                | "turn_terminal"
+        )
+    };
+    let allowed_error_code = |value: &str| {
+        matches!(
+            value,
+            "policy_mismatch"
+                | "capability"
+                | "request_invalid"
+                | "credential"
+                | "dns"
+                | "connect"
+                | "transport"
+                | "http_status"
+                | "content_type"
+                | "invalid_json"
+                | "response_shape"
+                | "response_identity"
+                | "output_shape"
+                | "usage_shape"
+                | "output_kind"
+                | "output_contract"
+                | "request_contract"
+                | "output_text"
+                | "expected_tool"
+                | "finish_reason"
+                | "turn_failed"
+        )
+    };
+    let allowed_output_kind = |value: &str| {
+        matches!(
+            value,
+            "none" | "unknown" | "function_call" | "message" | "output_text"
+        )
+    };
+    let phase = fields
+        .get("phase")
+        .copied()
+        .filter(|value| allowed_phase(value))?;
+    let round = fields
+        .get("round")
+        .copied()
+        .filter(|value| matches!(*value, "initial_request" | "final_request" | "unknown"))?;
+    let error_code = fields
+        .get("error_code")
+        .copied()
+        .filter(|value| allowed_error_code(value))?;
+    let output_kind = fields
+        .get("output_kind")
+        .copied()
+        .filter(|value| allowed_output_kind(value))?;
+    let parse_optional_u16 = |key: &str| {
+        let value = fields.get(key).copied()?;
+        if value == "none" {
+            return Some(None);
+        }
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|status| (100..=599).contains(status))
+            .map(Some)
+    };
+    let parse_counter = |key: &str| {
+        fields
+            .get(key)
+            .copied()?
+            .parse::<u8>()
+            .ok()
+            .filter(|value| *value <= 16)
+    };
+    let attempts = {
+        let value = fields.get("attempts").copied()?;
+        if value == "none" {
+            None
+        } else {
+            Some(value.parse::<u8>().ok().filter(|value| *value <= 16)?)
+        }
+    };
+    let http_status = parse_optional_u16("http_status")?;
+    let content_type_is_json = match fields.get("content_type_is_json").copied()? {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(D32NativeSafeDiagnostic {
+        phase: phase.to_string(),
+        round: round.to_string(),
+        attempts,
+        http_status,
+        error_code: error_code.to_string(),
+        output_kind: output_kind.to_string(),
+        content_type_is_json,
+        gateway_requests: parse_counter("gateway_requests")?,
+        provider_results: parse_counter("provider_results")?,
+        sse_created: parse_counter("sse_created")?,
+        sse_failed: parse_counter("sse_failed")?,
+        sse_completed: parse_counter("sse_completed")?,
+    })
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_native_diagnostic_summary(trace: &D32HostCanaryTraceSnapshot) -> String {
+    let Some(diagnostic) = trace.native_diagnostic.as_ref() else {
+        return "none".to_string();
+    };
+    format!(
+        "phase={} round={} attempts={} http_status={} error_code={} output_kind={} content_type_is_json={} gateway_requests={} provider_results={} sse_created={} sse_failed={} sse_completed={}",
+        diagnostic.phase,
+        diagnostic.round,
+        diagnostic
+            .attempts
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        diagnostic
+            .http_status
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        diagnostic.error_code,
+        diagnostic.output_kind,
+        diagnostic.content_type_is_json,
+        diagnostic.gateway_requests,
+        diagnostic.provider_results,
+        diagnostic.sse_created,
+        diagnostic.sse_failed,
+        diagnostic.sse_completed,
+    )
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -5349,7 +5520,12 @@ mod windows {
                     }
                 }
                 VitaMessage::TurnCompleted(_) => trace.turn_completed += 1,
-                VitaMessage::TurnFailed(_) => trace.turn_failed += 1,
+                VitaMessage::TurnFailed(message) => {
+                    trace.turn_failed += 1;
+                    if let Some(diagnostic) = parse_d32_native_safe_diagnostic(&message.message) {
+                        trace.native_diagnostic = Some(diagnostic);
+                    }
+                }
                 VitaMessage::ActionCancelled(_) => trace.action_cancelled += 1,
                 _ => {}
             });
@@ -12359,10 +12535,14 @@ mod windows {
                 thread::sleep(Duration::from_millis(100));
             };
             if !confirmation_seen {
-                return Err(d32_not_executable(d32_canary_no_confirmation_diagnostic(
+                let diagnostic = d32_canary_no_confirmation_diagnostic(
                     terminal.assistant_text.as_deref(),
                     terminal.turn_phase,
                     terminal.turn_error.as_deref(),
+                );
+                let native_diagnostic = d32_native_diagnostic_summary(&control.trace.snapshot());
+                return Err(d32_not_executable(format!(
+                    "{diagnostic}; d32_native_diagnostic={native_diagnostic}"
                 )));
             }
             if mode.expects_deny() {
@@ -12423,7 +12603,10 @@ mod windows {
             Ok(terminal) => terminal,
             Err(error) => {
                 let cleanup = environment.cleanup();
-                return Err(format!("{error}; D32 cleanup outcome: {cleanup:?}"));
+                let native_diagnostic = d32_native_diagnostic_summary(&control.trace.snapshot());
+                return Err(format!(
+                    "{error}; d32_native_diagnostic={native_diagnostic}; D32 cleanup outcome: {cleanup:?}"
+                ));
             }
         };
         let report_result = (|| -> Result<D32HostCanaryReport, String> {
@@ -12459,6 +12642,7 @@ mod windows {
                 );
             }
             let trace = control.trace.snapshot();
+            let native_diagnostic = trace.native_diagnostic.clone();
             d32_validate_trace(
                 mode,
                 &trace,
@@ -12480,6 +12664,7 @@ mod windows {
                 native_evidence,
                 terminal_phase: terminal.turn_phase,
                 turn_error: terminal.turn_error,
+                native_diagnostic,
                 cleanup: D32CleanupOutcome {
                     attempted: false,
                     validated: false,
@@ -12625,6 +12810,26 @@ mod windows {
                 d32_canary_sanitize_error_code(Some("provider_token=should-not-appear")),
                 "<redacted>"
             );
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        #[test]
+        fn d32_native_safe_diagnostic_accepts_only_static_fields() {
+            let message = "provider gateway protocol error: D32 native Responses rejected phase=http_status round=initial_request attempts=1 http_status=429 error_code=http_status output_kind=unknown content_type_is_json=true gateway_requests=1 provider_results=0 sse_created=1 sse_failed=1 sse_completed=0";
+            let diagnostic =
+                parse_d32_native_safe_diagnostic(message).expect("canonical D32 native diagnostic");
+            assert_eq!(diagnostic.phase, "http_status");
+            assert_eq!(diagnostic.round, "initial_request");
+            assert_eq!(diagnostic.attempts, Some(1));
+            assert_eq!(diagnostic.http_status, Some(429));
+            assert_eq!(diagnostic.error_code, "http_status");
+            assert_eq!(diagnostic.gateway_requests, 1);
+            assert_eq!(diagnostic.sse_failed, 1);
+
+            let hostile = format!(
+                "{message} provider-message Authorization: Bearer provider-token https://evil.example"
+            );
+            assert!(parse_d32_native_safe_diagnostic(&hostile).is_none());
         }
 
         #[test]

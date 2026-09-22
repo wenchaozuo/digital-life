@@ -585,6 +585,7 @@ where
             if (200..300).contains(&response.status) {
                 return Ok(ProviderTransportResponse {
                     status: response.status,
+                    attempts: attempt.saturating_add(1),
                     content_type: response.content_type,
                     body: response.body,
                 });

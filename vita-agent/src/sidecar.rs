@@ -112,7 +112,7 @@ struct GatewayGeneration {
 enum D32ForcedToolPhase {
     InitialRequest,
     InitialRequestInFlight,
-    AwaitingToolOutput { call_id: String },
+    AwaitingToolOutput { item_id: String, call_id: String },
     FinalRequestInFlight,
     Completed,
     Failed,
@@ -155,7 +155,7 @@ impl D32ForcedToolLatch {
                 *phase = D32ForcedToolPhase::InitialRequestInFlight;
                 Ok(())
             }
-            D32ForcedToolPhase::AwaitingToolOutput { call_id } => {
+            D32ForcedToolPhase::AwaitingToolOutput { item_id, call_id } => {
                 if request.options.forced_tool.is_some()
                     || request.options.tools.len() != 1
                     || request.options.tools[0].name != D32_CARGO_TOOL_NAME
@@ -171,6 +171,7 @@ impl D32ForcedToolLatch {
                 let call = &request.tool_calls[0];
                 let output = &request.tool_outputs[0];
                 if call.name != D32_CARGO_TOOL_NAME
+                    || call.item_id != *item_id
                     || call.id != *call_id
                     || !crate::provider_gateway::d32_arguments_are_strict_empty_object(
                         &call.arguments,
@@ -219,6 +220,7 @@ impl D32ForcedToolLatch {
                     );
                 }
                 *phase = D32ForcedToolPhase::AwaitingToolOutput {
+                    item_id: result.function_calls[0].item_id.clone(),
                     call_id: result.function_calls[0].id.clone(),
                 };
                 Ok(())
@@ -433,6 +435,19 @@ impl crate::provider_gateway::ProviderRequestTransport for BorrowedProviderTrans
         self.inner
             .post_json(endpoint, authorization, body, timeout, retry_policy)
     }
+
+    fn post_json_to_path(
+        &self,
+        endpoint: &crate::provider_gateway::ProviderEndpoint,
+        path: crate::provider_gateway::ProviderRequestPath,
+        authorization: Option<&ResolvedCredential>,
+        body: &[u8],
+        timeout: Duration,
+        retry_policy: crate::provider_gateway::ProviderRetryPolicy,
+    ) -> Result<crate::provider_gateway::ProviderTransportResponse, crate::VitaAgentError> {
+        self.inner
+            .post_json_to_path(endpoint, path, authorization, body, timeout, retry_policy)
+    }
 }
 
 /// Re-checks the sidecar turn generation immediately before the provider
@@ -465,6 +480,26 @@ impl crate::provider_gateway::ProviderRequestTransport for ActiveIdentityTranspo
         }
         self.inner
             .post_json(endpoint, authorization, body, timeout, retry_policy)
+    }
+
+    fn post_json_to_path(
+        &self,
+        endpoint: &crate::provider_gateway::ProviderEndpoint,
+        path: crate::provider_gateway::ProviderRequestPath,
+        authorization: Option<&ResolvedCredential>,
+        body: &[u8],
+        timeout: Duration,
+        retry_policy: crate::provider_gateway::ProviderRetryPolicy,
+    ) -> Result<crate::provider_gateway::ProviderTransportResponse, crate::VitaAgentError> {
+        if !active_identity_matches(&self.active_identity, &self.expected)
+            || !self.gateway_authority.is_current(&self.expected_gateway)
+        {
+            return Err(crate::VitaAgentError::CredentialResolution(
+                "Vita turn was cancelled before provider attempt",
+            ));
+        }
+        self.inner
+            .post_json_to_path(endpoint, path, authorization, body, timeout, retry_policy)
     }
 }
 
@@ -1080,6 +1115,7 @@ impl VitaGatewayServer {
         active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
         gateway_authority: Arc<GatewayAuthority>,
         transport: SidecarGatewayTransport,
+        d32_native_responses: bool,
     ) -> Result<Self, crate::VitaAgentError> {
         listener
             .set_nonblocking(true)
@@ -1105,6 +1141,7 @@ impl VitaGatewayServer {
                                 &active_identity,
                                 &gateway_authority_for_thread,
                                 &transport_for_thread,
+                                d32_native_responses,
                             );
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1148,6 +1185,7 @@ fn handle_gateway_connection(
     active_identity: &Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: &Arc<GatewayAuthority>,
     transport: &SidecarGatewayTransport,
+    d32_native_responses: bool,
 ) -> Result<(), String> {
     if !peer.ip().is_loopback() {
         return write_gateway_error(&mut stream, "403 Forbidden", "GATEWAY_PEER_DENIED");
@@ -1230,7 +1268,12 @@ fn handle_gateway_connection(
                 expected: identity.clone(),
                 expected_gateway: gateway.clone(),
             };
-            let gateway = ProviderGateway::new(ready.clone(), resolver, guarded);
+            let gateway = ProviderGateway::new_with_d32_native(
+                ready.clone(),
+                resolver,
+                guarded,
+                d32_native_responses,
+            );
             gateway.execute_responses_request_with_identity(&request, Some(&identity))
         }
         #[cfg(feature = "d29-h9-test-helper")]
@@ -1446,10 +1489,10 @@ fn write_gateway_success(
         events.push(serde_json::json!({"type":"response.completed","response":{"id":format!("resp-{}", result.id),"status":"completed","model":result.model,"usage":result.usage.as_ref().map(|usage| serde_json::json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens})),"end_turn":true}}));
     } else {
         for call in &result.function_calls {
-            events.push(serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":"","status":"in_progress"}}));
-            events.push(serde_json::json!({"type":"response.function_call_arguments.delta","item_id":call.id,"call_id":call.id,"delta":call.arguments}));
-            events.push(serde_json::json!({"type":"response.function_call_arguments.done","item_id":call.id,"call_id":call.id,"arguments":call.arguments}));
-            events.push(serde_json::json!({"type":"response.output_item.done","item":{"type":"function_call","id":call.id,"call_id":call.id,"name":call.name,"arguments":call.arguments,"status":"completed"}}));
+            events.push(serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":call.item_id,"call_id":call.id,"name":call.name,"arguments":"","status":"in_progress"}}));
+            events.push(serde_json::json!({"type":"response.function_call_arguments.delta","item_id":call.item_id,"call_id":call.id,"delta":call.arguments}));
+            events.push(serde_json::json!({"type":"response.function_call_arguments.done","item_id":call.item_id,"call_id":call.id,"arguments":call.arguments}));
+            events.push(serde_json::json!({"type":"response.output_item.done","item":{"type":"function_call","id":call.item_id,"call_id":call.id,"name":call.name,"arguments":call.arguments,"status":"completed"}}));
         }
         events.push(serde_json::json!({"type":"response.completed","response":{"id":format!("resp-{}", result.id),"status":"completed","model":result.model,"usage":result.usage.as_ref().map(|usage| serde_json::json!({"input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"total_tokens":usage.total_tokens})),"end_turn":false}}));
     }
@@ -1578,7 +1621,12 @@ fn parse_gateway_responses_request(
                 messages.push(GatewayMessage::text(role, bounded_gateway_text(&text)?));
             }
             "function_call" => {
-                let id = item
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("call_id").and_then(Value::as_str))
+                    .ok_or_else(|| "function call item id missing".to_string())?;
+                let call_id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
@@ -1600,7 +1648,8 @@ fn parse_gateway_responses_request(
                     .and_then(Value::as_str)
                     .ok_or_else(|| "function call arguments missing".to_string())?;
                 tool_calls.push(VitaFunctionCall {
-                    id: bounded_gateway_id(id)?,
+                    item_id: bounded_gateway_id(item_id)?,
+                    id: bounded_gateway_id(call_id)?,
                     name: name.to_string(),
                     arguments: bounded_gateway_text(arguments)?,
                 });
@@ -2294,6 +2343,7 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
             } else {
                 SidecarGatewayTransport::Production
             },
+            d32_canary && !test_canary,
         )
         .map_err(|error| format!("Vita local gateway startup failed: {error}"))?;
         let entrypoint =
@@ -4789,6 +4839,7 @@ mod tests {
             finish_reason: Some("tool_calls".to_string()),
             usage: None,
             function_calls: vec![VitaFunctionCall {
+                item_id: "call-1".to_string(),
                 id: "call-1".to_string(),
                 name: D32_CARGO_TOOL_NAME.to_string(),
                 arguments: "{}".to_string(),
@@ -4800,6 +4851,7 @@ mod tests {
         assert_eq!(
             latch.phase(),
             D32ForcedToolPhase::AwaitingToolOutput {
+                item_id: "call-1".to_string(),
                 call_id: "call-1".to_string()
             }
         );
@@ -4807,6 +4859,7 @@ mod tests {
         let mut second = first.clone();
         second.options.forced_tool = None;
         second.tool_calls.push(VitaFunctionCall {
+            item_id: "call-1".to_string(),
             id: "call-1".to_string(),
             name: D32_CARGO_TOOL_NAME.to_string(),
             arguments: "{}".to_string(),
@@ -4861,6 +4914,7 @@ mod tests {
             finish_reason: Some("tool_calls".to_string()),
             usage: None,
             function_calls: vec![VitaFunctionCall {
+                item_id: "call-1".to_string(),
                 id: "call-1".to_string(),
                 name: D32_CARGO_TOOL_NAME.to_string(),
                 arguments: "{}".to_string(),
@@ -4873,6 +4927,70 @@ mod tests {
         missing.tool_calls = result.function_calls.clone();
         assert!(latch.admit_request(&mut missing).is_err());
         assert_eq!(latch.phase(), D32ForcedToolPhase::Failed);
+    }
+
+    #[test]
+    fn d32_forced_tool_latch_rejects_new_call_id_item_id_and_duplicate_output() {
+        let initialized = || {
+            let latch = D32ForcedToolLatch::new();
+            let mut first = VitaResponsesRequest::new(
+                "model",
+                vec![GatewayMessage::text(VitaMessageRole::User, "run cargo")],
+                VitaResponsesRequestOptions {
+                    tools: vec![GatewayToolDefinition {
+                        name: D32_CARGO_TOOL_NAME.to_string(),
+                        description: None,
+                        parameters: json!({"type":"object"}),
+                    }],
+                    ..VitaResponsesRequestOptions::default()
+                },
+            );
+            latch.admit_request(&mut first).unwrap();
+            let result = crate::provider_gateway::VitaResponsesResult {
+                id: "first".to_string(),
+                model: "model".to_string(),
+                output_text: String::new(),
+                finish_reason: Some("tool_calls".to_string()),
+                usage: None,
+                function_calls: vec![VitaFunctionCall {
+                    item_id: "provider-item-1".to_string(),
+                    id: "provider-call-1".to_string(),
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            };
+            latch.admit_response(&first, &result).unwrap();
+            (latch, first, result)
+        };
+
+        let (latch, mut new_call, _) = initialized();
+        new_call.options.forced_tool = None;
+        new_call.tool_calls = vec![VitaFunctionCall {
+            item_id: "provider-item-new".to_string(),
+            id: "provider-call-new".to_string(),
+            name: D32_CARGO_TOOL_NAME.to_string(),
+            arguments: "{}".to_string(),
+        }];
+        new_call.tool_outputs = vec![VitaToolOutput {
+            call_id: "provider-call-new".to_string(),
+            output: "{}".to_string(),
+        }];
+        assert!(latch.admit_request(&mut new_call).is_err());
+
+        let (latch, mut duplicate_output, result) = initialized();
+        duplicate_output.options.forced_tool = None;
+        duplicate_output.tool_calls = result.function_calls;
+        duplicate_output.tool_outputs = vec![
+            VitaToolOutput {
+                call_id: "provider-call-1".to_string(),
+                output: "{}".to_string(),
+            },
+            VitaToolOutput {
+                call_id: "provider-call-1".to_string(),
+                output: "duplicate".to_string(),
+            },
+        ];
+        assert!(latch.admit_request(&mut duplicate_output).is_err());
     }
 
     #[test]
@@ -4914,6 +5032,7 @@ mod tests {
                 finish_reason: Some("tool_calls".to_string()),
                 usage: None,
                 function_calls: vec![VitaFunctionCall {
+                    item_id: "call-1".to_string(),
                     id: "call-1".to_string(),
                     name: D32_CARGO_TOOL_NAME.to_string(),
                     arguments: arguments.to_string(),
@@ -4948,6 +5067,7 @@ mod tests {
             finish_reason: Some("tool_calls".to_string()),
             usage: None,
             function_calls: vec![VitaFunctionCall {
+                item_id: "call-1".to_string(),
                 id: "call-1".to_string(),
                 name: D32_CARGO_TOOL_NAME.to_string(),
                 arguments: "{}".to_string(),
@@ -4958,6 +5078,7 @@ mod tests {
         let mut second = first;
         second.options.forced_tool = None;
         second.tool_calls.push(VitaFunctionCall {
+            item_id: "call-1".to_string(),
             id: "call-1".to_string(),
             name: D32_CARGO_TOOL_NAME.to_string(),
             arguments: "{\"extra\":1}".to_string(),

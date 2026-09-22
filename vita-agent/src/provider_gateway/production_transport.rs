@@ -21,8 +21,9 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::{
-    is_forbidden_ip, is_forbidden_network_host, ProviderEndpoint, ProviderRequestTransport,
-    ProviderRetryPolicy, ResolvedCredential, VitaAgentError,
+    is_forbidden_ip, is_forbidden_network_host, ProviderEndpoint, ProviderRequestPath,
+    ProviderRequestTransport, ProviderRetryPolicy, ProviderTransportResponse, ResolvedCredential,
+    VitaAgentError,
 };
 use crate::ProviderErrorDetail;
 
@@ -476,7 +477,8 @@ where
         body: &[u8],
         timeout: Duration,
         retry_policy: ProviderRetryPolicy,
-    ) -> Result<Vec<u8>, VitaAgentError> {
+        path_kind: ProviderRequestPath,
+    ) -> Result<ProviderTransportResponse, VitaAgentError> {
         self.limits.validate()?;
         let total_timeout = min_duration(timeout, self.limits.total_timeout);
         if total_timeout.is_zero() {
@@ -524,14 +526,14 @@ where
         let url = format!(
             "{}{suffix}",
             endpoint.normalized_base_url.trim_end_matches('/'),
-            suffix = "/chat/completions"
+            suffix = format!("/{}", path_kind.suffix())
         );
         if url::Url::parse(&url).is_err() {
             return Err(VitaAgentError::ProviderTransportRejected {
                 reason: "validated provider endpoint could not form a request URL",
             });
         }
-        let path = endpoint.request_path("chat/completions");
+        let path = endpoint.request_path(path_kind.suffix());
         let attempts = retry_policy.max_retries + 1;
 
         for attempt in 0..attempts {
@@ -584,7 +586,11 @@ where
             }
             enforce_response_limits(&response, self.limits)?;
             if (200..300).contains(&response.status) {
-                return Ok(response.body);
+                return Ok(ProviderTransportResponse {
+                    status: response.status,
+                    content_type: response.content_type,
+                    body: response.body,
+                });
             }
             // This includes 3xx and all retryable status classes.  A model
             // generation POST is not assumed idempotent, so an HTTP response
@@ -627,7 +633,27 @@ where
         timeout: Duration,
         retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError> {
-        self.post_json_inner(endpoint, authorization, body, timeout, retry_policy)
+        self.post_json_inner(
+            endpoint,
+            authorization,
+            body,
+            timeout,
+            retry_policy,
+            ProviderRequestPath::ChatCompletions,
+        )
+        .map(|response| response.body)
+    }
+
+    fn post_json_to_path(
+        &self,
+        endpoint: &ProviderEndpoint,
+        path: ProviderRequestPath,
+        authorization: Option<&ResolvedCredential>,
+        body: &[u8],
+        timeout: Duration,
+        retry_policy: ProviderRetryPolicy,
+    ) -> Result<ProviderTransportResponse, VitaAgentError> {
+        self.post_json_inner(endpoint, authorization, body, timeout, retry_policy, path)
     }
 }
 
@@ -1107,6 +1133,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Observation {
         url: String,
+        path: String,
         host: String,
         port: u16,
         address_count: usize,
@@ -1164,6 +1191,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(Observation {
                     url: request.url.clone(),
+                    path: request.path.clone(),
                     host: request.host.to_string(),
                     port: request.port,
                     address_count: request.addresses.len(),
@@ -1556,6 +1584,33 @@ mod tests {
         assert_eq!(observations[0].host, "provider.example");
         assert_eq!(observations[0].port, TEST_PORT);
         assert_eq!(observations[0].address_count, 1);
+    }
+
+    #[test]
+    fn typed_responses_path_reuses_transport_guards_and_retains_bounded_metadata() {
+        let http = TestHttp::with_responses([response(200, br#"{"status":"completed"}"#)]);
+        let observations = http.clone();
+        let transport = transport(
+            TestDns::answers(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))]),
+            http,
+        );
+        let response = transport
+            .post_json_to_path(
+                &endpoint(),
+                ProviderRequestPath::Responses,
+                Some(&ResolvedCredential::new("typed-test-secret")),
+                br#"{"stream":false}"#,
+                Duration::from_secs(1),
+                ProviderRetryPolicy::default(),
+            )
+            .expect("typed Responses request should use the production guard path");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        assert_eq!(response.body, br#"{"status":"completed"}"#);
+        let observations = observations.observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].path, "/v1/responses");
+        assert!(observations[0].authorization_present);
     }
 
     #[test]

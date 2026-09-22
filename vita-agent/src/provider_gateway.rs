@@ -1114,12 +1114,58 @@ pub(crate) trait ProviderRequestTransport {
         timeout: Duration,
         retry_policy: ProviderRetryPolicy,
     ) -> Result<Vec<u8>, VitaAgentError>;
+
+    /// Sends one bounded non-streaming JSON request to a typed provider path.
+    ///
+    /// The default implementation is deliberately unavailable.  Native D32
+    /// Responses traffic must never silently fall back to the Chat
+    /// Completions path when a transport has not opted into the typed seam.
+    fn post_json_to_path(
+        &self,
+        _endpoint: &ProviderEndpoint,
+        _path: ProviderRequestPath,
+        _authorization: Option<&ResolvedCredential>,
+        _body: &[u8],
+        _timeout: Duration,
+        _retry_policy: ProviderRetryPolicy,
+    ) -> Result<ProviderTransportResponse, VitaAgentError> {
+        Err(VitaAgentError::ProviderTransportRejected {
+            reason: "typed provider path is unavailable for this transport",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRequestPath {
+    ChatCompletions,
+    Responses,
+}
+
+impl ProviderRequestPath {
+    pub(crate) const fn suffix(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+/// Bounded metadata retained for the D32 native diagnostic path.  The body is
+/// the only provider material passed to the strict parser; status and content
+/// type are intentionally kept as small, non-secret fields for safe failure
+/// reporting and no raw HTTP headers/body are retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderTransportResponse {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Vec<u8>,
 }
 
 pub(crate) struct ProviderGateway<R, T> {
     ready: GatewayReadyProvider,
     credential_resolver: R,
     transport: T,
+    d32_native_responses: bool,
 }
 
 impl<R, T> ProviderGateway<R, T>
@@ -1128,10 +1174,20 @@ where
     T: ProviderRequestTransport,
 {
     pub(crate) fn new(ready: GatewayReadyProvider, credential_resolver: R, transport: T) -> Self {
+        Self::new_with_d32_native(ready, credential_resolver, transport, false)
+    }
+
+    pub(crate) fn new_with_d32_native(
+        ready: GatewayReadyProvider,
+        credential_resolver: R,
+        transport: T,
+        d32_native_responses: bool,
+    ) -> Self {
         Self {
             ready,
             credential_resolver,
             transport,
+            d32_native_responses,
         }
     }
 
@@ -1165,6 +1221,9 @@ where
         // to move a reference to another provider or destination between
         // configuration validation and request construction.
         self.ready.profile.validate()?;
+        if self.d32_native_responses && d32_native_request_is_cargo_round(request) {
+            return self.execute_d32_native_request(request, identity);
+        }
         // Codex's Responses client requires a streaming Responses response, but
         // D29-F deliberately keeps the downstream Chat mock non-streaming.  The
         // Vita listener owns that protocol boundary: validate the Codex request
@@ -1235,6 +1294,639 @@ where
         validate_d32_request_response_contract(request, &result)?;
         Ok(result)
     }
+
+    fn execute_d32_native_request(
+        &self,
+        request: &VitaResponsesRequest,
+        identity: Option<&ProviderRequestIdentity>,
+    ) -> Result<VitaResponsesResult, VitaAgentError> {
+        let policy_match = d32_native_responses_profile_allowed(&self.ready.profile);
+        let phase = if request.tool_calls.is_empty() && request.tool_outputs.is_empty() {
+            D32NativePhase::InitialRequest
+        } else {
+            D32NativePhase::FinalRequest
+        };
+        if !policy_match {
+            return Err(d32_native_failure(
+                phase,
+                false,
+                None,
+                None,
+                "policy_mismatch",
+                None,
+                None,
+            ));
+        }
+        if !self.ready.profile.capabilities.tools {
+            return Err(d32_native_failure(
+                phase,
+                true,
+                None,
+                None,
+                "capability",
+                Some("tools".to_string()),
+                None,
+            ));
+        }
+        let body = build_d32_native_request_body(request).map_err(|error| {
+            d32_native_failure(
+                phase,
+                true,
+                None,
+                None,
+                "request_invalid",
+                Some(error),
+                None,
+            )
+        })?;
+        let credential = self
+            .ready
+            .profile
+            .credential_ref
+            .as_ref()
+            .map(|reference| {
+                identity.map_or_else(
+                    || self.credential_resolver.resolve(reference),
+                    |identity| {
+                        self.credential_resolver
+                            .resolve_for_request(reference, identity)
+                    },
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                d32_native_failure(
+                    phase,
+                    true,
+                    None,
+                    None,
+                    "credential",
+                    Some(d32_native_error_code(&error)),
+                    None,
+                )
+            })?;
+        if credential
+            .as_ref()
+            .is_some_and(ResolvedCredential::is_empty)
+        {
+            return Err(d32_native_failure(
+                phase,
+                true,
+                None,
+                None,
+                "credential",
+                Some("empty".to_string()),
+                None,
+            ));
+        }
+        let response = self
+            .transport
+            .post_json_to_path(
+                &self.ready.profile.endpoint,
+                ProviderRequestPath::Responses,
+                credential.as_ref(),
+                &body,
+                self.ready.profile.timeout,
+                self.ready.profile.retry_policy,
+            )
+            .map_err(|error| {
+                let http_status = match &error {
+                    VitaAgentError::ProviderHttpStatus { status, .. } => Some(*status),
+                    _ => None,
+                };
+                d32_native_failure(
+                    phase,
+                    true,
+                    Some(1),
+                    http_status,
+                    "transport",
+                    Some(d32_native_error_code(&error)),
+                    None,
+                )
+            })?;
+        let status = response.status;
+        let content_type = response.content_type.as_deref();
+        if status != 200 {
+            return Err(d32_native_failure(
+                phase,
+                true,
+                Some(1),
+                Some(status),
+                "http_status",
+                None,
+                content_type,
+            ));
+        }
+        if !content_type.is_some_and(d32_content_type_is_json) {
+            return Err(d32_native_failure(
+                phase,
+                true,
+                Some(1),
+                Some(status),
+                "content_type",
+                None,
+                content_type,
+            ));
+        }
+        parse_d32_native_response(
+            request,
+            &response.body,
+            &self.ready.profile.model,
+            phase,
+            Some(1),
+            Some(status),
+            content_type,
+        )
+    }
+}
+
+fn d32_content_type_is_json(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+const D32_DEEPSEEK_THINKING_MODEL: &str = "deepseek/deepseek-v4-flash";
+const D32_COMMANDCODE_ENDPOINT_HOST: &str = "api.commandcode.ai";
+const D32_COMMANDCODE_ENDPOINT_PATH: &str = "/provider/v1";
+const MAX_D32_NATIVE_OUTPUT_TEXT_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D32NativePhase {
+    InitialRequest,
+    FinalRequest,
+}
+
+impl D32NativePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialRequest => "initial_request",
+            Self::FinalRequest => "final_request",
+        }
+    }
+}
+
+fn d32_native_responses_profile_allowed(profile: &ProviderProfile) -> bool {
+    profile.endpoint.scheme == "https"
+        && profile.endpoint.host == D32_COMMANDCODE_ENDPOINT_HOST
+        && profile.endpoint.port == 443
+        && profile.endpoint.path == D32_COMMANDCODE_ENDPOINT_PATH
+        && profile.model == D32_DEEPSEEK_THINKING_MODEL
+}
+
+fn d32_native_request_is_cargo_round(request: &VitaResponsesRequest) -> bool {
+    request.options.forced_tool.as_deref() == Some(D32_CARGO_TOOL_NAME)
+        || request
+            .options
+            .tools
+            .iter()
+            .any(|tool| tool.name == D32_CARGO_TOOL_NAME)
+        || !request.tool_calls.is_empty()
+        || !request.tool_outputs.is_empty()
+}
+
+fn d32_native_error_code(error: &VitaAgentError) -> String {
+    match error {
+        VitaAgentError::ProviderHttpStatus { status, detail } => detail
+            .as_ref()
+            .and_then(|detail| detail.code())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("http_{status}")),
+        VitaAgentError::ProviderTransportTimeout { phase } => format!("timeout_{phase}"),
+        VitaAgentError::ProviderRequestTooLarge { .. } => "request_too_large".to_string(),
+        VitaAgentError::ProviderResponseTooLarge { .. } => "response_too_large".to_string(),
+        VitaAgentError::CredentialResolution(_) => "credential".to_string(),
+        VitaAgentError::ProviderTransportRejected { .. } => "transport_rejected".to_string(),
+        VitaAgentError::GatewayProtocol(_) => "gateway_protocol".to_string(),
+        _ => "provider_error".to_string(),
+    }
+}
+
+fn d32_native_failure(
+    phase: D32NativePhase,
+    policy_match: bool,
+    attempts: Option<u8>,
+    http_status: Option<u16>,
+    safe_type: &'static str,
+    code: Option<String>,
+    content_type: Option<&str>,
+) -> VitaAgentError {
+    let content_type = content_type
+        .map(|value| {
+            value
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(64)
+                .collect::<String>()
+        })
+        .filter(|value| !value.is_empty());
+    VitaAgentError::GatewayProtocol(format!(
+        "D32 native Responses rejected phase={} policy_match={} attempts={} http_status={} type={} code={} finish={} output_kind={} content_type={}",
+        phase.as_str(),
+        policy_match,
+        attempts.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        http_status.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        safe_type,
+        code.as_deref().unwrap_or("none"),
+        "unknown",
+        if matches!(safe_type, "output_kind" | "output_text") {
+            code.as_deref().unwrap_or("unknown")
+        } else {
+            "unknown"
+        },
+        content_type.as_deref().unwrap_or("none"),
+    ))
+}
+
+fn build_d32_native_request_body(request: &VitaResponsesRequest) -> Result<Vec<u8>, String> {
+    if request.options.tools.len() != 1
+        || request.options.tools[0].name != D32_CARGO_TOOL_NAME
+        || request.options.parallel_tools
+    {
+        return Err("tool_policy".to_string());
+    }
+    let first_round = request.tool_calls.is_empty() && request.tool_outputs.is_empty();
+    if first_round {
+        if request.options.forced_tool.as_deref() != Some(D32_CARGO_TOOL_NAME) {
+            return Err("first_tool_choice".to_string());
+        }
+    } else if request.options.forced_tool.is_some()
+        || request.tool_calls.len() != 1
+        || request.tool_outputs.len() != 1
+    {
+        return Err("second_pairing".to_string());
+    }
+
+    let mut input = request
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": d32_native_message_role(message.role),
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+    if input.is_empty() {
+        return Err("input_empty".to_string());
+    }
+    let tool = &request.options.tools[0];
+    let mut tool_object = serde_json::Map::new();
+    tool_object.insert("type".to_string(), Value::String("function".to_string()));
+    tool_object.insert("name".to_string(), Value::String(tool.name.clone()));
+    if let Some(description) = &tool.description {
+        tool_object.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
+    }
+    tool_object.insert("parameters".to_string(), tool.parameters.clone());
+
+    let (tool_choice, reasoning) = if first_round {
+        (
+            serde_json::json!({"type":"function","name":D32_CARGO_TOOL_NAME}),
+            serde_json::json!({"effort":"none"}),
+        )
+    } else {
+        let call = &request.tool_calls[0];
+        let output = &request.tool_outputs[0];
+        if call.name != D32_CARGO_TOOL_NAME
+            || output.call_id != call.id
+            || !d32_native_identifier_is_bounded(&call.item_id)
+            || !d32_native_identifier_is_bounded(&call.id)
+            || !d32_arguments_are_strict_empty_object(&call.arguments)
+        {
+            return Err("second_pairing".to_string());
+        }
+        input.push(serde_json::json!({
+            "type": "function_call",
+            "id": call.item_id,
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }));
+        input.push(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": output.call_id,
+            "output": output.output,
+        }));
+        (
+            Value::String("none".to_string()),
+            serde_json::json!({"effort":"none"}),
+        )
+    };
+
+    serde_json::to_vec(&serde_json::json!({
+        "model": request.model,
+        "input": input,
+        "reasoning": reasoning,
+        "tools": [Value::Object(tool_object)],
+        "tool_choice": tool_choice,
+        "stream": false,
+    }))
+    .map_err(|_| "serialize".to_string())
+}
+
+fn d32_native_message_role(role: VitaMessageRole) -> &'static str {
+    match role {
+        VitaMessageRole::System => "system",
+        VitaMessageRole::Developer => "developer",
+        VitaMessageRole::User => "user",
+        VitaMessageRole::Assistant => "assistant",
+    }
+}
+
+fn parse_d32_native_response(
+    request: &VitaResponsesRequest,
+    body: &[u8],
+    expected_model: &str,
+    phase: D32NativePhase,
+    attempts: Option<u8>,
+    http_status: Option<u16>,
+    content_type: Option<&str>,
+) -> Result<VitaResponsesResult, VitaAgentError> {
+    let value = serde_json::from_slice::<Value>(body).map_err(|_| {
+        d32_native_failure(
+            phase,
+            true,
+            attempts,
+            http_status,
+            "invalid_json",
+            None,
+            content_type,
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        d32_native_failure(
+            phase,
+            true,
+            attempts,
+            http_status,
+            "response_shape",
+            Some("root_not_object".to_string()),
+            content_type,
+        )
+    })?;
+    let response_id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| d32_native_identifier_is_bounded(value))
+        .ok_or_else(|| {
+            d32_native_failure(
+                phase,
+                true,
+                attempts,
+                http_status,
+                "response_shape",
+                Some("response_id".to_string()),
+                content_type,
+            )
+        })?;
+    if object.get("model").and_then(Value::as_str) != Some(expected_model)
+        || object.get("status").and_then(Value::as_str) != Some("completed")
+    {
+        return Err(d32_native_failure(
+            phase,
+            true,
+            attempts,
+            http_status,
+            "response_identity",
+            Some("model_or_status".to_string()),
+            content_type,
+        ));
+    }
+    let output = object
+        .get("output")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 1)
+        .ok_or_else(|| {
+            d32_native_failure(
+                phase,
+                true,
+                attempts,
+                http_status,
+                "output_shape",
+                Some("exactly_one_output_required".to_string()),
+                content_type,
+            )
+        })?;
+    let usage = parse_d32_native_usage(object.get("usage")).map_err(|code| {
+        d32_native_failure(
+            phase,
+            true,
+            attempts,
+            http_status,
+            "usage_shape",
+            Some(code),
+            content_type,
+        )
+    })?;
+    let item = output[0].as_object().ok_or_else(|| {
+        d32_native_failure(
+            phase,
+            true,
+            attempts,
+            http_status,
+            "output_shape",
+            Some("output_item_not_object".to_string()),
+            content_type,
+        )
+    })?;
+    match phase {
+        D32NativePhase::InitialRequest => {
+            if item.get("type").and_then(Value::as_str) != Some("function_call")
+                || item.get("status").and_then(Value::as_str) != Some("completed")
+            {
+                return Err(d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "output_kind",
+                    Some("function_call_required".to_string()),
+                    content_type,
+                ));
+            }
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| d32_native_identifier_is_bounded(value));
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .filter(|value| d32_native_identifier_is_bounded(value));
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| *value == D32_CARGO_TOOL_NAME);
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .filter(|value| value.len() <= MAX_TOOL_ARGUMENT_BYTES);
+            if item_id.is_none()
+                || call_id.is_none()
+                || name.is_none()
+                || arguments.is_none()
+                || item.get("text").is_some()
+                || item.get("content").is_some()
+                || item.get("output_text").is_some()
+                || !d32_arguments_are_strict_empty_object(arguments.unwrap_or_default())
+            {
+                return Err(d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "output_contract",
+                    Some("function_call_fields".to_string()),
+                    content_type,
+                ));
+            }
+            if request.options.tools.len() != 1
+                || request.options.tools[0].name != D32_CARGO_TOOL_NAME
+            {
+                return Err(d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "request_contract",
+                    Some("cargo_tool".to_string()),
+                    content_type,
+                ));
+            }
+            Ok(VitaResponsesResult {
+                id: response_id.to_string(),
+                model: expected_model.to_string(),
+                output_text: String::new(),
+                finish_reason: Some("tool_calls".to_string()),
+                usage,
+                function_calls: vec![VitaFunctionCall {
+                    id: call_id.unwrap_or_default().to_string(),
+                    item_id: item_id.unwrap_or_default().to_string(),
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    arguments: arguments.unwrap_or_default().to_string(),
+                }],
+            })
+        }
+        D32NativePhase::FinalRequest => {
+            if item.get("type").and_then(Value::as_str) != Some("message")
+                || item.get("role").and_then(Value::as_str) != Some("assistant")
+                || item.get("status").and_then(Value::as_str) != Some("completed")
+                || !item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(d32_native_identifier_is_bounded)
+                || item.get("function_call").is_some()
+                || item.get("tool_calls").is_some()
+            {
+                return Err(d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "output_kind",
+                    Some("message_required".to_string()),
+                    content_type,
+                ));
+            }
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)
+                .filter(|parts| parts.len() == 1)
+                .ok_or_else(|| {
+                    d32_native_failure(
+                        phase,
+                        true,
+                        attempts,
+                        http_status,
+                        "output_text",
+                        Some("exactly_one_content_part_required".to_string()),
+                        content_type,
+                    )
+                })?;
+            let part = content[0].as_object().ok_or_else(|| {
+                d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "output_text",
+                    Some("content_part_not_object".to_string()),
+                    content_type,
+                )
+            })?;
+            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                return Err(d32_native_failure(
+                    phase,
+                    true,
+                    attempts,
+                    http_status,
+                    "output_text",
+                    Some("output_text_required".to_string()),
+                    content_type,
+                ));
+            }
+            let text = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|value| value.len() <= MAX_D32_NATIVE_OUTPUT_TEXT_BYTES)
+                .ok_or_else(|| {
+                    d32_native_failure(
+                        phase,
+                        true,
+                        attempts,
+                        http_status,
+                        "output_text",
+                        Some("text_missing_or_too_large".to_string()),
+                        content_type,
+                    )
+                })?;
+            Ok(VitaResponsesResult {
+                id: response_id.to_string(),
+                model: expected_model.to_string(),
+                output_text: text.to_string(),
+                finish_reason: Some("stop".to_string()),
+                usage,
+                function_calls: Vec::new(),
+            })
+        }
+    }
+}
+
+fn d32_native_identifier_is_bounded(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOOL_CALL_ID_BYTES
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
+}
+
+fn parse_d32_native_usage(value: Option<&Value>) -> Result<Option<VitaUsage>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "usage_object".to_string())?;
+    let input_tokens = object
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "input_tokens".to_string())?;
+    let output_tokens = object
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "output_tokens".to_string())?;
+    let total_tokens = object
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "total_tokens".to_string())?;
+    Ok(Some(VitaUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    }))
 }
 
 fn validate_d32_request_response_contract(
@@ -1634,9 +2326,6 @@ fn map_responses_request_to_chat(
     })
 }
 
-const D32_DEEPSEEK_THINKING_MODEL: &str = "deepseek/deepseek-v4-flash";
-const D32_COMMANDCODE_ENDPOINT_HOST: &str = "api.commandcode.ai";
-
 fn d32_forced_cargo_tool(
     forced_tool: Option<&str>,
     model: &str,
@@ -1727,6 +2416,11 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VitaFunctionCall {
+    /// Provider output-item identity. Responses uses a distinct `id` for the
+    /// function-call item and `call_id` for tool-result pairing; Chat tool
+    /// calls use the same value for both.
+    pub(crate) item_id: String,
+    /// Tool-result pairing identity (`call_id` in Responses).
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) arguments: String,
@@ -1876,6 +2570,7 @@ fn parse_chat_tool_calls_with_tools(
             "tool function arguments",
         )?;
         calls.push(VitaFunctionCall {
+            item_id: id.clone(),
             id,
             name,
             arguments,
@@ -2088,6 +2783,169 @@ mod tests {
             capabilities,
         )
         .expect("valid test-localhost profile")
+    }
+
+    #[cfg(windows)]
+    fn d32_native_profile() -> (GatewayReadyProvider, CredentialRef) {
+        let base_url = "https://api.commandcode.ai/provider/v1";
+        let credential = CredentialRef::new("native-ref", "provider-one", base_url)
+            .expect("native credential binding");
+        let profile = ProviderProfile::new(
+            "provider-one",
+            "CommandCode native D32",
+            ProviderProtocol::OpenAiChatCompletions,
+            base_url,
+            D32_DEEPSEEK_THINKING_MODEL,
+            Some(credential.clone()),
+            Duration::from_secs(10),
+            ProviderRetryPolicy::default(),
+            ProviderCapabilities {
+                tools: true,
+                ..ProviderCapabilities::none()
+            },
+        )
+        .expect("native provider profile");
+        let authority = VitaProviderAuthority::configure(profile).expect("native authority");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("native binding listener");
+        let binding = VitaGatewayBinding::for_owned_private_listener(
+            listener
+                .local_addr()
+                .expect("native listener address")
+                .port(),
+        )
+        .expect("native gateway binding");
+        (
+            authority
+                .prepare_gateway(binding)
+                .expect("native gateway ready"),
+            credential,
+        )
+    }
+
+    #[cfg(windows)]
+    fn d32_native_first_request() -> VitaResponsesRequest {
+        VitaResponsesRequest::new(
+            D32_DEEPSEEK_THINKING_MODEL,
+            vec![VitaMessage::text(VitaMessageRole::User, "run cargo")],
+            VitaResponsesRequestOptions {
+                stream: true,
+                tools: vec![GatewayToolDefinition {
+                    name: D32_CARGO_TOOL_NAME.to_string(),
+                    description: Some("Run cargo".to_string()),
+                    parameters: json!({"type":"object","properties":{}}),
+                }],
+                forced_tool: Some(D32_CARGO_TOOL_NAME.to_string()),
+                ..VitaResponsesRequestOptions::default()
+            },
+        )
+    }
+
+    #[cfg(windows)]
+    struct D32NativeTestTransport {
+        responses: Mutex<Vec<ProviderTransportResponse>>,
+        requests: Mutex<Vec<(ProviderRequestPath, Vec<u8>)>>,
+        chat_attempts: AtomicUsize,
+    }
+
+    #[cfg(windows)]
+    impl D32NativeTestTransport {
+        fn new(responses: Vec<ProviderTransportResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+                chat_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn requests(&self) -> Vec<(ProviderRequestPath, Vec<u8>)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(windows)]
+    impl ProviderRequestTransport for D32NativeTestTransport {
+        fn post_json(
+            &self,
+            _endpoint: &ProviderEndpoint,
+            _authorization: Option<&ResolvedCredential>,
+            _body: &[u8],
+            _timeout: Duration,
+            _retry_policy: ProviderRetryPolicy,
+        ) -> Result<Vec<u8>, VitaAgentError> {
+            self.chat_attempts.fetch_add(1, Ordering::AcqRel);
+            Err(VitaAgentError::GatewayProtocol(
+                "D32 native test must not use Chat Completions".to_string(),
+            ))
+        }
+
+        fn post_json_to_path(
+            &self,
+            _endpoint: &ProviderEndpoint,
+            path: ProviderRequestPath,
+            _authorization: Option<&ResolvedCredential>,
+            body: &[u8],
+            _timeout: Duration,
+            _retry_policy: ProviderRetryPolicy,
+        ) -> Result<ProviderTransportResponse, VitaAgentError> {
+            self.requests.lock().unwrap().push((path, body.to_vec()));
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Err(VitaAgentError::ProviderTransportRejected {
+                    reason: "D32 native test response queue exhausted",
+                })
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl ProviderRequestTransport for Arc<D32NativeTestTransport> {
+        fn post_json(
+            &self,
+            endpoint: &ProviderEndpoint,
+            authorization: Option<&ResolvedCredential>,
+            body: &[u8],
+            timeout: Duration,
+            retry_policy: ProviderRetryPolicy,
+        ) -> Result<Vec<u8>, VitaAgentError> {
+            self.as_ref()
+                .post_json(endpoint, authorization, body, timeout, retry_policy)
+        }
+
+        fn post_json_to_path(
+            &self,
+            endpoint: &ProviderEndpoint,
+            path: ProviderRequestPath,
+            authorization: Option<&ResolvedCredential>,
+            body: &[u8],
+            timeout: Duration,
+            retry_policy: ProviderRetryPolicy,
+        ) -> Result<ProviderTransportResponse, VitaAgentError> {
+            self.as_ref().post_json_to_path(
+                endpoint,
+                path,
+                authorization,
+                body,
+                timeout,
+                retry_policy,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    struct NoCredentialResolver;
+
+    #[cfg(windows)]
+    impl CredentialResolver for NoCredentialResolver {
+        fn resolve(
+            &self,
+            _credential_ref: &CredentialRef,
+        ) -> Result<ResolvedCredential, VitaAgentError> {
+            Err(VitaAgentError::CredentialResolution(
+                "native test has no credential",
+            ))
+        }
     }
 
     fn all_mapping_capabilities() -> ProviderCapabilities {
@@ -2532,6 +3390,7 @@ mod tests {
             },
         );
         request.tool_calls.push(VitaFunctionCall {
+            item_id: "call-1".to_string(),
             id: "call-1".to_string(),
             name: D32_CARGO_TOOL_NAME.to_string(),
             arguments: "{}".to_string(),
@@ -2547,6 +3406,250 @@ mod tests {
             .unwrap()
             .contains("tool_choice"));
         assert!(!serde_json::to_string(&mapped).unwrap().contains("thinking"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_responses_two_round_golden_and_pairing_are_exact() {
+        let first_response = serde_json::to_vec(&json!({
+            "id": "resp-native-1",
+            "model": D32_DEEPSEEK_THINKING_MODEL,
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc-item-1",
+                "call_id": "call-1",
+                "name": D32_CARGO_TOOL_NAME,
+                "arguments": "{}",
+                "status": "completed"
+            }]
+        }))
+        .unwrap();
+        let second_response = serde_json::to_vec(&json!({
+            "id": "resp-native-2",
+            "model": D32_DEEPSEEK_THINKING_MODEL,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg-1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "cargo completed"}]
+            }]
+        }))
+        .unwrap();
+        let transport = Arc::new(D32NativeTestTransport::new(vec![
+            ProviderTransportResponse {
+                status: 200,
+                content_type: Some("application/json; charset=utf-8".to_string()),
+                body: first_response,
+            },
+            ProviderTransportResponse {
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                body: second_response,
+            },
+        ]));
+        let (ready, credential) = d32_native_profile();
+        let gateway = ProviderGateway::new_with_d32_native(
+            ready,
+            InMemoryTestCredential {
+                reference: credential,
+                value: "native-test-credential".to_string(),
+            },
+            Arc::clone(&transport),
+            true,
+        );
+        let first = d32_native_first_request();
+        let first_result = gateway
+            .execute_responses_request(&first)
+            .expect("native first round");
+        assert_eq!(first_result.id, "resp-native-1");
+        assert_eq!(first_result.model, D32_DEEPSEEK_THINKING_MODEL);
+        assert_eq!(first_result.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(first_result.function_calls.len(), 1);
+        assert_eq!(first_result.function_calls[0].item_id, "fc-item-1");
+        assert_eq!(first_result.function_calls[0].id, "call-1");
+        assert_eq!(first_result.function_calls[0].arguments, "{}");
+
+        let mut second = first.clone();
+        second.options.forced_tool = None;
+        second.tool_calls = first_result.function_calls.clone();
+        second.tool_outputs = vec![VitaToolOutput {
+            call_id: "call-1".to_string(),
+            output: "{\"status\":\"completed\"}".to_string(),
+        }];
+        let second_result = gateway
+            .execute_responses_request(&second)
+            .expect("native second round");
+        assert_eq!(second_result.output_text, "cargo completed");
+        assert_eq!(second_result.finish_reason.as_deref(), Some("stop"));
+        assert!(second_result.function_calls.is_empty());
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, ProviderRequestPath::Responses);
+        assert_eq!(requests[1].0, ProviderRequestPath::Responses);
+        let first_wire: Value = serde_json::from_slice(&requests[0].1).unwrap();
+        assert_eq!(first_wire["model"], D32_DEEPSEEK_THINKING_MODEL);
+        assert_eq!(first_wire["stream"], false);
+        assert_eq!(first_wire["reasoning"]["effort"], "none");
+        assert_eq!(first_wire["tool_choice"]["type"], "function");
+        assert_eq!(first_wire["tool_choice"]["name"], D32_CARGO_TOOL_NAME);
+        assert_eq!(first_wire["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first_wire["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(first_wire["input"][0]["role"], "user");
+        assert!(first_wire.get("messages").is_none());
+        assert!(first_wire.get("thinking").is_none());
+        assert!(first_wire.get("reasoning_effort").is_none());
+
+        let second_wire: Value = serde_json::from_slice(&requests[1].1).unwrap();
+        assert_eq!(second_wire["stream"], false);
+        assert_eq!(second_wire["reasoning"]["effort"], "none");
+        assert_eq!(second_wire["tool_choice"], "none");
+        assert_eq!(second_wire["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(second_wire["input"][1]["type"], "function_call");
+        assert_eq!(second_wire["input"][1]["id"], "fc-item-1");
+        assert_eq!(second_wire["input"][1]["call_id"], "call-1");
+        assert_eq!(second_wire["input"][1]["name"], D32_CARGO_TOOL_NAME);
+        assert_eq!(second_wire["input"][1]["arguments"], "{}");
+        assert_eq!(second_wire["input"][2]["type"], "function_call_output");
+        assert_eq!(second_wire["input"][2]["call_id"], "call-1");
+        assert!(second_wire.get("messages").is_none());
+        assert_eq!(transport.chat_attempts.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_responses_fail_closed_for_policy_and_response_shape_matrix() {
+        let first_request = d32_native_first_request();
+        let bad_bodies = [
+            serde_json::to_vec(&json!({
+                "id":"resp","model":"wrong","status":"completed","output":[]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "output":[
+                    {"type":"function_call","id":"i","call_id":"c","name":D32_CARGO_TOOL_NAME,"arguments":"{}","status":"completed"},
+                    {"type":"function_call","id":"i2","call_id":"c2","name":D32_CARGO_TOOL_NAME,"arguments":"{}","status":"completed"}
+                ]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"bad first"}]}]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "output":[{"type":"function_call","id":"i","call_id":"c","name":D32_CARGO_TOOL_NAME,"arguments":"{}","text":"unexpected","status":"completed"}]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "output":[{"type":"function_call","id":"i","call_id":"c","name":"other","arguments":"{}","status":"completed"}]
+            }))
+            .unwrap(),
+            serde_json::to_vec(&json!({
+                "id":"resp","model":D32_DEEPSEEK_THINKING_MODEL,"status":"completed",
+                "output":[{"type":"function_call","id":"i","call_id":"c","name":D32_CARGO_TOOL_NAME,"arguments":"{\"x\":1}","status":"completed"}]
+            }))
+            .unwrap(),
+            b"not-json".to_vec(),
+        ];
+        for body in bad_bodies {
+            let error = parse_d32_native_response(
+                &first_request,
+                &body,
+                D32_DEEPSEEK_THINKING_MODEL,
+                D32NativePhase::InitialRequest,
+                Some(1),
+                Some(200),
+                Some("application/json"),
+            )
+            .expect_err("native response shape must fail closed");
+            let text = error.to_string();
+            assert!(text.contains("D32 native Responses rejected"));
+            assert!(!text.contains("bad first"));
+            assert!(!text.contains("x\\\":1"));
+        }
+
+        let generic_base = "https://provider.example/provider/v1";
+        let generic_profile = ProviderProfile::new(
+            "provider-one",
+            "generic",
+            ProviderProtocol::OpenAiChatCompletions,
+            generic_base,
+            D32_DEEPSEEK_THINKING_MODEL,
+            None,
+            Duration::from_secs(10),
+            ProviderRetryPolicy::default(),
+            ProviderCapabilities {
+                tools: true,
+                ..ProviderCapabilities::none()
+            },
+        )
+        .unwrap();
+        let authority = VitaProviderAuthority::configure(generic_profile).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let binding =
+            VitaGatewayBinding::for_owned_private_listener(listener.local_addr().unwrap().port())
+                .unwrap();
+        let ready = authority.prepare_gateway(binding).unwrap();
+        let transport = Arc::new(D32NativeTestTransport::new(Vec::new()));
+        let gateway = ProviderGateway::new_with_d32_native(
+            ready,
+            NoCredentialResolver,
+            Arc::clone(&transport),
+            true,
+        );
+        let error = gateway
+            .execute_responses_request(&first_request)
+            .expect_err("generic endpoint must not enter native adapter");
+        assert!(error.to_string().contains("policy_mismatch"));
+        assert!(transport.requests().is_empty());
+        assert_eq!(transport.chat_attempts.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_responses_reject_status_content_type_and_transport_without_raw_data() {
+        let first_request = d32_native_first_request();
+        let fixtures = [
+            ProviderTransportResponse {
+                status: 400,
+                content_type: Some("application/json".to_string()),
+                body: b"{\"secret\":\"not-retained\"}".to_vec(),
+            },
+            ProviderTransportResponse {
+                status: 200,
+                content_type: Some("text/event-stream".to_string()),
+                body: b"data: {}".to_vec(),
+            },
+        ];
+        for fixture in fixtures {
+            let transport = Arc::new(D32NativeTestTransport::new(vec![fixture]));
+            let (ready, credential) = d32_native_profile();
+            let gateway = ProviderGateway::new_with_d32_native(
+                ready,
+                InMemoryTestCredential {
+                    reference: credential,
+                    value: "native-test-credential".to_string(),
+                },
+                Arc::clone(&transport),
+                true,
+            );
+            let error = gateway
+                .execute_responses_request(&first_request)
+                .expect_err("status/content type must fail closed");
+            let text = error.to_string();
+            assert!(text.contains("phase=initial_request"));
+            assert!(text.contains("attempts=1"));
+            assert!(!text.contains("not-retained"));
+            assert!(!text.contains("data:"));
+            assert_eq!(transport.chat_attempts.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]
@@ -2631,6 +3734,7 @@ mod tests {
         assert_eq!(
             result.function_calls,
             vec![VitaFunctionCall {
+                item_id: "call-1".to_string(),
                 id: "call-1".to_string(),
                 name: "vita_workspace_git_status".to_string(),
                 arguments: "{}".to_string(),
@@ -2735,6 +3839,7 @@ mod tests {
             },
         );
         request.tool_calls.push(VitaFunctionCall {
+            item_id: "call-1".to_string(),
             id: "call-1".to_string(),
             name: TOOL_NAME.to_string(),
             arguments: "{}".to_string(),

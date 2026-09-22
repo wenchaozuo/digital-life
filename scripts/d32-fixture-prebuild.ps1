@@ -263,6 +263,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class D32NativeCleanupEvidenceV2
@@ -271,6 +272,9 @@ public sealed class D32NativeCleanupEvidenceV2
     public int JobTerminateLastError { get; internal set; }
     public bool ProcessWasAlreadySignaled { get; internal set; }
     public bool ProcessWaitSignaled { get; internal set; }
+    public bool JobActiveProcessCountVerified { get; internal set; }
+    public uint JobActiveProcessCount { get; internal set; }
+    public int JobActiveProcessCountLastError { get; internal set; }
     public bool JobCloseSucceeded { get; internal set; }
     public bool CleanupSucceeded { get; internal set; }
     public bool AlreadyClosed { get; internal set; }
@@ -282,16 +286,15 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private const uint CreateSuspended = 0x00000004;
     private const uint CreateNoWindow = 0x08000000;
     private const uint CreateUnicodeEnvironment = 0x00000400;
+    private const uint ExtendedStartupInfoPresent = 0x00080000;
     private const uint StartfUseStdHandles = 0x00000100;
     private const uint HandleFlagInherit = 0x00000001;
+    private const uint ProcThreadAttributeHandleList = 0x00020002;
     private const uint JobObjectExtendedLimitInformationClass = 9;
+    private const uint JobObjectBasicAccountingInformationClass = 1;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
     private const uint WaitObject0 = 0x00000000;
-    private const uint GenericRead = 0x80000000;
-    private const uint FileShareRead = 0x00000001;
-    private const uint FileShareWrite = 0x00000002;
-    private const uint OpenExisting = 3;
-    private const uint FileAttributeNormal = 0x00000080;
+    private const int ErrorInsufficientBuffer = 122;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes
@@ -322,6 +325,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         public IntPtr StandardInput;
         public IntPtr StandardOutput;
         public IntPtr StandardError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartupInfoEx
+    {
+        public StartupInfo StartupInfo;
+        public IntPtr AttributeList;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -369,6 +379,19 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         public UIntPtr PeakJobMemoryUsed;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectBasicAccountingInformation
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string name);
 
@@ -410,15 +433,43 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetHandleInformation(IntPtr handle, out uint flags);
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern IntPtr CreateFileW(
-        string fileName,
-        uint desiredAccess,
-        uint shareMode,
-        ref SecurityAttributes securityAttributes,
-        uint creationDisposition,
-        uint flagsAndAttributes,
-        IntPtr templateFile);
+    private static extern IntPtr CreateEventW(
+        ref SecurityAttributes eventAttributes,
+        bool manualReset,
+        bool initialState,
+        string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(
+        IntPtr job,
+        uint jobObjectInformationClass,
+        ref JobObjectBasicAccountingInformation jobObjectInformation,
+        uint jobObjectInformationLength,
+        out uint returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool InitializeProcThreadAttributeList(
+        IntPtr attributeList,
+        int attributeCount,
+        int flags,
+        ref IntPtr attributeListSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UpdateProcThreadAttribute(
+        IntPtr attributeList,
+        uint flags,
+        IntPtr attribute,
+        IntPtr value,
+        IntPtr size,
+        IntPtr previousValue,
+        IntPtr returnSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool CreateProcessW(
@@ -430,7 +481,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         uint creationFlags,
         IntPtr environment,
         string currentDirectory,
-        ref StartupInfo startupInfo,
+        ref StartupInfoEx startupInfo,
         out ProcessInformation processInformation);
 
     private IntPtr _job;
@@ -441,10 +492,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private FileStream _stdoutStream;
     private FileStream _stderrStream;
     private bool _disposed;
+    private bool _closedJobActiveProcessCountVerified;
+    private uint _closedJobActiveProcessCount;
+    private int _closedJobActiveProcessCountError;
 
     public int ProcessId { get; private set; }
     public bool JobAssigned { get; private set; }
-    public string LaunchMode { get { return "CreateProcessW(CREATE_SUSPENDED)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"; } }
+    public string LaunchMode { get { return "CreateProcessW(CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"; } }
 
     private D32FixtureNativeProcessV2(
         IntPtr job,
@@ -469,13 +523,45 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         throw new Win32Exception(error, prefix + " (win32=" + error.ToString() + ")");
     }
 
-    private static void CloseIfOpen(ref IntPtr handle)
+    private static string CloseIfOpen(ref IntPtr handle, string label)
     {
         if (handle != IntPtr.Zero && handle != new IntPtr(-1))
         {
-            CloseHandle(handle);
+            if (!CloseHandle(handle))
+            {
+                int error = Marshal.GetLastWin32Error();
+                return label + " failed (win32=" + error.ToString() + ")";
+            }
             handle = IntPtr.Zero;
         }
+        return null;
+    }
+
+    public static IntPtr CreateInheritableTestHandle()
+    {
+        SecurityAttributes attributes = new SecurityAttributes();
+        attributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+        attributes.InheritHandle = 1;
+        IntPtr handle = CreateEventW(ref attributes, false, false, null);
+        if (handle == IntPtr.Zero) ThrowLastError("CreateEventW(test handle) failed");
+        return handle;
+    }
+
+    public static bool CloseInheritableTestHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return true;
+        return CloseHandle(handle);
+    }
+
+    private static void RequireHandleInheritance(IntPtr handle, bool expected, string label)
+    {
+        uint flags;
+        if (!GetHandleInformation(handle, out flags))
+            ThrowLastError("GetHandleInformation(" + label + ") failed");
+        bool actual = (flags & HandleFlagInherit) != 0;
+        if (actual != expected)
+            throw new InvalidOperationException(
+                "HANDLE_INHERITANCE_MISMATCH: " + label + " expected=" + expected.ToString() + " actual=" + actual.ToString());
     }
 
     private static void ConfigureKillOnClose(IntPtr job)
@@ -492,10 +578,60 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         }
     }
 
+    private bool TryGetActiveProcessCount(out uint count, out int error)
+    {
+        count = 0;
+        error = 0;
+        if (_job == IntPtr.Zero)
+        {
+            error = 6;
+            return false;
+        }
+        JobObjectBasicAccountingInformation accounting = new JobObjectBasicAccountingInformation();
+        uint returnLength;
+        uint expectedLength = (uint)Marshal.SizeOf(typeof(JobObjectBasicAccountingInformation));
+        if (!QueryInformationJobObject(
+            _job,
+            JobObjectBasicAccountingInformationClass,
+            ref accounting,
+            expectedLength,
+            out returnLength))
+        {
+            error = Marshal.GetLastWin32Error();
+            return false;
+        }
+        if (returnLength < expectedLength)
+        {
+            error = 122;
+            return false;
+        }
+        count = accounting.ActiveProcesses;
+        return true;
+    }
+
+    private bool WaitForJobActiveProcessZero(int timeoutMilliseconds, out uint count, out int error)
+    {
+        if (timeoutMilliseconds < 0) timeoutMilliseconds = 0;
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+        do
+        {
+            if (!TryGetActiveProcessCount(out count, out error)) return false;
+            if (count == 0) return true;
+            int remaining = (int)Math.Max(0, (deadline - DateTime.UtcNow).TotalMilliseconds);
+            if (remaining == 0) break;
+            Thread.Sleep(Math.Min(50, remaining));
+        }
+        while (DateTime.UtcNow <= deadline);
+
+        if (!TryGetActiveProcessCount(out count, out error)) return false;
+        return count == 0;
+    }
+
     public static D32FixtureNativeProcessV2 Start(
         string filePath,
         string commandLine,
-        string workingDirectory)
+        string workingDirectory,
+        string testFailure)
     {
         if (String.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("filePath");
         if (String.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory");
@@ -505,9 +641,14 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         IntPtr stdoutWrite = IntPtr.Zero;
         IntPtr stderrRead = IntPtr.Zero;
         IntPtr stderrWrite = IntPtr.Zero;
-        IntPtr stdin = IntPtr.Zero;
+        IntPtr attributeList = IntPtr.Zero;
+        IntPtr attributeListSize = IntPtr.Zero;
+        IntPtr handleList = IntPtr.Zero;
         ProcessInformation pi = new ProcessInformation();
         bool transferred = false;
+        Exception failure = null;
+        string cleanupErrors = null;
+        D32FixtureNativeProcessV2 result = null;
 
         try
         {
@@ -520,30 +661,67 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             pipeAttributes.InheritHandle = 1;
             if (!CreatePipe(out stdoutRead, out stdoutWrite, ref pipeAttributes, 0))
                 ThrowLastError("CreatePipe(stdout) failed");
+            RequireHandleInheritance(stdoutWrite, true, "stdout child end");
             if (!SetHandleInformation(stdoutRead, HandleFlagInherit, 0))
-                ThrowLastError("SetHandleInformation(stdout) failed");
+                ThrowLastError("SetHandleInformation(stdout read) failed");
+            RequireHandleInheritance(stdoutRead, false, "stdout parent end");
             if (!CreatePipe(out stderrRead, out stderrWrite, ref pipeAttributes, 0))
                 ThrowLastError("CreatePipe(stderr) failed");
+            RequireHandleInheritance(stderrWrite, true, "stderr child end");
             if (!SetHandleInformation(stderrRead, HandleFlagInherit, 0))
-                ThrowLastError("SetHandleInformation(stderr) failed");
+                ThrowLastError("SetHandleInformation(stderr read) failed");
+            RequireHandleInheritance(stderrRead, false, "stderr parent end");
 
-            stdin = CreateFileW(
-                "NUL",
-                GenericRead,
-                FileShareRead | FileShareWrite,
-                ref pipeAttributes,
-                OpenExisting,
-                FileAttributeNormal,
-                IntPtr.Zero);
-            if (stdin == IntPtr.Zero || stdin == new IntPtr(-1))
-                ThrowLastError("CreateFileW(NUL) failed");
+            handleList = Marshal.AllocHGlobal(IntPtr.Size * 2);
+            Marshal.WriteIntPtr(handleList, 0, stdoutWrite);
+            Marshal.WriteIntPtr(handleList, IntPtr.Size, stderrWrite);
+            bool initialAttributeProbe = InitializeProcThreadAttributeList(
+                IntPtr.Zero,
+                1,
+                0,
+                ref attributeListSize);
+            int initialAttributeError = Marshal.GetLastWin32Error();
+            if (initialAttributeProbe ||
+                initialAttributeError != ErrorInsufficientBuffer ||
+                attributeListSize == IntPtr.Zero) {
+                throw new InvalidOperationException(
+                    "InitializeProcThreadAttributeList probe failed (win32=" +
+                    initialAttributeError.ToString() + ", size=" + attributeListSize.ToString() + ")");
+            }
+            attributeList = Marshal.AllocHGlobal(checked(attributeListSize.ToInt32()));
+            if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeListSize))
+                ThrowLastError("InitializeProcThreadAttributeList failed");
+            if (String.Equals(testFailure, "attribute", StringComparison.Ordinal)) {
+                if (UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    IntPtr.Zero,
+                    handleList,
+                    new IntPtr(IntPtr.Size * 2),
+                    IntPtr.Zero,
+                    IntPtr.Zero)) {
+                    throw new InvalidOperationException("SELFTEST_INJECTED_ATTRIBUTE_API_UNEXPECTED_SUCCESS");
+                }
+                ThrowLastError("SELFTEST_INJECTED_ATTRIBUTE_API_FAILURE");
+            }
+            if (!UpdateProcThreadAttribute(
+                attributeList,
+                0,
+                new IntPtr(ProcThreadAttributeHandleList),
+                handleList,
+                new IntPtr(IntPtr.Size * 2),
+                IntPtr.Zero,
+                IntPtr.Zero)) {
+                ThrowLastError("UpdateProcThreadAttribute(HANDLE_LIST) failed");
+            }
 
-            StartupInfo startup = new StartupInfo();
-            startup.Cb = Marshal.SizeOf(typeof(StartupInfo));
-            startup.Flags = StartfUseStdHandles;
-            startup.StandardInput = stdin;
-            startup.StandardOutput = stdoutWrite;
-            startup.StandardError = stderrWrite;
+            StartupInfoEx startup = new StartupInfoEx();
+            startup.StartupInfo.Cb = Marshal.SizeOf(typeof(StartupInfoEx));
+            startup.StartupInfo.Flags = StartfUseStdHandles;
+            startup.StartupInfo.StandardInput = IntPtr.Zero;
+            startup.StartupInfo.StandardOutput = stdoutWrite;
+            startup.StartupInfo.StandardError = stderrWrite;
+            startup.AttributeList = attributeList;
             StringBuilder mutableCommandLine = new StringBuilder(commandLine ?? String.Empty);
             if (!CreateProcessW(
                 filePath,
@@ -551,27 +729,36 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 IntPtr.Zero,
                 IntPtr.Zero,
                 true,
-                CreateSuspended | CreateNoWindow | CreateUnicodeEnvironment,
+                CreateSuspended | CreateNoWindow | CreateUnicodeEnvironment | ExtendedStartupInfoPresent,
                 IntPtr.Zero,
                 workingDirectory,
                 ref startup,
-                out pi))
-            {
+                out pi)) {
                 ThrowLastError("CreateProcessW failed");
             }
+            DeleteProcThreadAttributeList(attributeList);
+            attributeList = IntPtr.Zero;
 
-            CloseIfOpen(ref stdoutWrite);
-            CloseIfOpen(ref stderrWrite);
-            CloseIfOpen(ref stdin);
+            string closeError = CloseIfOpen(ref stdoutWrite, "CloseHandle(stdout child end)");
+            if (closeError != null) throw new InvalidOperationException(closeError);
+            closeError = CloseIfOpen(ref stderrWrite, "CloseHandle(stderr child end)");
+            if (closeError != null) throw new InvalidOperationException(closeError);
 
             if (!AssignProcessToJobObject(job, pi.Process))
                 ThrowLastError("AssignProcessToJobObject failed");
+            if (String.Equals(testFailure, "assign", StringComparison.Ordinal)) {
+                bool assignedWithInvalidJob = AssignProcessToJobObject(IntPtr.Zero, pi.Process);
+                int assignError = assignedWithInvalidJob ? 0 : Marshal.GetLastWin32Error();
+                if (assignedWithInvalidJob)
+                    throw new InvalidOperationException("SELFTEST_INJECTED_ASSIGN_API_UNEXPECTED_SUCCESS");
+                throw new Win32Exception(assignError, "SELFTEST_INJECTED_ASSIGN_API_FAILURE (win32=" + assignError.ToString() + ")");
+            }
 
             uint resumeResult = ResumeThread(pi.Thread);
             if (resumeResult == UInt32.MaxValue)
                 ThrowLastError("ResumeThread failed");
 
-            D32FixtureNativeProcessV2 result = new D32FixtureNativeProcessV2(
+            result = new D32FixtureNativeProcessV2(
                 job,
                 pi.Process,
                 pi.Thread,
@@ -584,45 +771,84 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             stdoutRead = IntPtr.Zero;
             stderrRead = IntPtr.Zero;
             transferred = true;
-            return result;
         }
         catch (Exception error)
         {
-            string cleanup = "attempted";
+            failure = error;
             try
             {
                 if (pi.Process != IntPtr.Zero)
                 {
-                    if (job != IntPtr.Zero) TerminateJobObject(job, 1);
-                    TerminateProcess(pi.Process, 1);
-                    WaitForSingleObject(pi.Process, 5000);
+                    bool jobTerminated = false;
+                    if (job != IntPtr.Zero)
+                    {
+                        jobTerminated = TerminateJobObject(job, 1);
+                        if (!jobTerminated) {
+                            int terminateJobError = Marshal.GetLastWin32Error();
+                            cleanupErrors = "TerminateJobObject failed (win32=" + terminateJobError.ToString() + ")";
+                        }
+                    }
+                    bool terminated = jobTerminated || TerminateProcess(pi.Process, 1);
+                    if (!terminated && jobTerminated == false)
+                    {
+                        int terminateError = Marshal.GetLastWin32Error();
+                        string terminateFailure = "TerminateProcess failed (win32=" + terminateError.ToString() + ")";
+                        cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? terminateFailure : cleanupErrors + "; " + terminateFailure;
+                    }
+                    uint waitResult = WaitForSingleObject(pi.Process, 5000);
+                    if (waitResult != WaitObject0) {
+                        string waitError = "WaitForSingleObject(process) failed/timeout (" + waitResult.ToString() + ")";
+                        cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? waitError : cleanupErrors + "; " + waitError;
+                    }
                 }
             }
             catch (Exception cleanupError)
             {
-                cleanup = "failed:" + cleanupError.Message;
+                string detail = "native cleanup exception: " + cleanupError.Message;
+                cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? detail : cleanupErrors + "; " + detail;
             }
-            throw new InvalidOperationException(
-                "D32_NATIVE_LAUNCH_FAILED: " + error.Message + "; native cleanup=" + cleanup,
-                error);
         }
         finally
         {
+            if (attributeList != IntPtr.Zero)
+            {
+                DeleteProcThreadAttributeList(attributeList);
+                attributeList = IntPtr.Zero;
+            }
+            if (handleList != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(handleList);
+                handleList = IntPtr.Zero;
+            }
             if (!transferred)
             {
-                CloseIfOpen(ref stdoutWrite);
-                CloseIfOpen(ref stderrWrite);
-                CloseIfOpen(ref stdin);
-                CloseIfOpen(ref stdoutRead);
-                CloseIfOpen(ref stderrRead);
-                CloseIfOpen(ref pi.Thread);
-                CloseIfOpen(ref pi.Process);
-                CloseIfOpen(ref job);
+                string closeError = CloseIfOpen(ref stdoutWrite, "CloseHandle(stdout child end)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref stderrWrite, "CloseHandle(stderr child end)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref stdoutRead, "CloseHandle(stdout parent end)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref stderrRead, "CloseHandle(stderr parent end)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref pi.Thread, "CloseHandle(process thread)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref pi.Process, "CloseHandle(process)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
+                closeError = CloseIfOpen(ref job, "CloseHandle(job)");
+                if (closeError != null) cleanupErrors = String.IsNullOrEmpty(cleanupErrors) ? closeError : cleanupErrors + "; " + closeError;
             }
         }
+
+        if (failure != null)
+        {
+            string detail = "D32_NATIVE_LAUNCH_FAILED: " + failure.Message;
+            if (!String.IsNullOrEmpty(cleanupErrors)) detail += "; native cleanup=" + cleanupErrors;
+            throw new InvalidOperationException(detail, failure);
+        }
+        return result;
     }
 
-    public bool HasExited
+   public bool HasExited
     {
         get { return WaitForSingleObject(_process, 0) == WaitObject0; }
     }
@@ -679,30 +905,68 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (_job == IntPtr.Zero)
         {
             evidence.AlreadyClosed = true;
+            evidence.JobCloseSucceeded = true;
+            evidence.JobActiveProcessCountVerified = _closedJobActiveProcessCountVerified;
+            evidence.JobActiveProcessCount = _closedJobActiveProcessCount;
+            evidence.JobActiveProcessCountLastError = _closedJobActiveProcessCountError;
             evidence.ProcessWaitSignaled = WaitForExit(timeoutMilliseconds);
-            evidence.CleanupSucceeded = evidence.ProcessWaitSignaled;
-            evidence.Detail = "job handle already closed";
+            evidence.JobTerminateCallSucceeded = evidence.JobActiveProcessCountVerified && evidence.JobActiveProcessCount == 0;
+            evidence.CleanupSucceeded = evidence.ProcessWaitSignaled &&
+                evidence.JobActiveProcessCountVerified &&
+                evidence.JobActiveProcessCount == 0;
+            evidence.Detail = evidence.CleanupSucceeded
+                ? "job handle already closed; active process count was verified at zero"
+                : "job handle already closed without verified zero active process count";
             return evidence;
         }
 
         evidence.ProcessWasAlreadySignaled = HasExited;
-        if (!evidence.ProcessWasAlreadySignaled)
+        uint activeProcessCount;
+        int activeProcessCountError;
+        evidence.JobActiveProcessCountVerified = TryGetActiveProcessCount(
+            out activeProcessCount,
+            out activeProcessCountError);
+        evidence.JobActiveProcessCount = activeProcessCount;
+        evidence.JobActiveProcessCountLastError = activeProcessCountError;
+
+        if (evidence.JobActiveProcessCountVerified && activeProcessCount == 0)
+        {
+            evidence.JobTerminateCallSucceeded = true;
+        }
+        else
         {
             evidence.JobTerminateCallSucceeded = TerminateJobObject(_job, 1);
             if (!evidence.JobTerminateCallSucceeded)
                 evidence.JobTerminateLastError = Marshal.GetLastWin32Error();
+            uint drainedCount;
+            int drainedError;
+            bool drained = WaitForJobActiveProcessZero(
+                timeoutMilliseconds,
+                out drainedCount,
+                out drainedError);
+            evidence.JobActiveProcessCountVerified = drained || (drainedCount == 0 && drainedError == 0);
+            evidence.JobActiveProcessCount = drainedCount;
+            evidence.JobActiveProcessCountLastError = drainedError;
         }
-        else
-        {
-            evidence.JobTerminateCallSucceeded = true;
-        }
+
         evidence.ProcessWaitSignaled = WaitForExit(timeoutMilliseconds);
-        evidence.JobCloseSucceeded = CloseHandle(_job);
-        _job = IntPtr.Zero;
-        evidence.CleanupSucceeded = evidence.JobCloseSucceeded && evidence.ProcessWaitSignaled;
+        string closeError = CloseIfOpen(ref _job, "CloseHandle(job)");
+        evidence.JobCloseSucceeded = closeError == null;
+        evidence.CleanupSucceeded = evidence.JobCloseSucceeded &&
+            evidence.ProcessWaitSignaled &&
+            evidence.JobTerminateCallSucceeded &&
+            evidence.JobActiveProcessCountVerified &&
+            evidence.JobActiveProcessCount == 0;
+        if (evidence.JobCloseSucceeded)
+        {
+            _closedJobActiveProcessCountVerified = evidence.JobActiveProcessCountVerified;
+            _closedJobActiveProcessCount = evidence.JobActiveProcessCount;
+            _closedJobActiveProcessCountError = evidence.JobActiveProcessCountLastError;
+        }
         evidence.Detail = evidence.CleanupSucceeded
-            ? "owned job closed and root process signaled"
-            : "owned job close or root process wait failed";
+            ? "owned job closed; root process signaled; job active process count reached zero"
+            : "owned job close, root process wait, termination API, or job active process count verification failed" +
+                (closeError == null ? String.Empty : "; " + closeError);
         return evidence;
     }
 
@@ -710,17 +974,22 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        string closeErrors = null;
         if (_job != IntPtr.Zero)
         {
-            CloseHandle(_job);
-            _job = IntPtr.Zero;
+            string closeError = CloseIfOpen(ref _job, "CloseHandle(job)");
+            if (closeError != null) closeErrors = closeError;
         }
         if (_stdoutStream != null) _stdoutStream.Dispose();
         if (_stderrStream != null) _stderrStream.Dispose();
         if (_stdoutHandle != null) _stdoutHandle.Dispose();
         if (_stderrHandle != null) _stderrHandle.Dispose();
-        CloseIfOpen(ref _thread);
-        CloseIfOpen(ref _process);
+        string threadError = CloseIfOpen(ref _thread, "CloseHandle(process thread)");
+        if (threadError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? threadError : closeErrors + "; " + threadError;
+        string processError = CloseIfOpen(ref _process, "CloseHandle(process)");
+        if (processError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? processError : closeErrors + "; " + processError;
+        if (!String.IsNullOrEmpty(closeErrors))
+            throw new InvalidOperationException("NATIVE_HANDLE_CLOSE_FAILED: " + closeErrors);
     }
 }
 '@ -Language CSharp
@@ -808,6 +1077,9 @@ function ConvertTo-D32NativeCleanupDocument {
         job_terminate_last_error     = [int]$Evidence.JobTerminateLastError
         process_was_already_signaled = [bool]$Evidence.ProcessWasAlreadySignaled
         process_wait_signaled        = [bool]$Evidence.ProcessWaitSignaled
+        job_active_process_count_verified = [bool]$Evidence.JobActiveProcessCountVerified
+        job_active_process_count     = [uint32]$Evidence.JobActiveProcessCount
+        job_active_process_count_last_error = [int]$Evidence.JobActiveProcessCountLastError
         job_close_succeeded          = [bool]$Evidence.JobCloseSucceeded
         cleanup_succeeded            = [bool]$Evidence.CleanupSucceeded
         already_closed               = [bool]$Evidence.AlreadyClosed
@@ -1065,7 +1337,7 @@ function Invoke-D32BoundedProcess {
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$PhaseLog,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
-        [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init')]
+        [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init', 'api-failure', 'attribute-failure', 'pipe-timeout')]
         [string]$FailureInjection = 'none'
     )
 
@@ -1101,10 +1373,16 @@ function Invoke-D32BoundedProcess {
     }
 
     try {
+        $nativeTestFailure = switch ($FailureInjection) {
+            'api-failure' { 'assign'; break }
+            'attribute-failure' { 'attribute'; break }
+            default { $null; break }
+        }
         $nativeProcess = [D32FixtureNativeProcessV2]::Start(
             (Get-D32FullPath $FilePath),
             $commandLine,
-            (Get-D32FullPath $WorkingDirectory))
+            (Get-D32FullPath $WorkingDirectory),
+            $nativeTestFailure)
         $processId = [int]$nativeProcess.ProcessId
         $script:D32LastProcessEvidence.native_launch = [ordered]@{
             process_id = $processId
@@ -1154,8 +1432,15 @@ function Invoke-D32BoundedProcess {
             throw 'SELFTEST_INJECTED_PIPE_INIT_EXCEPTION'
         }
         $stderrStream = $nativeProcess.OpenStderrStream()
-        $stdoutCopy = $stdoutStream.CopyToAsync($stdoutTarget)
-        $stderrCopy = $stderrStream.CopyToAsync($stderrTarget)
+        if ($FailureInjection -eq 'pipe-timeout') {
+            $neverCompletes = [System.Threading.Tasks.TaskCompletionSource[object]]::new()
+            $stdoutCopy = $neverCompletes.Task
+            $stderrCopy = $neverCompletes.Task
+        }
+        else {
+            $stdoutCopy = $stdoutStream.CopyToAsync($stdoutTarget)
+            $stderrCopy = $stderrStream.CopyToAsync($stderrTarget)
+        }
     }
     catch {
         $initError = $_.Exception.Message
@@ -1256,8 +1541,30 @@ function Invoke-D32BoundedProcess {
     }
     finally {
         try {
-            if ($null -ne $stdoutCopy) { [void]$stdoutCopy.Wait(1000) }
-            if ($null -ne $stderrCopy) { [void]$stderrCopy.Wait(1000) }
+            if ($null -ne $stdoutCopy) {
+                if (-not $stdoutCopy.Wait(1000)) {
+                    $pipeTimeoutError = 'PIPE_DRAIN_TIMEOUT: stdout copy did not complete within 1000ms'
+                    $treeError = if ($null -eq $treeError) { $pipeTimeoutError } else { "$treeError; $pipeTimeoutError" }
+                }
+                elseif ($stdoutCopy.IsFaulted) {
+                    throw "PIPE_DRAIN_FAILED: stdout copy task faulted: $($stdoutCopy.Exception.InnerException.Message)"
+                }
+                elseif ($stdoutCopy.IsCanceled) {
+                    throw 'PIPE_DRAIN_FAILED: stdout copy task was canceled'
+                }
+            }
+            if ($null -ne $stderrCopy) {
+                if (-not $stderrCopy.Wait(1000)) {
+                    $pipeTimeoutError = 'PIPE_DRAIN_TIMEOUT: stderr copy did not complete within 1000ms'
+                    $treeError = if ($null -eq $treeError) { $pipeTimeoutError } else { "$treeError; $pipeTimeoutError" }
+                }
+                elseif ($stderrCopy.IsFaulted) {
+                    throw "PIPE_DRAIN_FAILED: stderr copy task faulted: $($stderrCopy.Exception.InnerException.Message)"
+                }
+                elseif ($stderrCopy.IsCanceled) {
+                    throw 'PIPE_DRAIN_FAILED: stderr copy task was canceled'
+                }
+            }
         }
         catch {
             if ($null -eq $treeError) { $treeError = "PIPE_DRAIN_FAILED: $($_.Exception.Message)" }
@@ -1383,7 +1690,9 @@ function Invoke-D32SelfTest {
         $passed++
         if ($null -eq $zero.native_cleanup -or
             -not [bool]$zero.native_cleanup.cleanup_succeeded -or
-            -not [bool]$zero.native_cleanup.job_close_succeeded) {
+            -not [bool]$zero.native_cleanup.job_close_succeeded -or
+            -not [bool]$zero.native_cleanup.job_active_process_count_verified -or
+            [uint32]$zero.native_cleanup.job_active_process_count -ne 0) {
             throw 'SELFTEST_FAILED: normal exit did not produce verified job-close cleanup evidence'
         }
         $passed++
@@ -1418,6 +1727,9 @@ function Invoke-D32SelfTest {
             $normalWithChild.exit_code -ne 0 -or
             @($normalWithChild.captured_descendant_pids).Count -lt 1 -or
             @($normalWithChild.descendant_pids).Count -ne 0 -or
+            $null -eq $normalWithChild.native_cleanup -or
+            -not [bool]$normalWithChild.native_cleanup.job_active_process_count_verified -or
+            [uint32]$normalWithChild.native_cleanup.job_active_process_count -ne 0 -or
             $null -ne $normalWithChild.error) {
             throw 'SELFTEST_FAILED: normal exit with captured child was not cleanly reaped'
         }
@@ -1488,6 +1800,34 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
+        $ambientHandle = [IntPtr]::Zero
+        try {
+            $ambientHandle = [D32FixtureNativeProcessV2]::CreateInheritableTestHandle()
+            $ambientProbeScript = Join-Path $root 'ambient-handle-probe.ps1'
+            $ambientProbeContent = @(
+                'Add-Type -TypeDefinition ''using System; using System.Runtime.InteropServices; public static class D32AmbientHandleProbe { [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetHandleInformation(IntPtr handle, out uint flags); }'' -Language CSharp'
+                '$flags = 0'
+                ('if ([D32AmbientHandleProbe]::GetHandleInformation([IntPtr]{0}, [ref]$flags)) {{ exit 17 }} else {{ exit 0 }}' -f $ambientHandle.ToInt64())
+            ) -join [Environment]::NewLine
+            [IO.File]::WriteAllText($ambientProbeScript, $ambientProbeContent, [Text.UTF8Encoding]::new($false))
+            $ambient = Invoke-D32BoundedProcess `
+                -FilePath $powershell `
+                -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $ambientProbeScript) `
+                -WorkingDirectory $root `
+                -PhaseLog (Join-Path $root 'ambient-handle-phase') `
+                -TimeoutSeconds 5
+            if ($ambient.status -ne 'succeeded' -or $ambient.exit_code -ne 0) {
+                throw "SELFTEST_FAILED: ambient inheritable handle escaped explicit handle list (status=$($ambient.status), exit=$($ambient.exit_code), error=$($ambient.error))"
+            }
+            $passed++
+        }
+        finally {
+            if ($ambientHandle -ne [IntPtr]::Zero -and
+                -not [D32FixtureNativeProcessV2]::CloseInheritableTestHandle($ambientHandle)) {
+                throw 'SELFTEST_FAILED: ambient inheritable test handle could not be closed'
+            }
+        }
+
         $earlyChildPidPath = Join-Path $root 'early-child.pid'
         $earlyChildScript = Join-Path $root 'parent-early-exit.ps1'
         $earlyChildContent = @(
@@ -1502,7 +1842,9 @@ function Invoke-D32SelfTest {
             $earlyExitChild.exit_code -ne 0 -or
             @(Get-D32ProcessSnapshot -ProcessId $earlyChildPid).Count -ne 0 -or
             $null -eq $earlyExitChild.native_cleanup -or
-            -not [bool]$earlyExitChild.native_cleanup.cleanup_succeeded) {
+            -not [bool]$earlyExitChild.native_cleanup.cleanup_succeeded -or
+            -not [bool]$earlyExitChild.native_cleanup.job_active_process_count_verified -or
+            [uint32]$earlyExitChild.native_cleanup.job_active_process_count -ne 0) {
             throw 'SELFTEST_FAILED: parent early exit child was not closed by the owned job'
         }
         $passed++
@@ -1520,7 +1862,9 @@ function Invoke-D32SelfTest {
         if ($detachedChild.status -ne 'succeeded' -or
             @(Get-D32ProcessSnapshot -ProcessId $detachedPid).Count -ne 0 -or
             $null -eq $detachedChild.native_cleanup -or
-            -not [bool]$detachedChild.native_cleanup.cleanup_succeeded) {
+            -not [bool]$detachedChild.native_cleanup.cleanup_succeeded -or
+            -not [bool]$detachedChild.native_cleanup.job_active_process_count_verified -or
+            [uint32]$detachedChild.native_cleanup.job_active_process_count -ne 0) {
             throw 'SELFTEST_FAILED: detached/reparented child was not closed by the owned job'
         }
         $passed++
@@ -1549,6 +1893,36 @@ function Invoke-D32SelfTest {
             $null -eq $pipeInit.native_cleanup -or
             -not [bool]$pipeInit.native_cleanup.cleanup_succeeded) {
             throw 'SELFTEST_FAILED: pipe initialization exception did not close its owned job'
+        }
+        $passed++
+
+        $apiFailure = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'api-failure-phase') -TimeoutSeconds 5 -FailureInjection api-failure
+        if ($apiFailure.status -ne 'spawn_failed' -or
+            $apiFailure.error -notlike '*D32_NATIVE_LAUNCH_FAILED*' -or
+            $apiFailure.error -notlike '*SELFTEST_INJECTED_ASSIGN_API_FAILURE*' -or
+            $null -ne $apiFailure.pid) {
+            throw 'SELFTEST_FAILED: native API failure did not fail-closed after job/process cleanup'
+        }
+        $passed++
+
+        $attributeFailure = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'attribute-failure-phase') -TimeoutSeconds 5 -FailureInjection attribute-failure
+        if ($attributeFailure.status -ne 'spawn_failed' -or
+            $attributeFailure.error -notlike '*D32_NATIVE_LAUNCH_FAILED*' -or
+            $attributeFailure.error -notlike '*SELFTEST_INJECTED_ATTRIBUTE_API_FAILURE*' -or
+            $null -ne $attributeFailure.pid) {
+            throw 'SELFTEST_FAILED: handle-list API failure did not fail-closed'
+        }
+        $passed++
+
+        $pipeTimeout = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'pipe-timeout-phase') -TimeoutSeconds 5 -FailureInjection pipe-timeout
+        if ($pipeTimeout.status -ne 'process_tree_error' -or
+            $pipeTimeout.error -notlike '*PIPE_DRAIN_TIMEOUT*' -or
+            $null -eq $pipeTimeout.native_cleanup -or
+            -not [bool]$pipeTimeout.native_cleanup.cleanup_succeeded -or
+            -not [bool]$pipeTimeout.native_cleanup.job_active_process_count_verified -or
+            [uint32]$pipeTimeout.native_cleanup.job_active_process_count -ne 0 -or
+            @($pipeTimeout.descendant_pids).Count -ne 0) {
+            throw 'SELFTEST_FAILED: pipe copy timeout did not fail-closed after verified job cleanup'
         }
         $passed++
 

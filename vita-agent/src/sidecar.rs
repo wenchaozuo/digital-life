@@ -9,14 +9,18 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io::{BufReader, BufWriter, Read, Stdin, Stdout, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(feature = "d29-h9-test-helper")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -756,6 +760,191 @@ struct ActiveTurnTask {
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+    d32_completion: Option<tokio::sync::oneshot::Receiver<D32TurnWorkerCompletion>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum D32TurnWorkerCompletion {
+    Returned,
+    Panicked,
+    Aborted,
+}
+
+struct D32TurnCompletionGuard {
+    sender: Option<tokio::sync::oneshot::Sender<D32TurnWorkerCompletion>>,
+    completion: Option<D32TurnWorkerCompletion>,
+}
+
+impl D32TurnCompletionGuard {
+    fn new(sender: tokio::sync::oneshot::Sender<D32TurnWorkerCompletion>) -> Self {
+        Self {
+            sender: Some(sender),
+            completion: None,
+        }
+    }
+
+    fn complete(&mut self, completion: D32TurnWorkerCompletion) {
+        if self.completion.is_none() {
+            self.completion = Some(completion);
+        }
+    }
+}
+
+impl Drop for D32TurnCompletionGuard {
+    fn drop(&mut self) {
+        let completion = self.completion.unwrap_or(D32TurnWorkerCompletion::Aborted);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(completion);
+        }
+    }
+}
+
+struct D32CatchUnwindFuture<F> {
+    future: Pin<Box<F>>,
+    completion: D32TurnCompletionGuard,
+}
+
+impl<F> D32CatchUnwindFuture<F> {
+    fn new(future: F, sender: tokio::sync::oneshot::Sender<D32TurnWorkerCompletion>) -> Self {
+        Self {
+            future: Box::pin(future),
+            completion: D32TurnCompletionGuard::new(sender),
+        }
+    }
+}
+
+impl<F> Future for D32CatchUnwindFuture<F>
+where
+    F: Future<Output = Result<String, crate::VitaAgentError>>,
+{
+    type Output = Result<String, crate::VitaAgentError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // A D32 worker owns provider/tool state that must be terminal even if
+        // a panic occurs while polling any part of the turn future.  The
+        // scope guard publishes one bounded completion event for normal
+        // return, panic, or cancellation/drop.
+        // SAFETY: the pinned future field is never moved; it is only polled
+        // through its existing pin, while the completion guard is unpinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        match catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(result)) => {
+                this.completion.complete(D32TurnWorkerCompletion::Returned);
+                Poll::Ready(result)
+            }
+            Err(_) => {
+                this.completion.complete(D32TurnWorkerCompletion::Panicked);
+                Poll::Ready(Err(crate::VitaAgentError::GatewayProtocol(
+                    "D32 turn worker panicked".to_string(),
+                )))
+            }
+        }
+    }
+}
+
+struct D32OwnedTurnWorker {
+    join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+    completion: tokio::sync::oneshot::Receiver<D32TurnWorkerCompletion>,
+}
+
+enum D32WorkerObservation {
+    Observed {
+        join: Result<Result<String, crate::VitaAgentError>, tokio::task::JoinError>,
+        completion: Option<D32TurnWorkerCompletion>,
+    },
+    Unobserved(D32OwnedTurnWorker),
+}
+
+const D32_CANCEL_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const D32_CANCEL_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+const D32_COMPLETION_OBSERVE_TIMEOUT: Duration = Duration::from_millis(100);
+
+async fn d32_observe_completion(
+    completion: &mut tokio::sync::oneshot::Receiver<D32TurnWorkerCompletion>,
+) -> Option<D32TurnWorkerCompletion> {
+    tokio::time::timeout(D32_COMPLETION_OBSERVE_TIMEOUT, completion)
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+async fn d32_observe_worker(
+    worker: D32OwnedTurnWorker,
+    join_timeout: Duration,
+    abort_timeout: Duration,
+) -> D32WorkerObservation {
+    d32_observe_worker_with_abort(worker, join_timeout, abort_timeout, true).await
+}
+
+async fn d32_observe_worker_with_abort(
+    mut worker: D32OwnedTurnWorker,
+    join_timeout: Duration,
+    abort_timeout: Duration,
+    abort_after_timeout: bool,
+) -> D32WorkerObservation {
+    let first = tokio::time::timeout(join_timeout, &mut worker.join).await;
+    match first {
+        Ok(join) => D32WorkerObservation::Observed {
+            join,
+            completion: d32_observe_completion(&mut worker.completion).await,
+        },
+        Err(_) => {
+            if !abort_after_timeout {
+                return D32WorkerObservation::Unobserved(worker);
+            }
+            worker.join.abort();
+            match tokio::time::timeout(abort_timeout, &mut worker.join).await {
+                Ok(join) => D32WorkerObservation::Observed {
+                    join,
+                    completion: d32_observe_completion(&mut worker.completion).await,
+                },
+                Err(_) => D32WorkerObservation::Unobserved(worker),
+            }
+        }
+    }
+}
+
+async fn d32_abort_and_observe_worker(
+    mut worker: D32OwnedTurnWorker,
+    abort_timeout: Duration,
+) -> D32WorkerObservation {
+    worker.join.abort();
+    match tokio::time::timeout(abort_timeout, &mut worker.join).await {
+        Ok(join) => D32WorkerObservation::Observed {
+            join,
+            completion: d32_observe_completion(&mut worker.completion).await,
+        },
+        Err(_) => D32WorkerObservation::Unobserved(worker),
+    }
+}
+
+#[cfg(not(test))]
+fn d32_fail_closed_with_owned_worker(_worker: D32OwnedTurnWorker) -> ! {
+    // The JoinHandle remains owned by this stack frame until process
+    // termination.  Returning would drop it and detach an unobserved worker.
+    // The Host owns the process handle and performs its bounded cleanup and
+    // evidence validation after this fail-closed exit.
+    std::process::exit(1)
+}
+
+#[cfg(test)]
+fn d32_fail_closed_with_owned_worker(_worker: D32OwnedTurnWorker) -> ! {
+    panic!("D32 worker completion was not observed before fail-closed exit")
+}
+
+#[cfg(not(test))]
+fn d32_fail_closed_with_untracked_worker(
+    _join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+) -> ! {
+    std::process::exit(1)
+}
+
+#[cfg(test)]
+fn d32_fail_closed_with_untracked_worker(
+    _join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+) -> ! {
+    panic!("D32 worker completion channel was unavailable")
 }
 
 struct TurnOwnerInstallError {
@@ -810,6 +999,16 @@ impl TurnOwner {
                 active.take();
             }
         }
+    }
+
+    fn take_finished(&self) -> Option<ActiveTurnTask> {
+        self.active.lock().ok().and_then(|mut active| {
+            active
+                .as_ref()
+                .is_some_and(|task| task.join.is_finished())
+                .then(|| active.take())
+                .flatten()
+        })
     }
 }
 
@@ -2995,26 +3194,46 @@ pub async fn serve_ipc(mode: SidecarRunMode) -> Result<(), String> {
                     Arc::clone(&active_identity),
                     Arc::clone(&gateway_authority),
                     Arc::clone(&turn_owner),
+                    d32_canary,
                 )
                 .await;
             }
             HostMessage::CancelTurn(message) if message.session_id == init.session_id => {
-                handle_cancel_turn(
-                    message,
-                    &init,
-                    Arc::clone(&runtime),
-                    Arc::clone(&production),
-                    Arc::clone(&cargo_production),
-                    Arc::clone(&read_broker),
-                    Arc::clone(&read_authority),
-                    Arc::clone(&replace_broker),
-                    Arc::clone(&replace_authority),
-                    router.clone(),
-                    Arc::clone(&active_identity),
-                    Arc::clone(&gateway_authority),
-                    Arc::clone(&turn_owner),
-                )
-                .await?;
+                if d32_canary {
+                    handle_cancel_turn_d32(
+                        message,
+                        &init,
+                        Arc::clone(&runtime),
+                        Arc::clone(&production),
+                        Arc::clone(&cargo_production),
+                        Arc::clone(&read_broker),
+                        Arc::clone(&read_authority),
+                        Arc::clone(&replace_broker),
+                        Arc::clone(&replace_authority),
+                        router.clone(),
+                        Arc::clone(&active_identity),
+                        Arc::clone(&gateway_authority),
+                        Arc::clone(&turn_owner),
+                    )
+                    .await?;
+                } else {
+                    handle_cancel_turn(
+                        message,
+                        &init,
+                        Arc::clone(&runtime),
+                        Arc::clone(&production),
+                        Arc::clone(&cargo_production),
+                        Arc::clone(&read_broker),
+                        Arc::clone(&read_authority),
+                        Arc::clone(&replace_broker),
+                        Arc::clone(&replace_authority),
+                        router.clone(),
+                        Arc::clone(&active_identity),
+                        Arc::clone(&gateway_authority),
+                        Arc::clone(&turn_owner),
+                    )
+                    .await?;
+                }
             }
             HostMessage::Shutdown(message) if message.session_id == init.session_id => {
                 production.cancel();
@@ -3208,6 +3427,7 @@ async fn handle_start_turn(
     active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
     gateway_authority: Arc<GatewayAuthority>,
     turn_owner: Arc<TurnOwner>,
+    d32_canary: bool,
 ) {
     let request_id = message.request_id.clone();
     let turn_id = message.turn_id.clone();
@@ -3245,7 +3465,36 @@ async fn handle_start_turn(
         turn_id: message.turn_id.clone(),
         binding_hash: message.binding.binding_hash.clone(),
     };
-    turn_owner.reap_finished();
+    if d32_canary {
+        if let Some(task) = turn_owner.take_finished() {
+            let Some(completion) = task.d32_completion else {
+                d32_fail_closed_with_untracked_worker(task.join);
+            };
+            if let Ok(mut active) = active_identity.lock() {
+                if active.as_ref() == Some(&task.identity) {
+                    active.take();
+                }
+            }
+            gateway_authority.deactivate_generation(&task.gateway);
+            match d32_observe_worker(
+                D32OwnedTurnWorker {
+                    join: task.join,
+                    completion,
+                },
+                D32_CANCEL_JOIN_TIMEOUT,
+                D32_CANCEL_ABORT_TIMEOUT,
+            )
+            .await
+            {
+                D32WorkerObservation::Observed { .. } => {}
+                D32WorkerObservation::Unobserved(worker) => {
+                    d32_fail_closed_with_owned_worker(worker);
+                }
+            }
+        }
+    } else {
+        turn_owner.reap_finished();
+    }
     {
         let Ok(mut active) = active_identity.lock() else {
             failed("TURN_STATE_UNAVAILABLE");
@@ -3303,7 +3552,7 @@ async fn handle_start_turn(
     let router_for_task = router.clone();
     let d32_latch_for_task = gateway.d32_forced_tool.clone();
     let cargo_production_for_task = Arc::clone(&cargo_production);
-    let join = tokio::spawn(async move {
+    let worker = async move {
         let result = runtime
             .run_turn(
                 prompt,
@@ -3376,13 +3625,23 @@ async fn handle_start_turn(
             }
         }
         result
-    });
+    };
+    let (join, d32_completion) = if d32_canary {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (
+            tokio::spawn(D32CatchUnwindFuture::new(worker, sender)),
+            Some(receiver),
+        )
+    } else {
+        (tokio::spawn(worker), None)
+    };
     if let Err(error) = turn_owner.install(ActiveTurnTask {
         identity: identity.clone(),
         gateway,
         cancelled,
         cancel_notify,
         join,
+        d32_completion,
     }) {
         // The task was started before the owner lock was acquired.  An old
         // task may still occupy the owner after its Host identity was
@@ -3403,10 +3662,31 @@ async fn handle_start_turn(
         }
         error.task.cancelled.store(true, Ordering::Release);
         error.task.cancel_notify.notify_waiters();
-        error.task.join.abort();
-        let join_result = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
-        if !matches!(join_result, Ok(Ok(_))) {
-            cargo_production.d32_worker_join_failure();
+        if d32_canary {
+            let join = error.task.join;
+            let Some(completion) = error.task.d32_completion else {
+                d32_fail_closed_with_untracked_worker(join);
+            };
+            match d32_abort_and_observe_worker(
+                D32OwnedTurnWorker { join, completion },
+                D32_CANCEL_ABORT_TIMEOUT,
+            )
+            .await
+            {
+                D32WorkerObservation::Observed {
+                    completion: Some(D32TurnWorkerCompletion::Returned),
+                    ..
+                } => {}
+                D32WorkerObservation::Observed { .. } => {
+                    cargo_production.d32_worker_join_failure();
+                }
+                D32WorkerObservation::Unobserved(worker) => {
+                    d32_fail_closed_with_owned_worker(worker);
+                }
+            }
+        } else {
+            error.task.join.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
         }
         let message = gateway_for_install_error
             .d32_forced_tool
@@ -3424,6 +3704,24 @@ async fn handle_start_turn(
             message,
         }));
     }
+}
+
+async fn await_production_cancel_worker_with_timeout(
+    join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let joined = tokio::time::timeout(timeout, join)
+        .await
+        .map_err(|_| "Vita turn cancellation did not reach terminality".to_string())?
+        .map_err(|_| "Vita turn cancellation task failed".to_string())?;
+    let _ = joined;
+    Ok(())
+}
+
+async fn await_production_cancel_worker(
+    join: tokio::task::JoinHandle<Result<String, crate::VitaAgentError>>,
+) -> Result<(), String> {
+    await_production_cancel_worker_with_timeout(join, Duration::from_secs(5)).await
 }
 
 async fn handle_cancel_turn(
@@ -3467,58 +3765,125 @@ async fn handle_cancel_turn(
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
     };
     gateway_authority.deactivate_generation(&task.gateway);
-    let d32_latch = task.gateway.d32_forced_tool.clone();
     task.cancelled.store(true, Ordering::Release);
     task.cancel_notify.notify_waiters();
     let session_id = init.session_id.clone();
-    let request_id = message.request_id;
     let turn_id = message.turn_id;
     // The acknowledgement is emitted only after the bounded Codex interrupt
     // and the actual run_turn future have both terminated.  Clearing the
     // identity and gateway authority above fences late requests immediately;
     // this join proves the old lifecycle cannot later mutate a new turn.
     let _ = runtime.interrupt_active_turn().await;
-    let mut join = task.join;
-    let join_failure = match tokio::time::timeout(Duration::from_secs(5), &mut join).await {
-        Ok(Ok(_)) => None,
-        Ok(Err(_)) => {
-            cargo_production.d32_worker_join_failure();
-            Some("TURN_CANCEL_WORKER_JOIN_FAILED")
-        }
-        Err(_) => {
-            // A timeout must not detach the turn worker.  Abort it and wait
-            // once more within a fixed bound before publishing the terminal
-            // cancellation failure.
-            join.abort();
-            let _ = tokio::time::timeout(Duration::from_secs(1), join).await;
-            cargo_production.d32_worker_join_failure();
-            Some("TURN_CANCEL_WORKER_TIMEOUT")
-        }
-    };
-    if let Some(error_code) = join_failure {
-        let message = cargo_production
-            .d32_terminal_failure_message()
-            .map(|failure| {
-                d32_latch
-                    .as_ref()
-                    .map_or(failure.clone(), |latch| latch.safe_turn_failure(&failure))
-            })
-            .unwrap_or_else(|| "Vita turn worker failed during cancellation".to_string());
-        router.send(&VitaMessage::TurnFailed(TurnFailed {
-            request_id,
-            session_id,
-            turn_id,
-            phase: TurnPhase::Failed,
-            error_code: error_code.to_string(),
-            message,
-        }))?;
-        return Ok(());
-    }
+    await_production_cancel_worker(task.join).await?;
     router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-cancelled"),
         session_id,
         turn_id,
         phase: TurnPhase::Cancelled,
+    }))?;
+    Ok(())
+}
+
+async fn handle_cancel_turn_d32(
+    message: protocol::CancelTurn,
+    init: &InitializeSession,
+    runtime: Arc<VitaAgentRuntime>,
+    production: Arc<VitaGitStatusProduction>,
+    cargo_production: Arc<VitaCargoCheckProduction>,
+    read_broker: Arc<VitaWorkspaceReadBroker>,
+    read_authority: Arc<SidecarWorkspaceReadAuthority>,
+    replace_broker: Arc<VitaWorkspaceReplaceBroker>,
+    replace_authority: Arc<SidecarWorkspaceReplaceAuthority>,
+    router: SidecarRouter,
+    active_identity: Arc<Mutex<Option<ProviderRequestIdentity>>>,
+    gateway_authority: Arc<GatewayAuthority>,
+    turn_owner: Arc<TurnOwner>,
+) -> Result<(), String> {
+    if message.validate().is_err() {
+        return Ok(());
+    }
+    let identity = active_identity.lock().ok().and_then(|active| {
+        active
+            .as_ref()
+            .filter(|identity| identity.turn_id == message.turn_id)
+            .cloned()
+    });
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    if let Ok(mut active) = active_identity.lock() {
+        active.take();
+    }
+    production.cancel_turn();
+    cargo_production.cancel_turn();
+    read_broker.cancel_turn();
+    read_authority.cancel_turn();
+    replace_broker.cancel_turn();
+    replace_authority.cancel_turn();
+    let Some(task) = turn_owner.take(&identity) else {
+        gateway_authority.deactivate(&identity);
+        return Err("Vita turn owner disappeared before cancellation proof".to_string());
+    };
+    gateway_authority.deactivate_generation(&task.gateway);
+    let d32_latch = task.gateway.d32_forced_tool.clone();
+    let Some(completion) = task.d32_completion else {
+        d32_fail_closed_with_untracked_worker(task.join);
+    };
+    task.cancelled.store(true, Ordering::Release);
+    task.cancel_notify.notify_waiters();
+    let session_id = init.session_id.clone();
+    let request_id = message.request_id;
+    let turn_id = message.turn_id;
+    let _ = runtime.interrupt_active_turn().await;
+    let observation = d32_observe_worker(
+        D32OwnedTurnWorker {
+            join: task.join,
+            completion,
+        },
+        D32_CANCEL_JOIN_TIMEOUT,
+        D32_CANCEL_ABORT_TIMEOUT,
+    )
+    .await;
+    let completion = match observation {
+        D32WorkerObservation::Observed { join, completion } => {
+            let Some(completion) = completion else {
+                return Err("D32 worker completion was not observed".to_string());
+            };
+            match completion {
+                D32TurnWorkerCompletion::Returned if matches!(join, Ok(Ok(_))) => {
+                    router.send(&VitaMessage::TurnState(TurnState {
+                        request_id: next_request_id("vita-turn-cancelled"),
+                        session_id,
+                        turn_id,
+                        phase: TurnPhase::Cancelled,
+                    }))?;
+                    return Ok(());
+                }
+                D32TurnWorkerCompletion::Panicked => "TURN_CANCEL_WORKER_PANIC",
+                D32TurnWorkerCompletion::Aborted => "TURN_CANCEL_WORKER_ABORTED",
+                D32TurnWorkerCompletion::Returned => "TURN_CANCEL_WORKER_JOIN_FAILED",
+            }
+        }
+        D32WorkerObservation::Unobserved(worker) => {
+            d32_fail_closed_with_owned_worker(worker);
+        }
+    };
+    cargo_production.d32_worker_join_failure();
+    let message = cargo_production
+        .d32_terminal_failure_message()
+        .map(|failure| {
+            d32_latch
+                .as_ref()
+                .map_or(failure.clone(), |latch| latch.safe_turn_failure(&failure))
+        })
+        .unwrap_or_else(|| "Vita turn worker failed during cancellation".to_string());
+    router.send(&VitaMessage::TurnFailed(TurnFailed {
+        request_id,
+        session_id,
+        turn_id,
+        phase: TurnPhase::Failed,
+        error_code: completion.to_string(),
+        message,
     }))?;
     Ok(())
 }
@@ -5091,6 +5456,155 @@ mod tests {
         (app_data, workspace, profile)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_cancel_worker_keeps_the_legacy_join_errors() {
+        let failed = tokio::spawn(async { panic!("legacy worker panic") });
+        assert_eq!(
+            await_production_cancel_worker_with_timeout(failed, Duration::from_secs(1)).await,
+            Err("Vita turn cancellation task failed".to_string())
+        );
+
+        let pending = tokio::spawn(async {
+            std::future::pending::<Result<String, crate::VitaAgentError>>().await
+        });
+        assert_eq!(
+            await_production_cancel_worker_with_timeout(pending, Duration::from_millis(1)).await,
+            Err("Vita turn cancellation did not reach terminality".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn d32_worker_completion_guard_covers_return_panic_abort_and_cleanup() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(D32CatchUnwindFuture::new(
+            async { Ok::<String, crate::VitaAgentError>("done".to_string()) },
+            sender,
+        ));
+        match d32_observe_worker(
+            D32OwnedTurnWorker {
+                join,
+                completion: receiver,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            D32WorkerObservation::Observed {
+                join: Ok(Ok(text)),
+                completion: Some(D32TurnWorkerCompletion::Returned),
+            } => assert_eq!(text, "done"),
+            _ => panic!("normal D32 worker completion was not observed"),
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(D32CatchUnwindFuture::new(
+            async {
+                Err::<String, crate::VitaAgentError>(crate::VitaAgentError::GatewayProtocol(
+                    "fixture worker error".to_string(),
+                ))
+            },
+            sender,
+        ));
+        match d32_observe_worker(
+            D32OwnedTurnWorker {
+                join,
+                completion: receiver,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            D32WorkerObservation::Observed {
+                join: Ok(Err(crate::VitaAgentError::GatewayProtocol(message))),
+                completion: Some(D32TurnWorkerCompletion::Returned),
+            } => assert_eq!(message, "fixture worker error"),
+            _ => panic!("D32 worker error completion was not observed"),
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(D32CatchUnwindFuture::new(
+            async {
+                panic!("D32 panic fixture");
+                #[allow(unreachable_code)]
+                Ok::<String, crate::VitaAgentError>(String::new())
+            },
+            sender,
+        ));
+        match d32_observe_worker(
+            D32OwnedTurnWorker {
+                join,
+                completion: receiver,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            D32WorkerObservation::Observed {
+                join: Ok(Err(crate::VitaAgentError::GatewayProtocol(message))),
+                completion: Some(D32TurnWorkerCompletion::Panicked),
+            } => assert_eq!(message, "D32 turn worker panicked"),
+            _ => panic!("D32 panic completion was not observed"),
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(D32CatchUnwindFuture::new(
+            async { std::future::pending::<Result<String, crate::VitaAgentError>>().await },
+            sender,
+        ));
+        match d32_observe_worker(
+            D32OwnedTurnWorker {
+                join,
+                completion: receiver,
+            },
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            D32WorkerObservation::Observed {
+                join: Err(error),
+                completion: Some(D32TurnWorkerCompletion::Aborted),
+            } => assert!(error.is_cancelled()),
+            _ => panic!("D32 abort completion was not observed"),
+        }
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(D32CatchUnwindFuture::new(
+            async { std::future::pending::<Result<String, crate::VitaAgentError>>().await },
+            sender,
+        ));
+        let observation = d32_observe_worker_with_abort(
+            D32OwnedTurnWorker {
+                join,
+                completion: receiver,
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+        )
+        .await;
+        let D32WorkerObservation::Unobserved(mut worker) = observation else {
+            panic!("unobserved D32 worker must retain its JoinHandle");
+        };
+        assert!(!worker.join.is_finished());
+        worker.join.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut worker.join)
+            .await
+            .expect("test cleanup must observe the retained worker");
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        {
+            let _guard = D32TurnCompletionGuard::new(sender);
+        }
+        assert_eq!(
+            receiver.await.expect("scope guard completion"),
+            D32TurnWorkerCompletion::Aborted
+        );
+    }
+
     #[test]
     fn fresh_startup_creates_marker_before_recovery_store() {
         let (_app_data, _workspace, profile) = startup_profile_fixture();
@@ -5448,6 +5962,7 @@ mod tests {
                     cancelled: old_cancelled,
                     cancel_notify: old_notify,
                     join: old_join,
+                    d32_completion: None,
                 })
                 .is_ok());
 
@@ -5470,6 +5985,7 @@ mod tests {
                     cancelled: Arc::clone(&new_cancelled),
                     cancel_notify: Arc::clone(&new_notify),
                     join: new_join,
+                    d32_completion: None,
                 })
                 .expect_err("owner occupancy must reject the new task");
             assert_eq!(failure.message, "Vita turn owner is already occupied");

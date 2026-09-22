@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use codex_core_api::{
     CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, Op, SessionSource,
@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 
+use crate::test_codex_state::{snapshot_codex_state, CodexState, SyntheticCodexRoot};
 use crate::{
     fixture_manifest, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaAuthorityError,
     VitaAuthorityEvidenceSource, VitaAuthorityFuture, VitaAuthorityOutcome, VitaAuthorityReason,
@@ -54,68 +55,25 @@ const D29_H1_HOST_IPC_MAX_BODY: usize = 8 * 1024;
 const D29_H1_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
-enum UserCodexFileState {
-    Absent,
-    Present {
-        size: u64,
-        modified: Option<SystemTime>,
-    },
-    Unavailable,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct UserCodexState {
-    config: UserCodexFileState,
-    auth: UserCodexFileState,
-    global_state: UserCodexFileState,
-}
-
-#[derive(Clone, PartialEq, Eq)]
 struct HostCanary {
     parent_environment_fingerprint: u64,
-    user_codex_state: UserCodexState,
+    synthetic_codex_state: CodexState,
 }
 
 impl std::fmt::Debug for HostCanary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("HostCanary(<metadata-only>)")
+        formatter.write_str("HostCanary(<environment-and-content-redacted>)")
     }
 }
 
-fn host_canary() -> HostCanary {
+fn host_canary(codex_root: &Path) -> HostCanary {
     let mut environment = std::env::vars_os().collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = DefaultHasher::new();
     environment.hash(&mut hasher);
     HostCanary {
         parent_environment_fingerprint: hasher.finish(),
-        user_codex_state: snapshot_user_codex_state(),
-    }
-}
-
-fn snapshot_user_codex_state() -> UserCodexState {
-    let root = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|path| path.join(".codex"));
-    UserCodexState {
-        config: snapshot_user_codex_file(root.as_deref(), "config.toml"),
-        auth: snapshot_user_codex_file(root.as_deref(), "auth.json"),
-        global_state: snapshot_user_codex_file(root.as_deref(), ".codex-global-state.json"),
-    }
-}
-
-fn snapshot_user_codex_file(root: Option<&Path>, file_name: &str) -> UserCodexFileState {
-    let Some(root) = root else {
-        return UserCodexFileState::Unavailable;
-    };
-    match std::fs::symlink_metadata(root.join(file_name)) {
-        Ok(metadata) => UserCodexFileState::Present {
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserCodexFileState::Absent,
-        Err(_) => UserCodexFileState::Unavailable,
+        synthetic_codex_state: snapshot_codex_state(codex_root),
     }
 }
 
@@ -559,6 +517,7 @@ fn invoke_host_fixture(
 struct H1Runtime {
     _app_data: TempDir,
     _workspace: TempDir,
+    synthetic_codex_root: PathBuf,
     manager: Arc<ThreadManager>,
     thread: Option<Arc<codex_core_api::CodexThread>>,
     thread_id: Option<ThreadId>,
@@ -626,7 +585,9 @@ async fn shutdown_thread_once(thread: &Arc<codex_core_api::CodexThread>) -> Shut
     }
 }
 
-async fn start_runtime() -> Result<
+async fn start_runtime(
+    synthetic_codex_root: &Path,
+) -> Result<
     (
         H1Runtime,
         Arc<VitaToolBroker>,
@@ -640,7 +601,7 @@ async fn start_runtime() -> Result<
         .expect("D29-H1 repository root")
         .to_path_buf();
     d29h1_authority_fixture_executable(&repo_root).unwrap_or_else(|error| panic!("{error}"));
-    let before = host_canary();
+    let before = host_canary(synthetic_codex_root);
     let app_data = tempdir().map_err(|_| "create D29-H1 app data failed".to_string())?;
     let workspace = tempdir().map_err(|_| "create D29-H1 workspace failed".to_string())?;
     let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
@@ -718,6 +679,7 @@ async fn start_runtime() -> Result<
         H1Runtime {
             _app_data: app_data,
             _workspace: workspace,
+            synthetic_codex_root: synthetic_codex_root.to_path_buf(),
             manager,
             thread: Some(new_thread.thread),
             thread_id: Some(new_thread.thread_id),
@@ -783,8 +745,11 @@ fn d29h1_real_codex_tool_request_uses_isolated_host_authority() {
 }
 
 async fn d29h1_real_codex_tool_request_body() {
-    let (runtime, broker, canonical_authority, before) =
-        start_runtime().await.expect("D29-H1 runtime should start");
+    let synthetic_codex_root =
+        SyntheticCodexRoot::new().expect("D29-H1 synthetic Codex root should be created");
+    let (runtime, broker, canonical_authority, before) = start_runtime(synthetic_codex_root.path())
+        .await
+        .expect("D29-H1 runtime should start");
     let turn = run_turn(
         runtime
             .thread
@@ -794,8 +759,9 @@ async fn d29h1_real_codex_tool_request_body() {
     .await;
     let (terminal_message, terminal_error, event_count) =
         turn.expect("D29-H1 turn should reach TurnComplete");
+    let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
     let (cleanup, fixture) = runtime.shutdown().await.expect("D29-H1 cleanup should run");
-    let after = host_canary();
+    let after = host_canary(&synthetic_codex_root_path);
     assert_eq!(before, after, "D29-H1 host canary changed");
 
     assert_eq!(terminal_error, None);

@@ -39,6 +39,8 @@ pub mod recovery_journal;
 mod runtime_composition;
 #[cfg(windows)]
 mod sidecar;
+#[cfg(test)]
+mod test_codex_state;
 mod tool_authority;
 mod workspace_capability;
 

@@ -1265,13 +1265,14 @@ mod h3r1_tests {
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::thread;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
     use tempfile::{tempdir, TempDir};
 
     use crate::provider_gateway::{VitaGatewayBinding, VitaProviderAuthority};
+    use crate::test_codex_state::{snapshot_codex_canary, CodexCanary, SyntheticCodexRoot};
     use crate::{
         ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
         TrustedWorkspaceRoot, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaExecutionContext,
@@ -3129,24 +3130,8 @@ mod h3r1_tests {
         Ok(bytes[header_end..header_end + content_length].to_vec())
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct CodexStateCanary {
-        files: [Option<(u64, Option<SystemTime>)>; 3],
-    }
-
-    fn codex_state_canary() -> CodexStateCanary {
-        let root = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .map(|path| path.join(".codex"));
-        let names = ["config.toml", "auth.json", ".codex-global-state.json"];
-        CodexStateCanary {
-            files: names.map(|name| {
-                root.as_deref()
-                    .and_then(|root| fs::symlink_metadata(root.join(name)).ok())
-                    .map(|metadata| (metadata.len(), metadata.modified().ok()))
-            }),
-        }
+    fn codex_state_canary(root: &Path) -> CodexCanary {
+        snapshot_codex_canary(root)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3168,6 +3153,7 @@ mod h3r1_tests {
     struct H3Runtime {
         _app_data: TempDir,
         _workspace: TempDir,
+        synthetic_codex_root: PathBuf,
         manager: Arc<codex_core_api::ThreadManager>,
         thread: Option<Arc<codex_core_api::CodexThread>>,
         thread_id: Option<codex_core_api::ThreadId>,
@@ -3233,16 +3219,18 @@ mod h3r1_tests {
         }
     }
 
-    async fn start_h3_runtime() -> Result<
+    async fn start_h3_runtime(
+        synthetic_codex_root: &Path,
+    ) -> Result<
         (
             H3Runtime,
             Arc<VitaWorkspaceReadBroker>,
             Arc<ProcessIsolatedH3Authority>,
-            CodexStateCanary,
+            CodexCanary,
         ),
         String,
     > {
-        let before = codex_state_canary();
+        let before = codex_state_canary(synthetic_codex_root);
         let app_data = tempdir().map_err(|_| "create H3-R1 app data failed".to_string())?;
         let workspace = tempdir().map_err(|_| "create H3-R1 workspace failed".to_string())?;
         fs::write(
@@ -3332,6 +3320,7 @@ mod h3r1_tests {
             H3Runtime {
                 _app_data: app_data,
                 _workspace: workspace,
+                synthetic_codex_root: synthetic_codex_root.to_path_buf(),
                 manager,
                 thread: Some(new_thread.thread),
                 thread_id: Some(new_thread.thread_id),
@@ -3398,10 +3387,13 @@ mod h3r1_tests {
     }
 
     async fn d29h3_r1_real_codex_turn_body() {
-        let (runtime, broker, authority, before) = start_h3_runtime()
+        let synthetic_codex_root =
+            SyntheticCodexRoot::new().expect("H3-R1 synthetic Codex root should be created");
+        let (runtime, broker, authority, before) = start_h3_runtime(synthetic_codex_root.path())
             .await
             .expect("H3-R1 runtime should start");
         let turn = run_h3_turn(runtime.thread.as_ref().unwrap()).await;
+        let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
         let (cleanup, fixture_observation) = runtime.shutdown().await;
         let host_shutdown = authority.shutdown();
         let turn = turn.unwrap_or_else(|error| {
@@ -3409,8 +3401,8 @@ mod h3r1_tests {
         });
         assert_eq!(
             before,
-            codex_state_canary(),
-            "H3-R1 user Codex state changed"
+            codex_state_canary(&synthetic_codex_root_path),
+            "H3-R1 synthetic Codex state changed"
         );
         assert_eq!(turn.1, None);
         assert_eq!(turn.0.as_deref(), Some(H3_REPLY));

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use codex_core_api::{
     CodexAppsToolsCache, CodexAuth, EnvironmentManager, EventMsg, Op, SessionSource,
@@ -31,6 +31,7 @@ use super::{
     ProviderRetryPolicy, ResolvedCredential, VitaAgentError, VitaGatewayBinding, VitaMessage,
     VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
+use crate::test_codex_state::{snapshot_codex_canary, CodexState, SyntheticCodexRoot};
 use crate::{
     ProviderErrorDetail, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID,
     VITA_GATEWAY_PROVIDER_ID,
@@ -88,25 +89,9 @@ fn load_inputs() -> Result<G2Inputs, String> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum CodexFileState {
-    Absent,
-    Present {
-        size: u64,
-        modified: Option<SystemTime>,
-    },
-    Unavailable,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct UserCodexState {
-    config: CodexFileState,
-    auth: CodexFileState,
-    global_state: CodexFileState,
-}
-
-#[derive(Clone, PartialEq, Eq)]
 struct G2Canary {
-    user_codex_state: UserCodexState,
+    parent_environment_fingerprint: u64,
+    synthetic_codex_state: CodexState,
     provider_id: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
@@ -119,9 +104,11 @@ impl std::fmt::Debug for G2Canary {
     }
 }
 
-fn g2_canary() -> G2Canary {
+fn g2_canary(codex_root: &Path) -> G2Canary {
+    let codex_canary = snapshot_codex_canary(codex_root);
     G2Canary {
-        user_codex_state: snapshot_user_codex_state(),
+        parent_environment_fingerprint: codex_canary.parent_environment_fingerprint,
+        synthetic_codex_state: codex_canary.codex_state,
         provider_id: std::env::var(D29G2_PROVIDER_ID_ENV).ok(),
         base_url: std::env::var(D29G2_BASE_URL_ENV).ok(),
         model: std::env::var(D29G2_MODEL_ENV).ok(),
@@ -131,36 +118,10 @@ fn g2_canary() -> G2Canary {
     }
 }
 
-fn snapshot_user_codex_state() -> UserCodexState {
-    let root = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|path| path.join(".codex"));
-    UserCodexState {
-        config: snapshot_user_codex_file(root.as_deref(), "config.toml"),
-        auth: snapshot_user_codex_file(root.as_deref(), "auth.json"),
-        global_state: snapshot_user_codex_file(root.as_deref(), ".codex-global-state.json"),
-    }
-}
-
-fn snapshot_user_codex_file(root: Option<&Path>, file_name: &str) -> CodexFileState {
-    let Some(root) = root else {
-        return CodexFileState::Unavailable;
-    };
-    match std::fs::symlink_metadata(root.join(file_name)) {
-        Ok(metadata) => CodexFileState::Present {
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CodexFileState::Absent,
-        Err(_) => CodexFileState::Unavailable,
-    }
-}
-
 fn assert_canary_unchanged(before: &G2Canary, after: &G2Canary) -> Result<(), String> {
     if before != after {
         return Err(
-            "G2 canary changed user Codex metadata or explicit G2 input presence".to_string(),
+            "G2 canary changed synthetic Codex metadata or explicit G2 input presence".to_string(),
         );
     }
     Ok(())
@@ -1012,6 +973,7 @@ impl CredentialResolver for G2CredentialResolver {
 struct G2Runtime {
     _app_data: TempDir,
     _workspace: TempDir,
+    synthetic_codex_root: PathBuf,
     manager: Arc<ThreadManager>,
     thread: Option<Arc<codex_core_api::CodexThread>>,
     thread_id: Option<ThreadId>,
@@ -1980,6 +1942,7 @@ fn print_structural_diagnostic_report(evidence: &StructuralDiagnosticEvidence) {
 
 async fn start_runtime(
     inputs: G2Inputs,
+    synthetic_codex_root: &Path,
 ) -> Result<(G2Runtime, ProductionTransportObservationHandle, G2Canary), String> {
     let app_data = tempdir().map_err(|_| "create Vita app-data temp root failed".to_string())?;
     let workspace = tempdir().map_err(|_| "create Vita workspace temp root failed".to_string())?;
@@ -2095,13 +2058,14 @@ async fn start_runtime(
         G2Runtime {
             _app_data: app_data,
             _workspace: workspace,
+            synthetic_codex_root: synthetic_codex_root.to_path_buf(),
             manager,
             thread: Some(new_thread.thread),
             thread_id: Some(new_thread.thread_id),
             gateway: Some(gateway),
         },
         ProductionTransportObservationHandle(transport_observation),
-        g2_canary(),
+        g2_canary(synthetic_codex_root),
     ))
 }
 
@@ -2163,7 +2127,9 @@ struct SmokeEvidence {
 }
 
 async fn run_smoke() -> Result<SmokeEvidence, String> {
-    let before = g2_canary();
+    let synthetic_codex_root = SyntheticCodexRoot::new()
+        .map_err(|_| "create D29-G2 synthetic Codex root failed".to_string())?;
+    let before = g2_canary(synthetic_codex_root.path());
     let inputs = load_inputs()?;
     let provider_id = inputs.provider_id.clone();
     let base_url = inputs.base_url.clone();
@@ -2175,7 +2141,8 @@ async fn run_smoke() -> Result<SmokeEvidence, String> {
         .and_then(|url| url.host_str().map(str::to_string))
         .ok_or_else(|| "explicit G2 base URL did not contain a host".to_string())?;
     let started = Instant::now();
-    let (runtime, transport_observation, after_start) = start_runtime(inputs).await?;
+    let (runtime, transport_observation, after_start) =
+        start_runtime(inputs, synthetic_codex_root.path()).await?;
     assert_canary_unchanged(&before, &after_start)?;
 
     let turn_result = collect_turn(
@@ -2189,8 +2156,9 @@ async fn run_smoke() -> Result<SmokeEvidence, String> {
         .as_ref()
         .ok()
         .is_some_and(|turn| turn.interrupt_submitted);
+    let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
     let shutdown = runtime.shutdown(turn_interrupt_submitted).await?;
-    let after = g2_canary();
+    let after = g2_canary(&synthetic_codex_root_path);
     assert_canary_unchanged(&before, &after)?;
     let turn = turn_result?;
     let provider_status = transport_observation.0.last_status.load(Ordering::Acquire);
@@ -2262,7 +2230,7 @@ fn assert_smoke_success(evidence: &SmokeEvidence) -> Result<(), String> {
         return Err("D29-G2 cleanup evidence was incomplete".to_string());
     }
     if !evidence.canary_unchanged {
-        return Err("D29-G2 user Codex canary changed".to_string());
+        return Err("D29-G2 synthetic Codex canary changed".to_string());
     }
     Ok(())
 }

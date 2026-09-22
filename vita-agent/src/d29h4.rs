@@ -2949,13 +2949,14 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use tempfile::{tempdir, TempDir};
 
     use crate::d29h3::VITA_WORKSPACE_READ_TOOL_NAME;
+    use crate::test_codex_state::{snapshot_codex_canary, CodexCanary, SyntheticCodexRoot};
 
     const LIFE_ID: &str = "life-d29h4-a";
     const TASK_ID: &str = "task-d29h4-a";
@@ -6605,24 +6606,8 @@ pub(crate) mod tests {
         Ok(bytes[header_end..header_end + content_length].to_vec())
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct H4CodexStateCanary {
-        files: [Option<(u64, Option<SystemTime>)>; 3],
-    }
-
-    fn h4_codex_state_canary() -> H4CodexStateCanary {
-        let root = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .map(|path| path.join(".codex"));
-        let names = ["config.toml", "auth.json", ".codex-global-state.json"];
-        H4CodexStateCanary {
-            files: names.map(|name| {
-                root.as_deref()
-                    .and_then(|root| fs::symlink_metadata(root.join(name)).ok())
-                    .map(|metadata| (metadata.len(), metadata.modified().ok()))
-            }),
-        }
+    fn h4_codex_state_canary(root: &Path) -> CodexCanary {
+        snapshot_codex_canary(root)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6644,6 +6629,7 @@ pub(crate) mod tests {
     struct H4Runtime {
         _app_data: TempDir,
         workspace: TempDir,
+        synthetic_codex_root: PathBuf,
         manager: Arc<codex_core_api::ThreadManager>,
         thread: Option<Arc<codex_core_api::CodexThread>>,
         thread_id: Option<codex_core_api::ThreadId>,
@@ -6709,45 +6695,50 @@ pub(crate) mod tests {
         }
     }
 
-    async fn start_h4_runtime() -> Result<
-        (
-            H4Runtime,
-            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
-            Arc<VitaWorkspaceReplaceBroker>,
-            Arc<ProcessIsolatedH4Authority>,
-            H4CodexStateCanary,
-        ),
-        String,
-    > {
-        start_h4_runtime_with_mode(H4FixtureMode::AuthorizationOnly).await
-    }
-
-    async fn start_h4c_runtime() -> Result<
-        (
-            H4Runtime,
-            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
-            Arc<VitaWorkspaceReplaceBroker>,
-            Arc<ProcessIsolatedH4Authority>,
-            H4CodexStateCanary,
-        ),
-        String,
-    > {
-        start_h4_runtime_with_mode(H4FixtureMode::GovernedReplace).await
-    }
-
-    async fn start_h4_runtime_with_mode(
-        mode: H4FixtureMode,
+    async fn start_h4_runtime(
+        synthetic_codex_root: &Path,
     ) -> Result<
         (
             H4Runtime,
             Arc<crate::d29h3::VitaWorkspaceReadBroker>,
             Arc<VitaWorkspaceReplaceBroker>,
             Arc<ProcessIsolatedH4Authority>,
-            H4CodexStateCanary,
+            CodexCanary,
         ),
         String,
     > {
-        let before = h4_codex_state_canary();
+        start_h4_runtime_with_mode(H4FixtureMode::AuthorizationOnly, synthetic_codex_root).await
+    }
+
+    async fn start_h4c_runtime(
+        synthetic_codex_root: &Path,
+    ) -> Result<
+        (
+            H4Runtime,
+            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
+            Arc<VitaWorkspaceReplaceBroker>,
+            Arc<ProcessIsolatedH4Authority>,
+            CodexCanary,
+        ),
+        String,
+    > {
+        start_h4_runtime_with_mode(H4FixtureMode::GovernedReplace, synthetic_codex_root).await
+    }
+
+    async fn start_h4_runtime_with_mode(
+        mode: H4FixtureMode,
+        synthetic_codex_root: &Path,
+    ) -> Result<
+        (
+            H4Runtime,
+            Arc<crate::d29h3::VitaWorkspaceReadBroker>,
+            Arc<VitaWorkspaceReplaceBroker>,
+            Arc<ProcessIsolatedH4Authority>,
+            CodexCanary,
+        ),
+        String,
+    > {
+        let before = h4_codex_state_canary(synthetic_codex_root);
         let app_data = tempdir().map_err(|_| "create H4-A app data failed".to_string())?;
         let workspace = tempdir().map_err(|_| "create H4-A workspace failed".to_string())?;
         let file_path = workspace.path().join("replace-me.txt");
@@ -6851,6 +6842,7 @@ pub(crate) mod tests {
             H4Runtime {
                 _app_data: app_data,
                 workspace,
+                synthetic_codex_root: synthetic_codex_root.to_path_buf(),
                 manager,
                 thread: Some(new_thread.thread),
                 thread_id: Some(new_thread.thread_id),
@@ -6956,8 +6948,12 @@ pub(crate) mod tests {
     }
 
     async fn real_codex_h4a_canary_body() {
+        let synthetic_codex_root =
+            SyntheticCodexRoot::new().expect("H4-A synthetic Codex root should be created");
         let (runtime, h3_broker, h4_broker, authority, before) =
-            start_h4_runtime().await.expect("H4-A runtime should start");
+            start_h4_runtime(synthetic_codex_root.path())
+                .await
+                .expect("H4-A runtime should start");
         let file_path = runtime.workspace.path().join("replace-me.txt");
         let turn_id = start_h4_turn(runtime.thread.as_ref().unwrap())
             .await
@@ -6983,6 +6979,7 @@ pub(crate) mod tests {
             .release_initial_request();
         let turn = wait_h4_turn(runtime.thread.as_ref().unwrap()).await;
         let file_after = fs::read(&file_path).expect("H4-A canary target remains readable");
+        let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
         let (cleanup, fixture_observation) = runtime.shutdown().await;
         let host_shutdown = authority.shutdown();
         let turn = turn.unwrap_or_else(|error| {
@@ -6991,7 +6988,11 @@ pub(crate) mod tests {
             )
         });
 
-        assert_eq!(before, h4_codex_state_canary(), "user Codex state changed");
+        assert_eq!(
+            before,
+            h4_codex_state_canary(&synthetic_codex_root_path),
+            "synthetic Codex state changed"
+        );
         assert_eq!(turn.1, None);
         assert_eq!(turn.0.as_deref(), Some(H4_CANARY_REPLY));
         assert!(turn.2 > 0);
@@ -8394,9 +8395,12 @@ pub(crate) mod tests {
     }
 
     async fn real_codex_h4c_canary_body() {
-        let (runtime, h3_broker, h4_broker, authority, before) = start_h4c_runtime()
-            .await
-            .expect("H4-C runtime should start");
+        let synthetic_codex_root =
+            SyntheticCodexRoot::new().expect("H4-C synthetic Codex root should be created");
+        let (runtime, h3_broker, h4_broker, authority, before) =
+            start_h4c_runtime(synthetic_codex_root.path())
+                .await
+                .expect("H4-C runtime should start");
         let file_path = runtime.workspace.path().join("replace-me.txt");
         let turn_id = start_h4_turn(runtime.thread.as_ref().unwrap())
             .await
@@ -8422,6 +8426,7 @@ pub(crate) mod tests {
             .release_initial_request();
         let turn = wait_h4_turn(runtime.thread.as_ref().unwrap()).await;
         let file_after = fs::read(&file_path).expect("H4-C canary target remains readable");
+        let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
         let (cleanup, fixture_observation) = runtime.shutdown().await;
         let host_shutdown = authority.shutdown();
         let turn = turn.unwrap_or_else(|error| {
@@ -8430,7 +8435,11 @@ pub(crate) mod tests {
             )
         });
 
-        assert_eq!(before, h4_codex_state_canary(), "user Codex state changed");
+        assert_eq!(
+            before,
+            h4_codex_state_canary(&synthetic_codex_root_path),
+            "synthetic Codex state changed"
+        );
         assert_eq!(turn.1, None);
         assert_eq!(turn.0.as_deref(), Some(H4_CANARY_REPLY));
         assert!(turn.2 > 0);

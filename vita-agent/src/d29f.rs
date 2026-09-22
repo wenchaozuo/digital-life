@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -31,6 +31,7 @@ use super::{
     VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
 
+use crate::test_codex_state::{snapshot_codex_state, CodexState, SyntheticCodexRoot};
 use crate::{
     VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID,
 };
@@ -49,26 +50,9 @@ const D29F_HTTP_MAX_BODY: usize = 2 * 1024 * 1024;
 const D29F_TEST_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
-enum UserCodexFileState {
-    Absent,
-    Present {
-        size: u64,
-        modified: Option<SystemTime>,
-    },
-    Unavailable,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct UserCodexState {
-    config: UserCodexFileState,
-    auth: UserCodexFileState,
-    global_state: UserCodexFileState,
-}
-
-#[derive(Clone, PartialEq, Eq)]
 struct HostCanary {
     parent_environment_fingerprint: u64,
-    user_codex_state: UserCodexState,
+    synthetic_codex_state: CodexState,
 }
 
 impl std::fmt::Debug for HostCanary {
@@ -77,40 +61,14 @@ impl std::fmt::Debug for HostCanary {
     }
 }
 
-fn host_canary() -> HostCanary {
+fn host_canary(codex_root: &Path) -> HostCanary {
     let mut environment = std::env::vars_os().collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = DefaultHasher::new();
     environment.hash(&mut hasher);
     HostCanary {
         parent_environment_fingerprint: hasher.finish(),
-        user_codex_state: snapshot_user_codex_state(),
-    }
-}
-
-fn snapshot_user_codex_state() -> UserCodexState {
-    let root = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|path| path.join(".codex"));
-    UserCodexState {
-        config: snapshot_user_codex_file(root.as_deref(), "config.toml"),
-        auth: snapshot_user_codex_file(root.as_deref(), "auth.json"),
-        global_state: snapshot_user_codex_file(root.as_deref(), ".codex-global-state.json"),
-    }
-}
-
-fn snapshot_user_codex_file(root: Option<&Path>, file_name: &str) -> UserCodexFileState {
-    let Some(root) = root else {
-        return UserCodexFileState::Unavailable;
-    };
-    match std::fs::symlink_metadata(root.join(file_name)) {
-        Ok(metadata) => UserCodexFileState::Present {
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserCodexFileState::Absent,
-        Err(_) => UserCodexFileState::Unavailable,
+        synthetic_codex_state: snapshot_codex_state(codex_root),
     }
 }
 
@@ -118,8 +76,8 @@ fn canary_unchanged_result(before: &HostCanary, after: &HostCanary) -> Result<()
     if before.parent_environment_fingerprint != after.parent_environment_fingerprint {
         return Err("parent environment changed");
     }
-    if before.user_codex_state != after.user_codex_state {
-        return Err("user Codex state changed");
+    if before.synthetic_codex_state != after.synthetic_codex_state {
+        return Err("synthetic Codex state changed");
     }
     Ok(())
 }
@@ -1430,6 +1388,7 @@ fn map_d29f_downstream_io_error(error: std::io::Error) -> VitaAgentError {
 struct CaseRuntime {
     _app_data: TempDir,
     _workspace: TempDir,
+    synthetic_codex_root: PathBuf,
     manager: Arc<ThreadManager>,
     thread: Option<Arc<codex_core_api::CodexThread>>,
     thread_id: Option<ThreadId>,
@@ -1665,6 +1624,7 @@ async fn start_runtime(
     mode: Option<ChatMockMode>,
     listener_available: bool,
     response_mode: GatewayResponseMode,
+    synthetic_codex_root: &Path,
 ) -> Result<(CaseRuntime, VitaAgentRuntimeProfile, HostCanary), String> {
     let app_data = tempdir().map_err(|error| format!("create Vita app-data temp root: {error}"))?;
     let workspace =
@@ -1762,11 +1722,12 @@ async fn start_runtime(
     .map_err(|_| "D29-F real thread startup timed out".to_string())?
     .map_err(|error| format!("D29-F real thread startup failed: {error}"))?;
 
-    let canary = host_canary();
+    let canary = host_canary(synthetic_codex_root);
     Ok((
         CaseRuntime {
             _app_data: app_data,
             _workspace: workspace,
+            synthetic_codex_root: synthetic_codex_root.to_path_buf(),
             manager,
             thread: Some(new_thread.thread),
             thread_id: Some(new_thread.thread_id),
@@ -1865,10 +1826,16 @@ async fn run_case(
     listener_available: bool,
     response_mode: GatewayResponseMode,
     turn_deadline: Duration,
+    synthetic_codex_root: &Path,
 ) -> Result<CaseReport, String> {
-    let before = host_canary();
-    let (runtime, profile, runtime_canary) =
-        start_runtime(mode, listener_available, response_mode).await?;
+    let before = host_canary(synthetic_codex_root);
+    let (runtime, profile, runtime_canary) = start_runtime(
+        mode,
+        listener_available,
+        response_mode,
+        synthetic_codex_root,
+    )
+    .await?;
     let turn = match runtime.thread.as_ref() {
         Some(thread) => collect_turn(thread, turn_deadline).await,
         None => Err("D29-F runtime did not contain a thread".to_string()),
@@ -1877,8 +1844,9 @@ async fn run_case(
         .as_ref()
         .ok()
         .is_some_and(|turn| turn.interrupt_submitted);
+    let synthetic_codex_root_path = runtime.synthetic_codex_root.clone();
     let shutdown = runtime.shutdown(turn_interrupt_submitted).await?;
-    let after = host_canary();
+    let after = host_canary(&synthetic_codex_root_path);
     canary_unchanged_result(&before, &runtime_canary)?;
     canary_unchanged_result(&before, &after)?;
     Ok(CaseReport {
@@ -1917,11 +1885,15 @@ fn d29f_first_real_codex_turn_and_bounded_negative_paths() {
 }
 
 async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
+    let synthetic_codex_root =
+        SyntheticCodexRoot::new().expect("D29-F synthetic Codex root should be created");
+    let synthetic_codex_root = synthetic_codex_root.path();
     let success = run_case(
         Some(ChatMockMode::Success),
         true,
         GatewayResponseMode::Normal,
         D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F success case should run");
@@ -2016,6 +1988,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         true,
         GatewayResponseMode::Normal,
         D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F malformed case should run");
@@ -2028,6 +2001,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         true,
         GatewayResponseMode::Normal,
         D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F tool-call case should run");
@@ -2040,6 +2014,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         true,
         GatewayResponseMode::Normal,
         D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F timeout case should run");
@@ -2048,9 +2023,15 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
     assert!(timeout_case.gateway.as_ref().unwrap().request_count <= 1);
     assert_eq!(timeout_case.chat.as_ref().unwrap().request_count, 1);
 
-    let unavailable = run_case(None, true, GatewayResponseMode::Normal, D29F_TURN_TIMEOUT)
-        .await
-        .expect("D29-F unavailable-provider case should run");
+    let unavailable = run_case(
+        None,
+        true,
+        GatewayResponseMode::Normal,
+        D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
+    )
+    .await
+    .expect("D29-F unavailable-provider case should run");
     assert_case_failed(&unavailable, "transport error");
     assert_eq!(unavailable.gateway.as_ref().unwrap().request_count, 1);
     assert!(unavailable.chat.is_none());
@@ -2060,6 +2041,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         false,
         GatewayResponseMode::Normal,
         D29F_TURN_TIMEOUT,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F listener-unavailable case should run");
@@ -2095,6 +2077,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         true,
         GatewayResponseMode::HoldTerminalResponse,
         D29F_TRUE_TURN_DEADLINE,
+        synthetic_codex_root,
     )
     .await
     .expect("D29-F true-timeout case should run");
@@ -2176,7 +2159,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         Err(VitaAgentError::GatewayProtocol(message)) if message.contains("request model")
     ));
 
-    let canary_before = host_canary();
+    let canary_before = host_canary(synthetic_codex_root);
     let profile_app_data = tempdir().expect("D29-F A canary app-data");
     let profile_workspace = tempdir().expect("D29-F A canary workspace");
     let profile = VitaAgentRuntimeProfile::from_explicit_app_data_root(
@@ -2191,9 +2174,9 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         entrypoint.prepare_thread_start(),
         Err(VitaAgentError::NotConfiguredProvider)
     ));
-    assert_canary_unchanged(&canary_before, &host_canary());
+    assert_canary_unchanged(&canary_before, &host_canary(synthetic_codex_root));
     println!(
-        "D29-F CANARY PASS parent_environment=unchanged user_codex_state=unchanged raw_values=none"
+        "D29-F CANARY PASS parent_environment=unchanged synthetic_codex_state=unchanged raw_values=none"
     );
 }
 

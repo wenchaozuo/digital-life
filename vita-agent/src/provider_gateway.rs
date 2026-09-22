@@ -1150,15 +1150,34 @@ impl ProviderRequestPath {
     }
 }
 
-/// Bounded metadata retained for the D32 native diagnostic path.  The body is
-/// the only provider material passed to the strict parser; status and content
-/// type are intentionally kept as small, non-secret fields for safe failure
-/// reporting and no raw HTTP headers/body are retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Bounded metadata retained for the D32 native response parser.  The body is
+/// the only provider material passed to the strict parser; diagnostics derive
+/// only the HTTP status and a JSON-content-type boolean.  Raw response fields
+/// never enter the diagnostic or Debug representations.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProviderTransportResponse {
     pub(crate) status: u16,
     pub(crate) content_type: Option<String>,
     pub(crate) body: Vec<u8>,
+}
+
+impl fmt::Debug for ProviderTransportResponse {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // Provider response headers and bodies are untrusted input.  Keep this
+        // representation useful for bounded local diagnostics without allowing
+        // a future log/trace to copy provider-controlled content into it.
+        f.debug_struct("ProviderTransportResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .field(
+                "content_type_is_json",
+                &self
+                    .content_type
+                    .as_deref()
+                    .is_some_and(d32_content_type_is_json),
+            )
+            .finish()
+    }
 }
 
 pub(crate) struct ProviderGateway<R, T> {
@@ -1309,34 +1328,31 @@ where
         if !policy_match {
             return Err(d32_native_failure(
                 phase,
+                None,
+                None,
+                D32NativeErrorCode::PolicyMismatch,
+                D32NativeOutputKind::None,
                 false,
-                None,
-                None,
-                "policy_mismatch",
-                None,
-                None,
             ));
         }
         if !self.ready.profile.capabilities.tools {
             return Err(d32_native_failure(
                 phase,
-                true,
                 None,
                 None,
-                "capability",
-                Some("tools".to_string()),
-                None,
+                D32NativeErrorCode::Capability,
+                D32NativeOutputKind::None,
+                false,
             ));
         }
-        let body = build_d32_native_request_body(request).map_err(|error| {
+        let body = build_d32_native_request_body(request).map_err(|_error| {
             d32_native_failure(
                 phase,
-                true,
                 None,
                 None,
-                "request_invalid",
-                Some(error),
-                None,
+                D32NativeErrorCode::RequestInvalid,
+                D32NativeOutputKind::None,
+                false,
             )
         })?;
         let credential = self
@@ -1357,12 +1373,11 @@ where
             .map_err(|error| {
                 d32_native_failure(
                     phase,
-                    true,
                     None,
                     None,
-                    "credential",
-                    Some(d32_native_error_code(&error)),
-                    None,
+                    d32_native_error_code(&error),
+                    D32NativeOutputKind::None,
+                    false,
                 )
             })?;
         if credential
@@ -1371,12 +1386,11 @@ where
         {
             return Err(d32_native_failure(
                 phase,
-                true,
                 None,
                 None,
-                "credential",
-                Some("empty".to_string()),
-                None,
+                D32NativeErrorCode::Credential,
+                D32NativeOutputKind::None,
+                false,
             ));
         }
         let response = self
@@ -1396,36 +1410,34 @@ where
                 };
                 d32_native_failure(
                     phase,
-                    true,
                     Some(1),
                     http_status,
-                    "transport",
-                    Some(d32_native_error_code(&error)),
-                    None,
+                    d32_native_error_code(&error),
+                    D32NativeOutputKind::None,
+                    false,
                 )
             })?;
         let status = response.status;
         let content_type = response.content_type.as_deref();
+        let content_type_is_json = content_type.is_some_and(d32_content_type_is_json);
         if status != 200 {
             return Err(d32_native_failure(
                 phase,
-                true,
                 Some(1),
                 Some(status),
-                "http_status",
-                None,
-                content_type,
+                D32NativeErrorCode::HttpStatus,
+                D32NativeOutputKind::Unknown,
+                content_type_is_json,
             ));
         }
-        if !content_type.is_some_and(d32_content_type_is_json) {
+        if !content_type_is_json {
             return Err(d32_native_failure(
                 phase,
-                true,
                 Some(1),
                 Some(status),
-                "content_type",
-                None,
-                content_type,
+                D32NativeErrorCode::ContentType,
+                D32NativeOutputKind::Unknown,
+                false,
             ));
         }
         parse_d32_native_response(
@@ -1435,7 +1447,7 @@ where
             phase,
             Some(1),
             Some(status),
-            content_type,
+            content_type_is_json,
         )
     }
 }
@@ -1467,6 +1479,78 @@ impl D32NativePhase {
     }
 }
 
+/// Stable, Vita-owned diagnostic categories for the D32 native adapter.
+///
+/// These values are deliberately an enum rather than provider-supplied text.
+/// Provider error `code`, `type`, `param`, and `message` fields are useful only
+/// to the transport's internal classification and must never cross the D32
+/// diagnostic boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D32NativeErrorCode {
+    PolicyMismatch,
+    Capability,
+    RequestInvalid,
+    Credential,
+    Transport,
+    HttpStatus,
+    ContentType,
+    InvalidJson,
+    ResponseShape,
+    ResponseIdentity,
+    OutputShape,
+    UsageShape,
+    OutputKind,
+    OutputContract,
+    RequestContract,
+    OutputText,
+}
+
+impl D32NativeErrorCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyMismatch => "policy_mismatch",
+            Self::Capability => "capability",
+            Self::RequestInvalid => "request_invalid",
+            Self::Credential => "credential",
+            Self::Transport => "transport",
+            Self::HttpStatus => "http_status",
+            Self::ContentType => "content_type",
+            Self::InvalidJson => "invalid_json",
+            Self::ResponseShape => "response_shape",
+            Self::ResponseIdentity => "response_identity",
+            Self::OutputShape => "output_shape",
+            Self::UsageShape => "usage_shape",
+            Self::OutputKind => "output_kind",
+            Self::OutputContract => "output_contract",
+            Self::RequestContract => "request_contract",
+            Self::OutputText => "output_text",
+        }
+    }
+}
+
+/// Output classification is also Vita-owned.  It intentionally carries no
+/// provider `type` or arbitrary output label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D32NativeOutputKind {
+    None,
+    Unknown,
+    FunctionCall,
+    Message,
+    OutputText,
+}
+
+impl D32NativeOutputKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unknown => "unknown",
+            Self::FunctionCall => "function_call",
+            Self::Message => "message",
+            Self::OutputText => "output_text",
+        }
+    }
+}
+
 fn d32_native_responses_profile_allowed(profile: &ProviderProfile) -> bool {
     profile.endpoint.scheme == "https"
         && profile.endpoint.host == D32_COMMANDCODE_ENDPOINT_HOST
@@ -1486,56 +1570,38 @@ fn d32_native_request_is_cargo_round(request: &VitaResponsesRequest) -> bool {
         || !request.tool_outputs.is_empty()
 }
 
-fn d32_native_error_code(error: &VitaAgentError) -> String {
+fn d32_native_error_code(error: &VitaAgentError) -> D32NativeErrorCode {
     match error {
-        VitaAgentError::ProviderHttpStatus { status, detail } => detail
-            .as_ref()
-            .and_then(|detail| detail.code())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("http_{status}")),
-        VitaAgentError::ProviderTransportTimeout { phase } => format!("timeout_{phase}"),
-        VitaAgentError::ProviderRequestTooLarge { .. } => "request_too_large".to_string(),
-        VitaAgentError::ProviderResponseTooLarge { .. } => "response_too_large".to_string(),
-        VitaAgentError::CredentialResolution(_) => "credential".to_string(),
-        VitaAgentError::ProviderTransportRejected { .. } => "transport_rejected".to_string(),
-        VitaAgentError::GatewayProtocol(_) => "gateway_protocol".to_string(),
-        _ => "provider_error".to_string(),
+        // The detail is intentionally ignored at this boundary.  It remains
+        // available to the transport's internal status classifier, but none
+        // of its provider-controlled fields may enter the D32 string.
+        VitaAgentError::ProviderHttpStatus { .. } => D32NativeErrorCode::HttpStatus,
+        VitaAgentError::ProviderTransportTimeout { .. } => D32NativeErrorCode::Transport,
+        VitaAgentError::ProviderRequestTooLarge { .. }
+        | VitaAgentError::ProviderResponseTooLarge { .. }
+        | VitaAgentError::ProviderTransportRejected { .. } => D32NativeErrorCode::Transport,
+        VitaAgentError::CredentialResolution(_) => D32NativeErrorCode::Credential,
+        VitaAgentError::GatewayProtocol(_) => D32NativeErrorCode::RequestInvalid,
+        _ => D32NativeErrorCode::Transport,
     }
 }
 
 fn d32_native_failure(
     phase: D32NativePhase,
-    policy_match: bool,
     attempts: Option<u8>,
     http_status: Option<u16>,
-    safe_type: &'static str,
-    code: Option<String>,
-    content_type: Option<&str>,
+    error_code: D32NativeErrorCode,
+    output_kind: D32NativeOutputKind,
+    content_type_is_json: bool,
 ) -> VitaAgentError {
-    let content_type = content_type
-        .map(|value| {
-            value
-                .chars()
-                .filter(|character| !character.is_control())
-                .take(64)
-                .collect::<String>()
-        })
-        .filter(|value| !value.is_empty());
     VitaAgentError::GatewayProtocol(format!(
-        "D32 native Responses rejected phase={} policy_match={} attempts={} http_status={} type={} code={} finish={} output_kind={} content_type={}",
+        "D32 native Responses rejected phase={} attempts={} http_status={} error_code={} output_kind={} content_type_is_json={}",
         phase.as_str(),
-        policy_match,
         attempts.map_or_else(|| "none".to_string(), |value| value.to_string()),
         http_status.map_or_else(|| "none".to_string(), |value| value.to_string()),
-        safe_type,
-        code.as_deref().unwrap_or("none"),
-        "unknown",
-        if matches!(safe_type, "output_kind" | "output_text") {
-            code.as_deref().unwrap_or("unknown")
-        } else {
-            "unknown"
-        },
-        content_type.as_deref().unwrap_or("none"),
+        error_code.as_str(),
+        output_kind.as_str(),
+        content_type_is_json,
     ))
 }
 
@@ -1570,6 +1636,13 @@ fn build_d32_native_request_body(request: &VitaResponsesRequest) -> Result<Vec<u
         .collect::<Vec<_>>();
     if input.is_empty() {
         return Err("input_empty".to_string());
+    }
+    if !request
+        .messages
+        .iter()
+        .any(|message| message.role == VitaMessageRole::User)
+    {
+        return Err("user_input_required".to_string());
     }
     let tool = &request.options.tools[0];
     let mut tool_object = serde_json::Map::new();
@@ -1644,28 +1717,26 @@ fn parse_d32_native_response(
     phase: D32NativePhase,
     attempts: Option<u8>,
     http_status: Option<u16>,
-    content_type: Option<&str>,
+    content_type_is_json: bool,
 ) -> Result<VitaResponsesResult, VitaAgentError> {
     let value = serde_json::from_slice::<Value>(body).map_err(|_| {
         d32_native_failure(
             phase,
-            true,
             attempts,
             http_status,
-            "invalid_json",
-            None,
-            content_type,
+            D32NativeErrorCode::InvalidJson,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
         )
     })?;
     let object = value.as_object().ok_or_else(|| {
         d32_native_failure(
             phase,
-            true,
             attempts,
             http_status,
-            "response_shape",
-            Some("root_not_object".to_string()),
-            content_type,
+            D32NativeErrorCode::ResponseShape,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
         )
     })?;
     let response_id = object
@@ -1675,12 +1746,11 @@ fn parse_d32_native_response(
         .ok_or_else(|| {
             d32_native_failure(
                 phase,
-                true,
                 attempts,
                 http_status,
-                "response_shape",
-                Some("response_id".to_string()),
-                content_type,
+                D32NativeErrorCode::ResponseShape,
+                D32NativeOutputKind::Unknown,
+                content_type_is_json,
             )
         })?;
     if object.get("model").and_then(Value::as_str) != Some(expected_model)
@@ -1688,12 +1758,11 @@ fn parse_d32_native_response(
     {
         return Err(d32_native_failure(
             phase,
-            true,
             attempts,
             http_status,
-            "response_identity",
-            Some("model_or_status".to_string()),
-            content_type,
+            D32NativeErrorCode::ResponseIdentity,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
         ));
     }
     let output = object
@@ -1703,34 +1772,31 @@ fn parse_d32_native_response(
         .ok_or_else(|| {
             d32_native_failure(
                 phase,
-                true,
                 attempts,
                 http_status,
-                "output_shape",
-                Some("exactly_one_output_required".to_string()),
-                content_type,
+                D32NativeErrorCode::OutputShape,
+                D32NativeOutputKind::Unknown,
+                content_type_is_json,
             )
         })?;
-    let usage = parse_d32_native_usage(object.get("usage")).map_err(|code| {
+    let usage = parse_d32_native_usage(object.get("usage")).map_err(|_code| {
         d32_native_failure(
             phase,
-            true,
             attempts,
             http_status,
-            "usage_shape",
-            Some(code),
-            content_type,
+            D32NativeErrorCode::UsageShape,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
         )
     })?;
     let item = output[0].as_object().ok_or_else(|| {
         d32_native_failure(
             phase,
-            true,
             attempts,
             http_status,
-            "output_shape",
-            Some("output_item_not_object".to_string()),
-            content_type,
+            D32NativeErrorCode::OutputShape,
+            D32NativeOutputKind::Unknown,
+            content_type_is_json,
         )
     })?;
     match phase {
@@ -1740,12 +1806,11 @@ fn parse_d32_native_response(
             {
                 return Err(d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "output_kind",
-                    Some("function_call_required".to_string()),
-                    content_type,
+                    D32NativeErrorCode::OutputKind,
+                    D32NativeOutputKind::FunctionCall,
+                    content_type_is_json,
                 ));
             }
             let item_id = item
@@ -1775,12 +1840,11 @@ fn parse_d32_native_response(
             {
                 return Err(d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "output_contract",
-                    Some("function_call_fields".to_string()),
-                    content_type,
+                    D32NativeErrorCode::OutputContract,
+                    D32NativeOutputKind::FunctionCall,
+                    content_type_is_json,
                 ));
             }
             if request.options.tools.len() != 1
@@ -1788,12 +1852,11 @@ fn parse_d32_native_response(
             {
                 return Err(d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "request_contract",
-                    Some("cargo_tool".to_string()),
-                    content_type,
+                    D32NativeErrorCode::RequestContract,
+                    D32NativeOutputKind::FunctionCall,
+                    content_type_is_json,
                 ));
             }
             Ok(VitaResponsesResult {
@@ -1823,12 +1886,11 @@ fn parse_d32_native_response(
             {
                 return Err(d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "output_kind",
-                    Some("message_required".to_string()),
-                    content_type,
+                    D32NativeErrorCode::OutputKind,
+                    D32NativeOutputKind::Message,
+                    content_type_is_json,
                 ));
             }
             let content = item
@@ -1838,34 +1900,31 @@ fn parse_d32_native_response(
                 .ok_or_else(|| {
                     d32_native_failure(
                         phase,
-                        true,
                         attempts,
                         http_status,
-                        "output_text",
-                        Some("exactly_one_content_part_required".to_string()),
-                        content_type,
+                        D32NativeErrorCode::OutputText,
+                        D32NativeOutputKind::OutputText,
+                        content_type_is_json,
                     )
                 })?;
             let part = content[0].as_object().ok_or_else(|| {
                 d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "output_text",
-                    Some("content_part_not_object".to_string()),
-                    content_type,
+                    D32NativeErrorCode::OutputText,
+                    D32NativeOutputKind::OutputText,
+                    content_type_is_json,
                 )
             })?;
             if part.get("type").and_then(Value::as_str) != Some("output_text") {
                 return Err(d32_native_failure(
                     phase,
-                    true,
                     attempts,
                     http_status,
-                    "output_text",
-                    Some("output_text_required".to_string()),
-                    content_type,
+                    D32NativeErrorCode::OutputText,
+                    D32NativeOutputKind::OutputText,
+                    content_type_is_json,
                 ));
             }
             let text = part
@@ -1875,12 +1934,11 @@ fn parse_d32_native_response(
                 .ok_or_else(|| {
                     d32_native_failure(
                         phase,
-                        true,
                         attempts,
                         http_status,
-                        "output_text",
-                        Some("text_missing_or_too_large".to_string()),
-                        content_type,
+                        D32NativeErrorCode::OutputText,
+                        D32NativeOutputKind::OutputText,
+                        content_type_is_json,
                     )
                 })?;
             Ok(VitaResponsesResult {
@@ -2841,8 +2899,30 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn d32_native_request_requires_a_user_input_item() {
+        let mut empty = d32_native_first_request();
+        empty.messages.clear();
+        assert_eq!(
+            build_d32_native_request_body(&empty).unwrap_err(),
+            "input_empty"
+        );
+
+        let mut non_user = d32_native_first_request();
+        non_user.messages = vec![VitaMessage::text(
+            VitaMessageRole::Developer,
+            "provider-controlled content must not satisfy user input",
+        )];
+        assert_eq!(
+            build_d32_native_request_body(&non_user).unwrap_err(),
+            "user_input_required"
+        );
+    }
+
+    #[cfg(windows)]
     struct D32NativeTestTransport {
         responses: Mutex<Vec<ProviderTransportResponse>>,
+        error: Mutex<Option<VitaAgentError>>,
         requests: Mutex<Vec<(ProviderRequestPath, Vec<u8>)>>,
         chat_attempts: AtomicUsize,
     }
@@ -2852,6 +2932,16 @@ mod tests {
         fn new(responses: Vec<ProviderTransportResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                error: Mutex::new(None),
+                requests: Mutex::new(Vec::new()),
+                chat_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_error(error: VitaAgentError) -> Self {
+            Self {
+                responses: Mutex::new(Vec::new()),
+                error: Mutex::new(Some(error)),
                 requests: Mutex::new(Vec::new()),
                 chat_attempts: AtomicUsize::new(0),
             }
@@ -2888,6 +2978,9 @@ mod tests {
             _retry_policy: ProviderRetryPolicy,
         ) -> Result<ProviderTransportResponse, VitaAgentError> {
             self.requests.lock().unwrap().push((path, body.to_vec()));
+            if let Some(error) = self.error.lock().unwrap().take() {
+                return Err(error);
+            }
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Err(VitaAgentError::ProviderTransportRejected {
@@ -3566,7 +3659,7 @@ mod tests {
                 D32NativePhase::InitialRequest,
                 Some(1),
                 Some(200),
-                Some("application/json"),
+                true,
             )
             .expect_err("native response shape must fail closed");
             let text = error.to_string();
@@ -3616,16 +3709,36 @@ mod tests {
     #[test]
     fn d32_native_responses_reject_status_content_type_and_transport_without_raw_data() {
         let first_request = d32_native_first_request();
+        let provider_code = "provider-code https://evil.example/error?token=provider-token";
+        let provider_type = "provider-type Bearer provider-bearer-token";
+        let provider_param = "provider-param https://evil.example/param";
+        let provider_message =
+            "provider-message Authorization: Bearer provider-message-token https://evil.example";
         let fixtures = [
             ProviderTransportResponse {
                 status: 400,
-                content_type: Some("application/json".to_string()),
-                body: b"{\"secret\":\"not-retained\"}".to_vec(),
+                content_type: Some(format!(
+                    "application/json; error={provider_type}; url=https://evil.example"
+                )),
+                body: serde_json::to_vec(&json!({
+                    "error": {
+                        "code": provider_code,
+                        "type": provider_type,
+                        "param": provider_param,
+                        "message": provider_message,
+                    }
+                }))
+                .unwrap(),
             },
             ProviderTransportResponse {
                 status: 200,
-                content_type: Some("text/event-stream".to_string()),
-                body: b"data: {}".to_vec(),
+                content_type: Some(format!(
+                    "text/event-stream; url=https://evil.example; auth=Bearer {provider_code}"
+                )),
+                body: format!(
+                    "data: {provider_message}; url=https://evil.example; token=provider-token"
+                )
+                .into_bytes(),
             },
         ];
         for fixture in fixtures {
@@ -3646,10 +3759,100 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains("phase=initial_request"));
             assert!(text.contains("attempts=1"));
-            assert!(!text.contains("not-retained"));
+            assert!(text.contains("content_type_is_json="));
+            assert!(!text.contains(provider_code));
+            assert!(!text.contains(provider_type));
+            assert!(!text.contains(provider_param));
+            assert!(!text.contains(provider_message));
+            assert!(!text.contains("evil.example"));
+            assert!(!text.contains("Bearer"));
+            assert!(!text.contains("provider-token"));
             assert!(!text.contains("data:"));
             assert_eq!(transport.chat_attempts.load(Ordering::Acquire), 0);
         }
+
+        let detail = crate::ProviderErrorDetail::from_parts(
+            429,
+            Some(provider_code),
+            Some(provider_type),
+            Some(provider_param),
+            Some(provider_message),
+            None,
+        );
+        let transport = Arc::new(D32NativeTestTransport::with_error(
+            VitaAgentError::ProviderHttpStatus {
+                status: 429,
+                detail: Some(detail),
+            },
+        ));
+        let (ready, credential) = d32_native_profile();
+        let gateway = ProviderGateway::new_with_d32_native(
+            ready,
+            InMemoryTestCredential {
+                reference: credential,
+                value: "native-test-credential".to_string(),
+            },
+            Arc::clone(&transport),
+            true,
+        );
+        let error = gateway
+            .execute_responses_request(&first_request)
+            .expect_err("provider HTTP detail must not escape D32 diagnostics");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("error_code=http_status"));
+        assert!(diagnostic.contains("http_status=429"));
+        assert!(diagnostic.contains("content_type_is_json=false"));
+        for marker in [
+            provider_code,
+            provider_type,
+            provider_param,
+            provider_message,
+            "evil.example",
+            "Bearer",
+            "provider-token",
+        ] {
+            assert!(!diagnostic.contains(marker), "diagnostic leaked {marker:?}");
+        }
+
+        let failure_sse = serde_json::to_string(&json!({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": {"message": diagnostic}}
+        }))
+        .expect("failure SSE event should serialize");
+        for marker in [
+            provider_code,
+            provider_type,
+            provider_param,
+            provider_message,
+            "evil.example",
+            "Bearer",
+            "provider-token",
+        ] {
+            assert!(
+                !failure_sse.contains(marker),
+                "failure SSE leaked {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_transport_response_debug_redacts_provider_content() {
+        let response = ProviderTransportResponse {
+            status: 400,
+            content_type: Some(
+                "text/plain; url=https://evil.example; Authorization=Bearer secret-token"
+                    .to_string(),
+            ),
+            body: b"provider body https://evil.example Bearer secret-token".to_vec(),
+        };
+        let debug = format!("{response:?}");
+        assert!(debug.contains("status: 400"));
+        assert!(debug.contains("body_len:"));
+        assert!(debug.contains("content_type_is_json: false"));
+        assert!(!debug.contains("evil.example"));
+        assert!(!debug.contains("Bearer"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("provider body"));
     }
 
     #[test]

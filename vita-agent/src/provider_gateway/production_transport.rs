@@ -313,10 +313,7 @@ pub(super) struct OutboundRequest<'a> {
 impl fmt::Debug for OutboundRequest<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutboundRequest")
-            .field("url", &self.url)
-            .field("host", &self.host)
             .field("port", &self.port)
-            .field("path", &self.path)
             .field("resolved_address_count", &self.addresses.len())
             .field("body_len", &self.body.len())
             .field("authorization_present", &self.authorization.is_some())
@@ -2259,6 +2256,29 @@ mod tests {
             .is_some_and(HeaderValue::is_sensitive);
         assert!(authorization_present);
         assert!(authorization_sensitive);
+    }
+
+    #[test]
+    fn outbound_request_debug_redacts_url_path_and_body() {
+        let addresses = [SocketAddr::from(([93, 184, 216, 34], TEST_PORT))];
+        let request = OutboundRequest {
+            url: "https://evil.example/v1/responses?token=url-token".to_string(),
+            host: "evil.example",
+            port: TEST_PORT,
+            path: "/v1/responses?token=url-token".to_string(),
+            addresses: &addresses,
+            body: b"provider request https://evil.example Bearer body-token",
+            authorization: Some(&ResolvedCredential::new("authorization-token")),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("port: 443"));
+        assert!(debug.contains("body_len:"));
+        assert!(debug.contains("authorization_present: true"));
+        assert!(!debug.contains("evil.example"));
+        assert!(!debug.contains("url-token"));
+        assert!(!debug.contains("Bearer"));
+        assert!(!debug.contains("body-token"));
+        assert!(!debug.contains("authorization-token"));
     }
 
     #[test]

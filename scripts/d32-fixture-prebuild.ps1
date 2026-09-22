@@ -239,31 +239,100 @@ function ConvertTo-D32CommandLine {
             }) -join ' ')
 }
 
+function New-D32ProcessIdentityRecord {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [AllowNull()][Nullable[int]]$ParentProcessId,
+        [AllowNull()][string]$Name,
+        [AllowNull()][string]$CommandLine,
+        [AllowNull()][string]$CreationDate,
+        [Parameter(Mandatory = $true)][string]$ObservedAtUtc,
+        [Parameter(Mandatory = $true)][bool]$IdentityVerified
+    )
+
+    return [pscustomobject][ordered]@{
+        ProcessId       = $ProcessId
+        ParentProcessId = $ParentProcessId
+        Name            = $Name
+        CommandLine     = $CommandLine
+        CreationDate    = $CreationDate
+        ObservedAtUtc   = $ObservedAtUtc
+        IdentityVerified = $IdentityVerified
+    }
+}
+
 function Get-D32ProcessSnapshot {
+    param([int]$ProcessId = 0)
+
     try {
-        return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
-            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)
+        $observedAt = [DateTimeOffset]::UtcNow.ToString('o')
+        $filter = if ($ProcessId -gt 0) { "ProcessId=$ProcessId" } else { $null }
+        $items = if ($null -eq $filter) {
+            @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+        }
+        else {
+            @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)
+        }
+        return @($items | ForEach-Object {
+            $name = if ($null -eq $_.Name) { $null } else { [string]$_.Name }
+            $creation = if ($null -eq $_.CreationDate) { $null } else { [string]$_.CreationDate }
+            $parent = if ($null -eq $_.ParentProcessId) { $null } else { [int]$_.ParentProcessId }
+            $commandLine = if ($null -eq $_.CommandLine) { $null } else { [string]$_.CommandLine }
+            New-D32ProcessIdentityRecord `
+                -ProcessId ([int]$_.ProcessId) `
+                -ParentProcessId $parent `
+                -Name $name `
+                -CommandLine $commandLine `
+                -CreationDate $creation `
+                -ObservedAtUtc $observedAt `
+                -IdentityVerified ($null -ne $name -and $name.Length -gt 0 -and $null -ne $creation -and $creation.Length -gt 0)
+        })
     }
     catch {
         throw "PROCESS_TREE_ENUMERATION_FAILED: $($_.Exception.Message)"
     }
 }
 
-function Get-D32DescendantProcessIds {
-    param([Parameter(Mandatory = $true)][int]$RootPid)
+function ConvertTo-D32IdentityDocument {
+    param([AllowNull()][object]$Record)
 
-    $snapshot = Get-D32ProcessSnapshot
+    if ($null -eq $Record) { return $null }
+    return [ordered]@{
+        process_id        = if ($null -eq $Record.ProcessId) { $null } else { [int]$Record.ProcessId }
+        parent_process_id = if ($null -eq $Record.ParentProcessId) { $null } else { [int]$Record.ParentProcessId }
+        name              = $Record.Name
+        creation_date     = $Record.CreationDate
+        command_line      = $Record.CommandLine
+        observed_at_utc   = $Record.ObservedAtUtc
+        identity_verified = [bool]$Record.IdentityVerified
+    }
+}
+
+function Get-D32DescendantProcessRecordsFromSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Snapshot,
+        [Parameter(Mandatory = $true)][int]$RootPid
+    )
+
+    $byParent = @{}
+    foreach ($record in $Snapshot) {
+        if ($null -eq $record.ParentProcessId) { continue }
+        $parent = [int]$record.ParentProcessId
+        if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
+        $byParent[$parent] += $record
+    }
     $pending = [System.Collections.Generic.Queue[int]]::new()
     $seen = [System.Collections.Generic.HashSet[int]]::new()
     $pending.Enqueue($RootPid)
     [void]$seen.Add($RootPid)
-    $descendants = [System.Collections.Generic.List[int]]::new()
+    $descendants = [System.Collections.Generic.List[object]]::new()
     while ($pending.Count -gt 0) {
         $parent = $pending.Dequeue()
-        foreach ($record in $snapshot | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
+        if (-not $byParent.ContainsKey($parent)) { continue }
+        foreach ($record in $byParent[$parent]) {
             $child = [int]$record.ProcessId
             if ($seen.Add($child)) {
-                $descendants.Add($child)
+                $descendants.Add($record)
                 $pending.Enqueue($child)
             }
         }
@@ -271,97 +340,200 @@ function Get-D32DescendantProcessIds {
     return @($descendants)
 }
 
-function Test-D32ProcessIdsExited {
-    param([Parameter(Mandatory = $true)][int[]]$ProcessIds)
+function Get-D32DescendantProcessRecords {
+    param([Parameter(Mandatory = $true)][int]$RootPid)
 
-    foreach ($processId in $ProcessIds) {
-        if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
-            return $false
-        }
+    return @(Get-D32DescendantProcessRecordsFromSnapshot -Snapshot (Get-D32ProcessSnapshot) -RootPid $RootPid)
+}
+
+function Get-D32ProcessIdentityKey {
+    param([Parameter(Mandatory = $true)][object]$Record)
+
+    $creation = if ($null -eq $Record.CreationDate) { '<none>' } else { [string]$Record.CreationDate }
+    return "$([int]$Record.ProcessId)|$creation"
+}
+
+function Merge-D32ProcessIdentityRecords {
+    param(
+        [AllowNull()][object[]]$Existing,
+        [AllowNull()][object[]]$Incoming
+    )
+
+    $merged = [ordered]@{}
+    foreach ($record in @($Existing) + @($Incoming)) {
+        if ($null -eq $record) { continue }
+        $key = Get-D32ProcessIdentityKey $record
+        $merged[$key] = $record
     }
-    return $true
+    return @($merged.Values)
+}
+
+function New-D32FallbackProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$ObservedAtUtc
+    )
+
+    return New-D32ProcessIdentityRecord `
+        -ProcessId $ProcessId `
+        -ParentProcessId $null `
+        -Name ([IO.Path]::GetFileName($FilePath)) `
+        -CommandLine $CommandLine `
+        -CreationDate $null `
+        -ObservedAtUtc $ObservedAtUtc `
+        -IdentityVerified $false
 }
 
 function Test-D32CapturedProcessAlive {
     param([Parameter(Mandatory = $true)][object]$Record)
 
-    $current = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$([int]$Record.ProcessId)" -ErrorAction Stop)
+    $current = @(Get-D32ProcessSnapshot -ProcessId ([int]$Record.ProcessId))
     if ($current.Count -eq 0) { return $false }
     $candidate = $current[0]
-    return ([string]$candidate.Name -ceq [string]$Record.Name -and
-        [string]$candidate.CreationDate -ceq [string]$Record.CreationDate)
+    if (-not [bool]$Record.IdentityVerified) {
+        throw "PROCESS_IDENTITY_UNVERIFIED: pid $($Record.ProcessId) is still present but its captured identity was incomplete"
+    }
+    if ([string]$candidate.Name -cne [string]$Record.Name -or
+        [string]$candidate.CreationDate -cne [string]$Record.CreationDate) {
+        throw "PROCESS_IDENTITY_MISMATCH: captured pid $($Record.ProcessId) no longer matches name/creation identity"
+    }
+    return $true
 }
 
 function Stop-D32ProcessTreeAndVerify {
     param(
-        [Parameter(Mandatory = $true)][int]$RootPid,
-        [Parameter(Mandatory = $true)][int[]]$CapturedDescendants
+        [Parameter(Mandatory = $true)][object]$RootRecord,
+        [AllowNull()][object[]]$CapturedDescendantRecords = @()
     )
 
-    $captured = @($RootPid) + @($CapturedDescendants) | Select-Object -Unique
-    $snapshot = Get-D32ProcessSnapshot
-    $records = @($snapshot | Where-Object { $captured -contains [int]$_.ProcessId })
-    $rootRecord = @($records | Where-Object { [int]$_.ProcessId -eq $RootPid })
-    $killOutput = if ($rootRecord.Count -eq 1) { @(& taskkill.exe /PID $RootPid /T /F 2>&1) } else { @('root process identity was already gone; per-PID verification continues') }
+    $records = @(Merge-D32ProcessIdentityRecords -Existing @($RootRecord) -Incoming $CapturedDescendantRecords)
+    $killOutput = [System.Collections.Generic.List[string]]::new()
+    $rootAlive = Test-D32CapturedProcessAlive -Record $RootRecord
+    if ($rootAlive) {
+        $killOutput.AddRange([string[]]@(& taskkill.exe /PID ([int]$RootRecord.ProcessId) /T /F 2>&1))
+    }
+    else {
+        $killOutput.Add('root process identity was already gone; per-identity verification continues')
+    }
+
+    # Do not wait for a dead root to make a detached child disappear. The
+    # retained name/creation identity is the authorization for each explicit
+    # per-PID kill, so this remains safe across reparenting and PID reuse.
+    foreach ($record in $records) {
+        if ([int]$record.ProcessId -eq [int]$RootRecord.ProcessId) { continue }
+        if (Test-D32CapturedProcessAlive -Record $record) {
+            $killOutput.AddRange([string[]]@(& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1))
+        }
+    }
+
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
     do {
-        $alive = @($records | Where-Object { Test-D32CapturedProcessAlive -Record $_ })
+        $alive = [System.Collections.Generic.List[object]]::new()
+        foreach ($record in $records) {
+            if (Test-D32CapturedProcessAlive -Record $record) { $alive.Add($record) }
+        }
         if ($alive.Count -eq 0) {
-            return [ordered]@{ ProcessIds = $captured; Residual = @(); KillOutput = @($killOutput) }
+            return [ordered]@{
+                ProcessIds = @($records | ForEach-Object { [int]$_.ProcessId })
+                CapturedRecords = @($records)
+                ResidualRecords = @()
+                KillOutput = @($killOutput)
+                VerifiedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+            }
         }
         Start-Sleep -Milliseconds 100
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
 
-    # The recursive taskkill is the first action.  Explicitly target every
-    # captured PID once more so a process that detached or raced the tree
-    # capture cannot be silently inherited by the next phase.
+    # The recursive taskkill is the first action. Explicitly target every
+    # captured identity once more so a process that detached or raced the tree
+    # capture cannot be silently inherited by the next phase. Never target a
+    # PID whose name/creation identity no longer matches the capture.
     foreach ($record in $records) {
         if (Test-D32CapturedProcessAlive -Record $record) {
-            $killOutput += @(& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1)
+            $killOutput.AddRange([string[]]@(& taskkill.exe /PID ([int]$record.ProcessId) /F 2>&1))
         }
     }
     Start-Sleep -Milliseconds 250
-    $residual = @($records | Where-Object { Test-D32CapturedProcessAlive -Record $_ })
-    if ($residual.Count -gt 0) {
-        throw "PROCESS_TREE_REAP_FAILED: captured process IDs remained alive after recursive and per-PID kill: $($residual -join ',')"
+    $residual = [System.Collections.Generic.List[object]]::new()
+    foreach ($record in $records) {
+        if (Test-D32CapturedProcessAlive -Record $record) { $residual.Add($record) }
     }
-    return [ordered]@{ ProcessIds = $captured; Residual = @(); KillOutput = @($killOutput) }
+    if ($residual.Count -gt 0) {
+        $details = ($residual | ForEach-Object { "$($_.Name):$($_.ProcessId):parent=$($_.ParentProcessId):creation=$($_.CreationDate)" }) -join ', '
+        throw "PROCESS_TREE_REAP_FAILED: captured process identities remained alive after recursive and per-PID kill: $details"
+    }
+    return [ordered]@{
+        ProcessIds = @($records | ForEach-Object { [int]$_.ProcessId })
+        CapturedRecords = @($records)
+        ResidualRecords = @()
+        KillOutput = @($killOutput)
+        VerifiedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
 }
 
 function Test-D32NoOwnedCargoDescendants {
     param(
-        [Parameter(Mandatory = $true)][int[]]$RootPids,
+        [Parameter(Mandatory = $true)][object[]]$PhaseEvidence,
         [Parameter(Mandatory = $true)][string]$CheckName
     )
+
+    $tracked = [System.Collections.Generic.List[object]]::new()
+    foreach ($evidence in $PhaseEvidence) {
+        if ($null -ne $evidence.root_record) { $tracked.Add($evidence.root_record) }
+        foreach ($record in @($evidence.descendant_records)) {
+            if ($null -ne $record) { $tracked.Add($record) }
+        }
+        if ($null -ne $evidence.root_record) {
+            # Failed phases are deliberately included here. A normal phase
+            # may have no descendants, while a process-tree error must retain
+            # every identity captured before the error.
+            [void](Stop-D32ProcessTreeAndVerify -RootRecord $evidence.root_record -CapturedDescendantRecords @($evidence.descendant_records))
+        }
+    }
 
     $snapshot = Get-D32ProcessSnapshot
     $byParent = @{}
     foreach ($record in $snapshot) {
+        if ($null -eq $record.ParentProcessId) { continue }
         $parent = [int]$record.ParentProcessId
         if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
         $byParent[$parent] += $record
     }
-    $pending = [System.Collections.Generic.Queue[int]]::new()
-    $seen = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($rootPid in $RootPids) { $pending.Enqueue($rootPid) }
     $residual = [System.Collections.Generic.List[object]]::new()
-    while ($pending.Count -gt 0) {
-        $parent = $pending.Dequeue()
+    foreach ($record in (Merge-D32ProcessIdentityRecords -Existing @() -Incoming @($tracked))) {
+        if (Test-D32CapturedProcessAlive -Record $record) { $residual.Add($record) }
+    }
+
+    $rootQueue = [System.Collections.Generic.Queue[int]]::new()
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($evidence in $PhaseEvidence) {
+        if ($null -eq $evidence.root_record) { continue }
+        if (Test-D32CapturedProcessAlive -Record $evidence.root_record) {
+            $rootQueue.Enqueue([int]$evidence.root_record.ProcessId)
+        }
+    }
+    $relevantPattern = '(?i)(cargo|rustc|rustup|lld-link|(^|[-_])link([-.]|$)|fixture)'
+    while ($rootQueue.Count -gt 0) {
+        $parent = $rootQueue.Dequeue()
         if (-not $byParent.ContainsKey($parent)) { continue }
         foreach ($record in $byParent[$parent]) {
             $child = [int]$record.ProcessId
             if (-not $seen.Add($child)) { continue }
-            $pending.Enqueue($child)
-            if ([string]$record.Name -match '^(cargo|rustc)(\.exe)?$') {
-                $residual.Add($record)
-            }
+            $rootQueue.Enqueue($child)
+            if ([string]$record.Name -match $relevantPattern) { $residual.Add($record) }
         }
     }
     if ($residual.Count -gt 0) {
-        $details = ($residual | ForEach-Object { "$($_.Name):$($_.ProcessId):parent=$($_.ParentProcessId)" }) -join ', '
-        throw "PROCESS_TREE_REAP_FAILED: $CheckName found owned Cargo/rustc descendants: $details"
+        $details = ($residual | ForEach-Object { "$($_.Name):$($_.ProcessId):parent=$($_.ParentProcessId):creation=$($_.CreationDate)" }) -join ', '
+        throw "PROCESS_TREE_REAP_FAILED: $CheckName found owned process descendants in relevant set ($relevantPattern): $details"
     }
-    return $true
+    return [ordered]@{
+        checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        relevant_pattern = $relevantPattern
+        residual_identities = @()
+    }
 }
 
 function Invoke-D32BoundedProcess {
@@ -376,15 +548,26 @@ function Invoke-D32BoundedProcess {
     $stdoutPath = "$PhaseLog.stdout.log"
     $stderrPath = "$PhaseLog.stderr.log"
     $started = [DateTimeOffset]::UtcNow
+    $commandLine = ConvertTo-D32CommandLine $Arguments
     $process = $null
+    $processId = $null
+    $rootIdentity = $null
+    $capturedDescendantRecords = @()
+    $residualDescendantRecords = @()
     $stdoutStream = $null
     $stderrStream = $null
     $stdoutCopy = $null
     $stderrCopy = $null
+    $script:D32LastProcessEvidence = [ordered]@{
+        root_record = $null
+        descendant_records = @()
+        started_at_utc = $started.ToString('o')
+    }
+
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = $FilePath
-        $startInfo.Arguments = ConvertTo-D32CommandLine $Arguments
+        $startInfo.Arguments = $commandLine
         $startInfo.WorkingDirectory = $WorkingDirectory
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
@@ -409,45 +592,88 @@ function Invoke-D32BoundedProcess {
             throw "PROCESS_SPAWN_FAILED: process did not start: $FilePath"
         }
         $processId = [int]$process.Id
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            $rootCandidates = @(Get-D32ProcessSnapshot -ProcessId $processId)
+            if ($rootCandidates.Count -eq 1) {
+                $rootIdentity = $rootCandidates[0]
+                break
+            }
+            if ($process.HasExited) { break }
+            Start-Sleep -Milliseconds 50
+        }
+        if ($null -eq $rootIdentity) {
+            $rootIdentity = New-D32FallbackProcessIdentity `
+                -ProcessId $processId `
+                -FilePath $FilePath `
+                -CommandLine $commandLine `
+                -ObservedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
+        }
+        $script:D32LastProcessEvidence.root_record = $rootIdentity
         $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
         $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
     }
     catch {
+        $spawnError = $_.Exception.Message
+        $cleanupError = $null
         if ($null -ne $process) {
             try {
-                if (-not $process.HasExited) {
-                    [void](& taskkill.exe /PID $process.Id /T /F 2>&1)
+                if ($null -eq $rootIdentity) {
+                    $rootCandidates = @(Get-D32ProcessSnapshot -ProcessId ([int]$process.Id))
+                    if ($rootCandidates.Count -eq 1) { $rootIdentity = $rootCandidates[0] }
+                }
+                if ($null -ne $rootIdentity -and (Test-D32CapturedProcessAlive -Record $rootIdentity)) {
+                    [void](& taskkill.exe /PID ([int]$process.Id) /T /F 2>&1)
+                }
+                elseif ($null -eq $rootIdentity -and -not $process.HasExited) {
+                    $cleanupError = "PROCESS_IDENTITY_UNVERIFIED: refusing to kill unknown process pid $($process.Id) after spawn/capture failure"
                 }
             }
             catch {
-                # Preserve the original spawn/capture error.
+                $cleanupError = $_.Exception.Message
             }
+            if ($null -ne $rootIdentity) { $script:D32LastProcessEvidence.root_record = $rootIdentity }
             $process.Dispose()
         }
         if ($null -ne $stdoutStream) { $stdoutStream.Flush(); $stdoutStream.Close(); $stdoutStream.Dispose() }
         if ($null -ne $stderrStream) { $stderrStream.Flush(); $stderrStream.Close(); $stderrStream.Dispose() }
         return [ordered]@{
-            status     = 'spawn_failed'
-            exit_code  = $null
-            pid        = $null
+            status = if ($null -ne $cleanupError) { 'process_tree_error' } else { 'spawn_failed' }
+            exit_code = $null
+            pid = $processId
             elapsed_ms = ([DateTimeOffset]::UtcNow - $started).TotalMilliseconds
-            phase_log  = (Get-D32FullPath $PhaseLog)
+            phase_log = (Get-D32FullPath $PhaseLog)
             stdout_log = (Get-D32FullPath $stdoutPath)
             stderr_log = (Get-D32FullPath $stderrPath)
-            error      = $_.Exception.Message
+            root_identity = ConvertTo-D32IdentityDocument $rootIdentity
+            root_identity_record = $rootIdentity
+            captured_descendant_records = @()
+            descendant_pids = @()
+            captured_descendant_pids = @()
+            descendant_identities = @()
+            residual_descendant_identities = @()
+            reap = $null
+            error = if ($null -ne $cleanupError) { "$spawnError; $cleanupError" } else { $spawnError }
         }
     }
 
     $deadline = $started.AddSeconds($TimeoutSeconds)
     $timedOut = $false
-    $capturedDescendants = @()
-    $killOutput = @()
+    $killOutput = [System.Collections.Generic.List[string]]::new()
     $treeError = $null
+    $reap = $null
+
     while (-not $process.HasExited) {
+        try {
+            $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
+                -Existing $capturedDescendantRecords `
+                -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
+            $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
+        }
+        catch {
+            $treeError = $_.Exception.Message
+            break
+        }
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
-            # Capture the complete tree before taskkill can remove the parent;
-            # the captured IDs are then checked individually after the kill.
-            $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $process.Id)
             $timedOut = $true
             break
         }
@@ -455,37 +681,49 @@ function Invoke-D32BoundedProcess {
         $process.Refresh()
     }
 
-    if ($timedOut) {
+    # A short post-exit grace captures descendants that were reparented while
+    # the root was exiting. Any identity captured in an earlier snapshot is
+    # retained and is later checked by PID/name/creation, even after reparent.
+    $graceSamples = if ($timedOut) { 1 } else { 4 }
+    for ($sample = 0; $sample -lt $graceSamples; $sample++) {
         try {
-            $reap = Stop-D32ProcessTreeAndVerify `
-                -RootPid $processId `
-                -CapturedDescendants $capturedDescendants
-            $killOutput = @($reap.KillOutput)
+            $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
+                -Existing $capturedDescendantRecords `
+                -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
+            $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
         }
         catch {
-            $treeError = $_.Exception.Message
+            if ($null -eq $treeError) { $treeError = $_.Exception.Message }
+            break
         }
-        if ($process.HasExited) { [void]$process.WaitForExit() }
-        $exitCode = $null
+        if ($sample -lt ($graceSamples - 1)) { Start-Sleep -Milliseconds 100 }
     }
-    else {
+
+    $exitCode = $null
+    if (-not $timedOut) {
         # Wait on the retained native Process handle before reading ExitCode.
         # Start-Process without -Wait can return a detached wrapper whose
         # ExitCode reads as zero even when the child returned non-zero.
-        [void]$process.WaitForExit()
         try {
+            [void]$process.WaitForExit()
             $exitCode = [int]$process.ExitCode
         }
         catch {
-            throw "PROCESS_EXIT_CODE_UNAVAILABLE: pid $processId exited but its exit code could not be read: $($_.Exception.Message)"
+            if ($null -eq $treeError) { $treeError = "PROCESS_EXIT_CODE_UNAVAILABLE: pid $processId exited but its exit code could not be read: $($_.Exception.Message)" }
         }
-        $capturedDescendants = @(Get-D32DescendantProcessIds -RootPid $processId)
-        if ($capturedDescendants.Count -gt 0) {
+    }
+
+    if ($timedOut -or $capturedDescendantRecords.Count -gt 0 -or $null -ne $treeError) {
+        try {
             $reap = Stop-D32ProcessTreeAndVerify `
-                -RootPid $processId `
-                -CapturedDescendants $capturedDescendants
-            $killOutput = @($reap.KillOutput)
-            $treeError = "PROCESS_TREE_REAP_FAILED: pid $processId exited with residual descendants: $($capturedDescendants -join ',')"
+                -RootRecord $rootIdentity `
+                -CapturedDescendantRecords $capturedDescendantRecords
+            $killOutput.AddRange([string[]]@($reap.KillOutput))
+            $residualDescendantRecords = @($reap.ResidualRecords | Where-Object { [int]$_.ProcessId -ne [int]$rootIdentity.ProcessId })
+        }
+        catch {
+            if ($null -eq $treeError) { $treeError = $_.Exception.Message }
+            else { $treeError = "$treeError; $($_.Exception.Message)" }
         }
     }
 
@@ -495,8 +733,8 @@ function Invoke-D32BoundedProcess {
             if ($null -ne $stderrCopy) { $stderrCopy.Wait() }
         }
         else {
-            # A failed tree reap must remain bounded; do not wait forever on
-            # a pipe that may still be held by an unverified descendant.
+            # A failed tree/identity cleanup must remain bounded; do not wait
+            # forever on a pipe that may still be held by an unsafe descendant.
             if ($null -ne $stdoutCopy) { [void]$stdoutCopy.Wait(1000) }
             if ($null -ne $stderrCopy) { [void]$stderrCopy.Wait(1000) }
         }
@@ -511,31 +749,48 @@ function Invoke-D32BoundedProcess {
         if ($null -ne $process) { $process.Dispose() }
     }
 
+    $capturedDescendantPids = @($capturedDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
+    $residualDescendantPids = @($residualDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
     if ($timedOut) {
         [IO.File]::AppendAllText(
             $stderrPath,
-            "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($capturedDescendants -join ',')`n$($killOutput -join "`n")`n",
+            "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($capturedDescendantPids -join ',')`n$($killOutput -join "`n")`n",
             [Text.UTF8Encoding]::new($false)
         )
     }
-    if ($null -ne $treeError) { throw $treeError }
-
     $finished = [DateTimeOffset]::UtcNow
     [IO.File]::AppendAllText(
         $stdoutPath,
-        "`nD32_FIXTURE_EXIT_CODE=$exitCode`nD32_FIXTURE_DESCENDANTS=$($capturedDescendants -join ',')`n",
+        "`nD32_FIXTURE_EXIT_CODE=$exitCode`nD32_FIXTURE_DESCENDANTS=$($capturedDescendantPids -join ',')`n",
         [Text.UTF8Encoding]::new($false)
     )
     return [ordered]@{
-        status            = if ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
-        exit_code         = $exitCode
-        pid               = $processId
-        elapsed_ms        = ($finished - $started).TotalMilliseconds
-        phase_log         = (Get-D32FullPath $PhaseLog)
-        stdout_log        = (Get-D32FullPath $stdoutPath)
-        stderr_log        = (Get-D32FullPath $stderrPath)
-        descendant_pids   = @($capturedDescendants)
-        error             = if ($timedOut) { 'bounded timeout; process tree was killed and every captured PID was reaped' } else { $null }
+        status = if ($null -ne $treeError) { 'process_tree_error' } elseif ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
+        exit_code = $exitCode
+        pid = $processId
+        elapsed_ms = ($finished - $started).TotalMilliseconds
+        phase_log = (Get-D32FullPath $PhaseLog)
+        stdout_log = (Get-D32FullPath $stdoutPath)
+        stderr_log = (Get-D32FullPath $stderrPath)
+        root_identity = ConvertTo-D32IdentityDocument $rootIdentity
+        root_identity_record = $rootIdentity
+        captured_descendant_records = @($capturedDescendantRecords)
+        # descendant_pids is intentionally the residual set for compatibility
+        # with the fixture preflight contract. The complete captured/reaped
+        # evidence is persisted separately and is never discarded.
+        descendant_pids = @($residualDescendantPids)
+        captured_descendant_pids = @($capturedDescendantPids)
+        descendant_identities = @($capturedDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+        residual_descendant_identities = @($residualDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+        reap = if ($null -eq $reap) { $null } else {
+            [ordered]@{
+                process_ids = @($reap.ProcessIds)
+                verified_at_utc = $reap.VerifiedAtUtc
+                residual_identities = @($reap.ResidualRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+                kill_output = @($reap.KillOutput)
+            }
+        }
+        error = if ($null -ne $treeError) { $treeError } elseif ($timedOut) { 'bounded timeout; process tree was killed and every captured identity was reaped' } else { $null }
     }
 }
 
@@ -594,7 +849,7 @@ function Invoke-D32SelfTest {
             -PhaseLog (Join-Path $root 'zero-phase') `
             -TimeoutSeconds 5
         if ($zero.status -ne 'succeeded' -or $zero.exit_code -ne 0) {
-            throw "SELFTEST_FAILED: zero exit code was not captured exactly (status=$($zero.status), exit=$($zero.exit_code))"
+            throw "SELFTEST_FAILED: zero exit code was not captured exactly (status=$($zero.status), exit=$($zero.exit_code), error=$($zero.error))"
         }
         $passed++
 
@@ -609,6 +864,71 @@ function Invoke-D32SelfTest {
             -TimeoutSeconds 5
         if ($nonZero.status -ne 'failed' -or $nonZero.exit_code -ne 7) {
             throw "SELFTEST_FAILED: non-zero exit code was not captured exactly (status=$($nonZero.status), exit=$($nonZero.exit_code))"
+        }
+        $passed++
+
+        $normalChildScript = Join-Path $root 'descendant-normal.ps1'
+        [IO.File]::WriteAllText(
+            $normalChildScript,
+            "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null`nStart-Sleep -Milliseconds 750`nexit 0`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        $normalWithChild = Invoke-D32BoundedProcess `
+            -FilePath $powershell `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $normalChildScript) `
+            -WorkingDirectory $root `
+            -PhaseLog (Join-Path $root 'normal-descendant-phase') `
+            -TimeoutSeconds 5
+        if ($normalWithChild.status -ne 'succeeded' -or
+            $normalWithChild.exit_code -ne 0 -or
+            @($normalWithChild.captured_descendant_pids).Count -lt 1 -or
+            @($normalWithChild.descendant_pids).Count -ne 0 -or
+            $null -ne $normalWithChild.error) {
+            throw 'SELFTEST_FAILED: normal exit with captured child was not cleanly reaped'
+        }
+        $normalIdentity = @($normalWithChild.descendant_identities)[0]
+        foreach ($field in @('process_id', 'parent_process_id', 'name', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified')) {
+            if (-not $normalIdentity.Contains($field)) {
+                throw "SELFTEST_FAILED: descendant identity field was not persisted: $field"
+            }
+        }
+        $passed++
+
+        $nonZeroChildScript = Join-Path $root 'descendant-nonzero.ps1'
+        [IO.File]::WriteAllText(
+            $nonZeroChildScript,
+            "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null`nStart-Sleep -Milliseconds 750`nexit 7`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        $nonZeroWithChild = Invoke-D32BoundedProcess `
+            -FilePath $powershell `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $nonZeroChildScript) `
+            -WorkingDirectory $root `
+            -PhaseLog (Join-Path $root 'nonzero-descendant-phase') `
+            -TimeoutSeconds 5
+        if ($nonZeroWithChild.status -ne 'failed' -or
+            $nonZeroWithChild.exit_code -ne 7 -or
+            @($nonZeroWithChild.captured_descendant_pids).Count -lt 1 -or
+            @($nonZeroWithChild.descendant_pids).Count -ne 0 -or
+            $null -ne $nonZeroWithChild.error) {
+            throw 'SELFTEST_FAILED: non-zero exit with captured child was not cleanly reaped'
+        }
+        $passed++
+
+        $mismatch = New-D32ProcessIdentityRecord `
+            -ProcessId $PID `
+            -ParentProcessId $null `
+            -Name 'd32-identity-mismatch.exe' `
+            -CommandLine 'synthetic mismatch' `
+            -CreationDate 'synthetic-mismatch' `
+            -ObservedAtUtc ([DateTimeOffset]::UtcNow.ToString('o')) `
+            -IdentityVerified $true
+        try {
+            [void](Test-D32CapturedProcessAlive -Record $mismatch)
+            throw 'SELFTEST_FAILED: PID identity mismatch was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'PROCESS_IDENTITY_MISMATCH:*') { throw }
         }
         $passed++
 
@@ -645,7 +965,7 @@ function Invoke-D32SelfTest {
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'timeout-phase') `
             -TimeoutSeconds 1
-        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured PID*reaped*' -or @($bounded.descendant_pids).Count -lt 1) {
+        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured identity*reaped*' -or @($bounded.captured_descendant_pids).Count -lt 1 -or @($bounded.descendant_pids).Count -ne 0) {
             throw 'SELFTEST_FAILED: bounded timeout/tree reap'
         }
         $passed++
@@ -693,7 +1013,7 @@ $gitStatus = Get-D32GitOutput -Root $RepoRoot -Arguments @('status', '--short')
 $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
 $savedEnvironment = Set-D32IsolatedEnvironment -Plan $environmentPlan -Jobs $BuildJobs
 $results = @()
-$phaseRootPids = @()
+$phaseEvidence = @()
 $startedAt = [DateTimeOffset]::UtcNow
 try {
     $phase = 0
@@ -714,8 +1034,9 @@ try {
                 -WorkingDirectory $RepoRoot `
                 -PhaseLog $phaseLog `
                 -TimeoutSeconds $TimeoutSeconds
-            if ($null -ne $processResult.pid) {
-                $phaseRootPids += [int]$processResult.pid
+            $phaseEvidence += [pscustomobject]@{
+                root_record = $processResult.root_identity_record
+                descendant_records = @($processResult.captured_descendant_records)
             }
             $artifact = $null
             $artifactError = $null
@@ -743,6 +1064,11 @@ try {
                 exit_code      = $processResult.exit_code
                 pid            = $processResult.pid
                 descendant_pids = @($processResult.descendant_pids)
+                captured_descendant_pids = @($processResult.captured_descendant_pids)
+                root_identity  = $processResult.root_identity
+                descendant_identities = @($processResult.descendant_identities)
+                residual_descendant_identities = @($processResult.residual_descendant_identities)
+                reap           = $processResult.reap
                 elapsed_ms     = $processResult.elapsed_ms
                 phase_log      = $processResult.phase_log
                 stdout_log     = $processResult.stdout_log
@@ -752,6 +1078,11 @@ try {
             }
         }
         catch {
+            $failureEvidence = $script:D32LastProcessEvidence
+            $phaseEvidence += [pscustomobject]@{
+                root_record = $failureEvidence.root_record
+                descendant_records = @($failureEvidence.descendant_records)
+            }
             $results += [ordered]@{
                 phase          = $phase
                 name           = $spec.name
@@ -762,8 +1093,13 @@ try {
                 command        = ('cargo ' + (ConvertTo-D32CommandLine $arguments))
                 status         = 'phase_error'
                 exit_code      = $null
-                pid            = $null
+                pid            = if ($null -eq $failureEvidence.root_record) { $null } else { [int]$failureEvidence.root_record.ProcessId }
                 descendant_pids = @()
+                captured_descendant_pids = @($failureEvidence.descendant_records | ForEach-Object { [int]$_.ProcessId })
+                root_identity  = ConvertTo-D32IdentityDocument $failureEvidence.root_record
+                descendant_identities = @($failureEvidence.descendant_records | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+                residual_descendant_identities = @()
+                reap           = $null
                 elapsed_ms     = $null
                 phase_log      = (Get-D32FullPath $phaseLog)
                 stdout_log     = (Get-D32FullPath "$phaseLog.stdout.log")
@@ -780,11 +1116,16 @@ finally {
 
 $globalProcessError = $null
 try {
-    [void](Test-D32NoOwnedCargoDescendants -RootPids ([int[]]$phaseRootPids) -CheckName 'final fixture prebuild cleanup')
+    [void](Test-D32NoOwnedCargoDescendants -PhaseEvidence $phaseEvidence -CheckName 'final fixture prebuild cleanup')
 }
 catch {
     $globalProcessError = $_.Exception.Message
 }
+
+$phaseTreeErrors = @($results | Where-Object { $_.status -eq 'process_tree_error' } | ForEach-Object { $_.error })
+$allProcessErrors = @($phaseTreeErrors)
+if ($null -ne $globalProcessError) { $allProcessErrors += $globalProcessError }
+$manifestProcessError = if ($allProcessErrors.Count -eq 0) { $null } else { $allProcessErrors -join ' | ' }
 
 $manifestDocument = [ordered]@{
     schema_version = $script:SchemaVersion
@@ -801,8 +1142,8 @@ $manifestDocument = [ordered]@{
         process_tree_timeout_action = 'taskkill /T /F then verify every captured descendant PID'
     }
     environment = $environmentPlan
-    process_tree_check = if ($null -eq $globalProcessError) { 'succeeded' } else { 'failed' }
-    process_tree_error = $globalProcessError
+    process_tree_check = if ($null -eq $manifestProcessError) { 'succeeded' } else { 'failed' }
+    process_tree_error = $manifestProcessError
     fixtures = @($results)
 }
 Write-D32Manifest -Path $ManifestPath -Document $manifestDocument

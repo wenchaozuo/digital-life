@@ -79,7 +79,7 @@ const FIXTURE_SPECS: [FixtureSpec; 5] = [
     },
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureManifest {
     schema_version: u32,
@@ -105,7 +105,7 @@ struct BuildPolicy {
     process_tree_timeout_action: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BuildEnvironment {
     original_userprofile: String,
@@ -116,7 +116,7 @@ struct BuildEnvironment {
     rustup_toolchain: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureRecord {
     phase: u32,
@@ -150,7 +150,7 @@ struct ArtifactRecord {
     sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessIdentityDocument {
     process_id: u32,
@@ -178,7 +178,7 @@ struct NativeCleanupDocument {
     detail: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ReapDocument {
     process_ids: Vec<u32>,
@@ -186,6 +186,261 @@ struct ReapDocument {
     residual_identities: Vec<ProcessIdentityDocument>,
     native_cleanup: Option<NativeCleanupDocument>,
     kill_output: Vec<String>,
+}
+
+/// Serde normally treats a missing `Option<T>` field as `None`, which would
+/// make a producer omission indistinguishable from an explicit JSON `null`.
+/// Fixture v3 requires the field itself to be present while preserving the
+/// existing nullable value semantics.  The wire helpers below use this
+/// presence-aware value for every nullable fixture field, then convert back to
+/// the stable in-memory `Option<T>` representation.
+#[derive(Debug)]
+struct RequiredNullable<T> {
+    present: bool,
+    value: Option<T>,
+}
+
+impl<T> Default for RequiredNullable<T> {
+    fn default() -> Self {
+        Self {
+            present: false,
+            value: None,
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for RequiredNullable<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            present: true,
+            value: Option::<T>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl<T> RequiredNullable<T> {
+    fn into_option<E>(self, field: &'static str) -> Result<Option<T>, E>
+    where
+        E: serde::de::Error,
+    {
+        if self.present {
+            Ok(self.value)
+        } else {
+            Err(E::custom(format!(
+                "missing required nullable field `{field}`"
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureManifestWire {
+    schema_version: u32,
+    candidate_sha: String,
+    source_repo: String,
+    generated_at_utc: String,
+    started_at_utc: String,
+    elapsed_ms: f64,
+    working_tree_status: String,
+    build_policy: BuildPolicy,
+    environment: BuildEnvironment,
+    process_tree_check: String,
+    #[serde(default)]
+    process_tree_error: RequiredNullable<String>,
+    fixtures: Vec<FixtureRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildEnvironmentWire {
+    original_userprofile: String,
+    codex_home: String,
+    userprofile: String,
+    cargo_home: String,
+    rustup_home: String,
+    #[serde(default)]
+    rustup_toolchain: RequiredNullable<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureRecordWire {
+    phase: u32,
+    name: String,
+    project: String,
+    binary: String,
+    manifest_path: String,
+    features: Vec<String>,
+    command: String,
+    status: String,
+    #[serde(default)]
+    exit_code: RequiredNullable<i32>,
+    #[serde(default)]
+    pid: RequiredNullable<u32>,
+    descendant_pids: Vec<u32>,
+    #[serde(default)]
+    root_identity: RequiredNullable<ProcessIdentityDocument>,
+    descendant_identities: Vec<ProcessIdentityDocument>,
+    residual_descendant_identities: Vec<ProcessIdentityDocument>,
+    #[serde(default)]
+    reap: RequiredNullable<ReapDocument>,
+    #[serde(default)]
+    elapsed_ms: RequiredNullable<f64>,
+    phase_log: String,
+    stdout_log: String,
+    stderr_log: String,
+    #[serde(default)]
+    error: RequiredNullable<String>,
+    #[serde(default)]
+    artifact: RequiredNullable<ArtifactRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessIdentityWire {
+    process_id: u32,
+    #[serde(default)]
+    parent_process_id: RequiredNullable<u32>,
+    #[serde(default)]
+    name: RequiredNullable<String>,
+    #[serde(default)]
+    creation_date: RequiredNullable<String>,
+    #[serde(default)]
+    command_line: RequiredNullable<String>,
+    observed_at_utc: String,
+    identity_verified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapDocumentWire {
+    process_ids: Vec<u32>,
+    verified_at_utc: String,
+    residual_identities: Vec<ProcessIdentityDocument>,
+    #[serde(default)]
+    native_cleanup: RequiredNullable<NativeCleanupDocument>,
+    kill_output: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for FixtureManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = FixtureManifestWire::deserialize(deserializer)?;
+        Ok(Self {
+            schema_version: wire.schema_version,
+            candidate_sha: wire.candidate_sha,
+            source_repo: wire.source_repo,
+            generated_at_utc: wire.generated_at_utc,
+            started_at_utc: wire.started_at_utc,
+            elapsed_ms: wire.elapsed_ms,
+            working_tree_status: wire.working_tree_status,
+            build_policy: wire.build_policy,
+            environment: wire.environment,
+            process_tree_check: wire.process_tree_check,
+            process_tree_error: wire.process_tree_error.into_option("process_tree_error")?,
+            fixtures: wire.fixtures,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for BuildEnvironment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = BuildEnvironmentWire::deserialize(deserializer)?;
+        Ok(Self {
+            original_userprofile: wire.original_userprofile,
+            codex_home: wire.codex_home,
+            userprofile: wire.userprofile,
+            cargo_home: wire.cargo_home,
+            rustup_home: wire.rustup_home,
+            rustup_toolchain: wire
+                .rustup_toolchain
+                .into_option("environment.rustup_toolchain")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for FixtureRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = FixtureRecordWire::deserialize(deserializer)?;
+        Ok(Self {
+            phase: wire.phase,
+            name: wire.name,
+            project: wire.project,
+            binary: wire.binary,
+            manifest_path: wire.manifest_path,
+            features: wire.features,
+            command: wire.command,
+            status: wire.status,
+            exit_code: wire.exit_code.into_option("fixture.exit_code")?,
+            pid: wire.pid.into_option("fixture.pid")?,
+            descendant_pids: wire.descendant_pids,
+            root_identity: wire.root_identity.into_option("fixture.root_identity")?,
+            descendant_identities: wire.descendant_identities,
+            residual_descendant_identities: wire.residual_descendant_identities,
+            reap: wire.reap.into_option("fixture.reap")?,
+            elapsed_ms: wire.elapsed_ms.into_option("fixture.elapsed_ms")?,
+            phase_log: wire.phase_log,
+            stdout_log: wire.stdout_log,
+            stderr_log: wire.stderr_log,
+            error: wire.error.into_option("fixture.error")?,
+            artifact: wire.artifact.into_option("fixture.artifact")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessIdentityDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProcessIdentityWire::deserialize(deserializer)?;
+        Ok(Self {
+            process_id: wire.process_id,
+            parent_process_id: wire
+                .parent_process_id
+                .into_option("process_identity.parent_process_id")?,
+            name: wire.name.into_option("process_identity.name")?,
+            creation_date: wire
+                .creation_date
+                .into_option("process_identity.creation_date")?,
+            command_line: wire
+                .command_line
+                .into_option("process_identity.command_line")?,
+            observed_at_utc: wire.observed_at_utc,
+            identity_verified: wire.identity_verified,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ReapDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ReapDocumentWire::deserialize(deserializer)?;
+        Ok(Self {
+            process_ids: wire.process_ids,
+            verified_at_utc: wire.verified_at_utc,
+            residual_identities: wire.residual_identities,
+            native_cleanup: wire.native_cleanup.into_option("reap.native_cleanup")?,
+            kill_output: wire.kill_output,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,6 +932,70 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy)]
+    enum RequiredNullableField {
+        Manifest(&'static str),
+        Environment(&'static str),
+        Fixture(&'static str),
+        ProcessIdentity(&'static str),
+        Reap(&'static str),
+    }
+
+    fn set_object_field(object: &mut Value, name: &str, value: Option<Value>) {
+        let object = object
+            .as_object_mut()
+            .expect("fixture test path must identify an object");
+        match value {
+            Some(value) => {
+                object.insert(name.to_string(), value);
+            }
+            None => {
+                assert!(
+                    object.remove(name).is_some(),
+                    "fixture test field must exist before removal: {name}"
+                );
+            }
+        }
+    }
+
+    fn set_required_nullable_field(
+        manifest: &mut Value,
+        field: RequiredNullableField,
+        value: Option<Value>,
+    ) {
+        match field {
+            RequiredNullableField::Manifest(name) => set_object_field(manifest, name, value),
+            RequiredNullableField::Environment(name) => {
+                set_object_field(&mut manifest["environment"], name, value)
+            }
+            RequiredNullableField::Fixture(name) => {
+                set_object_field(&mut manifest["fixtures"][0], name, value)
+            }
+            RequiredNullableField::ProcessIdentity(name) => {
+                set_object_field(&mut manifest["fixtures"][0]["root_identity"], name, value)
+            }
+            RequiredNullableField::Reap(name) => {
+                set_object_field(&mut manifest["fixtures"][0]["reap"], name, value)
+            }
+        }
+    }
+
+    fn assert_required_nullable_field(field: RequiredNullableField, label: &str) {
+        let mut missing = producer_manifest_value();
+        set_required_nullable_field(&mut missing, field, None);
+        assert!(
+            serde_json::from_value::<FixtureManifest>(missing).is_err(),
+            "{label}: missing field must be rejected"
+        );
+
+        let mut explicit_null = producer_manifest_value();
+        set_required_nullable_field(&mut explicit_null, field, Some(Value::Null));
+        assert!(
+            serde_json::from_value::<FixtureManifest>(explicit_null).is_ok(),
+            "{label}: explicit null must be accepted"
+        );
+    }
+
     #[test]
     fn canonical_fixture_schema_has_five_exact_names() {
         assert_eq!(FIXTURE_NAMES.len(), 5);
@@ -741,12 +1060,71 @@ mod tests {
 
         let serialized = serde_json::to_value(&parsed).expect("manifest must round-trip");
         assert_eq!(serialized["schema_version"], produced["schema_version"]);
+        assert!(serialized["process_tree_error"].is_null());
+        assert!(serialized["environment"]["rustup_toolchain"].is_null());
+        assert!(serialized["fixtures"][0]["error"].is_null());
+        assert!(serialized["fixtures"][0]["reap"]["native_cleanup"].is_object());
         assert!(serialized["fixtures"][0]
             .get("captured_descendant_pids")
             .is_none());
         let reparsed: FixtureManifest = serde_json::from_value(serialized)
             .expect("the serialized manifest must remain consumable");
         assert_eq!(reparsed.fixtures.len(), 5);
+    }
+
+    #[test]
+    fn every_fixture_v3_nullable_field_requires_presence_but_accepts_null() {
+        for (field, label) in [
+            (
+                RequiredNullableField::Manifest("process_tree_error"),
+                "process_tree_error",
+            ),
+            (
+                RequiredNullableField::Environment("rustup_toolchain"),
+                "environment.rustup_toolchain",
+            ),
+            (
+                RequiredNullableField::Fixture("exit_code"),
+                "fixture.exit_code",
+            ),
+            (RequiredNullableField::Fixture("pid"), "fixture.pid"),
+            (
+                RequiredNullableField::Fixture("root_identity"),
+                "fixture.root_identity",
+            ),
+            (RequiredNullableField::Fixture("reap"), "fixture.reap"),
+            (
+                RequiredNullableField::Fixture("elapsed_ms"),
+                "fixture.elapsed_ms",
+            ),
+            (RequiredNullableField::Fixture("error"), "fixture.error"),
+            (
+                RequiredNullableField::Fixture("artifact"),
+                "fixture.artifact",
+            ),
+            (
+                RequiredNullableField::ProcessIdentity("parent_process_id"),
+                "process_identity.parent_process_id",
+            ),
+            (
+                RequiredNullableField::ProcessIdentity("name"),
+                "process_identity.name",
+            ),
+            (
+                RequiredNullableField::ProcessIdentity("creation_date"),
+                "process_identity.creation_date",
+            ),
+            (
+                RequiredNullableField::ProcessIdentity("command_line"),
+                "process_identity.command_line",
+            ),
+            (
+                RequiredNullableField::Reap("native_cleanup"),
+                "reap.native_cleanup",
+            ),
+        ] {
+            assert_required_nullable_field(field, label);
+        }
     }
 
     #[test]

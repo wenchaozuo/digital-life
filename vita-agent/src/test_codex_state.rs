@@ -6,10 +6,12 @@
 //! variable or ambient Codex directory is consulted.
 
 use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
 
 use tempfile::{Builder, TempDir};
@@ -22,6 +24,78 @@ const SENTINEL_FILES: [(&str, &[u8]); 3] = [
         b"{\"digital_life_synthetic\":true}\n",
     ),
 ];
+
+static PROCESS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Serializes test-only process-environment mutations and snapshots.
+///
+/// The lock deliberately lives in this test-only module so production code
+/// cannot acquire or depend on it.  Poison is recovered because a test panic
+/// must not make every later canary permanently unusable.
+pub(crate) struct ProcessEnvLockGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+pub(crate) fn lock_process_env() -> ProcessEnvLockGuard {
+    let guard = PROCESS_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ProcessEnvLockGuard { _guard: guard }
+}
+
+/// Test-only environment mutation guard.
+///
+/// It snapshots each named key while holding the common process lock, applies
+/// the requested values, and restores the original values on every exit path,
+/// including unwinding.  Keeping the lock as a field makes the restore happen
+/// while no other test can observe a partially restored environment.
+pub(crate) struct ProcessEnvSnapshotGuard {
+    previous: Vec<(String, Option<OsString>)>,
+    _lock: ProcessEnvLockGuard,
+}
+
+impl ProcessEnvSnapshotGuard {
+    pub(crate) fn install(entries: &[(&str, &str)]) -> Self {
+        Self::install_with_removals(entries, &[])
+    }
+
+    pub(crate) fn install_with_removals(entries: &[(&str, &str)], removals: &[&str]) -> Self {
+        let lock = lock_process_env();
+        let mut previous = Vec::new();
+        for key in entries
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(removals.iter().copied())
+        {
+            if previous.iter().any(|(seen, _)| seen == key) {
+                continue;
+            }
+            previous.push((key.to_string(), std::env::var_os(key)));
+        }
+        for (key, value) in entries {
+            std::env::set_var(key, value);
+        }
+        for key in removals {
+            std::env::remove_var(key);
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ProcessEnvSnapshotGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 /// A test-owned Codex-like root.  It is never derived from USERPROFILE and is
 /// kept alive by the caller for the duration of the canary.
@@ -183,6 +257,9 @@ fn snapshot_codex_file(root: &Path, file_name: &str) -> CodexFileState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn synthetic_root_snapshot_catches_content_and_metadata_mutation() {
@@ -220,5 +297,62 @@ mod tests {
         assert!(root_path.exists());
         drop(root);
         assert!(!root_path.exists(), "synthetic root must be cleaned up");
+    }
+
+    #[test]
+    fn process_env_snapshot_restores_after_panic_and_unlocks() {
+        const KEY: &str = "VITA_AGENT_TEST_PROCESS_ENV_PANIC_RESTORE_5032587";
+        let baseline = std::env::var_os(KEY);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _environment = ProcessEnvSnapshotGuard::install(&[(KEY, "panic-sentinel")]);
+            assert_eq!(
+                std::env::var_os(KEY).as_deref(),
+                Some("panic-sentinel".as_ref())
+            );
+            panic!("exercise test environment guard unwinding");
+        }));
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os(KEY), baseline);
+
+        let _lock = lock_process_env();
+    }
+
+    #[test]
+    fn process_env_lock_recovers_from_poison() {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _lock = lock_process_env();
+            panic!("exercise process environment lock poisoning");
+        }));
+        assert!(result.is_err());
+
+        let _recovered = lock_process_env();
+    }
+
+    #[test]
+    fn process_env_guard_serializes_parallel_mutations_and_restores_baseline() {
+        const KEY: &str = "VITA_AGENT_TEST_PROCESS_ENV_STRESS_5032587";
+        let baseline = std::env::var_os(KEY);
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..64 {
+                        let _environment =
+                            ProcessEnvSnapshotGuard::install(&[(KEY, "parallel-sentinel")]);
+                        assert_eq!(
+                            std::env::var_os(KEY).as_deref(),
+                            Some("parallel-sentinel".as_ref())
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("parallel env worker should finish");
+        }
+        assert_eq!(std::env::var_os(KEY), baseline);
     }
 }

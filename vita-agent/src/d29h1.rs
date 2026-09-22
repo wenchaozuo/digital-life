@@ -24,7 +24,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 
-use crate::test_codex_state::{snapshot_codex_state, CodexState, SyntheticCodexRoot};
+use crate::test_codex_state::{
+    lock_process_env, snapshot_codex_state, CodexState, SyntheticCodexRoot,
+};
 use crate::{
     fixture_manifest, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaAuthorityError,
     VitaAuthorityEvidenceSource, VitaAuthorityFuture, VitaAuthorityOutcome, VitaAuthorityReason,
@@ -745,6 +747,7 @@ fn d29h1_real_codex_tool_request_uses_isolated_host_authority() {
 }
 
 async fn d29h1_real_codex_tool_request_body() {
+    let _process_env_lock = lock_process_env();
     let synthetic_codex_root =
         SyntheticCodexRoot::new().expect("D29-H1 synthetic Codex root should be created");
     let (runtime, broker, canonical_authority, before) = start_runtime(synthetic_codex_root.path())

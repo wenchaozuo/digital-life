@@ -1272,7 +1272,9 @@ mod h3r1_tests {
     use tempfile::{tempdir, TempDir};
 
     use crate::provider_gateway::{VitaGatewayBinding, VitaProviderAuthority};
-    use crate::test_codex_state::{snapshot_codex_canary, CodexCanary, SyntheticCodexRoot};
+    use crate::test_codex_state::{
+        lock_process_env, snapshot_codex_canary, CodexCanary, SyntheticCodexRoot,
+    };
     use crate::{
         ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
         TrustedWorkspaceRoot, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VitaExecutionContext,
@@ -3387,6 +3389,7 @@ mod h3r1_tests {
     }
 
     async fn d29h3_r1_real_codex_turn_body() {
+        let _process_env_lock = lock_process_env();
         let synthetic_codex_root =
             SyntheticCodexRoot::new().expect("H3-R1 synthetic Codex root should be created");
         let (runtime, broker, authority, before) = start_h3_runtime(synthetic_codex_root.path())

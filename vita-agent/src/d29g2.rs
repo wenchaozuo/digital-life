@@ -31,7 +31,9 @@ use super::{
     ProviderRetryPolicy, ResolvedCredential, VitaAgentError, VitaGatewayBinding, VitaMessage,
     VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
-use crate::test_codex_state::{snapshot_codex_canary, CodexState, SyntheticCodexRoot};
+use crate::test_codex_state::{
+    lock_process_env, snapshot_codex_canary, CodexState, SyntheticCodexRoot,
+};
 use crate::{
     ProviderErrorDetail, VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID,
     VITA_GATEWAY_PROVIDER_ID,
@@ -2127,6 +2129,7 @@ struct SmokeEvidence {
 }
 
 async fn run_smoke() -> Result<SmokeEvidence, String> {
+    let _process_env_lock = lock_process_env();
     let synthetic_codex_root = SyntheticCodexRoot::new()
         .map_err(|_| "create D29-G2 synthetic Codex root failed".to_string())?;
     let before = g2_canary(synthetic_codex_root.path());

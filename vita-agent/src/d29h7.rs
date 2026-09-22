@@ -9818,6 +9818,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaGitStatusTool {
 mod tests {
     use super::*;
     use crate::provider_gateway::{VitaGatewayBinding, VitaProviderAuthority};
+    use crate::test_codex_state::ProcessEnvSnapshotGuard;
     use crate::{
         ProviderCapabilities, ProviderProfile, ProviderProtocol, ProviderRetryPolicy,
         VitaAgentEntrypoint, VitaAgentRuntimeProfile,
@@ -10056,30 +10057,13 @@ mod tests {
     }
 
     struct H7EnvironmentGuard {
-        previous: Vec<(String, Option<OsString>)>,
+        _environment: ProcessEnvSnapshotGuard,
     }
 
     impl H7EnvironmentGuard {
         fn install(entries: &[(&str, &str)]) -> Self {
-            let previous = entries
-                .iter()
-                .map(|(key, value)| {
-                    let previous = std::env::var_os(key);
-                    std::env::set_var(key, value);
-                    ((*key).to_string(), previous)
-                })
-                .collect();
-            Self { previous }
-        }
-    }
-
-    impl Drop for H7EnvironmentGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.previous {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
+            Self {
+                _environment: ProcessEnvSnapshotGuard::install(entries),
             }
         }
     }

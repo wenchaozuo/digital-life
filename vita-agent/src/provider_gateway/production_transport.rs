@@ -1049,10 +1049,10 @@ fn min_duration(left: Duration, right: Duration) -> Duration {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::ffi::OsString;
     use std::io::{Read, Write};
-    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex};
 
+    use crate::test_codex_state::ProcessEnvSnapshotGuard;
     use serde_json::json;
 
     const PUBLIC_IP: [u8; 4] = [93, 184, 216, 34];
@@ -1293,49 +1293,24 @@ mod tests {
     }
 
     struct ProxyEnvironmentGuard {
-        previous: Vec<(String, Option<OsString>)>,
+        _environment: ProcessEnvSnapshotGuard,
     }
 
     impl ProxyEnvironmentGuard {
         fn disable_ambient_proxy() -> Self {
-            let keys = [
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "http_proxy",
-                "https_proxy",
-                "all_proxy",
-                "NO_PROXY",
-                "no_proxy",
-            ];
-            let previous = keys
-                .iter()
-                .map(|key| ((*key).to_string(), std::env::var_os(key)))
-                .collect::<Vec<_>>();
-            for key in [
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "http_proxy",
-                "https_proxy",
-                "all_proxy",
-            ] {
-                std::env::set_var(key, "http://127.0.0.1:1");
-            }
-            for key in ["NO_PROXY", "no_proxy"] {
-                std::env::remove_var(key);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for ProxyEnvironmentGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.previous {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
+            let environment = ProcessEnvSnapshotGuard::install_with_removals(
+                &[
+                    ("HTTP_PROXY", "http://127.0.0.1:1"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:1"),
+                    ("ALL_PROXY", "http://127.0.0.1:1"),
+                    ("http_proxy", "http://127.0.0.1:1"),
+                    ("https_proxy", "http://127.0.0.1:1"),
+                    ("all_proxy", "http://127.0.0.1:1"),
+                ],
+                &["NO_PROXY", "no_proxy"],
+            );
+            Self {
+                _environment: environment,
             }
         }
     }
@@ -2423,11 +2398,6 @@ mod tests {
 
     #[test]
     fn reqwest_executor_ignores_ambient_proxy_environment() {
-        static PROXY_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _lock = PROXY_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _environment = ProxyEnvironmentGuard::disable_ambient_proxy();
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))

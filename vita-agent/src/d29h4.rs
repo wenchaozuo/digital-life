@@ -2956,7 +2956,9 @@ pub(crate) mod tests {
     use tempfile::{tempdir, TempDir};
 
     use crate::d29h3::VITA_WORKSPACE_READ_TOOL_NAME;
-    use crate::test_codex_state::{snapshot_codex_canary, CodexCanary, SyntheticCodexRoot};
+    use crate::test_codex_state::{
+        lock_process_env, snapshot_codex_canary, CodexCanary, SyntheticCodexRoot,
+    };
 
     const LIFE_ID: &str = "life-d29h4-a";
     const TASK_ID: &str = "task-d29h4-a";
@@ -6948,6 +6950,7 @@ pub(crate) mod tests {
     }
 
     async fn real_codex_h4a_canary_body() {
+        let _process_env_lock = lock_process_env();
         let synthetic_codex_root =
             SyntheticCodexRoot::new().expect("H4-A synthetic Codex root should be created");
         let (runtime, h3_broker, h4_broker, authority, before) =
@@ -8395,6 +8398,7 @@ pub(crate) mod tests {
     }
 
     async fn real_codex_h4c_canary_body() {
+        let _process_env_lock = lock_process_env();
         let synthetic_codex_root =
             SyntheticCodexRoot::new().expect("H4-C synthetic Codex root should be created");
         let (runtime, h3_broker, h4_broker, authority, before) =

@@ -31,7 +31,9 @@ use super::{
     VitaMessageRole, VitaProviderState, VitaResponsesRequest, VitaResponsesRequestOptions,
 };
 
-use crate::test_codex_state::{snapshot_codex_state, CodexState, SyntheticCodexRoot};
+use crate::test_codex_state::{
+    lock_process_env, snapshot_codex_state, CodexState, SyntheticCodexRoot,
+};
 use crate::{
     VitaAgentEntrypoint, VitaAgentRuntimeProfile, VITA_AGENT_RUNTIME_ID, VITA_GATEWAY_PROVIDER_ID,
 };
@@ -1828,6 +1830,7 @@ async fn run_case(
     turn_deadline: Duration,
     synthetic_codex_root: &Path,
 ) -> Result<CaseReport, String> {
+    let _process_env_lock = lock_process_env();
     let before = host_canary(synthetic_codex_root);
     let (runtime, profile, runtime_canary) = start_runtime(
         mode,
@@ -2159,6 +2162,7 @@ async fn d29f_first_real_codex_turn_and_bounded_negative_paths_body() {
         Err(VitaAgentError::GatewayProtocol(message)) if message.contains("request model")
     ));
 
+    let _process_env_lock = lock_process_env();
     let canary_before = host_canary(synthetic_codex_root);
     let profile_app_data = tempdir().expect("D29-F A canary app-data");
     let profile_workspace = tempdir().expect("D29-F A canary workspace");

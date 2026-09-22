@@ -994,6 +994,14 @@ pub enum VitaAgentError {
         status: u16,
         detail: Option<ProviderErrorDetail>,
     },
+    /// Transport-owned bounded attempt metadata for a typed D32 request.
+    /// Keeping this as a wrapper avoids changing the public HTTP error shape
+    /// used by the ordinary Chat path while preserving the real attempt count
+    /// for D32's safe diagnostic boundary.
+    ProviderTransportAttempted {
+        attempts: u8,
+        source: Box<VitaAgentError>,
+    },
     OwnershipViolation {
         path: PathBuf,
         reason: &'static str,
@@ -1098,6 +1106,7 @@ impl Display for VitaAgentError {
                 }
                 Ok(())
             }
+            Self::ProviderTransportAttempted { source, .. } => source.fmt(f),
             Self::OwnershipViolation { path, reason } => write!(
                 f,
                 "Vita ownership check failed ({reason}): {}",

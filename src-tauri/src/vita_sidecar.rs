@@ -214,6 +214,194 @@ impl D32HostCanaryMode {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+const D32_STAGE_COUNTER_MAX: u8 = 16;
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum D32HostCanaryStage {
+    Layout,
+    Catalog,
+    Sandbox,
+    ActionPrepare,
+    ScopeAuthority,
+    Populate,
+    ConfirmationBridge,
+    Grant,
+    Revalidate,
+    Evidence,
+    Cleanup,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32HostCanaryStage {
+    const ALL: [Self; 11] = [
+        Self::Layout,
+        Self::Catalog,
+        Self::Sandbox,
+        Self::ActionPrepare,
+        Self::ScopeAuthority,
+        Self::Populate,
+        Self::ConfirmationBridge,
+        Self::Grant,
+        Self::Revalidate,
+        Self::Evidence,
+        Self::Cleanup,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Layout => "layout",
+            Self::Catalog => "catalog",
+            Self::Sandbox => "sandbox",
+            Self::ActionPrepare => "action_prepare",
+            Self::ScopeAuthority => "scope_authority",
+            Self::Populate => "populate",
+            Self::ConfirmationBridge => "confirmation_bridge",
+            Self::Grant => "grant",
+            Self::Revalidate => "revalidate",
+            Self::Evidence => "evidence",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum D32StageFailureCode {
+    OperationFailed,
+    NotObserved,
+    Fixture,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32StageFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OperationFailed => "operation_failed",
+            Self::NotObserved => "not_observed",
+            Self::Fixture => "fixture",
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32StageTelemetryCounters {
+    pub started: u8,
+    pub passed: u8,
+    pub denied: u8,
+    pub failed: u8,
+    pub last_failure_code: Option<String>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D32StageTelemetrySnapshot {
+    pub layout: D32StageTelemetryCounters,
+    pub catalog: D32StageTelemetryCounters,
+    pub sandbox: D32StageTelemetryCounters,
+    pub action_prepare: D32StageTelemetryCounters,
+    pub scope_authority: D32StageTelemetryCounters,
+    pub populate: D32StageTelemetryCounters,
+    pub confirmation_bridge: D32StageTelemetryCounters,
+    pub grant: D32StageTelemetryCounters,
+    pub revalidate: D32StageTelemetryCounters,
+    pub evidence: D32StageTelemetryCounters,
+    pub cleanup: D32StageTelemetryCounters,
+    pub bridge_sent: u8,
+    pub bridge_replied: u8,
+    pub bridge_pending: u8,
+    pub bridge_pending_active: bool,
+    pub bridge_state: String,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl Default for D32StageTelemetrySnapshot {
+    fn default() -> Self {
+        Self {
+            layout: D32StageTelemetryCounters::default(),
+            catalog: D32StageTelemetryCounters::default(),
+            sandbox: D32StageTelemetryCounters::default(),
+            action_prepare: D32StageTelemetryCounters::default(),
+            scope_authority: D32StageTelemetryCounters::default(),
+            populate: D32StageTelemetryCounters::default(),
+            confirmation_bridge: D32StageTelemetryCounters::default(),
+            grant: D32StageTelemetryCounters::default(),
+            revalidate: D32StageTelemetryCounters::default(),
+            evidence: D32StageTelemetryCounters::default(),
+            cleanup: D32StageTelemetryCounters::default(),
+            bridge_sent: 0,
+            bridge_replied: 0,
+            bridge_pending: 0,
+            bridge_pending_active: false,
+            bridge_state: "idle".to_string(),
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32StageTelemetrySnapshot {
+    fn counters_mut(&mut self, stage: D32HostCanaryStage) -> &mut D32StageTelemetryCounters {
+        match stage {
+            D32HostCanaryStage::Layout => &mut self.layout,
+            D32HostCanaryStage::Catalog => &mut self.catalog,
+            D32HostCanaryStage::Sandbox => &mut self.sandbox,
+            D32HostCanaryStage::ActionPrepare => &mut self.action_prepare,
+            D32HostCanaryStage::ScopeAuthority => &mut self.scope_authority,
+            D32HostCanaryStage::Populate => &mut self.populate,
+            D32HostCanaryStage::ConfirmationBridge => &mut self.confirmation_bridge,
+            D32HostCanaryStage::Grant => &mut self.grant,
+            D32HostCanaryStage::Revalidate => &mut self.revalidate,
+            D32HostCanaryStage::Evidence => &mut self.evidence,
+            D32HostCanaryStage::Cleanup => &mut self.cleanup,
+        }
+    }
+
+    fn increment(counter: &mut u8) {
+        *counter = counter.saturating_add(1).min(D32_STAGE_COUNTER_MAX);
+    }
+
+    fn mark_started(&mut self, stage: D32HostCanaryStage) {
+        Self::increment(&mut self.counters_mut(stage).started);
+    }
+
+    fn mark_passed(&mut self, stage: D32HostCanaryStage) {
+        Self::increment(&mut self.counters_mut(stage).passed);
+    }
+
+    fn mark_denied(&mut self, stage: D32HostCanaryStage) {
+        Self::increment(&mut self.counters_mut(stage).denied);
+    }
+
+    fn mark_failed(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
+        let counters = self.counters_mut(stage);
+        Self::increment(&mut counters.failed);
+        counters.last_failure_code = Some(code.as_str().to_string());
+    }
+
+    fn bridge_sent(&mut self) {
+        Self::increment(&mut self.bridge_sent);
+        self.bridge_state = "sent".to_string();
+    }
+
+    fn bridge_pending(&mut self) {
+        if !self.bridge_pending_active {
+            Self::increment(&mut self.bridge_pending);
+        }
+        self.bridge_pending_active = true;
+        self.bridge_state = "pending".to_string();
+    }
+
+    fn bridge_replied(&mut self) {
+        Self::increment(&mut self.bridge_replied);
+        self.bridge_pending_active = false;
+        self.bridge_state = "replied".to_string();
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct D32HostCanaryTraceSnapshot {
@@ -251,6 +439,7 @@ pub(crate) struct D32HostCanaryTraceSnapshot {
     pub native_evidence_turn_id: Option<String>,
     pub native_evidence_tool_call_id: Option<String>,
     pub native_diagnostic: Option<D32NativeSafeDiagnostic>,
+    pub stage_telemetry: D32StageTelemetrySnapshot,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -458,6 +647,12 @@ fn d32_native_diagnostic_summary(trace: &D32HostCanaryTraceSnapshot) -> String {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_stage_telemetry_summary(trace: &D32HostCanaryTraceSnapshot) -> String {
+    serde_json::to_string(&trace.stage_telemetry)
+        .unwrap_or_else(|_| "{\"serialization\":\"failed\"}".to_string())
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 #[derive(Default)]
 pub(crate) struct D32HostCanaryTrace {
     snapshot: Mutex<D32HostCanaryTraceSnapshot>,
@@ -476,6 +671,34 @@ impl D32HostCanaryTrace {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default()
+    }
+
+    fn stage_started(&self, stage: D32HostCanaryStage) {
+        self.update(|snapshot| snapshot.stage_telemetry.mark_started(stage));
+    }
+
+    fn stage_passed(&self, stage: D32HostCanaryStage) {
+        self.update(|snapshot| snapshot.stage_telemetry.mark_passed(stage));
+    }
+
+    fn stage_denied(&self, stage: D32HostCanaryStage) {
+        self.update(|snapshot| snapshot.stage_telemetry.mark_denied(stage));
+    }
+
+    fn stage_failed(&self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
+        self.update(|snapshot| snapshot.stage_telemetry.mark_failed(stage, code));
+    }
+
+    fn bridge_sent(&self) {
+        self.update(|snapshot| snapshot.stage_telemetry.bridge_sent());
+    }
+
+    fn bridge_pending(&self) {
+        self.update(|snapshot| snapshot.stage_telemetry.bridge_pending());
+    }
+
+    fn bridge_replied(&self) {
+        self.update(|snapshot| snapshot.stage_telemetry.bridge_replied());
     }
 }
 
@@ -5501,16 +5724,111 @@ mod windows {
         }
 
         #[cfg(feature = "d32-a-host-canary")]
+        fn canary_stage_result(
+            &self,
+            stage: D32HostCanaryStage,
+            exact: bool,
+            allowed: bool,
+            sent: bool,
+        ) {
+            if !exact {
+                return;
+            }
+            let Some(control) = self.canary_control.as_ref() else {
+                return;
+            };
+            if !sent {
+                control
+                    .trace
+                    .stage_failed(stage, D32StageFailureCode::OperationFailed);
+            } else if allowed {
+                control.trace.stage_passed(stage);
+            } else {
+                control.trace.stage_denied(stage);
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
+        fn canary_stage_failure(
+            &self,
+            stage: D32HostCanaryStage,
+            exact: bool,
+            code: D32StageFailureCode,
+        ) {
+            if exact {
+                if let Some(control) = self.canary_control.as_ref() {
+                    control.trace.stage_failed(stage, code);
+                }
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
         fn record_inbound(&self, message: &VitaMessage) {
             let Some(control) = self.canary_control.as_ref() else {
                 return;
             };
             control.trace.update(|trace| match message {
-                VitaMessage::AuthorityEvaluate(_) => trace.authority_evaluate += 1,
-                VitaMessage::ConfirmationRequired(_) => trace.confirmation_required += 1,
-                VitaMessage::IssueGrant(_) => trace.issue_grant += 1,
+                VitaMessage::AuthorityEvaluate(request) => {
+                    trace.authority_evaluate += 1;
+                    if request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+                        && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+                    {
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::Catalog);
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::Sandbox);
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::ActionPrepare);
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::ScopeAuthority);
+                    }
+                }
+                VitaMessage::ConfirmationRequired(request) => {
+                    trace.confirmation_required += 1;
+                    if request.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+                        && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+                    {
+                        trace
+                            .stage_telemetry
+                            .mark_passed(D32HostCanaryStage::Catalog);
+                        trace
+                            .stage_telemetry
+                            .mark_passed(D32HostCanaryStage::Sandbox);
+                        trace
+                            .stage_telemetry
+                            .mark_passed(D32HostCanaryStage::ActionPrepare);
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::Populate);
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::ConfirmationBridge);
+                        trace.stage_telemetry.bridge_sent();
+                    }
+                }
+                VitaMessage::IssueGrant(request) => {
+                    trace.issue_grant += 1;
+                    if request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+                        && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+                    {
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::Grant);
+                    }
+                }
                 VitaMessage::RevalidateGrant(request) => {
                     trace.revalidate_grant += 1;
+                    if request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+                        && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+                    {
+                        trace
+                            .stage_telemetry
+                            .mark_started(D32HostCanaryStage::Revalidate);
+                    }
                     if control.mode == D32HostCanaryMode::GrantReplay
                         && request.session_id == self.session_id
                         && request.grant.session_id == self.session_id
@@ -7871,6 +8189,9 @@ mod windows {
         if request.session_id != session.session_id {
             return Err("Vita authority request session was not exact".to_string());
         }
+        #[cfg(feature = "d32-a-host-canary")]
+        let exact_d32 = request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID;
         let mut authority = session
             .turn_authority
             .lock()
@@ -7878,13 +8199,22 @@ mod windows {
         let active = match &mut *authority {
             HostTurnAuthority::Active(active) if active.turn_id == request.host_turn_id => active,
             _ => {
-                return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+                let result = session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
                     request_id: request.request_id,
                     session_id: session.session_id.clone(),
                     allowed: false,
                     authorization_revision: None,
                     error_code: Some("TURN_NOT_ACTIVE".to_string()),
                 }));
+                #[cfg(feature = "d32-a-host-canary")]
+                session.canary_stage_result(
+                    D32HostCanaryStage::ScopeAuthority,
+                    exact_d32,
+                    false,
+                    result.is_ok(),
+                );
+                drop(authority);
+                return result;
             }
         };
         if active
@@ -7892,13 +8222,22 @@ mod windows {
             .as_deref()
             .is_some_and(|codex_turn_id| codex_turn_id != request.binding.turn_id)
         {
-            return session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
+            let result = session.send(&HostMessage::AuthorityScopeReply(AuthorityScopeReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: false,
                 authorization_revision: None,
                 error_code: Some("CODEX_TURN_MISMATCH".to_string()),
             }));
+            #[cfg(feature = "d32-a-host-canary")]
+            session.canary_stage_result(
+                D32HostCanaryStage::ScopeAuthority,
+                exact_d32,
+                false,
+                result.is_ok(),
+            );
+            drop(authority);
+            return result;
         }
         let (allowed, revision, reply_error_code) = match storage.capability_authorization_scope() {
             Ok(authority_scope) => match current_workspace_revision_in_scope(
@@ -7922,6 +8261,13 @@ mod windows {
             authorization_revision: revision,
             error_code: reply_error_code,
         }));
+        #[cfg(feature = "d32-a-host-canary")]
+        session.canary_stage_result(
+            D32HostCanaryStage::ScopeAuthority,
+            exact_d32,
+            allowed,
+            result.is_ok(),
+        );
         drop(authority);
         result
     }
@@ -8270,6 +8616,9 @@ mod windows {
         {
             return Err("Vita confirmation binding was not exact".to_string());
         }
+        #[cfg(feature = "d32-a-host-canary")]
+        let exact_d32_confirmation = request.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID;
         validate_binding(session, &request.binding)?;
         let now = unix_millis();
         let Some(expires_at_unix_ms) =
@@ -8324,6 +8673,15 @@ mod windows {
             .lock()
             .map_err(|_| "Vita pending state lock was poisoned".to_string())?;
         if pending.len() >= MAX_PENDING {
+            #[cfg(feature = "d32-a-host-canary")]
+            if exact_d32_confirmation {
+                if let Some(control) = session.canary_control.as_ref() {
+                    control.trace.stage_failed(
+                        D32HostCanaryStage::Populate,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                }
+            }
             return Err("Vita pending confirmation capacity was exhausted".to_string());
         }
         let ticket = ExpiryTicket::for_pending(&session.session_id, &pending_action);
@@ -8331,6 +8689,12 @@ mod windows {
         drop(pending);
         drop(authority);
         session.expiry.schedule(ticket);
+        #[cfg(feature = "d32-a-host-canary")]
+        if exact_d32_confirmation {
+            if let Some(control) = session.canary_control.as_ref() {
+                control.trace.stage_passed(D32HostCanaryStage::Populate);
+            }
+        }
         Ok(())
     }
 
@@ -8346,6 +8710,9 @@ mod windows {
         if request.session_id != session.session_id {
             return Err("Vita grant request session was not exact".to_string());
         }
+        #[cfg(feature = "d32-a-host-canary")]
+        let exact_d32 = request.binding.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID;
         let authority = session
             .turn_authority
             .lock()
@@ -8355,25 +8722,43 @@ mod windows {
             HostTurnAuthority::Active(active)
                 if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
-            return session.send(&HostMessage::GrantIssued(GrantIssued {
+            let result = session.send(&HostMessage::GrantIssued(GrantIssued {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 allowed: false,
                 grant: None,
                 error_code: Some("TURN_NOT_ACTIVE".to_string()),
             }));
+            #[cfg(feature = "d32-a-host-canary")]
+            session.canary_stage_result(
+                D32HostCanaryStage::Grant,
+                exact_d32,
+                false,
+                result.is_ok(),
+            );
+            drop(authority);
+            return result;
         }
         expire_pending(session);
         let authority_scope = match storage.capability_authorization_scope() {
             Ok(scope) => scope,
             Err(error) => {
-                return session.send(&HostMessage::GrantIssued(GrantIssued {
+                let result = session.send(&HostMessage::GrantIssued(GrantIssued {
                     request_id: request.request_id,
                     session_id: session.session_id.clone(),
                     allowed: false,
                     grant: None,
                     error_code: Some(error.code),
                 }));
+                #[cfg(feature = "d32-a-host-canary")]
+                session.canary_stage_result(
+                    D32HostCanaryStage::Grant,
+                    exact_d32,
+                    false,
+                    result.is_ok(),
+                );
+                drop(authority);
+                return result;
             }
         };
         let allowed = validate_binding(session, &request.binding).and_then(|_| {
@@ -8438,6 +8823,8 @@ mod windows {
             );
             Ok(grant)
         });
+        #[cfg(feature = "d32-a-host-canary")]
+        let grant_allowed = allowed.is_ok();
         let result = match allowed {
             Ok(grant) => session.send(&HostMessage::GrantIssued(GrantIssued {
                 request_id: request.request_id,
@@ -8454,6 +8841,13 @@ mod windows {
                 error_code: Some(error_code(&error)),
             })),
         };
+        #[cfg(feature = "d32-a-host-canary")]
+        session.canary_stage_result(
+            D32HostCanaryStage::Grant,
+            exact_d32,
+            grant_allowed,
+            result.is_ok(),
+        );
         drop(authority);
         result
     }
@@ -8752,14 +9146,37 @@ mod windows {
         secrets: &WindowsCredentialSecretStore,
         request: RevalidateGrant,
     ) -> Result<(), String> {
+        let exact_d32 = canary_exact_cargo_request(session, &request);
         let mut effective_request = request.clone();
-        let mode = canary_prepare_revalidation(session, storage, registry, &mut effective_request)?;
+        let mode =
+            match canary_prepare_revalidation(session, storage, registry, &mut effective_request) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    session.canary_stage_failure(
+                        D32HostCanaryStage::Revalidate,
+                        exact_d32,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                    return Err(error);
+                }
+            };
         let Some(control) = session.canary_control() else {
             let response =
                 revalidate_grant_decision(session, storage, registry, effective_request)?;
             return session.send(&HostMessage::GrantRevalidated(response));
         };
-        let response = revalidate_grant_decision(session, storage, registry, effective_request)?;
+        let response =
+            match revalidate_grant_decision(session, storage, registry, effective_request) {
+                Ok(response) => response,
+                Err(error) => {
+                    session.canary_stage_failure(
+                        D32HostCanaryStage::Revalidate,
+                        exact_d32,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                    return Err(error);
+                }
+            };
         let expected_restart_code = match mode {
             Some(D32HostCanaryMode::LifeBeforeRevalidation) => Some(LIFE_RESTART_REQUIRED),
             Some(D32HostCanaryMode::MigrationBeforeRevalidation) => {
@@ -8806,7 +9223,14 @@ mod windows {
                     "D32_A_HOST_FAILURE: GrantReplay canonical duplicate was allowed".to_string(),
                 );
             }
-            return session.send(&HostMessage::GrantRevalidated(replay_response));
+            let result = session.send(&HostMessage::GrantRevalidated(replay_response));
+            session.canary_stage_result(
+                D32HostCanaryStage::Revalidate,
+                exact_d32,
+                replay_denied,
+                result.is_ok(),
+            );
+            return result;
         }
         if matches!(
             mode,
@@ -8819,7 +9243,15 @@ mod windows {
                 .trace
                 .update(|trace| trace.tamper_denied = !response.allowed);
         }
-        session.send(&HostMessage::GrantRevalidated(response))
+        let response_allowed = response.allowed;
+        let result = session.send(&HostMessage::GrantRevalidated(response));
+        session.canary_stage_result(
+            D32HostCanaryStage::Revalidate,
+            exact_d32,
+            response_allowed,
+            result.is_ok(),
+        );
+        result
     }
 
     fn handle_revalidate_grant_with_secrets(
@@ -9166,12 +9598,31 @@ mod windows {
         decision: ConfirmationDecision,
         authorization_revision: Option<i64>,
     ) -> Result<(), String> {
-        session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+        let result = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
             request_id: pending.request_id.clone(),
             session_id: session.session_id.clone(),
             decision,
             authorization_revision,
-        }))
+        }));
+        #[cfg(feature = "d32-a-host-canary")]
+        if pending.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
+            && pending.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
+        {
+            if let Some(control) = session.canary_control.as_ref() {
+                if result.is_ok() {
+                    control.trace.bridge_replied();
+                    control
+                        .trace
+                        .stage_passed(D32HostCanaryStage::ConfirmationBridge);
+                } else {
+                    control.trace.stage_failed(
+                        D32HostCanaryStage::ConfirmationBridge,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                }
+            }
+        }
+        result
     }
 
     fn send_workspace_read_confirmation_decision(
@@ -12460,6 +12911,8 @@ mod windows {
         let coordinator = app_handle.state::<VitaSidecarCoordinator>();
         let control = D32HostCanaryControl::new(mode);
         coordinator.configure_d32_host_canary(Arc::clone(&control))?;
+        control.trace.stage_started(D32HostCanaryStage::Layout);
+        control.trace.stage_passed(D32HostCanaryStage::Layout);
         let cancel_worker = if mode == D32HostCanaryMode::CancelBeforeRevalidation {
             let worker_control = Arc::clone(&control);
             let worker_app = app_handle.clone();
@@ -12497,7 +12950,14 @@ mod windows {
             retained
                 .revalidate("D32 native evidence app-data root before canary")
                 .map_err(d32_not_executable)?;
-            d32_prepare_native_evidence(&retained)?;
+            control.trace.stage_started(D32HostCanaryStage::Evidence);
+            if let Err(error) = d32_prepare_native_evidence(&retained) {
+                control.trace.stage_failed(
+                    D32HostCanaryStage::Evidence,
+                    D32StageFailureCode::OperationFailed,
+                );
+                return Err(error);
+            }
             app_data_root_retained = Some(retained);
             coordinator.start_turn(VitaTurnStartRequest {
                 prompt: D32_CANARY_CARGO_PROMPT.to_string(),
@@ -12510,6 +12970,7 @@ mod windows {
                 let status = coordinator.status()?;
                 if status.pending.is_some() {
                     confirmation_seen = true;
+                    control.trace.bridge_pending();
                     if !action_taken {
                         action_taken = true;
                         if let Some(pending) = status.pending.as_ref() {
@@ -12535,14 +12996,28 @@ mod windows {
                 thread::sleep(Duration::from_millis(100));
             };
             if !confirmation_seen {
+                control.trace.stage_failed(
+                    D32HostCanaryStage::ActionPrepare,
+                    D32StageFailureCode::NotObserved,
+                );
+                control.trace.stage_failed(
+                    D32HostCanaryStage::Populate,
+                    D32StageFailureCode::NotObserved,
+                );
+                control.trace.stage_failed(
+                    D32HostCanaryStage::ConfirmationBridge,
+                    D32StageFailureCode::NotObserved,
+                );
                 let diagnostic = d32_canary_no_confirmation_diagnostic(
                     terminal.assistant_text.as_deref(),
                     terminal.turn_phase,
                     terminal.turn_error.as_deref(),
                 );
-                let native_diagnostic = d32_native_diagnostic_summary(&control.trace.snapshot());
+                let trace = control.trace.snapshot();
+                let native_diagnostic = d32_native_diagnostic_summary(&trace);
+                let stage_telemetry = d32_stage_telemetry_summary(&trace);
                 return Err(d32_not_executable(format!(
-                    "{diagnostic}; d32_native_diagnostic={native_diagnostic}"
+                    "{diagnostic}; d32_stage_telemetry={stage_telemetry}; d32_native_diagnostic={native_diagnostic}"
                 )));
             }
             if mode.expects_deny() {
@@ -12602,7 +13077,16 @@ mod windows {
         let terminal = match result {
             Ok(terminal) => terminal,
             Err(error) => {
+                control.trace.stage_started(D32HostCanaryStage::Cleanup);
                 let cleanup = environment.cleanup();
+                if cleanup.validated && cleanup.removed && cleanup.error.is_none() {
+                    control.trace.stage_passed(D32HostCanaryStage::Cleanup);
+                } else {
+                    control.trace.stage_failed(
+                        D32HostCanaryStage::Cleanup,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                }
                 let native_diagnostic = d32_native_diagnostic_summary(&control.trace.snapshot());
                 return Err(format!(
                     "{error}; d32_native_diagnostic={native_diagnostic}; D32 cleanup outcome: {cleanup:?}"
@@ -12641,18 +13125,33 @@ mod windows {
                     "D32_A_HOST_FAILURE: production cargo run root was not cleaned".to_string(),
                 );
             }
-            let trace = control.trace.snapshot();
-            let native_diagnostic = trace.native_diagnostic.clone();
+            let trace_for_validation = control.trace.snapshot();
             d32_validate_trace(
                 mode,
-                &trace,
+                &trace_for_validation,
                 terminal.turn_phase,
                 terminal.turn_error.as_deref(),
             )?;
             let app_data_root_retained = app_data_root_retained
                 .as_ref()
                 .ok_or_else(|| d32_not_executable("D32 app-data authority was not retained"))?;
-            let native_evidence = d32_read_native_evidence(app_data_root_retained, &trace, mode)?;
+            let native_evidence =
+                match d32_read_native_evidence(app_data_root_retained, &trace_for_validation, mode)
+                {
+                    Ok(evidence) => {
+                        control.trace.stage_passed(D32HostCanaryStage::Evidence);
+                        evidence
+                    }
+                    Err(error) => {
+                        control.trace.stage_failed(
+                            D32HostCanaryStage::Evidence,
+                            D32StageFailureCode::OperationFailed,
+                        );
+                        return Err(error);
+                    }
+                };
+            let trace = control.trace.snapshot();
+            let native_diagnostic = trace.native_diagnostic.clone();
             Ok(D32HostCanaryReport {
                 mode: mode.as_str().to_string(),
                 status: if mode.expects_deny() {
@@ -12675,9 +13174,19 @@ mod windows {
             })
         })();
         let clear_result = coordinator.clear_d32_host_canary();
+        control.trace.stage_started(D32HostCanaryStage::Cleanup);
         let cleanup = environment.cleanup();
+        if cleanup.validated && cleanup.removed && cleanup.error.is_none() {
+            control.trace.stage_passed(D32HostCanaryStage::Cleanup);
+        } else {
+            control.trace.stage_failed(
+                D32HostCanaryStage::Cleanup,
+                D32StageFailureCode::OperationFailed,
+            );
+        }
         match (report_result, clear_result, cleanup.error.clone()) {
             (Ok(mut report), Ok(()), None) if cleanup.validated && cleanup.removed => {
+                report.trace = control.trace.snapshot();
                 report.cleanup = cleanup;
                 Ok(report)
             }
@@ -12830,6 +13339,158 @@ mod windows {
                 "{message} provider-message Authorization: Bearer provider-token https://evil.example"
             );
             assert!(parse_d32_native_safe_diagnostic(&hostile).is_none());
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_stage_failure_fixture_matrix_is_bounded_and_static() {
+            let trace = D32HostCanaryTrace::default();
+            for stage in D32HostCanaryStage::ALL {
+                trace.stage_started(stage);
+                trace.stage_failed(stage, D32StageFailureCode::Fixture);
+            }
+            trace.bridge_sent();
+            trace.bridge_pending();
+            trace.bridge_pending();
+            trace.bridge_replied();
+            let snapshot = trace.snapshot();
+            let json =
+                serde_json::to_string(&snapshot.stage_telemetry).expect("D32 stage telemetry JSON");
+            for field in [
+                "layout",
+                "catalog",
+                "sandbox",
+                "actionPrepare",
+                "scopeAuthority",
+                "populate",
+                "confirmationBridge",
+                "grant",
+                "revalidate",
+                "evidence",
+                "cleanup",
+            ] {
+                assert_eq!(json.matches(&format!("\"{field}\"")).count(), 1);
+            }
+            assert_eq!(snapshot.stage_telemetry.bridge_sent, 1);
+            assert_eq!(snapshot.stage_telemetry.bridge_pending, 1);
+            assert!(!snapshot.stage_telemetry.bridge_pending_active);
+            assert_eq!(snapshot.stage_telemetry.bridge_state, "replied");
+            assert!(json.contains("\"lastFailureCode\":\"fixture\""));
+            assert!(!json.to_ascii_lowercase().contains("provider"));
+            assert!(!json.to_ascii_lowercase().contains("token"));
+            assert!(!json.to_ascii_lowercase().contains("credential"));
+            assert!(!json.to_ascii_lowercase().contains("authorization"));
+            assert!(!json.to_ascii_lowercase().contains("body"));
+            assert!(!json.to_ascii_lowercase().contains("environment"));
+            assert!(!json.contains("http://"));
+            assert!(!json.contains("https://"));
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_full_report_json_has_unique_safe_stage_fields() {
+            let trace = D32HostCanaryTrace::default();
+            trace.stage_started(D32HostCanaryStage::Layout);
+            trace.stage_passed(D32HostCanaryStage::Layout);
+            trace.stage_started(D32HostCanaryStage::ConfirmationBridge);
+            trace.bridge_sent();
+            trace.bridge_replied();
+            let report = D32HostCanaryReport {
+                mode: "positive".to_string(),
+                status: "EXECUTED".to_string(),
+                trace: trace.snapshot(),
+                native_evidence: D32NativeEvidenceReport {
+                    record: serde_json::json!({}),
+                    sha256: "sha256-placeholder".to_string(),
+                    identity: "identity-placeholder".to_string(),
+                    bytes: 0,
+                },
+                terminal_phase: None,
+                turn_error: None,
+                native_diagnostic: None,
+                cleanup: D32CleanupOutcome {
+                    attempted: true,
+                    validated: true,
+                    removed: true,
+                    unsafe_left: false,
+                    error: None,
+                },
+            };
+            let json = serde_json::to_string(&report).expect("D32 report JSON");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("D32 report must remain valid JSON");
+            assert_eq!(parsed.as_object().map(serde_json::Map::len), Some(8));
+            for field in [
+                "mode",
+                "status",
+                "trace",
+                "nativeEvidence",
+                "terminalPhase",
+                "turnError",
+            ] {
+                assert_eq!(json.matches(&format!("\"{field}\"")).count(), 1);
+            }
+            assert_eq!(json.matches("\"cleanup\":{\"attempted\"").count(), 1);
+            let telemetry_json =
+                serde_json::to_string(&report.trace.stage_telemetry).expect("stage telemetry JSON");
+            for field in [
+                "layout",
+                "catalog",
+                "sandbox",
+                "actionPrepare",
+                "scopeAuthority",
+                "populate",
+                "confirmationBridge",
+                "grant",
+                "revalidate",
+                "evidence",
+                "cleanup",
+            ] {
+                assert_eq!(telemetry_json.matches(&format!("\"{field}\"")).count(), 1);
+            }
+            for marker in [
+                "provider",
+                "token",
+                "credential",
+                "authorization",
+                "body",
+                "environment",
+                "path",
+                "http://",
+                "https://",
+            ] {
+                assert!(
+                    !json.to_ascii_lowercase().contains(marker),
+                    "report leaked forbidden marker {marker:?}"
+                );
+            }
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_no_confirmation_diagnostic_retains_only_safe_stage_telemetry() {
+            let trace = D32HostCanaryTrace::default();
+            trace.stage_started(D32HostCanaryStage::ConfirmationBridge);
+            trace.stage_failed(
+                D32HostCanaryStage::ConfirmationBridge,
+                D32StageFailureCode::NotObserved,
+            );
+            let summary = d32_stage_telemetry_summary(&trace.snapshot());
+            assert!(summary.contains("confirmationBridge"));
+            assert!(summary.contains("not_observed"));
+            assert!(summary.contains("\"bridgeState\":\"idle\""));
+            for marker in [
+                "provider",
+                "token",
+                "credential",
+                "authorization",
+                "body",
+                "environment",
+                "http://",
+                "https://",
+            ] {
+                assert!(!summary.to_ascii_lowercase().contains(marker));
+            }
         }
 
         #[test]

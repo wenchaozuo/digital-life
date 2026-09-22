@@ -507,15 +507,22 @@ where
         // the connection cannot silently perform a fresh unchecked DNS lookup.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(VitaAgentError::ProviderTransportTimeout {
-                phase: "DNS resolution",
-            });
+            return Err(d32_wrap_transport_attempt(
+                path_kind,
+                1,
+                VitaAgentError::ProviderTransportTimeout {
+                    phase: "DNS resolution",
+                },
+            ));
         }
-        let mut addresses = self.dns.resolve_with_timeout(
+        let mut addresses = match self.dns.resolve_with_timeout(
             endpoint.host.as_str(),
             endpoint.port,
             min_duration(self.limits.dns_timeout, remaining),
-        )?;
+        ) {
+            Ok(addresses) => addresses,
+            Err(error) => return Err(d32_wrap_transport_attempt(path_kind, 1, error)),
+        };
         validate_resolved_addresses(endpoint, &addresses)?;
         addresses.sort_unstable();
         addresses.dedup();
@@ -534,9 +541,14 @@ where
         let attempts = retry_policy.max_retries + 1;
 
         for attempt in 0..attempts {
+            let attempt_number = attempt.saturating_add(1);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });
+                return Err(d32_wrap_transport_attempt(
+                    path_kind,
+                    attempt_number,
+                    VitaAgentError::ProviderTransportTimeout { phase: "request" },
+                ));
             }
             let request = OutboundRequest {
                 url: url.clone(),
@@ -559,11 +571,17 @@ where
             ) {
                 Ok(response) => response,
                 Err(HttpExecutionError::Retryable(_error)) if attempt + 1 < attempts => {
-                    wait_before_retry(retry_policy.backoff, deadline)?;
+                    if let Err(error) = wait_before_retry(retry_policy.backoff, deadline) {
+                        return Err(d32_wrap_transport_attempt(path_kind, attempt_number, error));
+                    }
                     continue;
                 }
-                Err(HttpExecutionError::Retryable(error)) => return Err(error),
-                Err(HttpExecutionError::Fatal(error)) => return Err(error),
+                Err(HttpExecutionError::Retryable(error)) => {
+                    return Err(d32_wrap_transport_attempt(path_kind, attempt_number, error));
+                }
+                Err(HttpExecutionError::Fatal(error)) => {
+                    return Err(d32_wrap_transport_attempt(path_kind, attempt_number, error));
+                }
             };
 
             #[cfg(test)]
@@ -579,9 +597,15 @@ where
             }
 
             if Instant::now() >= deadline {
-                return Err(VitaAgentError::ProviderTransportTimeout { phase: "request" });
+                return Err(d32_wrap_transport_attempt(
+                    path_kind,
+                    attempt_number,
+                    VitaAgentError::ProviderTransportTimeout { phase: "request" },
+                ));
             }
-            enforce_response_limits(&response, self.limits)?;
+            if let Err(error) = enforce_response_limits(&response, self.limits) {
+                return Err(d32_wrap_transport_attempt(path_kind, attempt_number, error));
+            }
             if (200..300).contains(&response.status) {
                 return Ok(ProviderTransportResponse {
                     status: response.status,
@@ -597,24 +621,51 @@ where
             // configured with Policy::none, so credentials cannot be forwarded
             // to another host.
             return if (300..400).contains(&response.status) {
-                Err(VitaAgentError::ProviderTransportRejected {
-                    reason: "provider redirects are disabled; explicit 3xx response rejected",
-                })
+                Err(d32_wrap_transport_attempt(
+                    path_kind,
+                    attempt_number,
+                    VitaAgentError::ProviderTransportRejected {
+                        reason: "provider redirects are disabled; explicit 3xx response rejected",
+                    },
+                ))
             } else {
-                Err(VitaAgentError::ProviderHttpStatus {
-                    status: response.status,
-                    detail: parse_provider_error_detail(
-                        response.status,
-                        &response.body,
-                        authorization,
-                    ),
-                })
+                Err(d32_wrap_transport_attempt(
+                    path_kind,
+                    attempt_number,
+                    VitaAgentError::ProviderHttpStatus {
+                        status: response.status,
+                        detail: parse_provider_error_detail(
+                            response.status,
+                            &response.body,
+                            authorization,
+                        ),
+                    },
+                ))
             };
         }
 
-        Err(VitaAgentError::ProviderTransportRejected {
-            reason: "provider transport retry loop terminated without a result",
-        })
+        Err(d32_wrap_transport_attempt(
+            path_kind,
+            attempts,
+            VitaAgentError::ProviderTransportRejected {
+                reason: "provider transport retry loop terminated without a result",
+            },
+        ))
+    }
+}
+
+fn d32_wrap_transport_attempt(
+    path_kind: ProviderRequestPath,
+    attempts: u8,
+    error: VitaAgentError,
+) -> VitaAgentError {
+    if path_kind == ProviderRequestPath::Responses {
+        VitaAgentError::ProviderTransportAttempted {
+            attempts: attempts.clamp(1, MAX_RETRY_COUNT.saturating_add(1)),
+            source: Box::new(error),
+        }
+    } else {
+        error
     }
 }
 
@@ -1603,12 +1654,84 @@ mod tests {
             )
             .expect("typed Responses request should use the production guard path");
         assert_eq!(response.status, 200);
+        assert_eq!(response.attempts, 1);
         assert_eq!(response.content_type.as_deref(), Some("application/json"));
         assert_eq!(response.body, br#"{"status":"completed"}"#);
         let observations = observations.observations();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].path, "/v1/responses");
         assert!(observations[0].authorization_present);
+    }
+
+    #[test]
+    fn typed_responses_http_status_keeps_transport_owned_attempt_count() {
+        let http = TestHttp::with_responses([response(429, br#"{"error":"redacted"}"#)]);
+        let observations = http.clone();
+        let transport = transport(
+            TestDns::answers(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))]),
+            http,
+        );
+        let error = transport
+            .post_json_to_path(
+                &endpoint(),
+                ProviderRequestPath::Responses,
+                None,
+                br#"{"stream":false}"#,
+                Duration::from_secs(1),
+                ProviderRetryPolicy::default(),
+            )
+            .expect_err("typed HTTP status should fail closed");
+        match error {
+            VitaAgentError::ProviderTransportAttempted { attempts, source } => {
+                assert_eq!(attempts, 1);
+                assert!(matches!(
+                    *source,
+                    VitaAgentError::ProviderHttpStatus { status: 429, .. }
+                ));
+            }
+            other => panic!("expected bounded typed transport error, got {other:?}"),
+        }
+        assert_eq!(observations.observations().len(), 1);
+    }
+
+    #[test]
+    fn typed_responses_retryable_transport_keeps_all_bounded_attempts() {
+        let retryable = || {
+            Err(HttpExecutionError::Retryable(
+                VitaAgentError::ProviderTransportRejected {
+                    reason: "test retry",
+                },
+            ))
+        };
+        let http = TestHttp::with_responses([retryable(), retryable(), retryable()]);
+        let observations = http.clone();
+        let transport = transport(
+            TestDns::answers(vec![SocketAddr::from((PUBLIC_IP, TEST_PORT))]),
+            http,
+        );
+        let error = transport
+            .post_json_to_path(
+                &endpoint(),
+                ProviderRequestPath::Responses,
+                None,
+                br#"{"stream":false}"#,
+                Duration::from_secs(1),
+                ProviderRetryPolicy::new(2, Duration::ZERO),
+            )
+            .expect_err("retry exhaustion should fail closed");
+        match error {
+            VitaAgentError::ProviderTransportAttempted { attempts, source } => {
+                assert_eq!(attempts, 3);
+                assert!(matches!(
+                    *source,
+                    VitaAgentError::ProviderTransportRejected {
+                        reason: "test retry"
+                    }
+                ));
+            }
+            other => panic!("expected bounded retry error, got {other:?}"),
+        }
+        assert_eq!(observations.observations().len(), 3);
     }
 
     #[test]

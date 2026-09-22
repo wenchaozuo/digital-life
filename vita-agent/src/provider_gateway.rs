@@ -1409,13 +1409,11 @@ where
                 self.ready.profile.retry_policy,
             )
             .map_err(|error| {
-                let http_status = match &error {
-                    VitaAgentError::ProviderHttpStatus { status, .. } => Some(*status),
-                    _ => None,
-                };
+                let http_status = d32_native_http_status(&error);
+                let attempts = d32_native_transport_attempts(&error).or(Some(1));
                 d32_native_failure(
                     phase,
-                    Some(1),
+                    attempts,
                     http_status,
                     d32_native_error_code(&error),
                     D32NativeOutputKind::None,
@@ -1438,7 +1436,7 @@ where
         if !content_type_is_json {
             return Err(d32_native_failure(
                 phase,
-                Some(1),
+                Some(response.attempts),
                 Some(status),
                 D32NativeErrorCode::ContentType,
                 D32NativeOutputKind::Unknown,
@@ -1622,6 +1620,7 @@ fn d32_native_request_is_cargo_round(request: &VitaResponsesRequest) -> bool {
 
 fn d32_native_error_code(error: &VitaAgentError) -> D32NativeErrorCode {
     match error {
+        VitaAgentError::ProviderTransportAttempted { source, .. } => d32_native_error_code(source),
         // The detail is intentionally ignored at this boundary.  It remains
         // available to the transport's internal status classifier, but none
         // of its provider-controlled fields may enter the D32 string.
@@ -1649,6 +1648,21 @@ fn d32_native_error_code(error: &VitaAgentError) -> D32NativeErrorCode {
         VitaAgentError::CredentialResolution(_) => D32NativeErrorCode::Credential,
         VitaAgentError::GatewayProtocol(_) => D32NativeErrorCode::RequestInvalid,
         _ => D32NativeErrorCode::Transport,
+    }
+}
+
+fn d32_native_transport_attempts(error: &VitaAgentError) -> Option<u8> {
+    match error {
+        VitaAgentError::ProviderTransportAttempted { attempts, .. } => Some(*attempts),
+        _ => None,
+    }
+}
+
+fn d32_native_http_status(error: &VitaAgentError) -> Option<u16> {
+    match error {
+        VitaAgentError::ProviderHttpStatus { status, .. } => Some(*status),
+        VitaAgentError::ProviderTransportAttempted { source, .. } => d32_native_http_status(source),
+        _ => None,
     }
 }
 
@@ -3996,6 +4010,87 @@ mod tests {
             assert!(diagnostic.contains("attempts=1"));
             assert!(!diagnostic.contains("provider secret"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_transport_wrapper_preserves_attempts_and_status_safely() {
+        let provider_code = "provider-code https://evil.example/error?token=provider-token";
+        let provider_message = "Authorization: Bearer provider-message-token";
+        let detail = crate::ProviderErrorDetail::from_parts(
+            429,
+            Some(provider_code),
+            Some("provider-type"),
+            Some("provider-param"),
+            Some(provider_message),
+            None,
+        );
+        let transport = Arc::new(D32NativeTestTransport::with_error(
+            VitaAgentError::ProviderTransportAttempted {
+                attempts: 2,
+                source: Box::new(VitaAgentError::ProviderHttpStatus {
+                    status: 429,
+                    detail: Some(detail),
+                }),
+            },
+        ));
+        let (ready, credential) = d32_native_profile();
+        let gateway = ProviderGateway::new_with_d32_native(
+            ready,
+            InMemoryTestCredential {
+                reference: credential,
+                value: "native-test-credential".to_string(),
+            },
+            Arc::clone(&transport),
+            true,
+        );
+        let diagnostic = gateway
+            .execute_responses_request(&d32_native_first_request())
+            .expect_err("wrapped HTTP status must fail closed")
+            .to_string();
+        assert!(diagnostic.contains("attempts=2"));
+        assert!(diagnostic.contains("http_status=429"));
+        assert!(diagnostic.contains("error_code=http_status"));
+        for marker in [
+            provider_code,
+            provider_message,
+            "evil.example",
+            "Bearer",
+            "provider-token",
+        ] {
+            assert!(!diagnostic.contains(marker), "diagnostic leaked {marker:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_non_json_response_preserves_transport_attempt_count() {
+        let transport = Arc::new(D32NativeTestTransport::new(vec![
+            ProviderTransportResponse {
+                status: 200,
+                attempts: 3,
+                content_type: Some("text/event-stream".to_string()),
+                body: b"provider body must not escape".to_vec(),
+            },
+        ]));
+        let (ready, credential) = d32_native_profile();
+        let gateway = ProviderGateway::new_with_d32_native(
+            ready,
+            InMemoryTestCredential {
+                reference: credential,
+                value: "native-test-credential".to_string(),
+            },
+            Arc::clone(&transport),
+            true,
+        );
+        let diagnostic = gateway
+            .execute_responses_request(&d32_native_first_request())
+            .expect_err("non-JSON response must fail closed")
+            .to_string();
+        assert!(diagnostic.contains("phase=response_headers"));
+        assert!(diagnostic.contains("attempts=3"));
+        assert!(diagnostic.contains("http_status=200"));
+        assert!(!diagnostic.contains("provider body"));
     }
 
     #[test]

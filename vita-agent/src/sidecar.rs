@@ -118,7 +118,7 @@ enum D32ForcedToolPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct D32TurnCounters {
     gateway_requests: u8,
     provider_results: u8,
@@ -147,7 +147,12 @@ impl D32TurnCounters {
 struct D32ForcedToolLatch {
     phase: Mutex<D32ForcedToolPhase>,
     counters: Mutex<D32TurnCounters>,
-    last_failure: Mutex<Option<String>>,
+    last_failure: Mutex<Option<D32FailureRecord>>,
+}
+
+struct D32FailureRecord {
+    message: String,
+    specificity: u8,
 }
 
 impl D32ForcedToolLatch {
@@ -178,6 +183,31 @@ impl D32ForcedToolLatch {
         }
     }
 
+    fn record_sse_write_failure(&self) {
+        self.fail();
+        let message = {
+            let mut counters = self
+                .counters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            counters.sse_created = counters.sse_created.saturating_add(1);
+            counters.sse_failed = counters.sse_failed.saturating_add(1);
+            format_d32_safe_failure("D32 gateway SSE write failed", *counters)
+        };
+        let specificity = d32_failure_specificity(&message);
+        if let Ok(mut last_failure) = self.last_failure.lock() {
+            if last_failure
+                .as_ref()
+                .is_none_or(|record| specificity >= record.specificity)
+            {
+                *last_failure = Some(D32FailureRecord {
+                    message,
+                    specificity,
+                });
+            }
+        }
+    }
+
     fn safe_failure(&self, raw: &str) -> String {
         self.fail();
         let message = {
@@ -189,24 +219,45 @@ impl D32ForcedToolLatch {
             counters.sse_failed = counters.sse_failed.saturating_add(1);
             format_d32_safe_failure(raw, *counters)
         };
+        let specificity = d32_failure_specificity(&message);
         if let Ok(mut last_failure) = self.last_failure.lock() {
-            *last_failure = Some(message.clone());
+            if last_failure
+                .as_ref()
+                .is_none_or(|record| specificity >= record.specificity)
+            {
+                *last_failure = Some(D32FailureRecord {
+                    message: message.clone(),
+                    specificity,
+                });
+            }
         }
         message
     }
 
     fn safe_turn_failure(&self, raw: &str) -> String {
+        let candidate = {
+            let counters = self
+                .counters
+                .lock()
+                .map(|counters| *counters)
+                .unwrap_or_default();
+            format_d32_safe_failure(raw, counters)
+        };
+        let candidate_specificity = d32_failure_specificity(&candidate);
         if let Ok(last_failure) = self.last_failure.lock() {
-            if let Some(message) = last_failure.as_ref() {
-                return message.clone();
+            if let Some(record) = last_failure.as_ref() {
+                if record.specificity > candidate_specificity {
+                    return record.message.clone();
+                }
             }
         }
-        let counters = self
-            .counters
-            .lock()
-            .map(|counters| *counters)
-            .unwrap_or_default();
-        format_d32_safe_failure(raw, counters)
+        if let Ok(mut last_failure) = self.last_failure.lock() {
+            *last_failure = Some(D32FailureRecord {
+                message: candidate.clone(),
+                specificity: candidate_specificity,
+            });
+        }
+        candidate
     }
 
     #[cfg(test)]
@@ -402,6 +453,27 @@ fn d32_bounded_counter(value: Option<&str>) -> String {
     value
         .and_then(|value| value.parse::<u8>().ok())
         .map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn d32_failure_specificity(value: &str) -> u8 {
+    let phase = value
+        .split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("phase="));
+    match phase {
+        Some("policy_gate") => 100,
+        Some("second_round_request") => 95,
+        Some("finish_reason") => 90,
+        Some("expected_tool") => 85,
+        Some("response_model") => 80,
+        Some("response_json") => 75,
+        Some("response_headers") => 70,
+        Some("http_status") => 65,
+        Some("connect") | Some("dns") | Some("transport") => 60,
+        Some("credential_resolution") => 55,
+        Some("request_contract") => 50,
+        Some("turn_terminal") => 10,
+        _ => 0,
+    }
 }
 
 fn format_d32_safe_failure(raw: &str, counters: D32TurnCounters) -> String {
@@ -1544,7 +1616,15 @@ fn handle_gateway_connection(
         return write_gateway_error(&mut stream, "409 Conflict", "TURN_NOT_ACTIVE");
     }
     if let Some(latch) = gateway.d32_forced_tool.as_ref() {
-        latch.record_success();
+        // A response is counted as created/completed only after the full SSE
+        // write succeeds.  Partial/failed writes remain failed diagnostics.
+        let result = write_gateway_success(&mut stream, &result);
+        if result.is_ok() {
+            latch.record_success();
+        } else {
+            latch.record_sse_write_failure();
+        }
+        return result;
     }
     write_gateway_success(&mut stream, &result)
 }
@@ -4958,6 +5038,46 @@ mod tests {
     }
 
     #[test]
+    fn d32_sse_write_failure_is_failed_and_never_completed() {
+        let latch = D32ForcedToolLatch::new();
+        latch.record_sse_write_failure();
+        let counters = latch.counters();
+        assert_eq!(counters.sse_created, 1);
+        assert_eq!(counters.sse_failed, 1);
+        assert_eq!(counters.sse_completed, 0);
+        let diagnostic = latch.safe_turn_failure("turn terminal after SSE write failure");
+        assert!(diagnostic.contains("sse_created=1"));
+        assert!(diagnostic.contains("sse_failed=1"));
+        assert!(diagnostic.contains("sse_completed=0"));
+        for marker in [
+            "provider-token",
+            "Authorization",
+            "Bearer",
+            "message=",
+            "body=",
+        ] {
+            assert!(!diagnostic.contains(marker), "diagnostic leaked {marker:?}");
+        }
+    }
+
+    #[test]
+    fn d32_same_turn_terminal_failure_prefers_specific_final_phase() {
+        let latch = D32ForcedToolLatch::new();
+        let early = latch.safe_failure(
+            "provider gateway protocol error: D32 native Responses rejected phase=expected_tool round=initial_request attempts=1 http_status=200 error_code=expected_tool output_kind=function_call content_type_is_json=true",
+        );
+        assert!(early.contains("phase=expected_tool"));
+        let final_failure = latch.safe_turn_failure(
+            "provider gateway protocol error: D32 native Responses rejected phase=finish_reason round=final_request attempts=2 http_status=200 error_code=finish_reason output_kind=message content_type_is_json=true",
+        );
+        assert!(final_failure.contains("phase=finish_reason"));
+        assert!(!final_failure.contains("phase=expected_tool"));
+
+        let generic = latch.safe_turn_failure("generic turn terminal failure");
+        assert!(generic.contains("phase=finish_reason"));
+    }
+
+    #[test]
     fn gateway_generation_rejects_old_turn_token_after_new_turn_activation() {
         let authority = GatewayAuthority::new();
         let identity_a = ProviderRequestIdentity {
@@ -4982,6 +5102,40 @@ mod tests {
         assert!(authority.is_current(&generation_b));
         assert!(authority.authorize(generation_b.token.as_str()).is_some());
         assert_eq!(generation_b.identity, identity_b);
+    }
+
+    #[test]
+    fn d32_generation_reset_starts_a_fresh_bounded_latch() {
+        let authority = GatewayAuthority::new_with_d32_forced_tool(true);
+        let generation_a = authority
+            .activate(ProviderRequestIdentity {
+                turn_id: "turn-a".to_string(),
+                binding_hash: "binding-a".to_string(),
+            })
+            .expect("turn A generation");
+        let latch_a = generation_a
+            .d32_forced_tool
+            .as_ref()
+            .expect("turn A D32 latch");
+        latch_a.record_gateway_request();
+        latch_a.safe_failure(
+            "provider gateway protocol error: D32 native Responses rejected phase=http_status round=initial_request attempts=1 http_status=400 error_code=http_status output_kind=unknown content_type_is_json=true",
+        );
+        assert_eq!(latch_a.counters().gateway_requests, 1);
+        assert!(authority.deactivate_generation(&generation_a));
+
+        let generation_b = authority
+            .activate(ProviderRequestIdentity {
+                turn_id: "turn-b".to_string(),
+                binding_hash: "binding-b".to_string(),
+            })
+            .expect("turn B generation");
+        let latch_b = generation_b
+            .d32_forced_tool
+            .as_ref()
+            .expect("turn B D32 latch");
+        assert_eq!(latch_b.counters(), D32TurnCounters::default());
+        assert_eq!(latch_b.phase(), D32ForcedToolPhase::InitialRequest);
     }
 
     #[test]

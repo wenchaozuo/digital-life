@@ -379,14 +379,21 @@ fn cleanup_d32_canary_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), String
 
 #[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
 pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, String> {
+    let failure_reporter = vita_sidecar::D32HostFailureReporter::new(mode);
     let mut context = tauri::generate_context!();
     #[cfg(all(windows, feature = "d32-a-host-canary"))]
     prepare_d32_a_host_config(context.config_mut());
     #[cfg(all(windows, feature = "d32-a-host-canary"))]
     debug_assert!(context.config().app.windows.is_empty());
     let mut environment =
-        vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier)
-            .map_err(|error| d32_outerize_error(&error, "environment_prepare_failed"))?;
+        match vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier) {
+            Ok(environment) => environment,
+            Err(error) => {
+                failure_reporter.record_failure(&error);
+                failure_reporter.write_failure_report();
+                return Err(d32_outerize_error(&error, "environment_prepare_failed"));
+            }
+        };
     let result = (|| {
         // Complete every real-root read and the isolated provider preflight
         // before publishing the stable baseline.  SQLite's read-only online
@@ -413,7 +420,8 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         #[allow(deprecated)]
         app.run_iteration(|_, _| {});
 
-        let canary_result = vita_sidecar::run_d32_a_host_integration(&mut app, mode);
+        let canary_result =
+            vita_sidecar::run_d32_a_host_integration(&mut app, mode, Arc::clone(&failure_reporter));
         let primary_storage = app.handle().state::<storage::StorageService>();
         let coordinator = app.handle().state::<vita_sidecar::VitaSidecarCoordinator>();
         let primary_storage_cleanup = primary_storage.inner().d32_a_close_for_canary();
@@ -422,6 +430,20 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         drop(primary_storage);
         let app_cleanup = cleanup_d32_canary_app(&mut app);
         drop(app);
+        let primary_storage_ok = primary_storage_cleanup.is_ok();
+        let authority_storage_ok = authority_storage_cleanup.is_ok();
+        let app_ok = app_cleanup.is_ok();
+        if let Err(error) = canary_result.as_ref() {
+            failure_reporter.record_failure(error);
+        }
+        failure_reporter.record_outer_cleanup(
+            Some(primary_storage_ok),
+            Some(authority_storage_ok),
+            Some(app_ok),
+            true,
+            true,
+            false,
+        );
         let report = match (
             canary_result,
             primary_storage_cleanup,
@@ -462,6 +484,18 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
     if result.is_ok() && audit.is_ok() && cleanup.is_ok() {
         return result;
     }
+    if let Err(error) = result.as_ref() {
+        failure_reporter.record_failure(error);
+    }
+    failure_reporter.record_outer_cleanup(
+        None,
+        None,
+        None,
+        audit.is_ok(),
+        cleanup.is_ok(),
+        cleanup.is_err(),
+    );
+    failure_reporter.write_failure_report();
     let result_not_executable = result
         .as_ref()
         .err()

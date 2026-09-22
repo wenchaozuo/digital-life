@@ -372,6 +372,14 @@ pub(crate) struct D32StageTelemetrySnapshot {
     pub bridge_cancelled: u8,
     pub bridge_timed_out: u8,
     pub bridge_failed: u8,
+    #[serde(skip_serializing)]
+    pub primary_failure_stage: Option<String>,
+    #[serde(skip_serializing)]
+    pub primary_failure_code: Option<String>,
+    #[serde(skip_serializing)]
+    pub secondary_failure_stage: Option<String>,
+    #[serde(skip_serializing)]
+    pub secondary_failure_code: Option<String>,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -400,6 +408,10 @@ impl Default for D32StageTelemetrySnapshot {
             bridge_cancelled: 0,
             bridge_timed_out: 0,
             bridge_failed: 0,
+            primary_failure_stage: None,
+            primary_failure_code: None,
+            secondary_failure_stage: None,
+            secondary_failure_code: None,
         }
     }
 }
@@ -450,6 +462,7 @@ impl D32StageTelemetrySnapshot {
             Self::increment(&mut counters.failed);
         }
         counters.last_failure_code = Some(code.as_str().to_string());
+        self.record_failure(stage, code);
     }
 
     fn mark_failed_at_least(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
@@ -463,6 +476,22 @@ impl D32StageTelemetrySnapshot {
             .min(counters.started)
             .min(D32_STAGE_COUNTER_MAX);
         counters.last_failure_code = Some(code.as_str().to_string());
+        self.record_failure(stage, code);
+    }
+
+    fn record_failure(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
+        let stage = stage.as_str().to_string();
+        let code = code.as_str().to_string();
+        if self.primary_failure_stage.is_none() {
+            self.primary_failure_stage = Some(stage);
+            self.primary_failure_code = Some(code);
+        } else if self.secondary_failure_stage.is_none()
+            && (self.primary_failure_stage.as_deref() != Some(stage.as_str())
+                || self.primary_failure_code.as_deref() != Some(code.as_str()))
+        {
+            self.secondary_failure_stage = Some(stage);
+            self.secondary_failure_code = Some(code);
+        }
     }
 
     fn mark_denied_at_least(&mut self, stage: D32HostCanaryStage) {
@@ -497,14 +526,17 @@ impl D32StageTelemetrySnapshot {
         self.merge_vita_stage_trace(&diagnostic.stage_trace);
         let mut marked = false;
         if let (Some(stage), Some(code)) = (diagnostic.primary_stage, diagnostic.primary_code) {
+            self.record_failure(stage, code);
             self.mark_vita_failure_event(stage, code);
             marked = true;
         }
         if let (Some(stage), Some(code)) = (diagnostic.secondary_stage, diagnostic.secondary_code) {
+            self.record_failure(stage, code);
             self.mark_vita_failure_event(stage, code);
             marked = true;
         }
         if !marked {
+            self.record_failure(diagnostic.stage, diagnostic.code);
             self.mark_vita_failure_event(diagnostic.stage, diagnostic.code);
         }
         self.merge_vita_bridge(
@@ -703,15 +735,25 @@ fn d32_observe_cancel_worker(
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
-fn d32_fail_closed_with_cancel_worker(_worker: JoinHandle<()>) -> ! {
+fn d32_fail_closed_with_cancel_worker(
+    _worker: JoinHandle<()>,
+    reporter: &D32HostFailureReporter,
+) -> ! {
     // A standard thread cannot be safely terminated from this Host process.
     // Do not drop its JoinHandle and detach it: the standalone D32 canary
     // process must terminate, after which the outer harness validates cleanup.
+    reporter.record_failure("D32_A_HOST_FAILURE: cancel coordinator worker join failed");
+    reporter.write_failure_report();
     std::process::exit(1)
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary", test))]
-fn d32_fail_closed_with_cancel_worker(_worker: JoinHandle<()>) -> ! {
+fn d32_fail_closed_with_cancel_worker(
+    _worker: JoinHandle<()>,
+    reporter: &D32HostFailureReporter,
+) -> ! {
+    reporter.record_failure("D32_A_HOST_FAILURE: cancel coordinator worker join failed");
+    reporter.write_failure_report();
     panic!("D32 cancel coordinator worker could not be observed");
 }
 
@@ -721,6 +763,8 @@ fn d32_fail_closed_with_cancel_worker(_worker: JoinHandle<()>) -> ! {
 pub(crate) struct D32HostCanaryTraceSnapshot {
     pub authority_evaluate: u64,
     pub confirmation_required: u64,
+    #[serde(skip_serializing)]
+    pub confirmation_observed: bool,
     pub issue_grant: u64,
     pub revalidate_grant: u64,
     pub grant_revalidated_allowed: u64,
@@ -815,6 +859,144 @@ fn d32_host_error_code(error: &str) -> &'static str {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_safe_mode(mode: &str) -> &'static str {
+    D32HostCanaryMode::parse(mode)
+        .map(|mode| mode.as_str())
+        .unwrap_or("unknown")
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_failure_report_code(error: &str) -> &'static str {
+    if error.starts_with("D32_A_NOT_EXECUTABLE:") {
+        "not_executable"
+    } else if error.contains("error_code=turn") || error.contains("error_code=provider") {
+        "turn_failed"
+    } else if error.contains("error_code=cleanup") {
+        "cleanup_failed"
+    } else if error.contains("report serialization") {
+        "report_serialization_failed"
+    } else if error.contains("production Host bootstrap") || error.contains("app_build_failed") {
+        "app_build_failed"
+    } else if error.contains("worker") {
+        "worker_failed"
+    } else if error.contains("audit") {
+        "real_host_audit_failed"
+    } else if error.contains("preflight") {
+        "provider_preflight_failed"
+    } else if error.contains("real_host_baseline") {
+        "real_host_baseline_failed"
+    } else if error.contains("environment_prepare") {
+        "environment_prepare_failed"
+    } else if error.contains("evidence") {
+        "evidence_failed"
+    } else if error.contains("trace") {
+        "trace_failed"
+    } else if error.contains("report failed") {
+        "report_generation_failed"
+    } else if error.contains("environment") && error.contains("cleanup") {
+        "environment_cleanup_failed"
+    } else if error.contains("primary_storage") {
+        "primary_storage_cleanup_failed"
+    } else if error.contains("authority_storage") {
+        "authority_storage_cleanup_failed"
+    } else if error.contains("app_cleanup") || error.contains("window") {
+        "app_cleanup_failed"
+    } else if error.contains("clear") {
+        "clear_failed"
+    } else if error.contains("cleanup") {
+        "cleanup_failed"
+    } else if error.contains("turn") || error.contains("provider") {
+        "turn_failed"
+    } else {
+        "host_failure"
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_sanitize_failure_trace(mut trace: D32HostCanaryTraceSnapshot) -> D32HostCanaryTraceSnapshot {
+    trace.native_evidence_run_id = None;
+    trace.native_evidence_session_id = None;
+    trace.native_evidence_life_id = None;
+    trace.native_evidence_task_id = None;
+    trace.native_evidence_turn_id = None;
+    trace.native_evidence_tool_call_id = None;
+    trace.grant_denial_code = trace.grant_denial_code.and_then(|value| {
+        matches!(
+            value.as_str(),
+            "CAPABILITY_ROOT_DISABLED"
+                | "CAPABILITY_AUTHORIZATION_REQUIRED"
+                | "CAPABILITY_AUTHORIZATION_UNAVAILABLE"
+                | "CAPABILITY_AUTHORIZATION_GATE_UNAVAILABLE"
+                | "CAPABILITY_AUTHORIZATION_REVISION_MISMATCH"
+                | "STALE_AUTHORIZATION_REVISION"
+                | "BINDING_MISMATCH"
+                | "AUTHORITY_DENIED"
+                | "TURN_NOT_ACTIVE"
+                | "TURN_AUTHORITY_UNAVAILABLE"
+                | "CREDENTIAL_MISSING"
+                | "PROVIDER_PROFILE_CHANGED"
+                | "PROVIDER_BINDING_MISMATCH"
+                | "CODEX_TURN_MISMATCH"
+                | "LIFE_RESTART_REQUIRED"
+                | "LIFE_UNAVAILABLE"
+                | "D32_TEST_DENIED"
+        )
+        .then_some(value)
+    });
+    trace
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+const D32_FAILURE_REPORT_ENV: &str = "D32_A_FAILURE_REPORT_PATH";
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_failure_report_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os(D32_FAILURE_REPORT_ENV) {
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    Some(std::env::temp_dir().join(format!(
+        "digital-life-d32-a-host-failure-{}.json",
+        std::process::id()
+    )))
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_write_failure_report_atomic(
+    path: &std::path::Path,
+    report: &D32SafeFailureReport,
+) -> Result<(), ()> {
+    use std::io::Write;
+
+    let bytes = serde_json::to_vec(report).map_err(|_| ())?;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path.file_name().ok_or(())?.to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| ())?;
+    let write_result = (|| {
+        file.write_all(&bytes).map_err(|_| ())?;
+        file.flush().map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        // `rename` replaces an existing destination on Windows.  Publishing
+        // through a same-directory hard link is an atomic, create-only
+        // directory operation on the supported filesystems, so a stale
+        // report can never be overwritten.
+        std::fs::hard_link(&temporary, path).map_err(|_| ())?;
+        std::fs::remove_file(&temporary).map_err(|_| ())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 fn d32_failure_context(
     control: &D32HostCanaryControl,
     error: &str,
@@ -845,6 +1027,326 @@ pub(crate) struct D32HostCanaryReport {
     pub turn_error: Option<String>,
     pub native_diagnostic: Option<D32NativeSafeDiagnostic>,
     pub cleanup: D32CleanupOutcome,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct D32SafeFailureCause {
+    stage: Option<String>,
+    code: String,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct D32SafeCleanupOutcome {
+    attempted: bool,
+    validated: bool,
+    removed: bool,
+    unsafe_left: bool,
+    error_code: Option<String>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32SafeCleanupOutcome {
+    fn from_outcome(outcome: &D32CleanupOutcome) -> Self {
+        Self {
+            attempted: outcome.attempted,
+            validated: outcome.validated,
+            removed: outcome.removed,
+            unsafe_left: outcome.unsafe_left,
+            error_code: outcome
+                .error
+                .as_deref()
+                .map(d32_host_error_code)
+                .map(str::to_string),
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct D32SafeFailureCleanup {
+    canary: Option<D32SafeCleanupOutcome>,
+    environment_attempted: bool,
+    environment_ok: bool,
+    real_host_audit_attempted: bool,
+    real_host_audit_ok: bool,
+    primary_storage_attempted: bool,
+    primary_storage_ok: bool,
+    authority_storage_attempted: bool,
+    authority_storage_ok: bool,
+    app_attempted: bool,
+    app_ok: bool,
+    residue_present: bool,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct D32SafeFailureReport {
+    schema: &'static str,
+    mode: String,
+    status: &'static str,
+    code: String,
+    primary: D32SafeFailureCause,
+    secondary: Option<D32SafeFailureCause>,
+    trace: D32HostCanaryTraceSnapshot,
+    confirmation_observed: bool,
+    native_evidence_present: bool,
+    native_diagnostic: Option<D32NativeSafeDiagnostic>,
+    cleanup: D32SafeFailureCleanup,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug)]
+struct D32SafeFailureState {
+    mode: String,
+    primary: Option<D32SafeFailureCause>,
+    secondary: Option<D32SafeFailureCause>,
+    trace: D32HostCanaryTraceSnapshot,
+    native_evidence_present: bool,
+    cleanup: D32SafeFailureCleanup,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+pub(crate) struct D32HostFailureReporter {
+    state: Mutex<D32SafeFailureState>,
+    trace: Mutex<Option<Arc<D32HostCanaryTrace>>>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32HostFailureReporter {
+    pub(crate) fn new(mode: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(D32SafeFailureState {
+                mode: d32_safe_mode(mode).to_string(),
+                primary: None,
+                secondary: None,
+                trace: D32HostCanaryTraceSnapshot::default(),
+                native_evidence_present: false,
+                cleanup: D32SafeFailureCleanup::default(),
+            }),
+            trace: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn attach_trace(&self, trace: Arc<D32HostCanaryTrace>) {
+        if let Ok(mut slot) = self.trace.lock() {
+            *slot = Some(trace);
+        }
+    }
+
+    fn record_failure_code(&self, stage: Option<&str>, code: &'static str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let cause = D32SafeFailureCause {
+            stage: stage.map(str::to_string),
+            code: code.to_string(),
+        };
+        if state.primary.is_none() {
+            state.primary = Some(cause);
+        } else if state.secondary.is_none()
+            && state.primary.as_ref().is_some_and(|primary| {
+                primary.stage.as_deref() != cause.stage.as_deref() || primary.code != cause.code
+            })
+        {
+            state.secondary = Some(cause);
+        }
+    }
+
+    pub(crate) fn record_failure(&self, error: &str) {
+        self.record_failure_code(None, d32_failure_report_code(error));
+    }
+
+    pub(crate) fn record_canary_cleanup(&self, cleanup: &D32CleanupOutcome) {
+        if let Ok(mut state) = self.state.lock() {
+            let current = D32SafeCleanupOutcome::from_outcome(cleanup);
+            if let Some(previous) = state.cleanup.canary.as_mut() {
+                previous.attempted |= current.attempted;
+                previous.validated &= current.validated;
+                previous.removed &= current.removed;
+                previous.unsafe_left |= current.unsafe_left;
+                if previous.error_code.is_none() {
+                    previous.error_code = current.error_code;
+                }
+            } else {
+                state.cleanup.canary = Some(current);
+            }
+        }
+        if cleanup.error.is_some() || cleanup.unsafe_left {
+            self.record_failure_code(Some("cleanup"), d32_failure_report_code("cleanup"));
+        }
+    }
+
+    pub(crate) fn record_outer_cleanup(
+        &self,
+        primary_storage_ok: Option<bool>,
+        authority_storage_ok: Option<bool>,
+        app_ok: Option<bool>,
+        real_host_audit_ok: bool,
+        environment_ok: bool,
+        residue_present: bool,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.cleanup.environment_attempted {
+                state.cleanup.environment_ok &= environment_ok;
+            } else {
+                state.cleanup.environment_ok = environment_ok;
+            }
+            state.cleanup.environment_attempted = true;
+            if state.cleanup.real_host_audit_attempted {
+                state.cleanup.real_host_audit_ok &= real_host_audit_ok;
+            } else {
+                state.cleanup.real_host_audit_ok = real_host_audit_ok;
+            }
+            state.cleanup.real_host_audit_attempted = true;
+            if let Some(ok) = primary_storage_ok {
+                state.cleanup.primary_storage_attempted = true;
+                state.cleanup.primary_storage_ok = ok;
+            }
+            if let Some(ok) = authority_storage_ok {
+                state.cleanup.authority_storage_attempted = true;
+                state.cleanup.authority_storage_ok = ok;
+            }
+            if let Some(ok) = app_ok {
+                state.cleanup.app_attempted = true;
+                state.cleanup.app_ok = ok;
+            }
+            state.cleanup.residue_present |= residue_present;
+        }
+        if !real_host_audit_ok {
+            self.record_failure_code(None, "real_host_audit_failed");
+        }
+        if !environment_ok {
+            self.record_failure_code(Some("cleanup"), "environment_cleanup_failed");
+        }
+        if primary_storage_ok == Some(false) {
+            self.record_failure_code(Some("cleanup"), "primary_storage_cleanup_failed");
+        }
+        if authority_storage_ok == Some(false) {
+            self.record_failure_code(Some("cleanup"), "authority_storage_cleanup_failed");
+        }
+        if app_ok == Some(false) {
+            self.record_failure_code(Some("cleanup"), "app_cleanup_failed");
+        }
+    }
+
+    pub(crate) fn record_native_evidence(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.native_evidence_present = true;
+        }
+    }
+
+    fn snapshot(&self) -> D32SafeFailureReport {
+        let state = self
+            .state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| D32SafeFailureState {
+                mode: "unknown".to_string(),
+                primary: Some(D32SafeFailureCause {
+                    stage: None,
+                    code: "report_state_poisoned".to_string(),
+                }),
+                secondary: None,
+                trace: D32HostCanaryTraceSnapshot::default(),
+                native_evidence_present: false,
+                cleanup: D32SafeFailureCleanup::default(),
+            });
+        let trace = self
+            .trace
+            .lock()
+            .ok()
+            .and_then(|trace| trace.as_ref().map(|trace| trace.snapshot()))
+            .unwrap_or(state.trace);
+        let trace_primary = trace
+            .stage_telemetry
+            .primary_failure_stage
+            .clone()
+            .zip(trace.stage_telemetry.primary_failure_code.clone())
+            .map(|(stage, code)| D32SafeFailureCause {
+                stage: Some(stage),
+                code,
+            });
+        let trace_secondary = trace
+            .stage_telemetry
+            .secondary_failure_stage
+            .clone()
+            .zip(trace.stage_telemetry.secondary_failure_code.clone())
+            .map(|(stage, code)| D32SafeFailureCause {
+                stage: Some(stage),
+                code,
+            });
+        let primary = trace_primary.clone().or(state.primary.clone());
+        let secondary = trace_secondary.or_else(|| {
+            state
+                .secondary
+                .clone()
+                .or_else(|| trace_primary.as_ref().and_then(|_| state.primary.clone()))
+                .filter(|candidate| {
+                    primary.as_ref().is_none_or(|primary| {
+                        primary.stage != candidate.stage || primary.code != candidate.code
+                    })
+                })
+        });
+        let primary = primary.or_else(|| {
+            trace
+                .stage_telemetry
+                .primary_failure_stage
+                .clone()
+                .zip(trace.stage_telemetry.primary_failure_code.clone())
+                .map(|(stage, code)| D32SafeFailureCause {
+                    stage: Some(stage),
+                    code,
+                })
+        });
+        let primary = primary.unwrap_or(D32SafeFailureCause {
+            stage: None,
+            code: "host_failure".to_string(),
+        });
+        let native_evidence_present = state.native_evidence_present
+            || trace.native_evidence_run_id.is_some()
+            || trace.native_evidence_session_id.is_some()
+            || trace.native_evidence_life_id.is_some()
+            || trace.native_evidence_task_id.is_some()
+            || trace.native_evidence_turn_id.is_some()
+            || trace.native_evidence_tool_call_id.is_some();
+        let trace = d32_sanitize_failure_trace(trace);
+        D32SafeFailureReport {
+            schema: "d32-a-host-failure-v1",
+            mode: state.mode,
+            status: "FAILURE",
+            code: primary.code.clone(),
+            primary,
+            secondary,
+            confirmation_observed: trace.confirmation_observed,
+            native_diagnostic: trace.native_diagnostic.clone(),
+            native_evidence_present,
+            trace,
+            cleanup: state.cleanup,
+        }
+    }
+
+    pub(crate) fn write_failure_report(&self) -> bool {
+        let report = self.snapshot();
+        let result = d32_failure_report_path()
+            .and_then(|path| d32_write_failure_report_atomic(&path, &report).ok());
+        eprintln!(
+            "D32_A_HOST_FAILURE: failure_report code={} written={} location={}",
+            report.code,
+            result.is_some(),
+            if result.is_some() {
+                "configured_or_temp"
+            } else {
+                "unavailable"
+            },
+        );
+        result.is_some()
+    }
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -1508,8 +2010,13 @@ impl VitaSidecarCoordinator {
 pub(crate) fn run_d32_a_host_integration(
     app: &mut tauri::App<tauri::Wry>,
     mode: &str,
+    reporter: Arc<D32HostFailureReporter>,
 ) -> Result<D32HostCanaryReport, String> {
-    windows::run_d32_a_host_integration_impl(app, mode)
+    let result = windows::run_d32_a_host_integration_impl(app, mode, Arc::clone(&reporter));
+    if let Err(error) = result.as_ref() {
+        reporter.record_failure(error);
+    }
+    result
 }
 
 /// Perform the canary's provider gate before the production Tauri setup hook
@@ -13196,6 +13703,7 @@ mod windows {
         workspace: PathBuf,
         staged_sidecar: Option<PathBuf>,
         cleaned: bool,
+        reporter: Arc<D32HostFailureReporter>,
     }
 
     #[cfg(feature = "d32-a-host-canary")]
@@ -13299,12 +13807,16 @@ mod windows {
 
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     impl D32ProductionCanaryEnvironment {
-        fn prepare<R: Runtime>(app: &AppHandle<R>) -> Result<Self, String> {
+        fn prepare<R: Runtime>(
+            app: &AppHandle<R>,
+            reporter: Arc<D32HostFailureReporter>,
+        ) -> Result<Self, String> {
             let workspace = Self::create_workspace()?;
             let mut environment = Self {
                 workspace,
                 staged_sidecar: None,
                 cleaned: false,
+                reporter,
             };
             if let Err(error) = environment.stage_sidecar(app) {
                 return Err(error);
@@ -13524,6 +14036,7 @@ mod windows {
                 self.cleaned = true;
                 self.staged_sidecar = None;
             }
+            self.reporter.record_canary_cleanup(&outcome);
             outcome
         }
     }
@@ -13547,6 +14060,7 @@ mod windows {
     pub(super) fn run_d32_a_host_integration_impl(
         app: &mut tauri::App<tauri::Wry>,
         mode: &str,
+        reporter: Arc<D32HostFailureReporter>,
     ) -> Result<D32HostCanaryReport, String> {
         let mode = D32HostCanaryMode::parse(mode)?;
         let app_handle = app.handle().clone();
@@ -13567,10 +14081,12 @@ mod windows {
             .ok_or_else(|| d32_not_executable("current Life is unavailable"))?;
         d32_require_cargo_root(storage.inner(), &life.id)?;
 
-        let mut environment = D32ProductionCanaryEnvironment::prepare(&app_handle)?;
+        let mut environment =
+            D32ProductionCanaryEnvironment::prepare(&app_handle, Arc::clone(&reporter))?;
         let app_data_root = sidecar_app_data_root(&app_handle)?;
         let coordinator = app_handle.state::<VitaSidecarCoordinator>();
         let control = D32HostCanaryControl::new(mode);
+        reporter.attach_trace(Arc::clone(&control.trace));
         coordinator.configure_d32_host_canary(Arc::clone(&control))?;
         control.trace.stage_started(D32HostCanaryStage::Layout);
         control.trace.stage_passed(D32HostCanaryStage::Layout);
@@ -13645,6 +14161,9 @@ mod windows {
                 let status = coordinator.status()?;
                 if status.pending.is_some() {
                     confirmation_seen = true;
+                    control
+                        .trace
+                        .update(|trace| trace.confirmation_observed = true);
                     if !action_taken {
                         action_taken = true;
                         if let Some(pending) = status.pending.as_ref() {
@@ -13715,12 +14234,12 @@ mod windows {
             let completion = match control.wait_for_cancel_completion(D32_CANCEL_COMPLETION_TIMEOUT)
             {
                 Ok(completion) => completion,
-                Err(_) => d32_fail_closed_with_cancel_worker(worker),
+                Err(_) => d32_fail_closed_with_cancel_worker(worker, &reporter),
             };
             let joined = match d32_observe_cancel_worker(worker, D32_CANCEL_JOIN_TIMEOUT) {
                 D32CancelWorkerObservation::Joined(result) => result.map_err(str::to_string),
                 D32CancelWorkerObservation::Unobserved(worker) => {
-                    d32_fail_closed_with_cancel_worker(worker)
+                    d32_fail_closed_with_cancel_worker(worker, &reporter)
                 }
             };
             joined.and_then(|_| {
@@ -13763,6 +14282,7 @@ mod windows {
                         D32StageFailureCode::OperationFailed,
                     );
                 }
+                reporter.record_canary_cleanup(&cleanup);
                 return Err(d32_failure_context(&control, &error, Some(&cleanup), false));
             }
         };
@@ -13813,6 +14333,7 @@ mod windows {
                 {
                     Ok(evidence) => {
                         control.trace.stage_passed(D32HostCanaryStage::Evidence);
+                        reporter.record_native_evidence();
                         evidence
                     }
                     Err(error) => {
@@ -13857,6 +14378,7 @@ mod windows {
                 D32StageFailureCode::OperationFailed,
             );
         }
+        reporter.record_canary_cleanup(&cleanup);
         match (report_result, clear_result, cleanup.error.clone()) {
             (Ok(mut report), Ok(()), None) if cleanup.validated && cleanup.removed => {
                 report.trace = control.trace.snapshot();
@@ -14323,6 +14845,145 @@ mod windows {
 
         #[cfg(all(windows, feature = "d32-a-host-canary"))]
         #[test]
+        fn d32_failure_report_preserves_stage_root_and_redacts_outer_failures() {
+            let reporter = D32HostFailureReporter::new("positive");
+            let trace = Arc::new(D32HostCanaryTrace::default());
+            trace.stage_failed(D32HostCanaryStage::Catalog, D32StageFailureCode::Fixture);
+            trace.stage_failed(
+                D32HostCanaryStage::Cleanup,
+                D32StageFailureCode::OperationFailed,
+            );
+            trace.update(|trace| trace.grant_denial_code = Some("untrusted_code".to_string()));
+            reporter.attach_trace(Arc::clone(&trace));
+            reporter.record_failure(
+                "provider body Authorization: Bearer token at C:\\Users\\secret\\workspace",
+            );
+            reporter.record_canary_cleanup(&D32CleanupOutcome {
+                attempted: true,
+                validated: false,
+                removed: false,
+                unsafe_left: true,
+                error: Some("C:\\Users\\secret\\workspace\\token".to_string()),
+            });
+            reporter.record_outer_cleanup(Some(false), Some(true), Some(false), false, false, true);
+            let report = reporter.snapshot();
+            assert_eq!(report.primary.stage.as_deref(), Some("catalog"));
+            assert_eq!(report.primary.code, "fixture");
+            assert_eq!(
+                report
+                    .secondary
+                    .as_ref()
+                    .and_then(|cause| cause.stage.as_deref()),
+                Some("cleanup")
+            );
+            assert!(report.cleanup.residue_present);
+            assert!(report.trace.grant_denial_code.is_none());
+            let json = serde_json::to_string(&report).expect("safe D32 failure report JSON");
+            serde_json::from_str::<serde_json::Value>(&json).expect("valid failure report JSON");
+            for marker in [
+                "Users",
+                "secret",
+                "provider",
+                "token",
+                "credential",
+                "authorization",
+                "body",
+                "path",
+                "http://",
+                "https://",
+            ] {
+                assert!(
+                    !json
+                        .to_ascii_lowercase()
+                        .contains(&marker.to_ascii_lowercase()),
+                    "failure report leaked forbidden marker {marker:?}"
+                );
+            }
+
+            let primary_only = D32HostFailureReporter::new("positive");
+            let primary_only_trace = Arc::new(D32HostCanaryTrace::default());
+            primary_only_trace
+                .stage_failed(D32HostCanaryStage::Catalog, D32StageFailureCode::Fixture);
+            primary_only.attach_trace(primary_only_trace);
+            primary_only.record_failure("turn failed");
+            primary_only.record_canary_cleanup(&D32CleanupOutcome {
+                attempted: true,
+                validated: false,
+                removed: false,
+                unsafe_left: true,
+                error: Some("cleanup_failed".to_string()),
+            });
+            let primary_only_report = primary_only.snapshot();
+            assert_eq!(
+                primary_only_report.primary.stage.as_deref(),
+                Some("catalog")
+            );
+            assert_eq!(
+                primary_only_report
+                    .secondary
+                    .as_ref()
+                    .and_then(|cause| cause.stage.as_deref()),
+                Some("cleanup")
+            );
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_failure_report_writer_is_atomic_and_rejects_overwrite() {
+            let reporter = D32HostFailureReporter::new("positive");
+            reporter.record_failure("D32_A_HOST_FAILURE: report serialization failed");
+            let report = reporter.snapshot();
+            let directory = tempfile::tempdir().expect("D32 failure report directory");
+            let path = directory.path().join("failure.json");
+            d32_write_failure_report_atomic(&path, &report).expect("atomic report write");
+            let json = fs::read_to_string(&path).expect("written failure report");
+            serde_json::from_str::<serde_json::Value>(&json).expect("valid failure report JSON");
+            assert!(
+                d32_write_failure_report_atomic(&path, &report).is_err(),
+                "existing report must not be overwritten"
+            );
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .expect("report directory")
+                    .count(),
+                1
+            );
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_failure_report_outer_failure_matrix_is_static() {
+            for (error, expected) in [
+                ("D32_A_NOT_EXECUTABLE: C:\\secret\\token", "not_executable"),
+                ("D32_A_HOST_FAILURE: app_build_failed", "app_build_failed"),
+                (
+                    "D32_A_HOST_FAILURE: provider_preflight_failed",
+                    "provider_preflight_failed",
+                ),
+                (
+                    "D32_A_HOST_FAILURE: real_host_baseline_failed",
+                    "real_host_baseline_failed",
+                ),
+                (
+                    "D32_A_HOST_FAILURE: cancel coordinator worker panicked",
+                    "worker_failed",
+                ),
+                ("D32_A_HOST_FAILURE: cleanup_failed", "cleanup_failed"),
+                (
+                    "D32_A_HOST_FAILURE: canary report serialization failed at C:\\secret",
+                    "report_serialization_failed",
+                ),
+                (
+                    "D32_A_HOST_FAILURE: error_code=turn clear_failed=false d32_cleanup=attempted=true",
+                    "turn_failed",
+                ),
+            ] {
+                assert_eq!(d32_failure_report_code(error), expected);
+            }
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
         fn d32_no_confirmation_diagnostic_does_not_infer_vita_stages() {
             let trace = D32HostCanaryTrace::default();
             let summary = d32_stage_telemetry_summary(&trace.snapshot());
@@ -14428,6 +15089,14 @@ mod windows {
                 Some("operation_failed")
             );
             assert_eq!(snapshot.stage_telemetry.cleanup.failed, 1);
+            assert_eq!(
+                snapshot.stage_telemetry.primary_failure_stage.as_deref(),
+                Some("catalog")
+            );
+            assert_eq!(
+                snapshot.stage_telemetry.secondary_failure_stage.as_deref(),
+                Some("cleanup")
+            );
             assert_eq!(snapshot.stage_telemetry.layout.started, 1);
             assert_eq!(snapshot.stage_telemetry.layout.passed, 1);
             assert_eq!(snapshot.stage_telemetry.bridge_confirmed, 1);

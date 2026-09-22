@@ -239,6 +239,497 @@ function ConvertTo-D32CommandLine {
             }) -join ' ')
 }
 
+function Assert-D32CleanGitStatus {
+    param(
+        [AllowNull()][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    if (-not [String]::IsNullOrWhiteSpace($Status)) {
+        throw "WORKTREE_DIRTY: refusing fixture prebuild PASS for dirty repository $($Root): $Status"
+    }
+}
+
+function Ensure-D32NativeLauncher {
+    $type = ([System.Management.Automation.PSTypeName]'D32FixtureNativeProcessV2').Type
+    if ($null -ne $type) { return }
+
+    $savedLib = [Environment]::GetEnvironmentVariable('LIB', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('LIB', $null, 'Process')
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class D32NativeCleanupEvidenceV2
+{
+    public bool JobTerminateCallSucceeded { get; internal set; }
+    public int JobTerminateLastError { get; internal set; }
+    public bool ProcessWasAlreadySignaled { get; internal set; }
+    public bool ProcessWaitSignaled { get; internal set; }
+    public bool JobCloseSucceeded { get; internal set; }
+    public bool CleanupSucceeded { get; internal set; }
+    public bool AlreadyClosed { get; internal set; }
+    public string Detail { get; internal set; }
+}
+
+public sealed class D32FixtureNativeProcessV2 : IDisposable
+{
+    private const uint CreateSuspended = 0x00000004;
+    private const uint CreateNoWindow = 0x08000000;
+    private const uint CreateUnicodeEnvironment = 0x00000400;
+    private const uint StartfUseStdHandles = 0x00000100;
+    private const uint HandleFlagInherit = 0x00000001;
+    private const uint JobObjectExtendedLimitInformationClass = 9;
+    private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+    private const uint WaitObject0 = 0x00000000;
+    private const uint GenericRead = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint OpenExisting = 3;
+    private const uint FileAttributeNormal = 0x00000080;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        public int InheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StartupInfo
+    {
+        public int Cb;
+        public IntPtr Reserved;
+        public IntPtr Desktop;
+        public IntPtr Title;
+        public int X;
+        public int Y;
+        public int XSize;
+        public int YSize;
+        public int XCountChars;
+        public int YCountChars;
+        public int FillAttribute;
+        public uint Flags;
+        public short ShowWindow;
+        public short Reserved2;
+        public IntPtr Reserved2Pointer;
+        public IntPtr StandardInput;
+        public IntPtr StandardOutput;
+        public IntPtr StandardError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        public IntPtr Process;
+        public IntPtr Thread;
+        public uint ProcessId;
+        public uint ThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectExtendedLimitInformation
+    {
+        public JobObjectBasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr job,
+        uint jobObjectInformationClass,
+        ref JobObjectExtendedLimitInformation jobObjectInformation,
+        uint jobObjectInformationLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CreatePipe(
+        out IntPtr readPipe,
+        out IntPtr writePipe,
+        ref SecurityAttributes pipeAttributes,
+        uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        ref SecurityAttributes securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessW(
+        string applicationName,
+        StringBuilder commandLine,
+        IntPtr processAttributes,
+        IntPtr threadAttributes,
+        bool inheritHandles,
+        uint creationFlags,
+        IntPtr environment,
+        string currentDirectory,
+        ref StartupInfo startupInfo,
+        out ProcessInformation processInformation);
+
+    private IntPtr _job;
+    private IntPtr _process;
+    private IntPtr _thread;
+    private SafeFileHandle _stdoutHandle;
+    private SafeFileHandle _stderrHandle;
+    private FileStream _stdoutStream;
+    private FileStream _stderrStream;
+    private bool _disposed;
+
+    public int ProcessId { get; private set; }
+    public bool JobAssigned { get; private set; }
+    public string LaunchMode { get { return "CreateProcessW(CREATE_SUSPENDED)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"; } }
+
+    private D32FixtureNativeProcessV2(
+        IntPtr job,
+        IntPtr process,
+        IntPtr thread,
+        IntPtr stdoutRead,
+        IntPtr stderrRead,
+        uint processId)
+    {
+        _job = job;
+        _process = process;
+        _thread = thread;
+        _stdoutHandle = new SafeFileHandle(stdoutRead, true);
+        _stderrHandle = new SafeFileHandle(stderrRead, true);
+        ProcessId = checked((int)processId);
+        JobAssigned = true;
+    }
+
+    private static void ThrowLastError(string prefix)
+    {
+        int error = Marshal.GetLastWin32Error();
+        throw new Win32Exception(error, prefix + " (win32=" + error.ToString() + ")");
+    }
+
+    private static void CloseIfOpen(ref IntPtr handle)
+    {
+        if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+        {
+            CloseHandle(handle);
+            handle = IntPtr.Zero;
+        }
+    }
+
+    private static void ConfigureKillOnClose(IntPtr job)
+    {
+        JobObjectExtendedLimitInformation limits = new JobObjectExtendedLimitInformation();
+        limits.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+        if (!SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformationClass,
+            ref limits,
+            (uint)Marshal.SizeOf(typeof(JobObjectExtendedLimitInformation))))
+        {
+            ThrowLastError("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed");
+        }
+    }
+
+    public static D32FixtureNativeProcessV2 Start(
+        string filePath,
+        string commandLine,
+        string workingDirectory)
+    {
+        if (String.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("filePath");
+        if (String.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory");
+
+        IntPtr job = IntPtr.Zero;
+        IntPtr stdoutRead = IntPtr.Zero;
+        IntPtr stdoutWrite = IntPtr.Zero;
+        IntPtr stderrRead = IntPtr.Zero;
+        IntPtr stderrWrite = IntPtr.Zero;
+        IntPtr stdin = IntPtr.Zero;
+        ProcessInformation pi = new ProcessInformation();
+        bool transferred = false;
+
+        try
+        {
+            job = CreateJobObjectW(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) ThrowLastError("CreateJobObjectW failed");
+            ConfigureKillOnClose(job);
+
+            SecurityAttributes pipeAttributes = new SecurityAttributes();
+            pipeAttributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+            pipeAttributes.InheritHandle = 1;
+            if (!CreatePipe(out stdoutRead, out stdoutWrite, ref pipeAttributes, 0))
+                ThrowLastError("CreatePipe(stdout) failed");
+            if (!SetHandleInformation(stdoutRead, HandleFlagInherit, 0))
+                ThrowLastError("SetHandleInformation(stdout) failed");
+            if (!CreatePipe(out stderrRead, out stderrWrite, ref pipeAttributes, 0))
+                ThrowLastError("CreatePipe(stderr) failed");
+            if (!SetHandleInformation(stderrRead, HandleFlagInherit, 0))
+                ThrowLastError("SetHandleInformation(stderr) failed");
+
+            stdin = CreateFileW(
+                "NUL",
+                GenericRead,
+                FileShareRead | FileShareWrite,
+                ref pipeAttributes,
+                OpenExisting,
+                FileAttributeNormal,
+                IntPtr.Zero);
+            if (stdin == IntPtr.Zero || stdin == new IntPtr(-1))
+                ThrowLastError("CreateFileW(NUL) failed");
+
+            StartupInfo startup = new StartupInfo();
+            startup.Cb = Marshal.SizeOf(typeof(StartupInfo));
+            startup.Flags = StartfUseStdHandles;
+            startup.StandardInput = stdin;
+            startup.StandardOutput = stdoutWrite;
+            startup.StandardError = stderrWrite;
+            StringBuilder mutableCommandLine = new StringBuilder(commandLine ?? String.Empty);
+            if (!CreateProcessW(
+                filePath,
+                mutableCommandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                true,
+                CreateSuspended | CreateNoWindow | CreateUnicodeEnvironment,
+                IntPtr.Zero,
+                workingDirectory,
+                ref startup,
+                out pi))
+            {
+                ThrowLastError("CreateProcessW failed");
+            }
+
+            CloseIfOpen(ref stdoutWrite);
+            CloseIfOpen(ref stderrWrite);
+            CloseIfOpen(ref stdin);
+
+            if (!AssignProcessToJobObject(job, pi.Process))
+                ThrowLastError("AssignProcessToJobObject failed");
+
+            uint resumeResult = ResumeThread(pi.Thread);
+            if (resumeResult == UInt32.MaxValue)
+                ThrowLastError("ResumeThread failed");
+
+            D32FixtureNativeProcessV2 result = new D32FixtureNativeProcessV2(
+                job,
+                pi.Process,
+                pi.Thread,
+                stdoutRead,
+                stderrRead,
+                pi.ProcessId);
+            job = IntPtr.Zero;
+            pi.Process = IntPtr.Zero;
+            pi.Thread = IntPtr.Zero;
+            stdoutRead = IntPtr.Zero;
+            stderrRead = IntPtr.Zero;
+            transferred = true;
+            return result;
+        }
+        catch (Exception error)
+        {
+            string cleanup = "attempted";
+            try
+            {
+                if (pi.Process != IntPtr.Zero)
+                {
+                    if (job != IntPtr.Zero) TerminateJobObject(job, 1);
+                    TerminateProcess(pi.Process, 1);
+                    WaitForSingleObject(pi.Process, 5000);
+                }
+            }
+            catch (Exception cleanupError)
+            {
+                cleanup = "failed:" + cleanupError.Message;
+            }
+            throw new InvalidOperationException(
+                "D32_NATIVE_LAUNCH_FAILED: " + error.Message + "; native cleanup=" + cleanup,
+                error);
+        }
+        finally
+        {
+            if (!transferred)
+            {
+                CloseIfOpen(ref stdoutWrite);
+                CloseIfOpen(ref stderrWrite);
+                CloseIfOpen(ref stdin);
+                CloseIfOpen(ref stdoutRead);
+                CloseIfOpen(ref stderrRead);
+                CloseIfOpen(ref pi.Thread);
+                CloseIfOpen(ref pi.Process);
+                CloseIfOpen(ref job);
+            }
+        }
+    }
+
+    public bool HasExited
+    {
+        get { return WaitForSingleObject(_process, 0) == WaitObject0; }
+    }
+
+    public bool WaitForExit(int timeoutMilliseconds)
+    {
+        if (timeoutMilliseconds < 0) timeoutMilliseconds = 0;
+        return WaitForSingleObject(_process, (uint)timeoutMilliseconds) == WaitObject0;
+    }
+
+    public int ExitCode
+    {
+        get
+        {
+            uint code;
+            if (!GetExitCodeProcess(_process, out code)) ThrowLastError("GetExitCodeProcess failed");
+            return unchecked((int)code);
+        }
+    }
+
+    public Stream StdoutStream
+    {
+        get
+        {
+            if (_stdoutStream == null)
+                _stdoutStream = new FileStream(_stdoutHandle, FileAccess.Read, 4096, false);
+            return _stdoutStream;
+        }
+    }
+
+    public Stream StderrStream
+    {
+        get
+        {
+            if (_stderrStream == null)
+                _stderrStream = new FileStream(_stderrHandle, FileAccess.Read, 4096, false);
+            return _stderrStream;
+        }
+    }
+
+    public Stream OpenStdoutStream()
+    {
+        return StdoutStream;
+    }
+
+    public Stream OpenStderrStream()
+    {
+        return StderrStream;
+    }
+
+    public D32NativeCleanupEvidenceV2 CloseJobAndWait(int timeoutMilliseconds)
+    {
+        D32NativeCleanupEvidenceV2 evidence = new D32NativeCleanupEvidenceV2();
+        if (_job == IntPtr.Zero)
+        {
+            evidence.AlreadyClosed = true;
+            evidence.ProcessWaitSignaled = WaitForExit(timeoutMilliseconds);
+            evidence.CleanupSucceeded = evidence.ProcessWaitSignaled;
+            evidence.Detail = "job handle already closed";
+            return evidence;
+        }
+
+        evidence.ProcessWasAlreadySignaled = HasExited;
+        if (!evidence.ProcessWasAlreadySignaled)
+        {
+            evidence.JobTerminateCallSucceeded = TerminateJobObject(_job, 1);
+            if (!evidence.JobTerminateCallSucceeded)
+                evidence.JobTerminateLastError = Marshal.GetLastWin32Error();
+        }
+        else
+        {
+            evidence.JobTerminateCallSucceeded = true;
+        }
+        evidence.ProcessWaitSignaled = WaitForExit(timeoutMilliseconds);
+        evidence.JobCloseSucceeded = CloseHandle(_job);
+        _job = IntPtr.Zero;
+        evidence.CleanupSucceeded = evidence.JobCloseSucceeded && evidence.ProcessWaitSignaled;
+        evidence.Detail = evidence.CleanupSucceeded
+            ? "owned job closed and root process signaled"
+            : "owned job close or root process wait failed";
+        return evidence;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_job != IntPtr.Zero)
+        {
+            CloseHandle(_job);
+            _job = IntPtr.Zero;
+        }
+        if (_stdoutStream != null) _stdoutStream.Dispose();
+        if (_stderrStream != null) _stderrStream.Dispose();
+        if (_stdoutHandle != null) _stdoutHandle.Dispose();
+        if (_stderrHandle != null) _stderrHandle.Dispose();
+        CloseIfOpen(ref _thread);
+        CloseIfOpen(ref _process);
+    }
+}
+'@ -Language CSharp
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('LIB', $savedLib, 'Process')
+    }
+}
+
 function New-D32ProcessIdentityRecord {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -305,6 +796,22 @@ function ConvertTo-D32IdentityDocument {
         command_line      = $Record.CommandLine
         observed_at_utc   = $Record.ObservedAtUtc
         identity_verified = [bool]$Record.IdentityVerified
+    }
+}
+
+function ConvertTo-D32NativeCleanupDocument {
+    param([AllowNull()][object]$Evidence)
+
+    if ($null -eq $Evidence) { return $null }
+    return [ordered]@{
+        job_terminate_call_succeeded = [bool]$Evidence.JobTerminateCallSucceeded
+        job_terminate_last_error     = [int]$Evidence.JobTerminateLastError
+        process_was_already_signaled = [bool]$Evidence.ProcessWasAlreadySignaled
+        process_wait_signaled        = [bool]$Evidence.ProcessWaitSignaled
+        job_close_succeeded          = [bool]$Evidence.JobCloseSucceeded
+        cleanup_succeeded            = [bool]$Evidence.CleanupSucceeded
+        already_closed               = [bool]$Evidence.AlreadyClosed
+        detail                       = [string]$Evidence.Detail
     }
 }
 
@@ -405,11 +912,24 @@ function Test-D32CapturedProcessAlive {
 function Stop-D32ProcessTreeAndVerify {
     param(
         [Parameter(Mandatory = $true)][object]$RootRecord,
-        [AllowNull()][object[]]$CapturedDescendantRecords = @()
+        [AllowNull()][object[]]$CapturedDescendantRecords = @(),
+        [AllowNull()][object]$NativeProcess = $null
     )
 
     $records = @(Merge-D32ProcessIdentityRecords -Existing @($RootRecord) -Incoming $CapturedDescendantRecords)
     $killOutput = [System.Collections.Generic.List[string]]::new()
+    $nativeCleanup = $null
+    if ($null -ne $NativeProcess) {
+        try {
+            $nativeCleanup = $NativeProcess.CloseJobAndWait(10000)
+            if (-not [bool]$nativeCleanup.CleanupSucceeded) {
+                throw "native job close did not verify process termination: $($nativeCleanup.Detail)"
+            }
+        }
+        catch {
+            throw "PROCESS_GROUP_REAP_FAILED: $($_.Exception.Message)"
+        }
+    }
     $rootAlive = Test-D32CapturedProcessAlive -Record $RootRecord
     if ($rootAlive) {
         $killOutput.AddRange([string[]]@(& taskkill.exe /PID ([int]$RootRecord.ProcessId) /T /F 2>&1))
@@ -440,6 +960,7 @@ function Stop-D32ProcessTreeAndVerify {
                 CapturedRecords = @($records)
                 ResidualRecords = @()
                 KillOutput = @($killOutput)
+                NativeCleanup = $nativeCleanup
                 VerifiedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
             }
         }
@@ -469,6 +990,7 @@ function Stop-D32ProcessTreeAndVerify {
         CapturedRecords = @($records)
         ResidualRecords = @()
         KillOutput = @($killOutput)
+        NativeCleanup = $nativeCleanup
         VerifiedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     }
 }
@@ -542,63 +1064,67 @@ function Invoke-D32BoundedProcess {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$PhaseLog,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init')]
+        [string]$FailureInjection = 'none'
     )
 
+    Ensure-D32NativeLauncher
     $stdoutPath = "$PhaseLog.stdout.log"
     $stderrPath = "$PhaseLog.stderr.log"
     $started = [DateTimeOffset]::UtcNow
-    $commandLine = ConvertTo-D32CommandLine $Arguments
-    $process = $null
+    $commandLine = ConvertTo-D32CommandLine (@($FilePath) + $Arguments)
+    $nativeProcess = $null
+    $nativeCleanup = $null
     $processId = $null
     $rootIdentity = $null
     $capturedDescendantRecords = @()
     $residualDescendantRecords = @()
+    $stdoutTarget = $null
+    $stderrTarget = $null
     $stdoutStream = $null
     $stderrStream = $null
     $stdoutCopy = $null
     $stderrCopy = $null
+    $initError = $null
+    $treeError = $null
+    $timedOut = $false
+    $exitCode = $null
+    $reap = $null
+    $killOutput = [System.Collections.Generic.List[string]]::new()
     $script:D32LastProcessEvidence = [ordered]@{
         root_record = $null
         descendant_records = @()
+        native_launch = $null
+        native_cleanup = $null
         started_at_utc = $started.ToString('o')
     }
 
     try {
-        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $startInfo.FileName = $FilePath
-        $startInfo.Arguments = $commandLine
-        $startInfo.WorkingDirectory = $WorkingDirectory
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        $startInfo.RedirectStandardOutput = $true
-        $startInfo.RedirectStandardError = $true
-
-        $stdoutStream = [IO.File]::Open(
-            $stdoutPath,
-            [IO.FileMode]::Create,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::Read
-        )
-        $stderrStream = [IO.File]::Open(
-            $stderrPath,
-            [IO.FileMode]::Create,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::Read
-        )
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $startInfo
-        if (-not $process.Start()) {
-            throw "PROCESS_SPAWN_FAILED: process did not start: $FilePath"
+        $nativeProcess = [D32FixtureNativeProcessV2]::Start(
+            (Get-D32FullPath $FilePath),
+            $commandLine,
+            (Get-D32FullPath $WorkingDirectory))
+        $processId = [int]$nativeProcess.ProcessId
+        $script:D32LastProcessEvidence.native_launch = [ordered]@{
+            process_id = $processId
+            job_assigned = [bool]$nativeProcess.JobAssigned
+            launch_mode = [string]$nativeProcess.LaunchMode
         }
-        $processId = [int]$process.Id
+        if ($FailureInjection -eq 'spawn-init') {
+            throw 'SELFTEST_INJECTED_SPAWN_INIT_EXCEPTION'
+        }
+
         for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            if ($FailureInjection -eq 'cim-init') {
+                throw 'SELFTEST_INJECTED_CIM_INIT_EXCEPTION'
+            }
             $rootCandidates = @(Get-D32ProcessSnapshot -ProcessId $processId)
             if ($rootCandidates.Count -eq 1) {
                 $rootIdentity = $rootCandidates[0]
                 break
             }
-            if ($process.HasExited) { break }
+            if ($nativeProcess.HasExited) { break }
             Start-Sleep -Milliseconds 50
         }
         if ($null -eq $rootIdentity) {
@@ -607,165 +1133,168 @@ function Invoke-D32BoundedProcess {
                 -FilePath $FilePath `
                 -CommandLine $commandLine `
                 -ObservedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
+            if (-not $nativeProcess.HasExited) {
+                throw "PROCESS_IDENTITY_UNVERIFIED: root pid $processId remained alive without a complete CIM identity"
+            }
         }
         $script:D32LastProcessEvidence.root_record = $rootIdentity
-        $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
-        $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
+
+        $stdoutTarget = [IO.File]::Open(
+            $stdoutPath,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read)
+        $stderrTarget = [IO.File]::Open(
+            $stderrPath,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read)
+        $stdoutStream = $nativeProcess.OpenStdoutStream()
+        if ($FailureInjection -eq 'pipe-init') {
+            throw 'SELFTEST_INJECTED_PIPE_INIT_EXCEPTION'
+        }
+        $stderrStream = $nativeProcess.OpenStderrStream()
+        $stdoutCopy = $stdoutStream.CopyToAsync($stdoutTarget)
+        $stderrCopy = $stderrStream.CopyToAsync($stderrTarget)
     }
     catch {
-        $spawnError = $_.Exception.Message
-        $cleanupError = $null
-        if ($null -ne $process) {
-            try {
-                if ($null -eq $rootIdentity) {
-                    $rootCandidates = @(Get-D32ProcessSnapshot -ProcessId ([int]$process.Id))
-                    if ($rootCandidates.Count -eq 1) { $rootIdentity = $rootCandidates[0] }
-                }
-                if ($null -ne $rootIdentity -and (Test-D32CapturedProcessAlive -Record $rootIdentity)) {
-                    [void](& taskkill.exe /PID ([int]$process.Id) /T /F 2>&1)
-                }
-                elseif ($null -eq $rootIdentity -and -not $process.HasExited) {
-                    $cleanupError = "PROCESS_IDENTITY_UNVERIFIED: refusing to kill unknown process pid $($process.Id) after spawn/capture failure"
+        $initError = $_.Exception.Message
+   }
+
+   if ($null -ne $initError) {
+        try {
+            if ($null -ne $nativeProcess) {
+                $nativeCleanup = $nativeProcess.CloseJobAndWait(10000)
+                if (-not [bool]$nativeCleanup.CleanupSucceeded) {
+                    $treeError = "PROCESS_GROUP_REAP_FAILED: $($nativeCleanup.Detail)"
                 }
             }
-            catch {
-                $cleanupError = $_.Exception.Message
+        }
+        catch {
+            $treeError = "PROCESS_GROUP_REAP_FAILED: $($_.Exception.Message)"
+        }
+    }
+    else {
+        try {
+            $deadline = $started.AddSeconds($TimeoutSeconds)
+            while (-not $nativeProcess.HasExited) {
+                try {
+                    $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
+                        -Existing $capturedDescendantRecords `
+                        -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
+                    $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
+                }
+                catch {
+                    $treeError = $_.Exception.Message
+                    break
+                }
+                if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                    $timedOut = $true
+                    break
+                }
+                Start-Sleep -Milliseconds 250
             }
-            if ($null -ne $rootIdentity) { $script:D32LastProcessEvidence.root_record = $rootIdentity }
-            $process.Dispose()
-        }
-        if ($null -ne $stdoutStream) { $stdoutStream.Flush(); $stdoutStream.Close(); $stdoutStream.Dispose() }
-        if ($null -ne $stderrStream) { $stderrStream.Flush(); $stderrStream.Close(); $stderrStream.Dispose() }
-        return [ordered]@{
-            status = if ($null -ne $cleanupError) { 'process_tree_error' } else { 'spawn_failed' }
-            exit_code = $null
-            pid = $processId
-            elapsed_ms = ([DateTimeOffset]::UtcNow - $started).TotalMilliseconds
-            phase_log = (Get-D32FullPath $PhaseLog)
-            stdout_log = (Get-D32FullPath $stdoutPath)
-            stderr_log = (Get-D32FullPath $stderrPath)
-            root_identity = ConvertTo-D32IdentityDocument $rootIdentity
-            root_identity_record = $rootIdentity
-            captured_descendant_records = @()
-            descendant_pids = @()
-            captured_descendant_pids = @()
-            descendant_identities = @()
-            residual_descendant_identities = @()
-            reap = $null
-            error = if ($null -ne $cleanupError) { "$spawnError; $cleanupError" } else { $spawnError }
-        }
-    }
 
-    $deadline = $started.AddSeconds($TimeoutSeconds)
-    $timedOut = $false
-    $killOutput = [System.Collections.Generic.List[string]]::new()
-    $treeError = $null
-    $reap = $null
+            $graceSamples = if ($timedOut) { 1 } else { 4 }
+            for ($sample = 0; $sample -lt $graceSamples; $sample++) {
+                try {
+                    $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
+                        -Existing $capturedDescendantRecords `
+                        -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
+                    $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
+                }
+                catch {
+                    if ($null -eq $treeError) { $treeError = $_.Exception.Message }
+                    break
+                }
+                if ($sample -lt ($graceSamples - 1)) { Start-Sleep -Milliseconds 100 }
+            }
 
-    while (-not $process.HasExited) {
-        try {
-            $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
-                -Existing $capturedDescendantRecords `
-                -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
-            $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
+            if (-not $timedOut) {
+                if (-not $nativeProcess.WaitForExit(1000)) {
+                    if ($null -eq $treeError) {
+                        $treeError = "PROCESS_EXIT_WAIT_FAILED: root pid $processId did not signal after observed exit"
+                    }
+                }
+                else {
+                    $exitCode = [int]$nativeProcess.ExitCode
+                }
+            }
+
+            if ($timedOut -or $capturedDescendantRecords.Count -gt 0 -or $null -ne $treeError) {
+                try {
+                    $reap = Stop-D32ProcessTreeAndVerify `
+                        -RootRecord $rootIdentity `
+                        -CapturedDescendantRecords $capturedDescendantRecords `
+                        -NativeProcess $nativeProcess
+                    $nativeCleanup = $reap.NativeCleanup
+                    $killOutput.AddRange([string[]]@($reap.KillOutput))
+                    $residualDescendantRecords = @($reap.ResidualRecords | Where-Object { [int]$_.ProcessId -ne [int]$rootIdentity.ProcessId })
+                }
+                catch {
+                    if ($null -eq $treeError) { $treeError = $_.Exception.Message }
+                    else { $treeError = "$treeError; $($_.Exception.Message)" }
+                }
+            }
         }
         catch {
-            $treeError = $_.Exception.Message
-            break
-        }
-        if ([DateTimeOffset]::UtcNow -ge $deadline) {
-            $timedOut = $true
-            break
-        }
-        Start-Sleep -Milliseconds 250
-        $process.Refresh()
-    }
-
-    # A short post-exit grace captures descendants that were reparented while
-    # the root was exiting. Any identity captured in an earlier snapshot is
-    # retained and is later checked by PID/name/creation, even after reparent.
-    $graceSamples = if ($timedOut) { 1 } else { 4 }
-    for ($sample = 0; $sample -lt $graceSamples; $sample++) {
-        try {
-            $capturedDescendantRecords = @(Merge-D32ProcessIdentityRecords `
-                -Existing $capturedDescendantRecords `
-                -Incoming (Get-D32DescendantProcessRecords -RootPid $processId))
-            $script:D32LastProcessEvidence.descendant_records = $capturedDescendantRecords
-        }
-        catch {
-            if ($null -eq $treeError) { $treeError = $_.Exception.Message }
-            break
-        }
-        if ($sample -lt ($graceSamples - 1)) { Start-Sleep -Milliseconds 100 }
-    }
-
-    $exitCode = $null
-    if (-not $timedOut) {
-        # Wait on the retained native Process handle before reading ExitCode.
-        # Start-Process without -Wait can return a detached wrapper whose
-        # ExitCode reads as zero even when the child returned non-zero.
-        try {
-            [void]$process.WaitForExit()
-            $exitCode = [int]$process.ExitCode
-        }
-        catch {
-            if ($null -eq $treeError) { $treeError = "PROCESS_EXIT_CODE_UNAVAILABLE: pid $processId exited but its exit code could not be read: $($_.Exception.Message)" }
-        }
-    }
-
-    if ($timedOut -or $capturedDescendantRecords.Count -gt 0 -or $null -ne $treeError) {
-        try {
-            $reap = Stop-D32ProcessTreeAndVerify `
-                -RootRecord $rootIdentity `
-                -CapturedDescendantRecords $capturedDescendantRecords
-            $killOutput.AddRange([string[]]@($reap.KillOutput))
-            $residualDescendantRecords = @($reap.ResidualRecords | Where-Object { [int]$_.ProcessId -ne [int]$rootIdentity.ProcessId })
-        }
-        catch {
-            if ($null -eq $treeError) { $treeError = $_.Exception.Message }
-            else { $treeError = "$treeError; $($_.Exception.Message)" }
+            $treeError = if ($null -eq $treeError) { $_.Exception.Message } else { "$treeError; $($_.Exception.Message)" }
         }
     }
 
     try {
-        if ($null -eq $treeError) {
-            if ($null -ne $stdoutCopy) { $stdoutCopy.Wait() }
-            if ($null -ne $stderrCopy) { $stderrCopy.Wait() }
+        if ($null -ne $nativeProcess -and $null -eq $nativeCleanup) {
+            $nativeCleanup = $nativeProcess.CloseJobAndWait(10000)
         }
-        else {
-            # A failed tree/identity cleanup must remain bounded; do not wait
-            # forever on a pipe that may still be held by an unsafe descendant.
+        if ($null -ne $nativeCleanup -and -not [bool]$nativeCleanup.CleanupSucceeded -and $null -eq $treeError) {
+            $treeError = "PROCESS_GROUP_REAP_FAILED: $($nativeCleanup.Detail)"
+        }
+    }
+    catch {
+        if ($null -eq $treeError) { $treeError = "PROCESS_GROUP_REAP_FAILED: $($_.Exception.Message)" }
+        else { $treeError = "$treeError; PROCESS_GROUP_REAP_FAILED: $($_.Exception.Message)" }
+    }
+    finally {
+        try {
             if ($null -ne $stdoutCopy) { [void]$stdoutCopy.Wait(1000) }
             if ($null -ne $stderrCopy) { [void]$stderrCopy.Wait(1000) }
         }
-    }
-    finally {
-        if ($null -ne $process) {
-            $process.StandardOutput.Close()
-            $process.StandardError.Close()
+        catch {
+            if ($null -eq $treeError) { $treeError = "PIPE_DRAIN_FAILED: $($_.Exception.Message)" }
+            else { $treeError = "$treeError; PIPE_DRAIN_FAILED: $($_.Exception.Message)" }
         }
-        if ($null -ne $stdoutStream) { $stdoutStream.Flush(); $stdoutStream.Close(); $stdoutStream.Dispose() }
-        if ($null -ne $stderrStream) { $stderrStream.Flush(); $stderrStream.Close(); $stderrStream.Dispose() }
-        if ($null -ne $process) { $process.Dispose() }
+        foreach ($stream in @($stdoutStream, $stderrStream, $stdoutTarget, $stderrTarget)) {
+            if ($null -ne $stream) {
+                try { $stream.Dispose() } catch {
+                    if ($null -eq $treeError) { $treeError = "PIPE_CLOSE_FAILED: $($_.Exception.Message)" }
+                    else { $treeError = "$treeError; PIPE_CLOSE_FAILED: $($_.Exception.Message)" }
+                }
+            }
+        }
+        if ($null -ne $nativeProcess) {
+            try { $nativeProcess.Dispose() } catch {
+                if ($null -eq $treeError) { $treeError = "NATIVE_HANDLE_CLOSE_FAILED: $($_.Exception.Message)" }
+                else { $treeError = "$treeError; NATIVE_HANDLE_CLOSE_FAILED: $($_.Exception.Message)" }
+            }
+        }
     }
 
+    $script:D32LastProcessEvidence.native_cleanup = ConvertTo-D32NativeCleanupDocument $nativeCleanup
     $capturedDescendantPids = @($capturedDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
     $residualDescendantPids = @($residualDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
     if ($timedOut) {
         [IO.File]::AppendAllText(
             $stderrPath,
             "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($capturedDescendantPids -join ',')`n$($killOutput -join "`n")`n",
-            [Text.UTF8Encoding]::new($false)
-        )
+            [Text.UTF8Encoding]::new($false))
     }
     $finished = [DateTimeOffset]::UtcNow
     [IO.File]::AppendAllText(
         $stdoutPath,
         "`nD32_FIXTURE_EXIT_CODE=$exitCode`nD32_FIXTURE_DESCENDANTS=$($capturedDescendantPids -join ',')`n",
-        [Text.UTF8Encoding]::new($false)
-    )
+        [Text.UTF8Encoding]::new($false))
     return [ordered]@{
-        status = if ($null -ne $treeError) { 'process_tree_error' } elseif ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
+        status = if ($null -ne $treeError) { 'process_tree_error' } elseif ($null -ne $initError) { 'spawn_failed' } elseif ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
         exit_code = $exitCode
         pid = $processId
         elapsed_ms = ($finished - $started).TotalMilliseconds
@@ -775,22 +1304,22 @@ function Invoke-D32BoundedProcess {
         root_identity = ConvertTo-D32IdentityDocument $rootIdentity
         root_identity_record = $rootIdentity
         captured_descendant_records = @($capturedDescendantRecords)
-        # descendant_pids is intentionally the residual set for compatibility
-        # with the fixture preflight contract. The complete captured/reaped
-        # evidence is persisted separately and is never discarded.
         descendant_pids = @($residualDescendantPids)
         captured_descendant_pids = @($capturedDescendantPids)
         descendant_identities = @($capturedDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
         residual_descendant_identities = @($residualDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+        native_launch = $script:D32LastProcessEvidence.native_launch
+        native_cleanup = ConvertTo-D32NativeCleanupDocument $nativeCleanup
         reap = if ($null -eq $reap) { $null } else {
             [ordered]@{
                 process_ids = @($reap.ProcessIds)
                 verified_at_utc = $reap.VerifiedAtUtc
                 residual_identities = @($reap.ResidualRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
+                native_cleanup = ConvertTo-D32NativeCleanupDocument $reap.NativeCleanup
                 kill_output = @($reap.KillOutput)
             }
         }
-        error = if ($null -ne $treeError) { $treeError } elseif ($timedOut) { 'bounded timeout; process tree was killed and every captured identity was reaped' } else { $null }
+        error = if ($null -ne $treeError) { $treeError } elseif ($null -ne $initError) { $initError } elseif ($timedOut) { 'bounded timeout; process group was killed and every captured identity was reaped' } else { $null }
     }
 }
 
@@ -850,6 +1379,12 @@ function Invoke-D32SelfTest {
             -TimeoutSeconds 5
         if ($zero.status -ne 'succeeded' -or $zero.exit_code -ne 0) {
             throw "SELFTEST_FAILED: zero exit code was not captured exactly (status=$($zero.status), exit=$($zero.exit_code), error=$($zero.error))"
+        }
+        $passed++
+        if ($null -eq $zero.native_cleanup -or
+            -not [bool]$zero.native_cleanup.cleanup_succeeded -or
+            -not [bool]$zero.native_cleanup.job_close_succeeded) {
+            throw 'SELFTEST_FAILED: normal exit did not produce verified job-close cleanup evidence'
         }
         $passed++
 
@@ -953,6 +1488,88 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
+        $earlyChildPidPath = Join-Path $root 'early-child.pid'
+        $earlyChildScript = Join-Path $root 'parent-early-exit.ps1'
+        $earlyChildContent = @(
+            '$child = Start-Process -FilePath ''{0}'' -ArgumentList ''-NoLogo'',''-NoProfile'',''-NonInteractive'',''-Command'',''Start-Sleep -Seconds 5'' -WindowStyle Hidden -PassThru'
+            '[IO.File]::WriteAllText(''{1}'',[string]$child.Id)'
+            'exit 0'
+        ) -join [Environment]::NewLine
+        [IO.File]::WriteAllText($earlyChildScript, ($earlyChildContent -f $powershell, $earlyChildPidPath), [Text.UTF8Encoding]::new($false))
+        $earlyExitChild = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $earlyChildScript) -WorkingDirectory $root -PhaseLog (Join-Path $root 'parent-early-exit-phase') -TimeoutSeconds 5
+        $earlyChildPid = [int][IO.File]::ReadAllText($earlyChildPidPath)
+        if ($earlyExitChild.status -ne 'succeeded' -or
+            $earlyExitChild.exit_code -ne 0 -or
+            @(Get-D32ProcessSnapshot -ProcessId $earlyChildPid).Count -ne 0 -or
+            $null -eq $earlyExitChild.native_cleanup -or
+            -not [bool]$earlyExitChild.native_cleanup.cleanup_succeeded) {
+            throw 'SELFTEST_FAILED: parent early exit child was not closed by the owned job'
+        }
+        $passed++
+
+        $detachedChildPidPath = Join-Path $root 'detached-child.pid'
+        $detachedChildScript = Join-Path $root 'detached-reparent.ps1'
+        $detachedChildContent = @(
+            '$child = Start-Process -FilePath ''{0}'' -ArgumentList ''-NoLogo'',''-NoProfile'',''-NonInteractive'',''-Command'',''Start-Sleep -Seconds 5'' -WindowStyle Hidden -PassThru'
+            '[IO.File]::WriteAllText(''{1}'',[string]$child.Id)'
+            'exit 0'
+        ) -join [Environment]::NewLine
+        [IO.File]::WriteAllText($detachedChildScript, ($detachedChildContent -f $powershell, $detachedChildPidPath), [Text.UTF8Encoding]::new($false))
+        $detachedChild = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $detachedChildScript) -WorkingDirectory $root -PhaseLog (Join-Path $root 'detached-reparent-phase') -TimeoutSeconds 5
+        $detachedPid = [int][IO.File]::ReadAllText($detachedChildPidPath)
+        if ($detachedChild.status -ne 'succeeded' -or
+            @(Get-D32ProcessSnapshot -ProcessId $detachedPid).Count -ne 0 -or
+            $null -eq $detachedChild.native_cleanup -or
+            -not [bool]$detachedChild.native_cleanup.cleanup_succeeded) {
+            throw 'SELFTEST_FAILED: detached/reparented child was not closed by the owned job'
+        }
+        $passed++
+
+        $spawnInit = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'spawn-init-exception-phase') -TimeoutSeconds 5 -FailureInjection spawn-init
+        if ($spawnInit.status -ne 'spawn_failed' -or
+            $spawnInit.error -notlike '*SELFTEST_INJECTED_SPAWN_INIT_EXCEPTION*' -or
+            $null -eq $spawnInit.native_cleanup -or
+            -not [bool]$spawnInit.native_cleanup.cleanup_succeeded) {
+            throw 'SELFTEST_FAILED: spawn initialization exception did not close its owned job'
+        }
+        $passed++
+
+        $cimInit = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'cim-init-exception-phase') -TimeoutSeconds 5 -FailureInjection cim-init
+        if ($cimInit.status -ne 'spawn_failed' -or
+            $cimInit.error -notlike '*SELFTEST_INJECTED_CIM_INIT_EXCEPTION*' -or
+            $null -eq $cimInit.native_cleanup -or
+            -not [bool]$cimInit.native_cleanup.cleanup_succeeded) {
+            throw 'SELFTEST_FAILED: CIM initialization exception did not close its owned job'
+        }
+        $passed++
+
+        $pipeInit = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedExitZero) -WorkingDirectory $root -PhaseLog (Join-Path $root 'pipe-init-exception-phase') -TimeoutSeconds 5 -FailureInjection pipe-init
+        if ($pipeInit.status -ne 'spawn_failed' -or
+            $pipeInit.error -notlike '*SELFTEST_INJECTED_PIPE_INIT_EXCEPTION*' -or
+            $null -eq $pipeInit.native_cleanup -or
+            -not [bool]$pipeInit.native_cleanup.cleanup_succeeded) {
+            throw 'SELFTEST_FAILED: pipe initialization exception did not close its owned job'
+        }
+        $passed++
+
+        try {
+            Assert-D32CleanGitStatus -Status ' M synthetic-dirty-file' -Root $root
+            throw 'SELFTEST_FAILED: dirty worktree was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'WORKTREE_DIRTY:*') { throw }
+        }
+        $passed++
+
+        $missingExecutable = Join-Path $root 'missing-fixture-executable.exe'
+        $handleFailure = Invoke-D32BoundedProcess -FilePath $missingExecutable -Arguments @('-NoLogo') -WorkingDirectory $root -PhaseLog (Join-Path $root 'handle-failure-phase') -TimeoutSeconds 5
+        if ($handleFailure.status -ne 'spawn_failed' -or
+            $handleFailure.error -notlike '*D32_NATIVE_LAUNCH_FAILED*' -or
+            $null -ne $handleFailure.pid) {
+            throw 'SELFTEST_FAILED: native spawn/handle failure was not fail-closed'
+        }
+        $passed++
+
         $childScript = Join-Path $root 'descendant-timeout.ps1'
         [IO.File]::WriteAllText(
             $childScript,
@@ -1010,6 +1627,7 @@ $logRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot 'logs')
 $environmentPlan = Get-D32EnvironmentPlan (Join-Path $OutputRoot 'isolated-env')
 
 $gitStatus = Get-D32GitOutput -Root $RepoRoot -Arguments @('status', '--short')
+Assert-D32CleanGitStatus -Status $gitStatus -Root $RepoRoot
 $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
 $savedEnvironment = Set-D32IsolatedEnvironment -Plan $environmentPlan -Jobs $BuildJobs
 $results = @()
@@ -1139,7 +1757,7 @@ $manifestDocument = [ordered]@{
         timeout_seconds = $TimeoutSeconds
         cargo_build_jobs = $BuildJobs
         nested_builds = $false
-        process_tree_timeout_action = 'taskkill /T /F then verify every captured descendant PID'
+        process_tree_timeout_action = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
     }
     environment = $environmentPlan
     process_tree_check = if ($null -eq $manifestProcessError) { 'succeeded' } else { 'failed' }

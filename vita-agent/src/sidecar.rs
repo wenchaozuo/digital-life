@@ -435,10 +435,11 @@ fn d32_allowlisted_vita_failure_code_or_none(value: &str) -> bool {
 
 fn d32_validate_vita_stage_trace(value: &str) -> bool {
     if value == "none" {
-        return true;
+        return false;
     }
     let mut seen = HashSet::new();
     let mut count = 0usize;
+    let mut observed = false;
     for entry in value.split(',') {
         let Some((stage, counters)) = entry.split_once(':') else {
             return false;
@@ -447,16 +448,25 @@ fn d32_validate_vita_stage_trace(value: &str) -> bool {
             return false;
         }
         let parts = counters.split('/').collect::<Vec<_>>();
-        if parts.len() != 3
-            || parts
-                .iter()
-                .any(|part| part.parse::<u8>().ok().is_none_or(|value| value > 16))
-        {
+        if parts.len() != 3 {
             return false;
         }
+        let Some(started) = parts[0].parse::<u8>().ok() else {
+            return false;
+        };
+        let Some(passed) = parts[1].parse::<u8>().ok() else {
+            return false;
+        };
+        let Some(failed) = parts[2].parse::<u8>().ok() else {
+            return false;
+        };
+        if started > 16 || passed > 16 || failed > 16 || passed > started || failed > started {
+            return false;
+        }
+        observed |= started != 0 || passed != 0 || failed != 0;
         count += 1;
     }
-    count == 11 && seen.len() == 11
+    count == 11 && seen.len() == 11 && observed
 }
 
 fn d32_allowlisted_bridge_decision(value: &str) -> bool {
@@ -532,10 +542,11 @@ fn d32_safe_vita_stage_failure(raw: &str, counters: D32TurnCounters) -> Option<S
     if (secondary_stage == "none") != (secondary_code == "none") {
         return None;
     }
-    let stage_trace = fields.get("stage_trace").copied().unwrap_or("none");
-    if !d32_validate_vita_stage_trace(stage_trace) {
-        return None;
-    }
+    let stage_trace = match fields.get("stage_trace").copied() {
+        Some(stage_trace) if d32_validate_vita_stage_trace(stage_trace) => stage_trace,
+        Some(_) => return None,
+        None => "none",
+    };
     let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
         "true" => true,
         "false" => false,
@@ -3393,7 +3404,10 @@ async fn handle_start_turn(
         error.task.cancelled.store(true, Ordering::Release);
         error.task.cancel_notify.notify_waiters();
         error.task.join.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
+        let join_result = tokio::time::timeout(Duration::from_secs(5), error.task.join).await;
+        if !matches!(join_result, Ok(Ok(_))) {
+            cargo_production.d32_worker_join_failure();
+        }
         let message = gateway_for_install_error
             .d32_forced_tool
             .as_ref()
@@ -3453,20 +3467,53 @@ async fn handle_cancel_turn(
         return Err("Vita turn owner disappeared before cancellation proof".to_string());
     };
     gateway_authority.deactivate_generation(&task.gateway);
+    let d32_latch = task.gateway.d32_forced_tool.clone();
     task.cancelled.store(true, Ordering::Release);
     task.cancel_notify.notify_waiters();
     let session_id = init.session_id.clone();
+    let request_id = message.request_id;
     let turn_id = message.turn_id;
     // The acknowledgement is emitted only after the bounded Codex interrupt
     // and the actual run_turn future have both terminated.  Clearing the
     // identity and gateway authority above fences late requests immediately;
     // this join proves the old lifecycle cannot later mutate a new turn.
     let _ = runtime.interrupt_active_turn().await;
-    let joined = tokio::time::timeout(Duration::from_secs(5), task.join)
-        .await
-        .map_err(|_| "Vita turn cancellation did not reach terminality".to_string())?
-        .map_err(|_| "Vita turn cancellation task failed".to_string())?;
-    let _ = joined;
+    let mut join = task.join;
+    let join_failure = match tokio::time::timeout(Duration::from_secs(5), &mut join).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(_)) => {
+            cargo_production.d32_worker_join_failure();
+            Some("TURN_CANCEL_WORKER_JOIN_FAILED")
+        }
+        Err(_) => {
+            // A timeout must not detach the turn worker.  Abort it and wait
+            // once more within a fixed bound before publishing the terminal
+            // cancellation failure.
+            join.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), join).await;
+            cargo_production.d32_worker_join_failure();
+            Some("TURN_CANCEL_WORKER_TIMEOUT")
+        }
+    };
+    if let Some(error_code) = join_failure {
+        let message = cargo_production
+            .d32_terminal_failure_message()
+            .map(|failure| {
+                d32_latch
+                    .as_ref()
+                    .map_or(failure.clone(), |latch| latch.safe_turn_failure(&failure))
+            })
+            .unwrap_or_else(|| "Vita turn worker failed during cancellation".to_string());
+        router.send(&VitaMessage::TurnFailed(TurnFailed {
+            request_id,
+            session_id,
+            turn_id,
+            phase: TurnPhase::Failed,
+            error_code: error_code.to_string(),
+            message,
+        }))?;
+        return Ok(());
+    }
     router.send(&VitaMessage::TurnState(TurnState {
         request_id: next_request_id("vita-turn-cancelled"),
         session_id,
@@ -5295,6 +5342,21 @@ mod tests {
         );
         assert!(retained.contains("stage=catalog"));
         assert!(!retained.contains("stage=cleanup"));
+    }
+
+    #[test]
+    fn d32_vita_stage_trace_rejects_empty_and_unstarted_terminal_events() {
+        let valid = "layout:1/1/0,catalog:1/0/1,sandbox:1/1/0,action_prepare:1/1/0,scope_authority:1/1/0,populate:1/1/0,confirmation_bridge:1/1/0,grant:1/1/0,revalidate:1/1/0,evidence:1/1/0,cleanup:1/0/1";
+        assert!(d32_validate_vita_stage_trace(valid));
+        assert!(!d32_validate_vita_stage_trace("none"));
+        assert!(!d32_validate_vita_stage_trace(
+            &valid.replace("catalog:1/0/1", "catalog:0/0/1")
+        ));
+        assert!(!d32_validate_vita_stage_trace(
+            &valid.replace("catalog:1/0/1", "catalog:1/2/0")
+        ));
+        let empty = "D32 Vita stage failure stage=catalog code=operation_failed stage_trace=none bridge_sent=0 bridge_pending=0 bridge_replied=0 bridge_pending_active=false bridge_decision=none bridge_confirmed=0 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0";
+        assert!(d32_safe_vita_stage_failure(empty, D32TurnCounters::default()).is_none());
     }
 
     #[test]

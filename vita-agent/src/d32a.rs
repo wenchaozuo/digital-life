@@ -228,7 +228,17 @@ impl D32VitaStageTelemetry {
     pub(crate) fn failed(&self, stage: D32VitaStage, code: D32VitaFailureCode) {
         if let Ok(mut state) = self.state.lock() {
             let counters = &mut state.stages[Self::stage_index(stage)];
-            Self::increment(&mut counters.failed);
+            // A terminal event is also an observation that the stage was
+            // entered.  Keep the emitted trace self-consistent even for an
+            // early/invalid-call branch which cannot reach its normal
+            // `stage_started` site.  The counter remains bounded and never
+            // fabricates a success event.
+            if counters.started <= counters.failed {
+                Self::increment(&mut counters.started);
+            }
+            if counters.failed < counters.started {
+                Self::increment(&mut counters.failed);
+            }
             if stage == D32VitaStage::Cleanup {
                 if state.secondary_failure.is_none() {
                     state.secondary_failure = Some((stage, code));
@@ -263,7 +273,9 @@ impl D32VitaStageTelemetry {
     pub(crate) fn stage_passed(&self, stage: D32VitaStage) {
         if let Ok(mut state) = self.state.lock() {
             let counters = &mut state.stages[Self::stage_index(stage)];
-            Self::increment(&mut counters.passed);
+            if counters.passed < counters.started {
+                Self::increment(&mut counters.passed);
+            }
             if state.active_stage == Some(stage) {
                 state.active_stage = None;
             }
@@ -1249,6 +1261,12 @@ impl VitaCargoCheckProduction {
             .as_ref()
             .and_then(|telemetry| telemetry.terminal_failure_message())
     }
+
+    pub(crate) fn d32_worker_join_failure(&self) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.failed_current(D32VitaFailureCode::WorkerJoin);
+        }
+    }
 }
 
 pub struct VitaCargoCheckToolContributor {
@@ -1794,6 +1812,34 @@ mod tests {
             .stage_trace_for_test()
             .contains("scope_authority:1/1/0"));
         assert!(telemetry.terminal_failure_message().is_none());
+    }
+
+    #[test]
+    fn d32_vita_terminal_counters_are_bounded_by_stage_entry() {
+        let telemetry = D32VitaStageTelemetry::new();
+        telemetry.stage_started(D32VitaStage::Catalog);
+        telemetry.stage_passed(D32VitaStage::Catalog);
+        telemetry.failed(D32VitaStage::Catalog, D32VitaFailureCode::OperationFailed);
+        for _ in 0..64 {
+            telemetry.failed(D32VitaStage::Catalog, D32VitaFailureCode::OperationFailed);
+        }
+        let trace = telemetry.stage_trace_for_test();
+        let catalog = trace
+            .split(',')
+            .find(|entry| entry.starts_with("catalog:"))
+            .expect("catalog trace");
+        let counters = catalog
+            .strip_prefix("catalog:")
+            .expect("catalog counters")
+            .split('/')
+            .map(|value| value.parse::<u8>().expect("bounded counter"))
+            .collect::<Vec<_>>();
+        assert_eq!(counters.len(), 3);
+        assert!(counters[1] <= counters[0]);
+        assert!(counters[2] <= counters[0]);
+        assert_eq!(counters[0], 16);
+        assert_eq!(counters[1], 1);
+        assert_eq!(counters[2], 16);
     }
 
     #[test]

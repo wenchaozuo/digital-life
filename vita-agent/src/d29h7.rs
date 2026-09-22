@@ -7924,30 +7924,33 @@ impl H7ProcessBroker {
         prevalidated_scope: Option<H7WorkspaceScopeProof>,
     ) -> H7ToolResult {
         if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
-            self.d32_stage_started(D32VitaStage::ScopeAuthority);
             if action.workspace_root.is_none() || action.workspace_root_identity.is_none() {
+                if prevalidated_scope.is_none() {
+                    self.d32_stage_started(D32VitaStage::ScopeAuthority);
+                }
                 self.d32_failed(
                     D32VitaStage::ScopeAuthority,
                     D32VitaFailureCode::OperationFailed,
                 );
                 return H7ToolResult::denied();
             }
-            if let Some(proof) = prevalidated_scope {
-                if self.validate_prevalidated_scope(&action, &proof).is_err() {
+            if let Some(proof) = prevalidated_scope.as_ref() {
+                if self.validate_prevalidated_scope(&action, proof).is_err() {
                     self.d32_failed(
                         D32VitaStage::ScopeAuthority,
                         D32VitaFailureCode::OperationFailed,
                     );
                     return H7ToolResult::denied();
                 }
-                self.d32_stage_passed(D32VitaStage::ScopeAuthority);
-            } else if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
-                self.d32_failed(
-                    D32VitaStage::ScopeAuthority,
-                    D32VitaFailureCode::OperationFailed,
-                );
-                return H7ToolResult::denied();
             } else {
+                self.d32_stage_started(D32VitaStage::ScopeAuthority);
+                if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
+                    self.d32_failed(
+                        D32VitaStage::ScopeAuthority,
+                        D32VitaFailureCode::OperationFailed,
+                    );
+                    return H7ToolResult::denied();
+                }
                 self.d32_stage_passed(D32VitaStage::ScopeAuthority);
             }
         } else if prevalidated_scope.is_some() {

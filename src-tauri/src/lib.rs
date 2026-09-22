@@ -312,16 +312,39 @@ pub fn run() {
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
 const D32_CANARY_APP_DRAIN_ITERATIONS: usize = 32;
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_outer_failure(codes: &[&'static str], not_executable: bool) -> String {
+    let prefix = if not_executable {
+        "D32_A_NOT_EXECUTABLE"
+    } else {
+        "D32_A_HOST_FAILURE"
+    };
+    let bounded_codes = if codes.is_empty() {
+        "host_failure".to_string()
+    } else {
+        codes.join(",")
+    };
+    format!("{prefix}: {bounded_codes}")
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_outerize_error(error: &str, fallback: &'static str) -> String {
+    let code = if error.contains("cleanup") {
+        "cleanup"
+    } else {
+        fallback
+    };
+    d32_outer_failure(&[code], error.starts_with("D32_A_NOT_EXECUTABLE:"))
+}
+
 #[cfg(all(windows, not(test), feature = "d32-a-host-canary"))]
 fn cleanup_d32_canary_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), String> {
     let labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
-    let mut errors = Vec::new();
+    let mut destroy_failed = false;
     for label in labels {
         if let Some(window) = app.get_webview_window(&label) {
-            if let Err(error) = window.destroy() {
-                errors.push(format!(
-                    "D32_A_HOST_FAILURE: canary window '{label}' destroy failed: {error}"
-                ));
+            if window.destroy().is_err() {
+                destroy_failed = true;
             }
         }
     }
@@ -335,20 +358,22 @@ fn cleanup_d32_canary_app(app: &mut tauri::App<tauri::Wry>) -> Result<(), String
         app.run_iteration(|_, _| {});
         drained = app.webview_windows().is_empty();
     }
-    if !drained {
-        let remaining = app.webview_windows().keys().cloned().collect::<Vec<_>>();
-        errors.push(format!(
-            "D32_A_HOST_FAILURE: canary windows remained after bounded teardown: {remaining:?}"
-        ));
-    }
+    let drain_failed = !drained;
 
     // `run_iteration` does not perform Tauri's normal exit cleanup.  Invoke it
     // only after window destruction/drain, and do not use Tauri APIs after it.
     app.cleanup_before_exit();
-    if errors.is_empty() {
+    if !destroy_failed && !drain_failed {
         Ok(())
     } else {
-        Err(errors.join("; "))
+        let mut codes = Vec::new();
+        if destroy_failed {
+            codes.push("window_destroy_failed");
+        }
+        if drain_failed {
+            codes.push("windows_not_drained");
+        }
+        Err(d32_outer_failure(&codes, false))
     }
 }
 
@@ -360,7 +385,8 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
     #[cfg(all(windows, feature = "d32-a-host-canary"))]
     debug_assert!(context.config().app.windows.is_empty());
     let mut environment =
-        vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier)?;
+        vita_sidecar::D32HostIntegrationEnvironment::prepare(&context.config().identifier)
+            .map_err(|error| d32_outerize_error(&error, "environment_prepare_failed"))?;
     let result = (|| {
         // Complete every real-root read and the isolated provider preflight
         // before publishing the stable baseline.  SQLite's read-only online
@@ -371,18 +397,12 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         let preflight =
             vita_sidecar::d32_a_preflight_chat_provider(&context.config().identifier, mode);
         let baseline = environment.establish_stable_baseline();
-        preflight?;
-        baseline?;
+        preflight.map_err(|error| d32_outerize_error(&error, "provider_preflight_failed"))?;
+        baseline.map_err(|error| d32_outerize_error(&error, "real_host_baseline_failed"))?;
         let mut app = production_builder()
             .any_thread()
             .build(context)
-            .map_err(|error| {
-                let message = error.to_string();
-                message
-                    .find("D32_A_NOT_EXECUTABLE:")
-                    .map(|index| message[index..].to_string())
-                    .unwrap_or_else(|| format!("D32-A production Host bootstrap failed: {message}"))
-            })?;
+            .map_err(|error| d32_outerize_error(&error.to_string(), "app_build_failed"))?;
 
         // `Builder::build` constructs the App but deliberately defers the
         // production setup hook until the runtime enters its event loop.  The
@@ -410,42 +430,56 @@ pub fn run_d32_a_host_integration(mode: &str) -> Result<serde_json::Value, Strin
         ) {
             (Ok(report), Ok(()), Ok(()), Ok(())) => report,
             (canary, primary, authority, app) => {
-                let mut errors = Vec::new();
-                if let Err(error) = canary {
-                    errors.push(error);
+                let canary_not_executable = canary
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.starts_with("D32_A_NOT_EXECUTABLE:"));
+                let mut codes = Vec::new();
+                if canary.is_err() {
+                    codes.push("canary_integration_failed");
                 }
-                if let Err(error) = primary {
-                    errors.push(format!(
-                        "D32_A_HOST_FAILURE: primary storage cleanup failed: {error}"
-                    ));
+                if primary.is_err() {
+                    codes.push("primary_storage_cleanup_failed");
                 }
-                if let Err(error) = authority {
-                    errors.push(format!(
-                        "D32_A_HOST_FAILURE: authority storage cleanup failed: {error}"
-                    ));
+                if authority.is_err() {
+                    codes.push("authority_storage_cleanup_failed");
                 }
-                if let Err(error) = app {
-                    errors.push(error);
+                if app.is_err() {
+                    codes.push("app_cleanup_failed");
                 }
-                return Err(errors.join("; "));
+                return Err(d32_outer_failure(
+                    &codes,
+                    canary_not_executable && codes.len() == 1,
+                ));
             }
         };
-        serde_json::to_value(report).map_err(|error| {
-            format!("D32_A_HOST_FAILURE: canary report serialization failed: {error}")
-        })
+        serde_json::to_value(report)
+            .map_err(|_| d32_outer_failure(&["report_serialization_failed"], false))
     })();
     let audit = environment.verify_real_roots_unchanged();
     let cleanup = environment.cleanup();
     drop(environment);
-    match (result, audit, cleanup) {
-        (_, Err(audit_error), Err(cleanup_error)) => Err(format!(
-            "{audit_error}; D32 cleanup outcome: {cleanup_error}"
-        )),
-        (_, Err(audit_error), Ok(())) => Err(audit_error),
-        (_, Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Ok(()), Ok(())) => Err(error),
-        (Ok(report), Ok(()), Ok(())) => Ok(report),
+    if result.is_ok() && audit.is_ok() && cleanup.is_ok() {
+        return result;
     }
+    let result_not_executable = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.starts_with("D32_A_NOT_EXECUTABLE:"));
+    let mut codes = Vec::new();
+    if result.is_err() {
+        codes.push("integration_failed");
+    }
+    if audit.is_err() {
+        codes.push("real_host_audit_failed");
+    }
+    if cleanup.is_err() {
+        codes.push("environment_cleanup_failed");
+    }
+    Err(d32_outer_failure(
+        &codes,
+        result_not_executable && codes.len() == 1,
+    ))
 }
 
 #[cfg(all(test, windows, feature = "d32-a-host-canary"))]
@@ -474,6 +508,30 @@ mod d32_canary_lifecycle_tests {
     fn app_teardown_drain_is_nonzero_and_bounded() {
         assert!(D32_CANARY_APP_DRAIN_ITERATIONS > 0);
         assert!(D32_CANARY_APP_DRAIN_ITERATIONS <= 64);
+    }
+
+    #[test]
+    fn outer_canary_failures_are_static_and_bounded() {
+        let error = super::d32_outer_failure(
+            &[
+                "window_destroy_failed",
+                "primary_storage_cleanup_failed",
+                "report_serialization_failed",
+            ],
+            false,
+        );
+        assert_eq!(
+            error,
+            "D32_A_HOST_FAILURE: window_destroy_failed,primary_storage_cleanup_failed,report_serialization_failed"
+        );
+        assert!(!error.contains("label"));
+        assert!(!error.contains("path"));
+        assert!(!error.contains("token"));
+        assert!(super::d32_outerize_error(
+            "D32_A_NOT_EXECUTABLE: canary setup cleanup failed at C:\\secret",
+            "environment_prepare_failed",
+        )
+        .starts_with("D32_A_NOT_EXECUTABLE: cleanup"));
     }
 }
 

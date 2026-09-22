@@ -424,7 +424,10 @@ impl D32StageTelemetrySnapshot {
     }
 
     fn mark_passed(&mut self, stage: D32HostCanaryStage) {
-        Self::increment(&mut self.counters_mut(stage).passed);
+        let counters = self.counters_mut(stage);
+        if counters.passed < counters.started {
+            Self::increment(&mut counters.passed);
+        }
     }
 
     fn mark_denied(&mut self, stage: D32HostCanaryStage) {
@@ -433,13 +436,25 @@ impl D32StageTelemetrySnapshot {
 
     fn mark_failed(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
         let counters = self.counters_mut(stage);
-        Self::increment(&mut counters.failed);
+        if counters.started <= counters.failed {
+            Self::increment(&mut counters.started);
+        }
+        if counters.failed < counters.started {
+            Self::increment(&mut counters.failed);
+        }
         counters.last_failure_code = Some(code.as_str().to_string());
     }
 
     fn mark_failed_at_least(&mut self, stage: D32HostCanaryStage, code: D32StageFailureCode) {
         let counters = self.counters_mut(stage);
-        counters.failed = counters.failed.max(1).min(D32_STAGE_COUNTER_MAX);
+        if counters.started <= counters.failed {
+            Self::increment(&mut counters.started);
+        }
+        counters.failed = counters
+            .failed
+            .max(1)
+            .min(counters.started)
+            .min(D32_STAGE_COUNTER_MAX);
         counters.last_failure_code = Some(code.as_str().to_string());
     }
 
@@ -887,10 +902,11 @@ struct D32VitaSafeStageDiagnostic {
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
 fn parse_d32_vita_stage_trace(value: &str) -> Option<Vec<D32VitaStageTrace>> {
     if value == "none" {
-        return Some(Vec::new());
+        return None;
     }
     let mut seen = std::collections::HashSet::new();
     let mut trace = Vec::new();
+    let mut observed = false;
     for item in value.split(',') {
         let (stage, counters) = item.split_once(':')?;
         let stage = D32HostCanaryStage::parse(stage)?;
@@ -907,11 +923,18 @@ fn parse_d32_vita_stage_trace(value: &str) -> Option<Vec<D32VitaStageTrace>> {
                 .ok()
                 .filter(|value| *value <= D32_STAGE_COUNTER_MAX)
         };
+        let started = parse_counter(values[0])?;
+        let passed = parse_counter(values[1])?;
+        let failed = parse_counter(values[2])?;
+        if passed > started || failed > started {
+            return None;
+        }
+        observed |= started != 0 || passed != 0 || failed != 0;
         trace.push(D32VitaStageTrace {
             stage,
-            started: parse_counter(values[0])?,
-            passed: parse_counter(values[1])?,
-            failed: parse_counter(values[2])?,
+            started,
+            passed,
+            failed,
         });
     }
     if trace.len() != D32HostCanaryStage::ALL.len()
@@ -921,7 +944,7 @@ fn parse_d32_vita_stage_trace(value: &str) -> Option<Vec<D32VitaStageTrace>> {
     {
         return None;
     }
-    Some(trace)
+    observed.then_some(trace)
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -980,8 +1003,10 @@ fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStag
         ),
         _ => return None,
     };
-    let stage_trace =
-        parse_d32_vita_stage_trace(fields.get("stage_trace").copied().unwrap_or("none"))?;
+    let stage_trace = match fields.get("stage_trace").copied() {
+        Some(stage_trace) => parse_d32_vita_stage_trace(stage_trace)?,
+        None => Vec::new(),
+    };
     let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
         "true" => true,
         "false" => false,
@@ -12849,16 +12874,15 @@ mod windows {
                     d32_not_executable("canary isolated temp root could not be created")
                 })?;
                 crate::storage::d32_a_snapshot_app_data(&real_app_data_root, &app_data_root)
-                    .map_err(|error| {
-                        d32_not_executable(format!(
-                            "canary app-data snapshot failed: {}",
-                            error.message
-                        ))
-                    })?;
+                    .map_err(|_| d32_not_executable("canary app-data snapshot failed"))?;
                 Ok::<_, String>(())
             })();
             if let Err(error) = setup {
-                let _ = fs::remove_dir_all(&root);
+                let cleanup_result = fs::remove_dir_all(&root);
+                let root_remaining = fs::symlink_metadata(&root).is_ok();
+                if cleanup_result.is_err() || root_remaining {
+                    return Err(d32_not_executable("canary setup cleanup failed"));
+                }
                 return Err(error);
             }
 
@@ -13999,6 +14023,25 @@ mod windows {
             assert!(parse_d32_vita_safe_stage_diagnostic(
                 &canonical.replace("bridge_failed=0", "bridge_failed=17")
             )
+            .is_none());
+            let valid_trace = "layout:1/1/0,catalog:1/0/1,sandbox:1/1/0,action_prepare:1/1/0,scope_authority:1/1/0,populate:1/1/0,confirmation_bridge:1/1/0,grant:1/1/0,revalidate:1/1/0,evidence:1/1/0,cleanup:1/0/1";
+            assert!(parse_d32_vita_safe_stage_diagnostic(&format!(
+                "{canonical} stage_trace={valid_trace}"
+            ))
+            .is_some());
+            assert!(
+                parse_d32_vita_safe_stage_diagnostic(&format!("{canonical} stage_trace=none"))
+                    .is_none()
+            );
+            assert!(parse_d32_vita_safe_stage_diagnostic(&format!(
+                "{canonical} stage_trace={}",
+                valid_trace.replace("catalog:1/0/1", "catalog:0/0/1")
+            ))
+            .is_none());
+            assert!(parse_d32_vita_safe_stage_diagnostic(&format!(
+                "{canonical} stage_trace={}",
+                valid_trace.replace("catalog:1/0/1", "catalog:1/2/0")
+            ))
             .is_none());
         }
 

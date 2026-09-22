@@ -509,7 +509,7 @@ where
         if remaining.is_zero() {
             return Err(d32_wrap_transport_attempt(
                 path_kind,
-                1,
+                0,
                 VitaAgentError::ProviderTransportTimeout {
                     phase: "DNS resolution",
                 },
@@ -521,7 +521,7 @@ where
             min_duration(self.limits.dns_timeout, remaining),
         ) {
             Ok(addresses) => addresses,
-            Err(error) => return Err(d32_wrap_transport_attempt(path_kind, 1, error)),
+            Err(error) => return Err(d32_wrap_transport_attempt(path_kind, 0, error)),
         };
         validate_resolved_addresses(endpoint, &addresses)?;
         addresses.sort_unstable();
@@ -546,7 +546,7 @@ where
             if remaining.is_zero() {
                 return Err(d32_wrap_transport_attempt(
                     path_kind,
-                    attempt_number,
+                    attempt,
                     VitaAgentError::ProviderTransportTimeout { phase: "request" },
                 ));
             }
@@ -661,7 +661,7 @@ fn d32_wrap_transport_attempt(
 ) -> VitaAgentError {
     if path_kind == ProviderRequestPath::Responses {
         VitaAgentError::ProviderTransportAttempted {
-            attempts: attempts.clamp(1, MAX_RETRY_COUNT.saturating_add(1)),
+            attempts: attempts.min(MAX_RETRY_COUNT.saturating_add(1)),
             source: Box::new(error),
         }
     } else {

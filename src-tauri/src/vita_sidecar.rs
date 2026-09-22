@@ -271,6 +271,7 @@ enum D32StageFailureCode {
     OperationFailed,
     NotObserved,
     Fixture,
+    LedgerCapacity,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -280,6 +281,17 @@ impl D32StageFailureCode {
             Self::OperationFailed => "operation_failed",
             Self::NotObserved => "not_observed",
             Self::Fixture => "fixture",
+            Self::LedgerCapacity => "ledger_capacity",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "operation_failed" => Some(Self::OperationFailed),
+            "not_observed" => Some(Self::NotObserved),
+            "fixture" => Some(Self::Fixture),
+            "ledger_capacity" => Some(Self::LedgerCapacity),
+            _ => None,
         }
     }
 }
@@ -315,6 +327,12 @@ pub(crate) struct D32StageTelemetrySnapshot {
     pub bridge_pending: u8,
     pub bridge_pending_active: bool,
     pub bridge_state: String,
+    pub bridge_decision: String,
+    pub bridge_confirmed: u8,
+    pub bridge_denied: u8,
+    pub bridge_cancelled: u8,
+    pub bridge_timed_out: u8,
+    pub bridge_failed: u8,
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -337,6 +355,12 @@ impl Default for D32StageTelemetrySnapshot {
             bridge_pending: 0,
             bridge_pending_active: false,
             bridge_state: "idle".to_string(),
+            bridge_decision: "none".to_string(),
+            bridge_confirmed: 0,
+            bridge_denied: 0,
+            bridge_cancelled: 0,
+            bridge_timed_out: 0,
+            bridge_failed: 0,
         }
     }
 }
@@ -381,6 +405,28 @@ impl D32StageTelemetrySnapshot {
         counters.last_failure_code = Some(code.as_str().to_string());
     }
 
+    fn mark_vita_failure(&mut self, diagnostic: &D32VitaSafeStageDiagnostic) {
+        if diagnostic.code == D32StageFailureCode::OperationFailed
+            || diagnostic.code == D32StageFailureCode::LedgerCapacity
+        {
+            self.mark_failed(diagnostic.stage, diagnostic.code);
+        } else {
+            self.mark_denied(diagnostic.stage);
+        }
+        self.merge_vita_bridge(
+            diagnostic.bridge_sent,
+            diagnostic.bridge_pending,
+            diagnostic.bridge_replied,
+            diagnostic.bridge_pending_active,
+            &diagnostic.bridge_decision,
+            diagnostic.bridge_confirmed,
+            diagnostic.bridge_denied,
+            diagnostic.bridge_cancelled,
+            diagnostic.bridge_timed_out,
+            diagnostic.bridge_failed,
+        );
+    }
+
     fn bridge_sent(&mut self) {
         Self::increment(&mut self.bridge_sent);
         self.bridge_state = "sent".to_string();
@@ -394,10 +440,75 @@ impl D32StageTelemetrySnapshot {
         self.bridge_state = "pending".to_string();
     }
 
-    fn bridge_replied(&mut self) {
+    fn bridge_replied(&mut self, decision: D32BridgeDecision) {
         Self::increment(&mut self.bridge_replied);
         self.bridge_pending_active = false;
         self.bridge_state = "replied".to_string();
+        self.bridge_decision = decision.as_str().to_string();
+        match decision {
+            D32BridgeDecision::Confirm => Self::increment(&mut self.bridge_confirmed),
+            D32BridgeDecision::Deny => Self::increment(&mut self.bridge_denied),
+            D32BridgeDecision::Cancel => Self::increment(&mut self.bridge_cancelled),
+            D32BridgeDecision::Timeout => Self::increment(&mut self.bridge_timed_out),
+            D32BridgeDecision::Error => Self::increment(&mut self.bridge_failed),
+        }
+    }
+
+    fn merge_vita_bridge(
+        &mut self,
+        sent: u8,
+        pending: u8,
+        replied: u8,
+        pending_active: bool,
+        decision: &str,
+        confirmed: u8,
+        denied: u8,
+        cancelled: u8,
+        timed_out: u8,
+        failed: u8,
+    ) {
+        self.bridge_sent = self.bridge_sent.max(sent).min(D32_STAGE_COUNTER_MAX);
+        self.bridge_pending = self.bridge_pending.max(pending).min(D32_STAGE_COUNTER_MAX);
+        self.bridge_replied = self.bridge_replied.max(replied).min(D32_STAGE_COUNTER_MAX);
+        self.bridge_pending_active = pending_active;
+        self.bridge_decision = decision.to_string();
+        self.bridge_confirmed = self
+            .bridge_confirmed
+            .max(confirmed)
+            .min(D32_STAGE_COUNTER_MAX);
+        self.bridge_denied = self.bridge_denied.max(denied).min(D32_STAGE_COUNTER_MAX);
+        self.bridge_cancelled = self
+            .bridge_cancelled
+            .max(cancelled)
+            .min(D32_STAGE_COUNTER_MAX);
+        self.bridge_timed_out = self
+            .bridge_timed_out
+            .max(timed_out)
+            .min(D32_STAGE_COUNTER_MAX);
+        self.bridge_failed = self.bridge_failed.max(failed).min(D32_STAGE_COUNTER_MAX);
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum D32BridgeDecision {
+    Confirm,
+    Deny,
+    Cancel,
+    Timeout,
+    Error,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32BridgeDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirm",
+            Self::Deny => "deny",
+            Self::Cancel => "cancel",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
     }
 }
 
@@ -472,6 +583,54 @@ pub(crate) struct D32CleanupOutcome {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_cleanup_summary(cleanup: &D32CleanupOutcome) -> String {
+    format!(
+        "attempted={} validated={} removed={} unsafe_left={} error_present={}",
+        cleanup.attempted,
+        cleanup.validated,
+        cleanup.removed,
+        cleanup.unsafe_left,
+        cleanup.error.is_some(),
+    )
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_host_error_code(error: &str) -> &'static str {
+    if error.contains("cleanup") {
+        "cleanup"
+    } else if error.contains("clear") {
+        "clear"
+    } else if error.contains("trace") {
+        "trace"
+    } else if error.contains("evidence") {
+        "evidence"
+    } else if error.contains("turn") || error.contains("provider") {
+        "turn"
+    } else {
+        "host_failure"
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_failure_context(
+    control: &D32HostCanaryControl,
+    error: &str,
+    cleanup: Option<&D32CleanupOutcome>,
+    clear_failed: bool,
+) -> String {
+    let trace = control.trace.snapshot();
+    let cleanup = cleanup.map_or_else(|| "none".to_string(), d32_cleanup_summary);
+    format!(
+        "D32_A_HOST_FAILURE: error_code={} clear_failed={} d32_stage_telemetry={} d32_native_diagnostic={} d32_cleanup={}",
+        d32_host_error_code(error),
+        clear_failed,
+        d32_stage_telemetry_summary(&trace),
+        d32_native_diagnostic_summary(&trace),
+        cleanup,
+    )
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct D32HostCanaryReport {
@@ -502,7 +661,9 @@ fn parse_d32_native_safe_diagnostic(message: &str) -> Option<D32NativeSafeDiagno
     let mut fields = std::collections::HashMap::new();
     for token in message[start..].split_ascii_whitespace() {
         let (key, value) = token.split_once('=')?;
-        fields.insert(key, value);
+        if fields.insert(key, value).is_some() {
+            return None;
+        }
     }
     let allowed_phase = |value: &str| {
         matches!(
@@ -621,6 +782,100 @@ fn parse_d32_native_safe_diagnostic(message: &str) -> Option<D32NativeSafeDiagno
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct D32VitaSafeStageDiagnostic {
+    stage: D32HostCanaryStage,
+    code: D32StageFailureCode,
+    bridge_sent: u8,
+    bridge_pending: u8,
+    bridge_replied: u8,
+    bridge_pending_active: bool,
+    bridge_decision: String,
+    bridge_confirmed: u8,
+    bridge_denied: u8,
+    bridge_cancelled: u8,
+    bridge_timed_out: u8,
+    bridge_failed: u8,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn parse_d32_vita_safe_stage_diagnostic(message: &str) -> Option<D32VitaSafeStageDiagnostic> {
+    const PREFIX: &str = "D32 Vita stage failure";
+    let start = message.find(PREFIX)? + PREFIX.len();
+    let mut fields = std::collections::HashMap::new();
+    for token in message[start..].split_ascii_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        if !matches!(
+            key,
+            "stage"
+                | "code"
+                | "bridge_sent"
+                | "bridge_pending"
+                | "bridge_replied"
+                | "bridge_pending_active"
+                | "bridge_decision"
+                | "bridge_confirmed"
+                | "bridge_denied"
+                | "bridge_cancelled"
+                | "bridge_timed_out"
+                | "bridge_failed"
+        ) || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    let stage = match fields.get("stage").copied()? {
+        "layout" => D32HostCanaryStage::Layout,
+        "catalog" => D32HostCanaryStage::Catalog,
+        "sandbox" => D32HostCanaryStage::Sandbox,
+        "action_prepare" => D32HostCanaryStage::ActionPrepare,
+        "scope_authority" => D32HostCanaryStage::ScopeAuthority,
+        "populate" => D32HostCanaryStage::Populate,
+        "confirmation_bridge" => D32HostCanaryStage::ConfirmationBridge,
+        "grant" => D32HostCanaryStage::Grant,
+        "revalidate" => D32HostCanaryStage::Revalidate,
+        "evidence" => D32HostCanaryStage::Evidence,
+        "cleanup" => D32HostCanaryStage::Cleanup,
+        _ => return None,
+    };
+    let code = D32StageFailureCode::parse(fields.get("code").copied()?)?;
+    let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    let bridge_decision = fields.get("bridge_decision").copied()?;
+    if !matches!(
+        bridge_decision,
+        "none" | "confirm" | "deny" | "cancel" | "timeout" | "error"
+    ) {
+        return None;
+    }
+    let bounded = |key: &str| {
+        fields
+            .get(key)
+            .copied()?
+            .parse::<u8>()
+            .ok()
+            .filter(|value| *value <= D32_STAGE_COUNTER_MAX)
+    };
+    Some(D32VitaSafeStageDiagnostic {
+        stage,
+        code,
+        bridge_sent: bounded("bridge_sent")?,
+        bridge_pending: bounded("bridge_pending")?,
+        bridge_replied: bounded("bridge_replied")?,
+        bridge_pending_active,
+        bridge_decision: bridge_decision.to_string(),
+        bridge_confirmed: bounded("bridge_confirmed")?,
+        bridge_denied: bounded("bridge_denied")?,
+        bridge_cancelled: bounded("bridge_cancelled")?,
+        bridge_timed_out: bounded("bridge_timed_out")?,
+        bridge_failed: bounded("bridge_failed")?,
+    })
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 fn d32_native_diagnostic_summary(trace: &D32HostCanaryTraceSnapshot) -> String {
     let Some(diagnostic) = trace.native_diagnostic.as_ref() else {
         return "none".to_string();
@@ -697,8 +952,8 @@ impl D32HostCanaryTrace {
         self.update(|snapshot| snapshot.stage_telemetry.bridge_pending());
     }
 
-    fn bridge_replied(&self) {
-        self.update(|snapshot| snapshot.stage_telemetry.bridge_replied());
+    fn bridge_replied(&self, decision: D32BridgeDecision) {
+        self.update(|snapshot| snapshot.stage_telemetry.bridge_replied(decision));
     }
 }
 
@@ -5763,6 +6018,23 @@ mod windows {
         }
 
         #[cfg(feature = "d32-a-host-canary")]
+        fn canary_bridge_result(&self, exact: bool, decision: D32BridgeDecision, sent: bool) {
+            if !exact {
+                return;
+            }
+            if let Some(control) = self.canary_control.as_ref() {
+                if sent {
+                    control.trace.bridge_replied(decision);
+                } else {
+                    control.trace.stage_failed(
+                        D32HostCanaryStage::ConfirmationBridge,
+                        D32StageFailureCode::OperationFailed,
+                    );
+                }
+            }
+        }
+
+        #[cfg(feature = "d32-a-host-canary")]
         fn record_inbound(&self, message: &VitaMessage) {
             let Some(control) = self.canary_control.as_ref() else {
                 return;
@@ -5775,15 +6047,6 @@ mod windows {
                     {
                         trace
                             .stage_telemetry
-                            .mark_started(D32HostCanaryStage::Catalog);
-                        trace
-                            .stage_telemetry
-                            .mark_started(D32HostCanaryStage::Sandbox);
-                        trace
-                            .stage_telemetry
-                            .mark_started(D32HostCanaryStage::ActionPrepare);
-                        trace
-                            .stage_telemetry
                             .mark_started(D32HostCanaryStage::ScopeAuthority);
                     }
                 }
@@ -5792,18 +6055,6 @@ mod windows {
                     if request.capability_id == PRODUCTION_CARGO_CHECK_CAPABILITY_ID
                         && request.binding.profile_id == PRODUCTION_CARGO_CHECK_PROFILE_ID
                     {
-                        trace
-                            .stage_telemetry
-                            .mark_passed(D32HostCanaryStage::Catalog);
-                        trace
-                            .stage_telemetry
-                            .mark_passed(D32HostCanaryStage::Sandbox);
-                        trace
-                            .stage_telemetry
-                            .mark_passed(D32HostCanaryStage::ActionPrepare);
-                        trace
-                            .stage_telemetry
-                            .mark_started(D32HostCanaryStage::Populate);
                         trace
                             .stage_telemetry
                             .mark_started(D32HostCanaryStage::ConfirmationBridge);
@@ -5842,6 +6093,10 @@ mod windows {
                     trace.turn_failed += 1;
                     if let Some(diagnostic) = parse_d32_native_safe_diagnostic(&message.message) {
                         trace.native_diagnostic = Some(diagnostic);
+                    }
+                    if let Some(diagnostic) = parse_d32_vita_safe_stage_diagnostic(&message.message)
+                    {
+                        trace.stage_telemetry.mark_vita_failure(&diagnostic);
                     }
                 }
                 VitaMessage::ActionCancelled(_) => trace.action_cancelled += 1,
@@ -8624,12 +8879,19 @@ mod windows {
         let Some(expires_at_unix_ms) =
             effective_confirmation_expiry(now, request.expires_at_unix_ms)
         else {
-            session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+            let result = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 decision: ConfirmationDecision::Deny,
                 authorization_revision: None,
-            }))?;
+            }));
+            #[cfg(feature = "d32-a-host-canary")]
+            session.canary_bridge_result(
+                exact_d32_confirmation,
+                D32BridgeDecision::Deny,
+                result.is_ok(),
+            );
+            result?;
             return Ok(());
         };
         // The active timer is authoritative; this opportunistic pass only
@@ -8648,12 +8910,19 @@ mod windows {
             HostTurnAuthority::Active(active)
                 if active_h7_binding_matches(active, &request.host_turn_id, &request.binding)
         ) {
-            session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
+            let result = session.send(&HostMessage::ConfirmationReply(ConfirmationReply {
                 request_id: request.request_id,
                 session_id: session.session_id.clone(),
                 decision: ConfirmationDecision::Cancel,
                 authorization_revision: None,
-            }))?;
+            }));
+            #[cfg(feature = "d32-a-host-canary")]
+            session.canary_bridge_result(
+                exact_d32_confirmation,
+                D32BridgeDecision::Cancel,
+                result.is_ok(),
+            );
+            result?;
             return Ok(());
         }
         let pending_id = format!("pending:{}", secure_id("vita")?);
@@ -8677,8 +8946,8 @@ mod windows {
             if exact_d32_confirmation {
                 if let Some(control) = session.canary_control.as_ref() {
                     control.trace.stage_failed(
-                        D32HostCanaryStage::Populate,
-                        D32StageFailureCode::OperationFailed,
+                        D32HostCanaryStage::ConfirmationBridge,
+                        D32StageFailureCode::LedgerCapacity,
                     );
                 }
             }
@@ -8692,7 +8961,7 @@ mod windows {
         #[cfg(feature = "d32-a-host-canary")]
         if exact_d32_confirmation {
             if let Some(control) = session.canary_control.as_ref() {
-                control.trace.stage_passed(D32HostCanaryStage::Populate);
+                control.trace.bridge_pending();
             }
         }
         Ok(())
@@ -9610,7 +9879,12 @@ mod windows {
         {
             if let Some(control) = session.canary_control.as_ref() {
                 if result.is_ok() {
-                    control.trace.bridge_replied();
+                    let bridge_decision = match decision {
+                        ConfirmationDecision::Confirm => D32BridgeDecision::Confirm,
+                        ConfirmationDecision::Deny => D32BridgeDecision::Deny,
+                        ConfirmationDecision::Cancel => D32BridgeDecision::Cancel,
+                    };
+                    control.trace.bridge_replied(bridge_decision);
                     control
                         .trace
                         .stage_passed(D32HostCanaryStage::ConfirmationBridge);
@@ -12531,7 +12805,10 @@ mod windows {
             }
             if !self.cleaned {
                 if let Err(error) = self.cleanup() {
-                    eprintln!("{error}");
+                    eprintln!(
+                        "D32_A_HOST_FAILURE: cleanup outcome error_code={}",
+                        d32_host_error_code(&error)
+                    );
                 }
             }
         }
@@ -12858,9 +13135,13 @@ mod windows {
             outcome.validated = errors.is_empty() && !outcome.unsafe_left;
             outcome.removed = outcome.validated;
             if !errors.is_empty() {
-                outcome.error = Some(errors.join("; "));
+                outcome.error = Some(if outcome.unsafe_left {
+                    "cleanup_unsafe_state".to_string()
+                } else {
+                    "cleanup_failed".to_string()
+                });
             } else if outcome.unsafe_left {
-                outcome.error = Some("cleanup left unsafe state".to_string());
+                outcome.error = Some("cleanup_unsafe_state".to_string());
             }
             if outcome.validated {
                 self.cleaned = true;
@@ -12876,7 +13157,10 @@ mod windows {
             if !self.cleaned {
                 let outcome = self.cleanup();
                 if outcome.error.is_some() || outcome.unsafe_left {
-                    eprintln!("D32_A_HOST_FAILURE: canary cleanup outcome: {outcome:?}");
+                    eprintln!(
+                        "D32_A_HOST_FAILURE: canary cleanup outcome: {}",
+                        d32_cleanup_summary(&outcome)
+                    );
                 }
             }
         }
@@ -12970,7 +13254,6 @@ mod windows {
                 let status = coordinator.status()?;
                 if status.pending.is_some() {
                     confirmation_seen = true;
-                    control.trace.bridge_pending();
                     if !action_taken {
                         action_taken = true;
                         if let Some(pending) = status.pending.as_ref() {
@@ -12996,18 +13279,6 @@ mod windows {
                 thread::sleep(Duration::from_millis(100));
             };
             if !confirmation_seen {
-                control.trace.stage_failed(
-                    D32HostCanaryStage::ActionPrepare,
-                    D32StageFailureCode::NotObserved,
-                );
-                control.trace.stage_failed(
-                    D32HostCanaryStage::Populate,
-                    D32StageFailureCode::NotObserved,
-                );
-                control.trace.stage_failed(
-                    D32HostCanaryStage::ConfirmationBridge,
-                    D32StageFailureCode::NotObserved,
-                );
                 let diagnostic = d32_canary_no_confirmation_diagnostic(
                     terminal.assistant_text.as_deref(),
                     terminal.turn_phase,
@@ -13087,10 +13358,7 @@ mod windows {
                         D32StageFailureCode::OperationFailed,
                     );
                 }
-                let native_diagnostic = d32_native_diagnostic_summary(&control.trace.snapshot());
-                return Err(format!(
-                    "{error}; d32_native_diagnostic={native_diagnostic}; D32 cleanup outcome: {cleanup:?}"
-                ));
+                return Err(d32_failure_context(&control, &error, Some(&cleanup), false));
             }
         };
         let report_result = (|| -> Result<D32HostCanaryReport, String> {
@@ -13190,13 +13458,31 @@ mod windows {
                 report.cleanup = cleanup;
                 Ok(report)
             }
-            (Ok(_), Ok(()), _) => Err(format!(
-                "D32_A_HOST_FAILURE: cleanup did not validate: {cleanup:?}"
+            (Ok(_), Ok(()), _) => Err(d32_failure_context(
+                &control,
+                "cleanup did not validate",
+                Some(&cleanup),
+                false,
             )),
-            (Err(error), Ok(()), _) => Err(format!("{error}; D32 cleanup outcome: {cleanup:?}")),
-            (result, clear, _) => Err(format!(
-                "D32_A_HOST_FAILURE: report={result:?}, clear={clear:?}, cleanup={cleanup:?}"
-            )),
+            (Err(error), Ok(()), _) => {
+                Err(d32_failure_context(&control, &error, Some(&cleanup), false))
+            }
+            (result, clear, _) => {
+                let clear_failed = clear.is_err();
+                let error = if result.is_err() {
+                    "report failed"
+                } else if clear_failed {
+                    "clear failed"
+                } else {
+                    "host finalization failed"
+                };
+                Err(d32_failure_context(
+                    &control,
+                    error,
+                    Some(&cleanup),
+                    clear_failed,
+                ))
+            }
         }
     }
 
@@ -13339,6 +13625,10 @@ mod windows {
                 "{message} provider-message Authorization: Bearer provider-token https://evil.example"
             );
             assert!(parse_d32_native_safe_diagnostic(&hostile).is_none());
+            assert!(
+                parse_d32_native_safe_diagnostic(&format!("{message} gateway_requests=2"))
+                    .is_none()
+            );
         }
 
         #[cfg(all(windows, feature = "d32-a-host-canary"))]
@@ -13352,7 +13642,7 @@ mod windows {
             trace.bridge_sent();
             trace.bridge_pending();
             trace.bridge_pending();
-            trace.bridge_replied();
+            trace.bridge_replied(D32BridgeDecision::Confirm);
             let snapshot = trace.snapshot();
             let json =
                 serde_json::to_string(&snapshot.stage_telemetry).expect("D32 stage telemetry JSON");
@@ -13394,7 +13684,7 @@ mod windows {
             trace.stage_passed(D32HostCanaryStage::Layout);
             trace.stage_started(D32HostCanaryStage::ConfirmationBridge);
             trace.bridge_sent();
-            trace.bridge_replied();
+            trace.bridge_replied(D32BridgeDecision::Confirm);
             let report = D32HostCanaryReport {
                 mode: "positive".to_string(),
                 status: "EXECUTED".to_string(),
@@ -13406,8 +13696,21 @@ mod windows {
                     bytes: 0,
                 },
                 terminal_phase: None,
-                turn_error: None,
-                native_diagnostic: None,
+                turn_error: Some("TURN_FAILED".to_string()),
+                native_diagnostic: Some(D32NativeSafeDiagnostic {
+                    phase: "http_status".to_string(),
+                    round: "initial_request".to_string(),
+                    attempts: Some(1),
+                    http_status: Some(429),
+                    error_code: "http_status".to_string(),
+                    output_kind: "unknown".to_string(),
+                    content_type_is_json: true,
+                    gateway_requests: 1,
+                    provider_results: 1,
+                    sse_created: 1,
+                    sse_failed: 1,
+                    sse_completed: 0,
+                }),
                 cleanup: D32CleanupOutcome {
                     attempted: true,
                     validated: true,
@@ -13430,6 +13733,7 @@ mod windows {
             ] {
                 assert_eq!(json.matches(&format!("\"{field}\"")).count(), 1);
             }
+            assert_eq!(json.matches("\"nativeDiagnostic\"").count(), 2);
             assert_eq!(json.matches("\"cleanup\":{\"attempted\"").count(), 1);
             let telemetry_json =
                 serde_json::to_string(&report.trace.stage_telemetry).expect("stage telemetry JSON");
@@ -13449,7 +13753,7 @@ mod windows {
                 assert_eq!(telemetry_json.matches(&format!("\"{field}\"")).count(), 1);
             }
             for marker in [
-                "provider",
+                "provider secret",
                 "token",
                 "credential",
                 "authorization",
@@ -13468,16 +13772,13 @@ mod windows {
 
         #[cfg(all(windows, feature = "d32-a-host-canary"))]
         #[test]
-        fn d32_no_confirmation_diagnostic_retains_only_safe_stage_telemetry() {
+        fn d32_no_confirmation_diagnostic_does_not_infer_vita_stages() {
             let trace = D32HostCanaryTrace::default();
-            trace.stage_started(D32HostCanaryStage::ConfirmationBridge);
-            trace.stage_failed(
-                D32HostCanaryStage::ConfirmationBridge,
-                D32StageFailureCode::NotObserved,
-            );
             let summary = d32_stage_telemetry_summary(&trace.snapshot());
-            assert!(summary.contains("confirmationBridge"));
-            assert!(summary.contains("not_observed"));
+            for stage in ["actionPrepare", "populate", "confirmationBridge"] {
+                assert!(summary.contains(&format!("\"{stage}\":{{\"started\":0")));
+                assert!(!summary.contains("not_observed"));
+            }
             assert!(summary.contains("\"bridgeState\":\"idle\""));
             for marker in [
                 "provider",
@@ -13490,6 +13791,84 @@ mod windows {
                 "https://",
             ] {
                 assert!(!summary.to_ascii_lowercase().contains(marker));
+            }
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_vita_stage_failure_is_mapped_only_from_safe_turn_failed_message() {
+            let message = "D32 Vita stage failure stage=populate code=operation_failed bridge_sent=1 bridge_pending=1 bridge_replied=1 bridge_pending_active=false bridge_decision=confirm bridge_confirmed=1 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0";
+            let diagnostic =
+                parse_d32_vita_safe_stage_diagnostic(message).expect("safe Vita stage diagnostic");
+            let trace = D32HostCanaryTrace::default();
+            trace.update(|snapshot| snapshot.stage_telemetry.mark_vita_failure(&diagnostic));
+            let snapshot = trace.snapshot();
+            assert_eq!(snapshot.stage_telemetry.populate.failed, 1);
+            assert_eq!(
+                snapshot
+                    .stage_telemetry
+                    .populate
+                    .last_failure_code
+                    .as_deref(),
+                Some("operation_failed")
+            );
+            assert_eq!(snapshot.stage_telemetry.bridge_confirmed, 1);
+            assert_eq!(snapshot.stage_telemetry.bridge_decision, "confirm");
+            assert_eq!(snapshot.stage_telemetry.layout.started, 0);
+            assert_eq!(snapshot.stage_telemetry.catalog.started, 0);
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_vita_stage_parser_rejects_duplicate_or_provider_controlled_fields() {
+            let canonical = "D32 Vita stage failure stage=cleanup code=operation_failed bridge_sent=0 bridge_pending=0 bridge_replied=0 bridge_pending_active=false bridge_decision=none bridge_confirmed=0 bridge_denied=0 bridge_cancelled=0 bridge_timed_out=0 bridge_failed=0";
+            assert!(parse_d32_vita_safe_stage_diagnostic(canonical).is_some());
+            assert!(
+                parse_d32_vita_safe_stage_diagnostic(&format!("{canonical} stage=grant")).is_none()
+            );
+            assert!(parse_d32_vita_safe_stage_diagnostic(&format!(
+                "{canonical} provider_message=secret"
+            ))
+            .is_none());
+            assert!(parse_d32_vita_safe_stage_diagnostic(
+                &canonical.replace("bridge_failed=0", "bridge_failed=17")
+            )
+            .is_none());
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_failure_context_redacts_cleanup_and_transport_details() {
+            let control = D32HostCanaryControl::new(D32HostCanaryMode::Positive);
+            let cleanup = D32CleanupOutcome {
+                attempted: true,
+                validated: false,
+                removed: false,
+                unsafe_left: true,
+                error: Some("C:\\Users\\secret\\workspace\\provider-message=token".to_string()),
+            };
+            let context = d32_failure_context(
+                &control,
+                "provider body Authorization: Bearer token at C:\\secret",
+                Some(&cleanup),
+                true,
+            );
+            assert!(context.contains("error_code=turn"));
+            assert!(context.contains("clear_failed=true"));
+            assert!(context.contains("error_present=true"));
+            for marker in [
+                "Users",
+                "secret",
+                "provider-message",
+                "Authorization",
+                "Bearer",
+                "token",
+                "C:\\",
+            ] {
+                assert!(
+                    !context.contains(marker),
+                    "failure context leaked {marker:?}"
+                );
             }
         }
 

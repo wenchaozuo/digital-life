@@ -58,6 +58,185 @@ const D32_NATIVE_EVIDENCE_VERSION: u32 = 2;
 const D32_NATIVE_EVIDENCE_DIR_NAME: &str = ".d32-native-evidence-v2";
 const D32_NATIVE_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
+const D32_VITA_COUNTER_MAX: u8 = 16;
+
+/// The D32-only stage vocabulary is deliberately private to the real canary
+/// and is never added to the frozen Vita/Host wire schema.  The Host can
+/// receive a bounded projection of this vocabulary only through the existing
+/// TurnFailed message plumbing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum D32VitaStage {
+    Layout,
+    Catalog,
+    Sandbox,
+    ActionPrepare,
+    ScopeAuthority,
+    Populate,
+    ConfirmationBridge,
+    Grant,
+    Revalidate,
+    Evidence,
+    Cleanup,
+}
+
+impl D32VitaStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Layout => "layout",
+            Self::Catalog => "catalog",
+            Self::Sandbox => "sandbox",
+            Self::ActionPrepare => "action_prepare",
+            Self::ScopeAuthority => "scope_authority",
+            Self::Populate => "populate",
+            Self::ConfirmationBridge => "confirmation_bridge",
+            Self::Grant => "grant",
+            Self::Revalidate => "revalidate",
+            Self::Evidence => "evidence",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum D32VitaFailureCode {
+    OperationFailed,
+    LedgerCapacity,
+}
+
+impl D32VitaFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OperationFailed => "operation_failed",
+            Self::LedgerCapacity => "ledger_capacity",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum D32VitaBridgeDecision {
+    Confirm,
+    Deny,
+    Cancel,
+    Timeout,
+    Error,
+}
+
+impl D32VitaBridgeDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirm",
+            Self::Deny => "deny",
+            Self::Cancel => "cancel",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct D32VitaStageState {
+    failure: Option<(D32VitaStage, D32VitaFailureCode)>,
+    bridge_sent: u8,
+    bridge_pending: u8,
+    bridge_replied: u8,
+    bridge_pending_active: bool,
+    bridge_decision: Option<D32VitaBridgeDecision>,
+    bridge_confirmed: u8,
+    bridge_denied: u8,
+    bridge_cancelled: u8,
+    bridge_timed_out: u8,
+    bridge_failed: u8,
+}
+
+/// Turn-scoped, D32-only telemetry owned by Vita.  It contains only static
+/// stage/decision labels and bounded counters; no request, response, path,
+/// credential, provider, or process payload is retained.
+pub(crate) struct D32VitaStageTelemetry {
+    state: Mutex<D32VitaStageState>,
+}
+
+impl D32VitaStageTelemetry {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(D32VitaStageState::default()),
+        }
+    }
+
+    fn increment(counter: &mut u8) {
+        *counter = counter.saturating_add(1).min(D32_VITA_COUNTER_MAX);
+    }
+
+    pub(crate) fn reset(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = D32VitaStageState::default();
+        }
+    }
+
+    pub(crate) fn failed(&self, stage: D32VitaStage, code: D32VitaFailureCode) {
+        if let Ok(mut state) = self.state.lock() {
+            state.failure = Some((stage, code));
+        }
+    }
+
+    pub(crate) fn stage_started(&self, _stage: D32VitaStage) {}
+
+    pub(crate) fn bridge_sent(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::increment(&mut state.bridge_sent);
+            state.bridge_decision = None;
+        }
+    }
+
+    pub(crate) fn bridge_pending(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.bridge_pending_active {
+                Self::increment(&mut state.bridge_pending);
+            }
+            state.bridge_pending_active = true;
+        }
+    }
+
+    pub(crate) fn bridge_result(&self, decision: D32VitaBridgeDecision) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.bridge_pending_active {
+                return;
+            }
+            Self::increment(&mut state.bridge_replied);
+            state.bridge_pending_active = false;
+            state.bridge_decision = Some(decision);
+            match decision {
+                D32VitaBridgeDecision::Confirm => Self::increment(&mut state.bridge_confirmed),
+                D32VitaBridgeDecision::Deny => Self::increment(&mut state.bridge_denied),
+                D32VitaBridgeDecision::Cancel => Self::increment(&mut state.bridge_cancelled),
+                D32VitaBridgeDecision::Timeout => Self::increment(&mut state.bridge_timed_out),
+                D32VitaBridgeDecision::Error => Self::increment(&mut state.bridge_failed),
+            }
+        }
+    }
+
+    pub(crate) fn terminal_failure_message(&self) -> Option<String> {
+        let state = self.state.lock().ok().map(|state| *state)?;
+        let (stage, code) = state.failure?;
+        Some(format!(
+            "D32 Vita stage failure stage={} code={} bridge_sent={} bridge_pending={} bridge_replied={} bridge_pending_active={} bridge_decision={} bridge_confirmed={} bridge_denied={} bridge_cancelled={} bridge_timed_out={} bridge_failed={}",
+            stage.as_str(),
+            code.as_str(),
+            state.bridge_sent,
+            state.bridge_pending,
+            state.bridge_replied,
+            state.bridge_pending_active,
+            state
+                .bridge_decision
+                .map_or("none", D32VitaBridgeDecision::as_str),
+            state.bridge_confirmed,
+            state.bridge_denied,
+            state.bridge_cancelled,
+            state.bridge_timed_out,
+            state.bridge_failed,
+        ))
+    }
+}
+
 #[cfg(feature = "d32-a-test-helper")]
 static D32_TEST_EVIDENCE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
 
@@ -231,7 +410,6 @@ pub(crate) struct D32ExecutionProjection {
 /// independent of the async tool path: an early `?`, a panic, or a failed
 /// copy must not leave a partial app-owned projection behind.
 struct D32ProjectionRollbackState {
-    root: PathBuf,
     retained_root: Arc<H7RetainedDirectory>,
     armed: AtomicBool,
     cleanup_failed: AtomicBool,
@@ -239,9 +417,8 @@ struct D32ProjectionRollbackState {
 }
 
 impl D32ProjectionRollbackState {
-    fn new(root: PathBuf, retained_root: Arc<H7RetainedDirectory>) -> Arc<Self> {
+    fn new(retained_root: Arc<H7RetainedDirectory>) -> Arc<Self> {
         Arc::new(Self {
-            root,
             retained_root,
             armed: AtomicBool::new(true),
             cleanup_failed: AtomicBool::new(false),
@@ -261,10 +438,7 @@ impl D32ProjectionRollbackState {
                 *failure = Some(error.clone());
             }
         }
-        eprintln!(
-            "D32 projection cleanup failed (fail-closed): root={} error={error}",
-            self.root.display(),
-        );
+        eprintln!("D32 projection cleanup failed (fail-closed): cleanup_failed");
     }
 }
 
@@ -349,7 +523,7 @@ impl D32ExecutionProjection {
         let toolchain_root = toolchain.root.clone();
         let cargo_home = root.join(D32_CARGO_HOME_DIR_NAME);
         let target = root.join(D32_TARGET_DIR_NAME);
-        let rollback = D32ProjectionRollbackState::new(root.clone(), Arc::clone(&root_retained));
+        let rollback = D32ProjectionRollbackState::new(Arc::clone(&root_retained));
         for name in [
             OsStr::new(D32_SOURCE_DIR_NAME),
             OsStr::new(D32_CARGO_HOME_DIR_NAME),
@@ -810,6 +984,7 @@ struct CargoInner {
     active_broker: Mutex<Option<Arc<H7ProcessBroker>>>,
     run_mode: SidecarRunMode,
     native_evidence: Option<Arc<D32NativeEvidenceSink>>,
+    d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
 }
 
 /// Production D32 Cargo profile.  If a trusted toolchain or AppContainer
@@ -821,6 +996,7 @@ pub struct VitaCargoCheckProduction {
     confirmation: Arc<H7PendingConfirmationBridge>,
     receiver: Mutex<Option<CargoConfirmationReceiver>>,
     unavailable_reason: Option<String>,
+    d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
 }
 
 impl VitaCargoCheckProduction {
@@ -832,8 +1008,12 @@ impl VitaCargoCheckProduction {
         session_id: String,
         run_mode: SidecarRunMode,
     ) -> Self {
-        let (confirmation, receiver) =
-            H7PendingConfirmationBridge::new_with_timeout(std::time::Duration::from_secs(30));
+        let d32_telemetry =
+            (run_mode == SidecarRunMode::D32Canary).then(|| Arc::new(D32VitaStageTelemetry::new()));
+        let (confirmation, receiver) = H7PendingConfirmationBridge::new_with_d32_telemetry(
+            std::time::Duration::from_secs(30),
+            d32_telemetry.clone(),
+        );
         let attempted = (|| {
             let selected = cargo_selection
                 .ok_or_else(|| "D32 Host Cargo selection was unavailable".to_string())?;
@@ -867,6 +1047,7 @@ impl VitaCargoCheckProduction {
                 active_broker: Mutex::new(None),
                 run_mode,
                 native_evidence,
+                d32_telemetry: d32_telemetry.clone(),
             }))
         })();
         let (inner, unavailable_reason) = match attempted {
@@ -878,6 +1059,7 @@ impl VitaCargoCheckProduction {
             confirmation,
             receiver: Mutex::new(Some(receiver)),
             unavailable_reason,
+            d32_telemetry,
         }
     }
 
@@ -916,6 +1098,9 @@ impl VitaCargoCheckProduction {
 
     pub fn begin_turn(&self) {
         self.confirmation.begin_turn();
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.reset();
+        }
         if let Some(inner) = &self.inner {
             if let Ok(broker) = inner.active_broker.lock() {
                 if let Some(broker) = broker.as_ref() {
@@ -934,6 +1119,12 @@ impl VitaCargoCheckProduction {
             }
         }
         self.confirmation.cancel_pending();
+    }
+
+    pub(crate) fn d32_terminal_failure_message(&self) -> Option<String> {
+        self.d32_telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.terminal_failure_message())
     }
 }
 
@@ -1055,10 +1246,16 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     let projection = match projection {
                         Ok(projection) => projection,
                         Err(_) => {
+                            if let Some(telemetry) = &inner.d32_telemetry {
+                                telemetry.failed(
+                                    D32VitaStage::Layout,
+                                    D32VitaFailureCode::OperationFailed,
+                                );
+                            }
                             return Ok(Box::new(JsonToolOutput::with_success(
                                 denied_value(),
                                 Some(false),
-                            )) as Box<dyn ToolOutput>)
+                            )) as Box<dyn ToolOutput>);
                         }
                     };
                     let catalog = match H7ExecutableCatalog::cargo_check_projected(
@@ -1074,8 +1271,20 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     ) {
                         Ok(catalog) => Arc::new(catalog),
                         Err(_error) => {
-                            if let Err(error) = projection.cleanup() {
-                                eprintln!("D32 catalog cleanup denied: {error}");
+                            if let Some(telemetry) = &inner.d32_telemetry {
+                                telemetry.failed(
+                                    D32VitaStage::Catalog,
+                                    D32VitaFailureCode::OperationFailed,
+                                );
+                            }
+                            if let Err(_error) = projection.cleanup() {
+                                if let Some(telemetry) = &inner.d32_telemetry {
+                                    telemetry.failed(
+                                        D32VitaStage::Cleanup,
+                                        D32VitaFailureCode::OperationFailed,
+                                    );
+                                }
+                                eprintln!("D32 catalog cleanup denied: cleanup_failed");
                             }
                             return Ok(Box::new(JsonToolOutput::with_success(
                                 denied_value(),
@@ -1091,8 +1300,18 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                         )
                         .is_err()
                     {
-                        if let Err(error) = projection.cleanup() {
-                            eprintln!("D32 sandbox cleanup denied: {error}");
+                        if let Some(telemetry) = &inner.d32_telemetry {
+                            telemetry
+                                .failed(D32VitaStage::Sandbox, D32VitaFailureCode::OperationFailed);
+                        }
+                        if let Err(_error) = projection.cleanup() {
+                            if let Some(telemetry) = &inner.d32_telemetry {
+                                telemetry.failed(
+                                    D32VitaStage::Cleanup,
+                                    D32VitaFailureCode::OperationFailed,
+                                );
+                            }
+                            eprintln!("D32 sandbox cleanup denied: cleanup_failed");
                         }
                         return Ok(Box::new(JsonToolOutput::with_success(
                             denied_value(),
@@ -1105,6 +1324,11 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                             Arc::clone(&catalog),
                             Arc::clone(&inner.authority),
                             Arc::clone(&inner.confirmation),
+                            inner
+                                .d32_telemetry
+                                .as_ref()
+                                .expect("D32 canary broker telemetry")
+                                .clone(),
                         )
                     } else {
                         H7ProcessBroker::new(
@@ -1135,10 +1359,18 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                             // governed workspace.  The proof is consumed by
                             // the broker so the same scope is not evaluated a
                             // second time over the Host wire.
-                            let scope_proof = broker.preauthorize_workspace_scope(&action);
-                            if scope_proof.is_err()
-                                || projection.populate(&inner.workspace_root).is_err()
-                            {
+                            let scope_proof = broker.preauthorize_workspace_scope(&action).ok();
+                            let populated = scope_proof.is_some()
+                                && projection.populate(&inner.workspace_root).is_ok();
+                            if !populated {
+                                if let Some(telemetry) = &inner.d32_telemetry {
+                                    telemetry.failed(
+                                        D32VitaStage::Populate,
+                                        D32VitaFailureCode::OperationFailed,
+                                    );
+                                }
+                            }
+                            if scope_proof.is_none() || !populated {
                                 denied_value()
                             } else {
                                 if let Ok(mut active) = inner.active_broker.lock() {
@@ -1181,6 +1413,14 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                                 } else {
                                     Ok(())
                                 };
+                                if evidence_published.is_err() {
+                                    if let Some(telemetry) = &inner.d32_telemetry {
+                                        telemetry.failed(
+                                            D32VitaStage::Evidence,
+                                            D32VitaFailureCode::OperationFailed,
+                                        );
+                                    }
+                                }
                                 if evidence_published.is_ok() {
                                     result.cargo_value()
                                 } else {
@@ -1188,7 +1428,15 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                                 }
                             }
                         }
-                        Err(_error) => denied_value(),
+                        Err(_error) => {
+                            if let Some(telemetry) = &inner.d32_telemetry {
+                                telemetry.failed(
+                                    D32VitaStage::ActionPrepare,
+                                    D32VitaFailureCode::OperationFailed,
+                                );
+                            }
+                            denied_value()
+                        }
                     };
                     // The catalog retains the prepared source-directory handle
                     // used by the H7 binding.  Release the broker/catalog before
@@ -1197,11 +1445,15 @@ impl<'call> ToolExecutor<ToolCall<'call>> for VitaCargoCheckTool {
                     // child Job has reached terminal state.
                     drop(broker);
                     drop(catalog);
-                    if let Err(error) = projection.cleanup() {
+                    if let Err(_error) = projection.cleanup() {
+                        if let Some(telemetry) = &inner.d32_telemetry {
+                            telemetry
+                                .failed(D32VitaStage::Cleanup, D32VitaFailureCode::OperationFailed);
+                        }
                         // A terminal run must not be reported as a successful
                         // Cargo result while its app-owned run root is still
                         // present or has become unsafe to remove.
-                        eprintln!("D32 terminal cleanup denied: {error}");
+                        eprintln!("D32 terminal cleanup denied: cleanup_failed");
                         denied_value()
                     } else {
                         result
@@ -1281,6 +1533,90 @@ mod tests {
                 "telemetry leaked: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn d32_vita_stage_fixture_matrix_is_static_and_bounded() {
+        let stages = [
+            D32VitaStage::Layout,
+            D32VitaStage::Catalog,
+            D32VitaStage::Sandbox,
+            D32VitaStage::ActionPrepare,
+            D32VitaStage::ScopeAuthority,
+            D32VitaStage::Populate,
+            D32VitaStage::ConfirmationBridge,
+            D32VitaStage::Grant,
+            D32VitaStage::Revalidate,
+            D32VitaStage::Evidence,
+            D32VitaStage::Cleanup,
+        ];
+        for stage in stages {
+            let telemetry = D32VitaStageTelemetry::new();
+            telemetry.failed(stage, D32VitaFailureCode::OperationFailed);
+            telemetry.bridge_sent();
+            telemetry.bridge_pending();
+            telemetry.bridge_result(D32VitaBridgeDecision::Confirm);
+            let message = telemetry
+                .terminal_failure_message()
+                .expect("D32 Vita failure fixture");
+            assert!(message.contains(&format!("stage={}", stage.as_str())));
+            assert!(message.contains("code=operation_failed"));
+            assert!(message.contains("bridge_confirmed=1"));
+            for marker in [
+                "provider",
+                "token",
+                "credential",
+                "authorization",
+                "body",
+                "http://",
+                "https://",
+            ] {
+                assert!(!message.to_ascii_lowercase().contains(marker));
+            }
+        }
+    }
+
+    #[test]
+    fn d32_vita_bridge_counters_follow_the_pending_ledger() {
+        let telemetry = D32VitaStageTelemetry::new();
+        telemetry.bridge_result(D32VitaBridgeDecision::Error);
+        telemetry.failed(
+            D32VitaStage::ConfirmationBridge,
+            D32VitaFailureCode::OperationFailed,
+        );
+        let before_send = telemetry
+            .terminal_failure_message()
+            .expect("failure must be visible");
+        assert!(before_send.contains("bridge_replied=0"));
+        assert!(before_send.contains("bridge_failed=0"));
+
+        telemetry.bridge_sent();
+        telemetry.bridge_pending();
+        telemetry.bridge_result(D32VitaBridgeDecision::Deny);
+        telemetry.bridge_result(D32VitaBridgeDecision::Confirm);
+        let after_reply = telemetry
+            .terminal_failure_message()
+            .expect("failure must remain visible");
+        assert!(after_reply.contains("bridge_sent=1"));
+        assert!(after_reply.contains("bridge_pending=1"));
+        assert!(after_reply.contains("bridge_replied=1"));
+        assert!(after_reply.contains("bridge_decision=deny"));
+        assert!(after_reply.contains("bridge_denied=1"));
+        assert!(after_reply.contains("bridge_confirmed=0"));
+        assert!(after_reply.contains("bridge_pending_active=false"));
+
+        for _ in 0..64 {
+            telemetry.bridge_sent();
+            telemetry.bridge_pending();
+            telemetry.bridge_result(D32VitaBridgeDecision::Timeout);
+        }
+        let bounded = telemetry
+            .terminal_failure_message()
+            .expect("bounded failure telemetry");
+        assert!(bounded.contains("bridge_sent=16"));
+        assert!(bounded.contains("bridge_pending=16"));
+        assert!(bounded.contains("bridge_replied=16"));
+        assert!(bounded.contains("bridge_timed_out=16"));
     }
 
     #[cfg(windows)]

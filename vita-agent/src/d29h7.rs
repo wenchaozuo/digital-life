@@ -36,6 +36,8 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use vita_agent_protocol as protocol;
 
+use crate::d32a::{D32VitaBridgeDecision, D32VitaFailureCode, D32VitaStage, D32VitaStageTelemetry};
+
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FileIdBothDirectoryInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
@@ -6756,6 +6758,7 @@ pub struct H7PendingProcessAction {
     response: tokio::sync::oneshot::Sender<i64>,
     generation: u64,
     generation_state: Arc<AtomicU64>,
+    d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
 }
 
 #[derive(Clone)]
@@ -6765,6 +6768,7 @@ pub struct H7PendingConfirmationBridge {
     cancelled_notify: Arc<Notify>,
     generation: Arc<AtomicU64>,
     timeout: Duration,
+    d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
 }
 
 impl H7PendingConfirmationBridge {
@@ -6781,6 +6785,16 @@ impl H7PendingConfirmationBridge {
         Arc<Self>,
         tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
     ) {
+        Self::new_with_d32_telemetry(timeout, None)
+    }
+
+    pub(crate) fn new_with_d32_telemetry(
+        timeout: Duration,
+        d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::Receiver<H7PendingProcessAction>,
+    ) {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         (
             Arc::new(Self {
@@ -6789,6 +6803,7 @@ impl H7PendingConfirmationBridge {
                 cancelled_notify: Arc::new(Notify::new()),
                 generation: Arc::new(AtomicU64::new(0)),
                 timeout,
+                d32_telemetry,
             }),
             receiver,
         )
@@ -6823,11 +6838,28 @@ impl H7PendingConfirmationBridge {
         cancellation: &AtomicBool,
         cancellation_notify: &Notify,
     ) -> Result<i64, String> {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.stage_started(D32VitaStage::ConfirmationBridge);
+        }
         let generation = self.generation.load(Ordering::Acquire);
         if cancellation.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire) {
+            if let Some(telemetry) = &self.d32_telemetry {
+                telemetry.failed(
+                    D32VitaStage::ConfirmationBridge,
+                    D32VitaFailureCode::OperationFailed,
+                );
+                telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+            }
             return Err("D29-H7 process action was cancelled before confirmation".to_string());
         }
         if self.generation.load(Ordering::Acquire) != generation {
+            if let Some(telemetry) = &self.d32_telemetry {
+                telemetry.failed(
+                    D32VitaStage::ConfirmationBridge,
+                    D32VitaFailureCode::OperationFailed,
+                );
+                telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+            }
             return Err("D29-H7 process action belongs to a retired turn".to_string());
         }
         let (response, receiver) = tokio::sync::oneshot::channel();
@@ -6836,21 +6868,80 @@ impl H7PendingConfirmationBridge {
             response,
             generation,
             generation_state: Arc::clone(&self.generation),
+            d32_telemetry: self.d32_telemetry.clone(),
         });
         tokio::pin!(send);
-        tokio::select! {
-            result = &mut send => result.map_err(|_| "D29-H7 confirmation bridge closed".to_string())?,
-            _ = cancellation_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
-            _ = self.cancelled_notify.notified() => return Err("D29-H7 process action cancelled".to_string()),
-            _ = tokio::time::sleep(self.timeout) => return Err("D29-H7 confirmation timed out".to_string()),
+        let send_result = tokio::select! {
+            result = &mut send => result,
+            _ = cancellation_notify.notified() => {
+                if let Some(telemetry) = &self.d32_telemetry {
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+                }
+                return Err("D29-H7 process action cancelled".to_string());
+            }
+            _ = self.cancelled_notify.notified() => {
+                if let Some(telemetry) = &self.d32_telemetry {
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+                }
+                return Err("D29-H7 process action cancelled".to_string());
+            }
+            _ = tokio::time::sleep(self.timeout) => {
+                if let Some(telemetry) = &self.d32_telemetry {
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::LedgerCapacity);
+                    telemetry.bridge_result(D32VitaBridgeDecision::Timeout);
+                }
+                return Err("D29-H7 confirmation timed out".to_string());
+            }
+        };
+        if let Err(_error) = send_result {
+            if let Some(telemetry) = &self.d32_telemetry {
+                telemetry.failed(
+                    D32VitaStage::ConfirmationBridge,
+                    D32VitaFailureCode::OperationFailed,
+                );
+                telemetry.bridge_result(D32VitaBridgeDecision::Error);
+            }
+            return Err("D29-H7 confirmation bridge closed".to_string());
+        }
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.bridge_sent();
         }
         tokio::select! {
             result = tokio::time::timeout(self.timeout, receiver) => {
-                result.map_err(|_| "D29-H7 confirmation timed out".to_string())?
-                    .map_err(|_| "D29-H7 confirmation response closed".to_string())
+                match result {
+                    Ok(Ok(revision)) => Ok(revision),
+                    Ok(Err(_)) => {
+                        if let Some(telemetry) = &self.d32_telemetry {
+                            telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                            telemetry.bridge_result(D32VitaBridgeDecision::Error);
+                        }
+                        Err("D29-H7 confirmation response closed".to_string())
+                    }
+                    Err(_) => {
+                        if let Some(telemetry) = &self.d32_telemetry {
+                            telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                            telemetry.bridge_result(D32VitaBridgeDecision::Timeout);
+                        }
+                        Err("D29-H7 confirmation timed out".to_string())
+                    }
+                }
             }
-            _ = cancellation_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
-            _ = self.cancelled_notify.notified() => Err("D29-H7 process action cancelled".to_string()),
+            _ = cancellation_notify.notified() => {
+                if let Some(telemetry) = &self.d32_telemetry {
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+                }
+                Err("D29-H7 process action cancelled".to_string())
+            }
+            _ = self.cancelled_notify.notified() => {
+                if let Some(telemetry) = &self.d32_telemetry {
+                    telemetry.failed(D32VitaStage::ConfirmationBridge, D32VitaFailureCode::OperationFailed);
+                    telemetry.bridge_result(D32VitaBridgeDecision::Cancel);
+                }
+                Err("D29-H7 process action cancelled".to_string())
+            }
         }
     }
 }
@@ -6869,6 +6960,32 @@ impl H7PendingProcessAction {
         self.response
             .send(authorization_revision)
             .map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
+    }
+
+    pub fn mark_pending(&self) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.bridge_pending();
+        }
+    }
+
+    pub fn resolve(
+        self,
+        authorization_revision: i64,
+        decision: D32VitaBridgeDecision,
+    ) -> Result<(), String> {
+        let result = self.response.send(authorization_revision);
+        if result.is_ok() {
+            if let Some(telemetry) = &self.d32_telemetry {
+                telemetry.bridge_result(decision);
+            }
+        } else if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.failed(
+                D32VitaStage::ConfirmationBridge,
+                D32VitaFailureCode::OperationFailed,
+            );
+            telemetry.bridge_result(D32VitaBridgeDecision::Error);
+        }
+        result.map_err(|_| "D29-H7-C confirmation waiter is no longer active".to_string())
     }
 
     pub fn is_current(&self) -> bool {
@@ -7389,6 +7506,7 @@ pub(crate) struct H7ProcessBroker {
     unlisted_inheritable_handle: Option<usize>,
     post_host_mutation: H7PostHostMutation,
     output_terminality_gate: Option<Arc<H7TerminalityGate>>,
+    d32_telemetry: Option<Arc<D32VitaStageTelemetry>>,
 }
 
 /// Process-local proof that the Host has evaluated the workspace scope for a
@@ -7438,6 +7556,7 @@ impl H7ProcessBroker {
             unlisted_inheritable_handle: None,
             post_host_mutation: H7PostHostMutation::None,
             output_terminality_gate: None,
+            d32_telemetry: None,
         })
     }
 
@@ -7446,11 +7565,15 @@ impl H7ProcessBroker {
         catalog: Arc<H7ExecutableCatalog>,
         authority: Arc<dyn H7AuthorityPort>,
         bridge: Arc<H7PendingConfirmationBridge>,
+        d32_telemetry: Arc<D32VitaStageTelemetry>,
     ) -> Arc<Self> {
         let mut broker = Self::new(context, catalog, authority, bridge);
         Arc::get_mut(&mut broker)
             .expect("D32 real canary broker must be configured before sharing")
             .d32_real_canary = true;
+        Arc::get_mut(&mut broker)
+            .expect("D32 telemetry must be configured before sharing broker")
+            .d32_telemetry = Some(d32_telemetry);
         broker
     }
 
@@ -7551,6 +7674,12 @@ impl H7ProcessBroker {
         Arc::clone(&self.metrics)
     }
 
+    fn d32_failed(&self, stage: D32VitaStage, code: D32VitaFailureCode) {
+        if let Some(telemetry) = &self.d32_telemetry {
+            telemetry.failed(stage, code);
+        }
+    }
+
     pub(crate) async fn execute(
         self: &Arc<Self>,
         action: Arc<PreparedProcessAction>,
@@ -7570,13 +7699,36 @@ impl H7ProcessBroker {
             || action.workspace_root.is_none()
             || action.workspace_root_identity.is_none()
         {
+            self.d32_failed(
+                D32VitaStage::ScopeAuthority,
+                D32VitaFailureCode::OperationFailed,
+            );
             return Err(
                 "D32 workspace scope proof was requested for a non-Cargo action".to_string(),
             );
         }
-        verify_workspace_root_binding(action)?;
-        let authorization_revision = self.authority.evaluate_workspace_scope(action)?;
+        if verify_workspace_root_binding(action).is_err() {
+            self.d32_failed(
+                D32VitaStage::ScopeAuthority,
+                D32VitaFailureCode::OperationFailed,
+            );
+            return Err("D32 workspace scope proof binding was invalid".to_string());
+        }
+        let authorization_revision = match self.authority.evaluate_workspace_scope(action) {
+            Ok(revision) => revision,
+            Err(_error) => {
+                self.d32_failed(
+                    D32VitaStage::ScopeAuthority,
+                    D32VitaFailureCode::OperationFailed,
+                );
+                return Err("D32 workspace scope authority was denied".to_string());
+            }
+        };
         if authorization_revision <= 0 {
+            self.d32_failed(
+                D32VitaStage::ScopeAuthority,
+                D32VitaFailureCode::OperationFailed,
+            );
             return Err("D32 workspace scope authority revision was not positive".to_string());
         }
         Ok(H7WorkspaceScopeProof {
@@ -7596,6 +7748,10 @@ impl H7ProcessBroker {
         proof: H7WorkspaceScopeProof,
     ) -> H7ToolResult {
         if self.validate_prevalidated_scope(&action, &proof).is_err() {
+            self.d32_failed(
+                D32VitaStage::ScopeAuthority,
+                D32VitaFailureCode::OperationFailed,
+            );
             return H7ToolResult::denied();
         }
         self.execute_tool_action_with_scope(action, Some(proof))
@@ -7631,7 +7787,13 @@ impl H7ProcessBroker {
     ) -> H7ToolResult {
         let admission = match self.admission.try_acquire() {
             Some(admission) => admission,
-            None => return H7ToolResult::denied(),
+            None => {
+                self.d32_failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::OperationFailed,
+                );
+                return H7ToolResult::denied();
+            }
         };
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancellation_notify = Arc::new(Notify::new());
@@ -7663,16 +7825,32 @@ impl H7ProcessBroker {
     ) -> H7ToolResult {
         if action.capability_id == VITA_WORKSPACE_CARGO_CHECK_CAPABILITY_ID {
             if action.workspace_root.is_none() || action.workspace_root_identity.is_none() {
+                self.d32_failed(
+                    D32VitaStage::ScopeAuthority,
+                    D32VitaFailureCode::OperationFailed,
+                );
                 return H7ToolResult::denied();
             }
             if let Some(proof) = prevalidated_scope {
                 if self.validate_prevalidated_scope(&action, &proof).is_err() {
+                    self.d32_failed(
+                        D32VitaStage::ScopeAuthority,
+                        D32VitaFailureCode::OperationFailed,
+                    );
                     return H7ToolResult::denied();
                 }
             } else if let Err(_error) = self.authority.evaluate_workspace_scope(&action) {
+                self.d32_failed(
+                    D32VitaStage::ScopeAuthority,
+                    D32VitaFailureCode::OperationFailed,
+                );
                 return H7ToolResult::denied();
             }
         } else if prevalidated_scope.is_some() {
+            self.d32_failed(
+                D32VitaStage::ScopeAuthority,
+                D32VitaFailureCode::OperationFailed,
+            );
             return H7ToolResult::denied();
         }
         let authorization_revision = match self
@@ -7707,6 +7885,7 @@ impl H7ProcessBroker {
         {
             Ok(Ok(grant)) => grant,
             Ok(Err(_error)) => {
+                self.d32_failed(D32VitaStage::Grant, D32VitaFailureCode::OperationFailed);
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
@@ -7714,11 +7893,12 @@ impl H7ProcessBroker {
                 };
             }
             _ => {
+                self.d32_failed(D32VitaStage::Grant, D32VitaFailureCode::OperationFailed);
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
                     H7ToolResult::denied()
-                }
+                };
             }
         };
         let preparation_action = Arc::clone(&action);
@@ -7737,11 +7917,15 @@ impl H7ProcessBroker {
         {
             Ok(Ok(preparation)) => preparation,
             _ => {
+                self.d32_failed(
+                    D32VitaStage::ActionPrepare,
+                    D32VitaFailureCode::OperationFailed,
+                );
                 return if cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
                     H7ToolResult::denied()
-                }
+                };
             }
         };
         if let Some(gate) = &self.final_fence_gate {
@@ -7761,6 +7945,7 @@ impl H7ProcessBroker {
         let worker_metrics = Arc::clone(&metrics);
         let worker_admission = admission.clone();
         let worker_cancellation = Arc::clone(&cancellation);
+        let d32_telemetry = self.d32_telemetry.clone();
         match tokio::task::spawn_blocking(move || {
             let _admission = worker_admission;
             let _worker = H7NativeWorkerGuard::new(worker_metrics);
@@ -7770,6 +7955,12 @@ impl H7ProcessBroker {
             let mut grant = grant;
             if let Err(_error) = authority.revalidate_process_grant(&action_for_launch, &mut grant)
             {
+                if let Some(telemetry) = &d32_telemetry {
+                    telemetry.failed(
+                        D32VitaStage::Revalidate,
+                        D32VitaFailureCode::OperationFailed,
+                    );
+                }
                 return if worker_cancellation.load(Ordering::Acquire) {
                     H7ToolResult::cancelled_before_start()
                 } else {
@@ -7802,6 +7993,12 @@ impl H7ProcessBroker {
                 if replay_result.is_err() {
                     d32_replay_denied = true;
                 } else {
+                    if let Some(telemetry) = &d32_telemetry {
+                        telemetry.failed(
+                            D32VitaStage::Revalidate,
+                            D32VitaFailureCode::OperationFailed,
+                        );
+                    }
                     return H7ToolResult::denied();
                 }
             }

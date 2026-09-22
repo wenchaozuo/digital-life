@@ -1410,7 +1410,8 @@ where
             )
             .map_err(|error| {
                 let http_status = d32_native_http_status(&error);
-                let attempts = d32_native_transport_attempts(&error).or(Some(1));
+                let attempts =
+                    d32_native_transport_attempts(&error).filter(|attempts| *attempts > 0);
                 d32_native_failure(
                     phase,
                     attempts,
@@ -4059,6 +4060,53 @@ mod tests {
             "provider-token",
         ] {
             assert!(!diagnostic.contains(marker), "diagnostic leaked {marker:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d32_native_transport_differentiates_no_http_from_one_attempt() {
+        let cases = [
+            (
+                0_u8,
+                VitaAgentError::ProviderTransportRejected {
+                    reason: "provider DNS returned no destination addresses",
+                },
+                "phase=dns round=initial_request attempts=none",
+            ),
+            (
+                1_u8,
+                VitaAgentError::ProviderTransportRejected {
+                    reason: "provider HTTPS request failed",
+                },
+                "phase=connect round=initial_request attempts=1",
+            ),
+        ];
+        for (attempts, source, expected) in cases {
+            let transport = Arc::new(D32NativeTestTransport::with_error(
+                VitaAgentError::ProviderTransportAttempted {
+                    attempts,
+                    source: Box::new(source),
+                },
+            ));
+            let (ready, credential) = d32_native_profile();
+            let gateway = ProviderGateway::new_with_d32_native(
+                ready,
+                InMemoryTestCredential {
+                    reference: credential,
+                    value: "native-test-credential".to_string(),
+                },
+                Arc::clone(&transport),
+                true,
+            );
+            let diagnostic = gateway
+                .execute_responses_request(&d32_native_first_request())
+                .expect_err("transport fixture must fail")
+                .to_string();
+            assert!(
+                diagnostic.contains(expected),
+                "unexpected diagnostic: {diagnostic}"
+            );
         }
     }
 

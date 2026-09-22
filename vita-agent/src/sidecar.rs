@@ -33,6 +33,7 @@ use vita_agent_protocol as protocol;
 
 use crate::d29h5::RecoveryExecutionOutcome;
 use crate::d29h7::H7RetainedDirectory;
+use crate::d32a::D32VitaBridgeDecision;
 use crate::d32a::D32_TOOLCHAIN_MIRROR_ROOT_NAME;
 use crate::provider_gateway::{
     CredentialResolver, GatewayReadyProvider, GatewayToolDefinition, ProviderGateway,
@@ -217,7 +218,8 @@ impl D32ForcedToolLatch {
                 .unwrap_or_else(|error| error.into_inner());
             counters.sse_created = counters.sse_created.saturating_add(1);
             counters.sse_failed = counters.sse_failed.saturating_add(1);
-            format_d32_safe_failure(raw, *counters)
+            d32_safe_vita_stage_failure(raw, *counters)
+                .unwrap_or_else(|| format_d32_safe_failure(raw, *counters))
         };
         let specificity = d32_failure_specificity(&message);
         if let Ok(mut last_failure) = self.last_failure.lock() {
@@ -241,7 +243,8 @@ impl D32ForcedToolLatch {
                 .lock()
                 .map(|counters| *counters)
                 .unwrap_or_default();
-            format_d32_safe_failure(raw, counters)
+            d32_safe_vita_stage_failure(raw, counters)
+                .unwrap_or_else(|| format_d32_safe_failure(raw, counters))
         };
         let candidate_specificity = d32_failure_specificity(&candidate);
         if let Ok(last_failure) = self.last_failure.lock() {
@@ -390,6 +393,105 @@ impl D32ForcedToolLatch {
 }
 
 const D32_SAFE_DIAGNOSTIC_PREFIX: &str = "D32 native Responses rejected";
+const D32_VITA_STAGE_FAILURE_PREFIX: &str = "D32 Vita stage failure";
+
+fn d32_allowlisted_vita_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "layout"
+            | "catalog"
+            | "sandbox"
+            | "action_prepare"
+            | "scope_authority"
+            | "populate"
+            | "confirmation_bridge"
+            | "grant"
+            | "revalidate"
+            | "evidence"
+            | "cleanup"
+    )
+}
+
+fn d32_allowlisted_vita_failure_code(value: &str) -> bool {
+    matches!(value, "operation_failed" | "ledger_capacity")
+}
+
+fn d32_allowlisted_bridge_decision(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "confirm" | "deny" | "cancel" | "timeout" | "error"
+    )
+}
+
+fn d32_vita_stage_specificity(value: &str) -> u8 {
+    value
+        .contains(D32_VITA_STAGE_FAILURE_PREFIX)
+        .then_some(100)
+        .unwrap_or(0)
+}
+
+fn d32_safe_vita_stage_failure(raw: &str, counters: D32TurnCounters) -> Option<String> {
+    let start = raw.find(D32_VITA_STAGE_FAILURE_PREFIX)? + D32_VITA_STAGE_FAILURE_PREFIX.len();
+    let mut fields = HashMap::new();
+    for token in raw[start..].split_ascii_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        if !matches!(
+            key,
+            "stage"
+                | "code"
+                | "bridge_sent"
+                | "bridge_pending"
+                | "bridge_replied"
+                | "bridge_pending_active"
+                | "bridge_decision"
+                | "bridge_confirmed"
+                | "bridge_denied"
+                | "bridge_cancelled"
+                | "bridge_timed_out"
+                | "bridge_failed"
+        ) || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    let stage = fields
+        .get("stage")
+        .copied()
+        .filter(|value| d32_allowlisted_vita_stage(value))?;
+    let code = fields
+        .get("code")
+        .copied()
+        .filter(|value| d32_allowlisted_vita_failure_code(value))?;
+    let bridge_pending_active = match fields.get("bridge_pending_active").copied()? {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    let decision = fields.get("bridge_decision").copied()?;
+    if !d32_allowlisted_bridge_decision(decision) {
+        return None;
+    }
+    let bounded = |key: &str| {
+        fields
+            .get(key)
+            .copied()?
+            .parse::<u8>()
+            .ok()
+            .filter(|value| *value <= 16)
+    };
+    Some(format!(
+        "{D32_VITA_STAGE_FAILURE_PREFIX} stage={stage} code={code} bridge_sent={} bridge_pending={} bridge_replied={} bridge_pending_active={bridge_pending_active} bridge_decision={decision} bridge_confirmed={} bridge_denied={} bridge_cancelled={} bridge_timed_out={} bridge_failed={} {}",
+        bounded("bridge_sent")?,
+        bounded("bridge_pending")?,
+        bounded("bridge_replied")?,
+        bounded("bridge_confirmed")?,
+        bounded("bridge_denied")?,
+        bounded("bridge_cancelled")?,
+        bounded("bridge_timed_out")?,
+        bounded("bridge_failed")?,
+        counters.as_suffix(),
+    ))
+}
 
 fn d32_allowlisted_phase(value: &str) -> bool {
     matches!(
@@ -456,6 +558,10 @@ fn d32_bounded_counter(value: Option<&str>) -> String {
 }
 
 fn d32_failure_specificity(value: &str) -> u8 {
+    let vita_specificity = d32_vita_stage_specificity(value);
+    if vita_specificity != 0 {
+        return vita_specificity;
+    }
     let phase = value
         .split_ascii_whitespace()
         .find_map(|token| token.strip_prefix("phase="));
@@ -486,7 +592,12 @@ fn format_d32_safe_failure(raw: &str, counters: D32TurnCounters) -> String {
             let Some((key, value)) = token.split_once('=') else {
                 continue;
             };
-            fields.insert(key, value);
+            if fields.insert(key, value).is_some() {
+                return format!(
+                    "{D32_SAFE_DIAGNOSTIC_PREFIX} phase=turn_terminal round=unknown attempts=none http_status=none error_code=turn_failed output_kind=none content_type_is_json=false {}",
+                    counters.as_suffix()
+                );
+            }
         }
     }
     let default_phase = if raw.contains("finish reason") {
@@ -3106,6 +3217,7 @@ async fn handle_start_turn(
     let cancel_notify_for_task = Arc::clone(&cancel_notify);
     let router_for_task = router.clone();
     let d32_latch_for_task = gateway.d32_forced_tool.clone();
+    let cargo_production_for_task = Arc::clone(&cargo_production);
     let join = tokio::spawn(async move {
         let result = runtime
             .run_turn(
@@ -3115,6 +3227,16 @@ async fn handle_start_turn(
                 cancel_notify_for_task,
             )
             .await;
+        let result = match (
+            result,
+            cargo_production_for_task.d32_terminal_failure_message(),
+        ) {
+            (Err(error), Some(_)) if error.to_string().to_ascii_lowercase().contains("cancel") => {
+                Err(error)
+            }
+            (_, Some(message)) => Err(crate::VitaAgentError::GatewayProtocol(message)),
+            (result, None) => result,
+        };
         let still_current = active_identity_for_task
             .lock()
             .ok()
@@ -3289,13 +3411,14 @@ fn spawn_confirmation_loop(
 ) {
     tokio::spawn(async move {
         while let Some(action) = receiver.recv().await {
+            action.mark_pending();
             if !action.is_current() {
-                let _ = action.confirm(0);
+                let _ = action.resolve(0, D32VitaBridgeDecision::Cancel);
                 continue;
             }
             let binding = action.binding();
             let Some(active) = active_identity_snapshot(&active_identity) else {
-                let _ = action.confirm(0);
+                let _ = action.resolve(0, D32VitaBridgeDecision::Cancel);
                 continue;
             };
             let host_turn_id = active.turn_id.clone();
@@ -3329,21 +3452,30 @@ fn spawn_confirmation_loop(
                 move || router.request(message)
             })
             .await;
-            let revision = match response {
+            let (revision, decision) = match response {
                 Ok(Ok(HostMessage::ConfirmationReply(reply)))
                     if reply.session_id == init.session_id
                         && reply.decision == ConfirmationDecision::Confirm
                         && reply.authorization_revision.is_some() =>
                 {
-                    reply.authorization_revision.unwrap_or(0)
+                    (
+                        reply.authorization_revision.unwrap_or(0),
+                        D32VitaBridgeDecision::Confirm,
+                    )
                 }
-                _ => 0,
+                Ok(Ok(HostMessage::ConfirmationReply(reply)))
+                    if reply.session_id == init.session_id
+                        && reply.decision == ConfirmationDecision::Deny =>
+                {
+                    (0, D32VitaBridgeDecision::Deny)
+                }
+                _ => (0, D32VitaBridgeDecision::Error),
             };
             if !action.is_current() {
-                let _ = action.confirm(0);
+                let _ = action.resolve(0, D32VitaBridgeDecision::Cancel);
                 continue;
             }
-            let _ = action.confirm(revision);
+            let _ = action.resolve(revision, decision);
             if active_identity_matches(&active_identity, &active) {
                 let _ = router.send(&VitaMessage::TurnState(TurnState {
                     request_id: next_request_id("vita-turn-resumed"),

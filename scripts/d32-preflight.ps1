@@ -87,8 +87,44 @@ $script:D32BundleArtifactNames = @(
     'd32a-production-canary-host.exe',
     'digital_life_lib.dll'
 )
-$script:D32FixtureSchemaVersion = 2
-$script:D32FixtureProcessTreePolicy = 'taskkill /T /F then verify every captured descendant PID'
+$script:D32FixtureSchemaVersion = 3
+$script:D32FixtureProcessTreePolicy = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
+$script:D32FixtureManifestFields = @(
+    'schema_version', 'candidate_sha', 'source_repo', 'generated_at_utc',
+    'started_at_utc', 'elapsed_ms', 'working_tree_status', 'build_policy',
+    'environment', 'process_tree_check', 'process_tree_error', 'fixtures'
+)
+$script:D32FixtureBuildPolicyFields = @(
+    'timeout_seconds', 'cargo_build_jobs', 'nested_builds',
+    'process_tree_timeout_action'
+)
+$script:D32FixtureEnvironmentFields = @(
+    'original_userprofile', 'codex_home', 'userprofile', 'cargo_home',
+    'rustup_home', 'rustup_toolchain'
+)
+$script:D32FixtureIdentityFields = @(
+    'process_id', 'parent_process_id', 'name', 'creation_date',
+    'command_line', 'observed_at_utc', 'identity_verified'
+)
+$script:D32FixtureNativeCleanupFields = @(
+    'job_terminate_call_succeeded', 'job_terminate_last_error',
+    'process_was_already_signaled', 'process_wait_signaled',
+    'job_active_process_count_verified', 'job_active_process_count',
+    'job_active_process_count_last_error', 'job_close_succeeded',
+    'cleanup_succeeded', 'already_closed', 'detail'
+)
+$script:D32FixtureReapFields = @(
+    'process_ids', 'verified_at_utc', 'residual_identities',
+    'native_cleanup', 'kill_output'
+)
+$script:D32FixtureArtifactFields = @('path', 'bytes', 'sha256')
+$script:D32FixtureRecordFields = @(
+    'phase', 'name', 'project', 'binary', 'manifest_path', 'features',
+    'command', 'status', 'exit_code', 'pid', 'descendant_pids',
+    'root_identity', 'descendant_identities', 'residual_descendant_identities',
+    'reap', 'elapsed_ms', 'phase_log', 'stdout_log', 'stderr_log', 'error',
+    'artifact'
+)
 $script:D32FixtureSpecs = @(
     [ordered]@{
         phase = 1
@@ -288,6 +324,18 @@ function Test-D32JsonProperty {
         return $false
     }
     return $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-D32UnexpectedJsonProperties {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Allowed
+    )
+
+    if ($null -eq $Object) {
+        return @()
+    }
+    return @($Object.PSObject.Properties.Name | Where-Object { $Allowed -cnotcontains $_ })
 }
 
 function Read-D32Json {
@@ -1258,6 +1306,10 @@ function Test-D32FixtureManifest {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.file' -Message "fixture manifest is missing or unreadable: $FixtureManifestPath"
         return
     }
+    $unexpectedManifestFields = @(Get-D32UnexpectedJsonProperties -Object $FixtureManifest -Allowed $script:D32FixtureManifestFields)
+    if ($unexpectedManifestFields.Count -gt 0) {
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.schema' -Message "unknown fixture manifest fields: $($unexpectedManifestFields -join ',')"
+    }
     foreach ($field in @('schema_version', 'candidate_sha', 'source_repo', 'build_policy', 'environment', 'process_tree_check', 'process_tree_error', 'fixtures')) {
         if (-not (Test-D32JsonProperty -Object $FixtureManifest -Name $field)) {
             Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.schema' -Message "missing fixture manifest field: $field"
@@ -1295,6 +1347,10 @@ function Test-D32FixtureManifest {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message 'build_policy is missing'
     }
     else {
+        $unexpectedPolicyFields = @(Get-D32UnexpectedJsonProperties -Object $policy -Allowed $script:D32FixtureBuildPolicyFields)
+        if ($unexpectedPolicyFields.Count -gt 0) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message "unknown build policy fields: $($unexpectedPolicyFields -join ',')"
+        }
         $nested = Get-D32JsonProperty -Object $policy -Name 'nested_builds'
         $action = Get-D32JsonProperty -Object $policy -Name 'process_tree_timeout_action'
         $timeout = Get-D32JsonProperty -Object $policy -Name 'timeout_seconds'
@@ -1319,6 +1375,10 @@ function Test-D32FixtureManifest {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.environment' -Message 'environment metadata is missing'
     }
     else {
+        $unexpectedEnvironmentFields = @(Get-D32UnexpectedJsonProperties -Object $environment -Allowed $script:D32FixtureEnvironmentFields)
+        if ($unexpectedEnvironmentFields.Count -gt 0) {
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.environment' -Message "unknown environment fields: $($unexpectedEnvironmentFields -join ',')"
+        }
         $environmentInvalid = @(@('original_userprofile', 'codex_home', 'userprofile', 'cargo_home', 'rustup_home') | Where-Object {
             $value = Get-D32JsonProperty -Object $environment -Name $_
             -not ($value -is [string]) -or [String]::IsNullOrWhiteSpace($value)
@@ -1346,6 +1406,8 @@ function Test-D32FixtureManifest {
         }
         $record = $record[0]
         $recordErrors = [System.Collections.ArrayList]::new()
+        $unexpectedRecordFields = @(Get-D32UnexpectedJsonProperties -Object $record -Allowed $script:D32FixtureRecordFields)
+        if ($unexpectedRecordFields.Count -gt 0) { [void]$recordErrors.Add("unknown:$($unexpectedRecordFields -join '|')") }
         if ((Get-D32JsonProperty -Object $record -Name 'phase') -ne $spec.phase) { [void]$recordErrors.Add('phase') }
         if ((Get-D32JsonProperty -Object $record -Name 'project') -cne $spec.project) { [void]$recordErrors.Add('project') }
         if ((Get-D32JsonProperty -Object $record -Name 'binary') -cne $spec.binary) { [void]$recordErrors.Add('binary') }
@@ -1354,12 +1416,34 @@ function Test-D32FixtureManifest {
         if ((Get-D32JsonProperty -Object $record -Name 'status') -cne 'succeeded') { [void]$recordErrors.Add('status') }
         if ((Get-D32JsonProperty -Object $record -Name 'exit_code') -ne 0) { [void]$recordErrors.Add('exit_code') }
         if (@((Get-D32JsonProperty -Object $record -Name 'descendant_pids')).Count -ne 0) { [void]$recordErrors.Add('descendant_pids') }
+        foreach ($identityField in @('root_identity')) {
+            $identity = Get-D32JsonProperty -Object $record -Name $identityField
+            $unexpectedIdentityFields = @(Get-D32UnexpectedJsonProperties -Object $identity -Allowed $script:D32FixtureIdentityFields)
+            if ($unexpectedIdentityFields.Count -gt 0) { [void]$recordErrors.Add("$identityField.unknown:$($unexpectedIdentityFields -join '|')") }
+        }
+        foreach ($identityListField in @('descendant_identities', 'residual_descendant_identities')) {
+            $identityList = Get-D32JsonProperty -Object $record -Name $identityListField
+            foreach ($identity in @($identityList)) {
+                $unexpectedIdentityFields = @(Get-D32UnexpectedJsonProperties -Object $identity -Allowed $script:D32FixtureIdentityFields)
+                if ($unexpectedIdentityFields.Count -gt 0) { [void]$recordErrors.Add("$identityListField.unknown:$($unexpectedIdentityFields -join '|')") }
+            }
+        }
+        $reap = Get-D32JsonProperty -Object $record -Name 'reap'
+        $unexpectedReapFields = @(Get-D32UnexpectedJsonProperties -Object $reap -Allowed $script:D32FixtureReapFields)
+        if ($unexpectedReapFields.Count -gt 0) { [void]$recordErrors.Add("reap.unknown:$($unexpectedReapFields -join '|')") }
+        if ($null -ne $reap) {
+            $nativeCleanup = Get-D32JsonProperty -Object $reap -Name 'native_cleanup'
+            $unexpectedCleanupFields = @(Get-D32UnexpectedJsonProperties -Object $nativeCleanup -Allowed $script:D32FixtureNativeCleanupFields)
+            if ($unexpectedCleanupFields.Count -gt 0) { [void]$recordErrors.Add("reap.native_cleanup.unknown:$($unexpectedCleanupFields -join '|')") }
+        }
         $expectedManifestPath = [System.IO.Path]::GetFullPath((Join-Path $Repository $spec.manifest))
         $declaredManifestPath = Get-D32JsonProperty -Object $record -Name 'manifest_path'
         if (-not ($declaredManifestPath -is [string]) -or -not (Test-D32PathEqual -Left ([string]$declaredManifestPath) -Right $expectedManifestPath)) { [void]$recordErrors.Add('manifest_path') }
         $expectedCommand = ConvertTo-D32FixtureCommand -Repository $Repository -Spec $spec
         if (([string](Get-D32JsonProperty -Object $record -Name 'command')).Replace('/', '\') -cne $expectedCommand) { [void]$recordErrors.Add('command') }
         $artifact = Get-D32JsonProperty -Object $record -Name 'artifact'
+        $unexpectedArtifactFields = @(Get-D32UnexpectedJsonProperties -Object $artifact -Allowed $script:D32FixtureArtifactFields)
+        if ($unexpectedArtifactFields.Count -gt 0) { [void]$recordErrors.Add("artifact.unknown:$($unexpectedArtifactFields -join '|')") }
         $artifactPath = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'path' } else { $null }
         $artifactHash = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'sha256' } else { $null }
         $artifactBytes = if ($null -ne $artifact) { Get-D32JsonProperty -Object $artifact -Name 'bytes' } else { $null }
@@ -1760,6 +1844,18 @@ function Invoke-D32SelfTest {
                 exit_code = 0
                 pid = 1
                 descendant_pids = @()
+                root_identity = [ordered]@{
+                    process_id = 1
+                    parent_process_id = $null
+                    name = 'fixture-root.exe'
+                    creation_date = '2026-09-22T00:00:00.0000000Z'
+                    command_line = 'fixture-root'
+                    observed_at_utc = '2026-09-22T00:00:00.0000000Z'
+                    identity_verified = $true
+                }
+                descendant_identities = @()
+                residual_descendant_identities = @()
+                reap = $null
                 elapsed_ms = 1
                 phase_log = (Join-Path $root "logs\$($fixtureSpec.name)")
                 stdout_log = (Join-Path $root "logs\$($fixtureSpec.name).stdout.log")
@@ -1834,6 +1930,13 @@ function Invoke-D32SelfTest {
         Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixtureShaFindings -Check 'fixture-selftest.sha') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixtureShaFindings
         Assert-D32SelfTest -Condition (@($wrongFixtureShaFindings | Where-Object { $_.Check -eq 'fixture-manifest.candidate_sha' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest wrong candidate SHA is reported' -Failures $failures
 
+        $wrongFixturePolicy = $validFixtureJson | ConvertFrom-Json
+        $wrongFixturePolicy.build_policy.process_tree_timeout_action = 'taskkill /T /F then verify every captured descendant PID'
+        Write-D32Json -Path $fixtureManifest -Value $wrongFixturePolicy
+        $wrongFixturePolicyFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $wrongFixturePolicyFindings -Check 'fixture-selftest.policy') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongFixturePolicyFindings
+        Assert-D32SelfTest -Condition (@($wrongFixturePolicyFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest non-canonical timeout action is reported' -Failures $failures
+
         $wrongFixtureHash = $validFixtureJson | ConvertFrom-Json
         $wrongFixtureHash.fixtures[0].artifact.sha256 = ('0' * 64)
         Write-D32Json -Path $fixtureManifest -Value $wrongFixtureHash
@@ -1862,6 +1965,13 @@ function Invoke-D32SelfTest {
         Test-D32FixtureManifest -FixtureManifest ($validFixtureJson | ConvertFrom-Json) -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $replacedFindings
         Assert-D32SelfTest -Condition (@($replacedFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'replaced or stale fixture artifact is reported' -Failures $failures
         [System.IO.File]::WriteAllBytes($replacedArtifactPath, $replacedArtifactBytes)
+
+        $unknownFixtureField = $validFixtureJson | ConvertFrom-Json
+        Add-Member -InputObject $unknownFixtureField.fixtures[0] -MemberType NoteProperty -Name 'captured_descendant_pids' -Value @([int]1)
+        Write-D32Json -Path $fixtureManifest -Value $unknownFixtureField
+        $unknownFixtureFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest (Read-D32Json -Path $fixtureManifest -Findings $unknownFixtureFindings -Check 'fixture-selftest.unknown') -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $unknownFixtureFindings
+        Assert-D32SelfTest -Condition (@($unknownFixtureFindings | Where-Object { $_.Check -eq 'fixture-manifest.d29h1-authority-fixture' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest unknown legacy field is rejected' -Failures $failures
         Write-D32Json -Path $fixtureManifest -Value ($validFixtureJson | ConvertFrom-Json)
         $missingTrustResult = Invoke-D32Validation -Repository $fixture -Manifest $provenance -Image $image -BundleManifest $bundleManifest -FixtureManifest $fixtureManifest -ExpectedCandidateSha $head -Base $null -MergeBase $null -RunRoot (Join-Path $root 'new-run-missing-trust') -Modes $null
         Assert-D32SelfTest -Condition ((-not $missingTrustResult.Success) -and @($missingTrustResult.Findings | Where-Object { $_.Check -eq 'git.trusted-image' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'validation requires explicit trusted Git path and hash' -Failures $failures

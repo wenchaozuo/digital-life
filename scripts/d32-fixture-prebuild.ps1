@@ -15,7 +15,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:OwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
-$script:SchemaVersion = 2
+$script:SchemaVersion = 3
+$script:D32FixtureProcessTreePolicy = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
 $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $script:FixtureSpecs = @(
@@ -1612,7 +1613,6 @@ function Invoke-D32BoundedProcess {
         root_identity_record = $rootIdentity
         captured_descendant_records = @($capturedDescendantRecords)
         descendant_pids = @($residualDescendantPids)
-        captured_descendant_pids = @($capturedDescendantPids)
         descendant_identities = @($capturedDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
         residual_descendant_identities = @($residualDescendantRecords | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
         native_launch = $script:D32LastProcessEvidence.native_launch
@@ -1725,7 +1725,7 @@ function Invoke-D32SelfTest {
             -TimeoutSeconds 5
         if ($normalWithChild.status -ne 'succeeded' -or
             $normalWithChild.exit_code -ne 0 -or
-            @($normalWithChild.captured_descendant_pids).Count -lt 1 -or
+            @($normalWithChild.descendant_identities).Count -lt 1 -or
             @($normalWithChild.descendant_pids).Count -ne 0 -or
             $null -eq $normalWithChild.native_cleanup -or
             -not [bool]$normalWithChild.native_cleanup.job_active_process_count_verified -or
@@ -1755,7 +1755,7 @@ function Invoke-D32SelfTest {
             -TimeoutSeconds 5
         if ($nonZeroWithChild.status -ne 'failed' -or
             $nonZeroWithChild.exit_code -ne 7 -or
-            @($nonZeroWithChild.captured_descendant_pids).Count -lt 1 -or
+            @($nonZeroWithChild.descendant_identities).Count -lt 1 -or
             @($nonZeroWithChild.descendant_pids).Count -ne 0 -or
             $null -ne $nonZeroWithChild.error) {
             throw 'SELFTEST_FAILED: non-zero exit with captured child was not cleanly reaped'
@@ -1956,7 +1956,7 @@ function Invoke-D32SelfTest {
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'timeout-phase') `
             -TimeoutSeconds 1
-        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured identity*reaped*' -or @($bounded.captured_descendant_pids).Count -lt 1 -or @($bounded.descendant_pids).Count -ne 0) {
+        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured identity*reaped*' -or @($bounded.descendant_identities).Count -lt 1 -or @($bounded.descendant_pids).Count -ne 0) {
             throw 'SELFTEST_FAILED: bounded timeout/tree reap'
         }
         $passed++
@@ -2056,7 +2056,6 @@ try {
                 exit_code      = $processResult.exit_code
                 pid            = $processResult.pid
                 descendant_pids = @($processResult.descendant_pids)
-                captured_descendant_pids = @($processResult.captured_descendant_pids)
                 root_identity  = $processResult.root_identity
                 descendant_identities = @($processResult.descendant_identities)
                 residual_descendant_identities = @($processResult.residual_descendant_identities)
@@ -2087,7 +2086,6 @@ try {
                 exit_code      = $null
                 pid            = if ($null -eq $failureEvidence.root_record) { $null } else { [int]$failureEvidence.root_record.ProcessId }
                 descendant_pids = @()
-                captured_descendant_pids = @($failureEvidence.descendant_records | ForEach-Object { [int]$_.ProcessId })
                 root_identity  = ConvertTo-D32IdentityDocument $failureEvidence.root_record
                 descendant_identities = @($failureEvidence.descendant_records | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
                 residual_descendant_identities = @()
@@ -2131,7 +2129,7 @@ $manifestDocument = [ordered]@{
         timeout_seconds = $TimeoutSeconds
         cargo_build_jobs = $BuildJobs
         nested_builds = $false
-        process_tree_timeout_action = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
+        process_tree_timeout_action = $script:D32FixtureProcessTreePolicy
     }
     environment = $environmentPlan
     process_tree_check = if ($null -eq $manifestProcessError) { 'succeeded' } else { 'failed' }

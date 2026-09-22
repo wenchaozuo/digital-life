@@ -6,7 +6,7 @@
 //! prebuild script is the producer; this is the consumer-side revalidation
 //! immediately before a fixture is spawned.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) const D32_FIXTURE_MANIFEST_ENV: &str = "D32_FIXTURE_MANIFEST_PATH";
-pub(crate) const D32_FIXTURE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const D32_FIXTURE_SCHEMA_VERSION: u32 = 3;
+const D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION: &str =
+    "native Job Object kill-on-close, then verify every captured identity and relevant descendant";
 
 const FIXTURE_NAMES: [&str; 5] = [
     "d29h1-authority-fixture",
@@ -77,7 +79,7 @@ const FIXTURE_SPECS: [FixtureSpec; 5] = [
     },
 ];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureManifest {
     schema_version: u32,
@@ -94,7 +96,7 @@ struct FixtureManifest {
     fixtures: Vec<FixtureRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuildPolicy {
     timeout_seconds: u64,
@@ -103,7 +105,7 @@ struct BuildPolicy {
     process_tree_timeout_action: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuildEnvironment {
     original_userprofile: String,
@@ -114,7 +116,7 @@ struct BuildEnvironment {
     rustup_toolchain: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureRecord {
     phase: u32,
@@ -128,6 +130,10 @@ struct FixtureRecord {
     exit_code: Option<i32>,
     pid: Option<u32>,
     descendant_pids: Vec<u32>,
+    root_identity: Option<ProcessIdentityDocument>,
+    descendant_identities: Vec<ProcessIdentityDocument>,
+    residual_descendant_identities: Vec<ProcessIdentityDocument>,
+    reap: Option<ReapDocument>,
     elapsed_ms: Option<f64>,
     phase_log: String,
     stdout_log: String,
@@ -136,12 +142,50 @@ struct FixtureRecord {
     artifact: Option<ArtifactRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactRecord {
     path: String,
     bytes: u64,
     sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessIdentityDocument {
+    process_id: u32,
+    parent_process_id: Option<u32>,
+    name: Option<String>,
+    creation_date: Option<String>,
+    command_line: Option<String>,
+    observed_at_utc: String,
+    identity_verified: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCleanupDocument {
+    job_terminate_call_succeeded: bool,
+    job_terminate_last_error: i32,
+    process_was_already_signaled: bool,
+    process_wait_signaled: bool,
+    job_active_process_count_verified: bool,
+    job_active_process_count: u32,
+    job_active_process_count_last_error: i32,
+    job_close_succeeded: bool,
+    cleanup_succeeded: bool,
+    already_closed: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReapDocument {
+    process_ids: Vec<u32>,
+    verified_at_utc: String,
+    residual_identities: Vec<ProcessIdentityDocument>,
+    native_cleanup: Option<NativeCleanupDocument>,
+    kill_output: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +404,7 @@ fn validate_record_shape(
     }
     if record.pid.is_none()
         || !record.descendant_pids.is_empty()
+        || record.root_identity.is_none()
         || record.elapsed_ms.is_none()
         || record.phase_log.is_empty()
         || record.stdout_log.is_empty()
@@ -424,6 +469,19 @@ fn validate_record_shape(
     Ok(())
 }
 
+fn validate_build_policy(policy: &BuildPolicy) -> Result<(), String> {
+    if policy.timeout_seconds == 0
+        || policy.cargo_build_jobs == 0
+        || policy.nested_builds
+        || policy.process_tree_timeout_action != D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION
+    {
+        return Err(invalid(
+            "manifest build policy is not the bounded existing-only policy",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_manifest(path: &Path) -> Result<FixtureManifest, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| invalid(format!("fixture manifest cannot be read: {error}")))?;
@@ -460,16 +518,7 @@ fn validate_manifest_common(manifest: &FixtureManifest, repo_root: &Path) -> Res
     {
         return Err(invalid("manifest build provenance metadata is not exact"));
     }
-    if manifest.build_policy.timeout_seconds == 0
-        || manifest.build_policy.cargo_build_jobs == 0
-        || manifest.build_policy.nested_builds
-        || manifest.build_policy.process_tree_timeout_action
-            != "taskkill /T /F then verify every captured descendant PID"
-    {
-        return Err(invalid(
-            "manifest build policy is not the bounded existing-only policy",
-        ));
-    }
+    validate_build_policy(&manifest.build_policy)?;
     if manifest.process_tree_check != "succeeded" || manifest.process_tree_error.is_some() {
         return Err(invalid("global fixture process cleanup did not succeed"));
     }
@@ -533,6 +582,100 @@ pub(crate) fn existing_fixture(repo_root: &Path, name: &str) -> Result<PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    fn process_identity_value(process_id: u32) -> Value {
+        json!({
+            "process_id": process_id,
+            "parent_process_id": null,
+            "name": "cargo.exe",
+            "creation_date": "2026-09-22T00:00:00.0000000Z",
+            "command_line": "cargo build",
+            "observed_at_utc": "2026-09-22T00:00:00.0000000Z",
+            "identity_verified": true
+        })
+    }
+
+    fn producer_manifest_value() -> Value {
+        let fixtures = FIXTURE_SPECS
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let process_id = 1000 + index as u32;
+                json!({
+                    "phase": index + 1,
+                    "name": spec.name,
+                    "project": spec.project,
+                    "binary": spec.binary,
+                    "manifest_path": format!(r"C:\repo\{}", spec.manifest),
+                    "features": spec.features,
+                    "command": expected_command(Path::new(r"C:\repo"), *spec),
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "pid": process_id,
+                    "descendant_pids": [],
+                    "root_identity": process_identity_value(process_id),
+                    "descendant_identities": [process_identity_value(process_id + 1)],
+                    "residual_descendant_identities": [],
+                    "reap": {
+                        "process_ids": [process_id, process_id + 1],
+                        "verified_at_utc": "2026-09-22T00:00:00.0000000Z",
+                        "residual_identities": [],
+                        "native_cleanup": {
+                            "job_terminate_call_succeeded": true,
+                            "job_terminate_last_error": 0,
+                            "process_was_already_signaled": false,
+                            "process_wait_signaled": true,
+                            "job_active_process_count_verified": true,
+                            "job_active_process_count": 0,
+                            "job_active_process_count_last_error": 0,
+                            "job_close_succeeded": true,
+                            "cleanup_succeeded": true,
+                            "already_closed": false,
+                            "detail": ""
+                        },
+                        "kill_output": []
+                    },
+                    "elapsed_ms": 1.0,
+                    "phase_log": format!(r"C:\logs\{}", spec.name),
+                    "stdout_log": format!(r"C:\logs\{}.stdout.log", spec.name),
+                    "stderr_log": format!(r"C:\logs\{}.stderr.log", spec.name),
+                    "error": null,
+                    "artifact": {
+                        "path": format!(r"C:\repo\{}", spec.artifact),
+                        "bytes": 1,
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema_version": D32_FIXTURE_SCHEMA_VERSION,
+            "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+            "source_repo": r"C:\repo",
+            "generated_at_utc": "2026-09-22T00:00:00.0000000Z",
+            "started_at_utc": "2026-09-22T00:00:00.0000000Z",
+            "elapsed_ms": 1.0,
+            "working_tree_status": "",
+            "build_policy": {
+                "timeout_seconds": 1,
+                "cargo_build_jobs": 1,
+                "nested_builds": false,
+                "process_tree_timeout_action": D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION
+            },
+            "environment": {
+                "original_userprofile": r"C:\user",
+                "codex_home": r"C:\codex",
+                "userprofile": r"C:\profile",
+                "cargo_home": r"C:\cargo",
+                "rustup_home": r"C:\rustup",
+                "rustup_toolchain": null
+            },
+            "process_tree_check": "succeeded",
+            "process_tree_error": null,
+            "fixtures": fixtures
+        })
+    }
 
     #[test]
     fn canonical_fixture_schema_has_five_exact_names() {
@@ -582,5 +725,59 @@ mod tests {
             "candidate_sha"
         )
         .is_err());
+    }
+
+    #[test]
+    fn producer_consumer_round_trip_covers_all_five_fixture_records() {
+        let produced = producer_manifest_value();
+        let parsed: FixtureManifest = serde_json::from_value(produced.clone())
+            .expect("the producer-shaped manifest must satisfy the strict consumer");
+        assert_eq!(parsed.fixtures.len(), 5);
+        assert!(parsed
+            .fixtures
+            .iter()
+            .all(|record| record.root_identity.is_some()));
+        assert!(parsed.fixtures.iter().all(|record| record.reap.is_some()));
+
+        let serialized = serde_json::to_value(&parsed).expect("manifest must round-trip");
+        assert_eq!(serialized["schema_version"], produced["schema_version"]);
+        assert!(serialized["fixtures"][0]
+            .get("captured_descendant_pids")
+            .is_none());
+        let reparsed: FixtureManifest = serde_json::from_value(serialized)
+            .expect("the serialized manifest must remain consumable");
+        assert_eq!(reparsed.fixtures.len(), 5);
+    }
+
+    #[test]
+    fn strict_manifest_rejects_legacy_or_nested_unknown_fields() {
+        let mut legacy = producer_manifest_value();
+        legacy["fixtures"][0]["captured_descendant_pids"] = json!([1001]);
+        assert!(serde_json::from_value::<FixtureManifest>(legacy).is_err());
+
+        let mut nested = producer_manifest_value();
+        nested["fixtures"][0]["descendant_identities"][0]["captured_processes"] = json!([]);
+        assert!(serde_json::from_value::<FixtureManifest>(nested).is_err());
+    }
+
+    #[test]
+    fn timeout_action_uses_one_static_canonical_value() {
+        assert_eq!(
+            D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION,
+            "native Job Object kill-on-close, then verify every captured identity and relevant descendant"
+        );
+        let valid = BuildPolicy {
+            timeout_seconds: 1,
+            cargo_build_jobs: 1,
+            nested_builds: false,
+            process_tree_timeout_action: D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION.to_string(),
+        };
+        assert!(validate_build_policy(&valid).is_ok());
+        let invalid_policy = BuildPolicy {
+            process_tree_timeout_action: "taskkill /T /F then verify every captured descendant PID"
+                .to_string(),
+            ..valid
+        };
+        assert!(validate_build_policy(&invalid_policy).is_err());
     }
 }

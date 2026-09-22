@@ -7,6 +7,13 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+use std::thread::{self, JoinHandle};
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime, State};
 use vita_agent_protocol as protocol;
@@ -600,6 +607,115 @@ impl D32BridgeDecision {
 }
 
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum D32CancelWorkerCompletion {
+    Returned,
+    Failed,
+    Panicked,
+    SignalTimeout,
+    ScopeDropped,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32CancelWorkerCompletion {
+    fn error(self) -> Option<&'static str> {
+        match self {
+            Self::Returned => None,
+            Self::Failed => Some("D32_A_HOST_FAILURE: cancel coordinator worker failed"),
+            Self::Panicked => Some("D32_A_HOST_FAILURE: cancel coordinator worker panicked"),
+            Self::SignalTimeout => {
+                Some("D32_A_HOST_FAILURE: cancel coordinator worker signal timed out")
+            }
+            Self::ScopeDropped => {
+                Some("D32_A_HOST_FAILURE: cancel coordinator worker scope ended unexpectedly")
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+struct D32CancelCompletionGuard {
+    sender: Option<mpsc::SyncSender<D32CancelWorkerCompletion>>,
+    completion: Option<D32CancelWorkerCompletion>,
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl D32CancelCompletionGuard {
+    fn new(sender: mpsc::SyncSender<D32CancelWorkerCompletion>) -> Self {
+        Self {
+            sender: Some(sender),
+            completion: None,
+        }
+    }
+
+    fn complete(&mut self, completion: D32CancelWorkerCompletion) {
+        if self.completion.is_none() {
+            self.completion = Some(completion);
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+impl Drop for D32CancelCompletionGuard {
+    fn drop(&mut self) {
+        let completion = self
+            .completion
+            .unwrap_or(D32CancelWorkerCompletion::ScopeDropped);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(completion);
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+enum D32CancelWorkerObservation {
+    Joined(Result<(), &'static str>),
+    Unobserved(JoinHandle<()>),
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+const D32_CANCEL_SIGNAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+const D32_CANCEL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+const D32_CANCEL_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
+fn d32_observe_cancel_worker(
+    worker: JoinHandle<()>,
+    timeout: Duration,
+) -> D32CancelWorkerObservation {
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return D32CancelWorkerObservation::Unobserved(worker);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    D32CancelWorkerObservation::Joined(
+        worker
+            .join()
+            .map_err(|_| "D32_A_HOST_FAILURE: cancel coordinator worker join failed"),
+    )
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary", not(test)))]
+fn d32_fail_closed_with_cancel_worker(_worker: JoinHandle<()>) -> ! {
+    // A standard thread cannot be safely terminated from this Host process.
+    // Do not drop its JoinHandle and detach it: the standalone D32 canary
+    // process must terminate, after which the outer harness validates cleanup.
+    std::process::exit(1)
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary", test))]
+fn d32_fail_closed_with_cancel_worker(_worker: JoinHandle<()>) -> ! {
+    panic!("D32 cancel coordinator worker could not be observed");
+}
+
+#[cfg(all(windows, feature = "d32-a-host-canary"))]
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct D32HostCanaryTraceSnapshot {
@@ -1135,7 +1251,9 @@ pub(crate) struct D32HostCanaryControl {
     pub(crate) mode: D32HostCanaryMode,
     pub(crate) trace: Arc<D32HostCanaryTrace>,
     cancel_signal: Arc<(Mutex<bool>, std::sync::Condvar)>,
-    cancel_barrier: Arc<std::sync::Barrier>,
+    cancel_completion_sender: Mutex<Option<mpsc::SyncSender<D32CancelWorkerCompletion>>>,
+    cancel_completion_receiver: Mutex<Option<mpsc::Receiver<D32CancelWorkerCompletion>>>,
+    cancel_completion_observed: Mutex<Option<D32CancelWorkerCompletion>>,
     revoke_restore_revision: Mutex<Option<i64>>,
     replay_capture_enabled: Mutex<bool>,
     replay_captured_response: Mutex<Option<protocol::GrantRevalidated>>,
@@ -1144,28 +1262,41 @@ pub(crate) struct D32HostCanaryControl {
 #[cfg(all(windows, feature = "d32-a-host-canary"))]
 impl D32HostCanaryControl {
     fn new(mode: D32HostCanaryMode) -> Arc<Self> {
+        let (cancel_completion_sender, cancel_completion_receiver) = mpsc::sync_channel(1);
         Arc::new(Self {
             mode,
             trace: Arc::new(D32HostCanaryTrace::default()),
             cancel_signal: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
-            cancel_barrier: Arc::new(std::sync::Barrier::new(2)),
+            cancel_completion_sender: Mutex::new(Some(cancel_completion_sender)),
+            cancel_completion_receiver: Mutex::new(Some(cancel_completion_receiver)),
+            cancel_completion_observed: Mutex::new(None),
             revoke_restore_revision: Mutex::new(None),
             replay_capture_enabled: Mutex::new(false),
             replay_captured_response: Mutex::new(None),
         })
     }
 
-    fn wait_for_cancel_signal(&self) {
+    fn wait_for_cancel_signal(&self, timeout: Duration) -> bool {
         let (signal, wake) = &*self.cancel_signal;
         let Ok(mut signal) = signal.lock() else {
-            return;
+            return false;
         };
+        let deadline = Instant::now() + timeout;
         while !*signal {
-            signal = match wake.wait(signal) {
-                Ok(signal) => signal,
-                Err(_) => return,
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next_signal, result) = match wake.wait_timeout(signal, remaining) {
+                Ok(result) => result,
+                Err(_) => return false,
             };
+            signal = next_signal;
+            if result.timed_out() && !*signal {
+                return false;
+            }
         }
+        true
     }
 
     fn signal_cancel_worker(&self) {
@@ -1176,8 +1307,58 @@ impl D32HostCanaryControl {
         }
     }
 
-    fn cancel_barrier(&self) -> Arc<std::sync::Barrier> {
-        Arc::clone(&self.cancel_barrier)
+    fn take_cancel_completion_sender(
+        &self,
+    ) -> Result<mpsc::SyncSender<D32CancelWorkerCompletion>, String> {
+        self.cancel_completion_sender
+            .lock()
+            .map_err(|_| "D32 cancel completion sender lock was poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "D32 cancel completion sender was already consumed".to_string())
+    }
+
+    fn wait_for_cancel_completion(
+        &self,
+        timeout: Duration,
+    ) -> Result<D32CancelWorkerCompletion, &'static str> {
+        if let Ok(observed) = self.cancel_completion_observed.lock() {
+            if let Some(completion) = *observed {
+                return Ok(completion);
+            }
+        } else {
+            return Err("D32 cancel completion state was poisoned");
+        }
+
+        let receiver = {
+            let mut slot = self
+                .cancel_completion_receiver
+                .lock()
+                .map_err(|_| "D32 cancel completion receiver state was poisoned")?;
+            slot.take()
+                .ok_or("D32 cancel completion receiver was already consumed")?
+        };
+        match receiver.recv_timeout(timeout) {
+            Ok(completion) => {
+                let mut observed = self
+                    .cancel_completion_observed
+                    .lock()
+                    .map_err(|_| "D32 cancel completion state was poisoned")?;
+                if observed.is_some() {
+                    return Err("D32 cancel completion was reported more than once");
+                }
+                *observed = Some(completion);
+                Ok(completion)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Ok(mut slot) = self.cancel_completion_receiver.lock() {
+                    *slot = Some(receiver);
+                }
+                Err("D32 cancel completion timed out")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("D32 cancel completion channel was disconnected")
+            }
+        }
     }
 
     fn set_revoke_restore_revision(&self, revision: i64) {
@@ -1419,6 +1600,8 @@ mod windows {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    #[cfg(feature = "d32-a-host-canary")]
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::{Component, Path, PathBuf, Prefix};
     #[cfg(all(feature = "d32-a-host-canary", not(test)))]
     use std::process::{Command, ExitStatus, Stdio};
@@ -9478,8 +9661,12 @@ mod windows {
             }
             D32HostCanaryMode::CancelBeforeRevalidation => {
                 control.signal_cancel_worker();
-                control.cancel_barrier().wait();
-                Ok(Some(control.mode))
+                let completion = control
+                    .wait_for_cancel_completion(D32_CANCEL_COMPLETION_TIMEOUT)
+                    .map_err(str::to_string)?;
+                completion
+                    .error()
+                    .map_or(Ok(Some(control.mode)), |error| Err(error.to_string()))
             }
             D32HostCanaryMode::ExecutableIdentityTamper => {
                 request.binding.executable_identity =
@@ -13390,18 +13577,32 @@ mod windows {
         let cancel_worker = if mode == D32HostCanaryMode::CancelBeforeRevalidation {
             let worker_control = Arc::clone(&control);
             let worker_app = app_handle.clone();
-            let barrier = control.cancel_barrier();
+            let completion_sender = control
+                .take_cancel_completion_sender()
+                .map_err(d32_not_executable)?;
             Some(
                 thread::Builder::new()
                     .name("d32-a-cancel-coordinator-worker".to_string())
                     .spawn(move || {
-                        worker_control.wait_for_cancel_signal();
-                        let result = {
-                            let coordinator = worker_app.state::<VitaSidecarCoordinator>();
-                            coordinator.cancel_turn().map(|_| ())
-                        };
-                        barrier.wait();
-                        result
+                        let mut completion = D32CancelCompletionGuard::new(completion_sender);
+                        let worker_result = catch_unwind(AssertUnwindSafe(|| {
+                            if !worker_control.wait_for_cancel_signal(D32_CANCEL_SIGNAL_TIMEOUT) {
+                                completion.complete(D32CancelWorkerCompletion::SignalTimeout);
+                                return;
+                            }
+                            let result = {
+                                let coordinator = worker_app.state::<VitaSidecarCoordinator>();
+                                coordinator.cancel_turn().map(|_| ())
+                            };
+                            completion.complete(if result.is_ok() {
+                                D32CancelWorkerCompletion::Returned
+                            } else {
+                                D32CancelWorkerCompletion::Failed
+                            });
+                        }));
+                        if worker_result.is_err() {
+                            completion.complete(D32CancelWorkerCompletion::Panicked);
+                        }
                     })
                     .map_err(|_| d32_not_executable("cancel coordinator worker unavailable"))?,
             )
@@ -13509,18 +13710,32 @@ mod windows {
             }
             Ok(terminal)
         })();
-        let stop_result = coordinator.stop().map(|_| ());
         let worker_result = if let Some(worker) = cancel_worker {
             control.signal_cancel_worker();
-            if !control.trace.snapshot().pre_native_fence_seen {
-                control.cancel_barrier().wait();
-            }
-            worker
-                .join()
-                .map_err(|_| "D32_A_HOST_FAILURE: cancel coordinator worker panicked".to_string())?
+            let completion = match control.wait_for_cancel_completion(D32_CANCEL_COMPLETION_TIMEOUT)
+            {
+                Ok(completion) => completion,
+                Err(_) => d32_fail_closed_with_cancel_worker(worker),
+            };
+            let joined = match d32_observe_cancel_worker(worker, D32_CANCEL_JOIN_TIMEOUT) {
+                D32CancelWorkerObservation::Joined(result) => result.map_err(str::to_string),
+                D32CancelWorkerObservation::Unobserved(worker) => {
+                    d32_fail_closed_with_cancel_worker(worker)
+                }
+            };
+            joined.and_then(|_| {
+                completion
+                    .error()
+                    .map_or(Ok(()), |error| Err(error.to_string()))
+            })
         } else {
             Ok(())
         };
+        // Observe the canary-only cancellation worker before taking the
+        // coordinator lifecycle lock.  A blocked cancel_turn may hold that
+        // lock; waiting for stop first would prevent the bounded fail-closed
+        // path from ever being reached.
+        let stop_result = coordinator.stop().map(|_| ());
         // The revalidation reader owns the coordinator's authority view.  A
         // revoke must be restored through that same view so the canary cannot
         // accidentally prove a different StorageService path than the one
@@ -13795,6 +14010,152 @@ mod windows {
                 d32_canary_sanitize_error_code(Some("provider_token=should-not-appear")),
                 "<redacted>"
             );
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_cancel_worker_completion_covers_return_panic_and_scope_cleanup() {
+            let control = D32HostCanaryControl::new(D32HostCanaryMode::CancelBeforeRevalidation);
+            let sender = control
+                .take_cancel_completion_sender()
+                .expect("return fixture completion sender");
+            let worker_control = Arc::clone(&control);
+            let worker = thread::spawn(move || {
+                let mut completion = D32CancelCompletionGuard::new(sender);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    assert!(worker_control.wait_for_cancel_signal(Duration::from_secs(1)));
+                    completion.complete(D32CancelWorkerCompletion::Returned);
+                }));
+                if result.is_err() {
+                    completion.complete(D32CancelWorkerCompletion::Panicked);
+                }
+            });
+            control.signal_cancel_worker();
+            assert_eq!(
+                control
+                    .wait_for_cancel_completion(Duration::from_secs(1))
+                    .expect("return completion"),
+                D32CancelWorkerCompletion::Returned
+            );
+            assert!(matches!(
+                d32_observe_cancel_worker(worker, Duration::from_secs(1)),
+                D32CancelWorkerObservation::Joined(Ok(()))
+            ));
+
+            let control = D32HostCanaryControl::new(D32HostCanaryMode::CancelBeforeRevalidation);
+            let sender = control
+                .take_cancel_completion_sender()
+                .expect("panic fixture completion sender");
+            let worker_control = Arc::clone(&control);
+            let worker = thread::spawn(move || {
+                let mut completion = D32CancelCompletionGuard::new(sender);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    assert!(worker_control.wait_for_cancel_signal(Duration::from_secs(1)));
+                    panic!("D32 cancel panic fixture");
+                }));
+                if result.is_err() {
+                    completion.complete(D32CancelWorkerCompletion::Panicked);
+                }
+            });
+            control.signal_cancel_worker();
+            assert_eq!(
+                control
+                    .wait_for_cancel_completion(Duration::from_secs(1))
+                    .expect("panic completion"),
+                D32CancelWorkerCompletion::Panicked
+            );
+            assert!(matches!(
+                d32_observe_cancel_worker(worker, Duration::from_secs(1)),
+                D32CancelWorkerObservation::Joined(Ok(()))
+            ));
+
+            let control = D32HostCanaryControl::new(D32HostCanaryMode::CancelBeforeRevalidation);
+            let sender = control
+                .take_cancel_completion_sender()
+                .expect("timeout fixture completion sender");
+            let worker_control = Arc::clone(&control);
+            let worker = thread::spawn(move || {
+                let mut completion = D32CancelCompletionGuard::new(sender);
+                if !worker_control.wait_for_cancel_signal(Duration::from_millis(1)) {
+                    completion.complete(D32CancelWorkerCompletion::SignalTimeout);
+                }
+            });
+            assert_eq!(
+                control
+                    .wait_for_cancel_completion(Duration::from_secs(1))
+                    .expect("signal timeout completion"),
+                D32CancelWorkerCompletion::SignalTimeout
+            );
+            assert!(matches!(
+                d32_observe_cancel_worker(worker, Duration::from_secs(1)),
+                D32CancelWorkerObservation::Joined(Ok(()))
+            ));
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let mut completion = D32CancelCompletionGuard::new(sender);
+            completion.complete(D32CancelWorkerCompletion::Failed);
+            drop(completion);
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("failure completion"),
+                D32CancelWorkerCompletion::Failed
+            );
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            {
+                let _completion = D32CancelCompletionGuard::new(sender);
+            }
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("scope cleanup completion"),
+                D32CancelWorkerCompletion::ScopeDropped
+            );
+        }
+
+        #[cfg(all(windows, feature = "d32-a-host-canary"))]
+        #[test]
+        fn d32_cancel_worker_hang_is_bounded_without_detach_and_can_cleanup() {
+            let control = D32HostCanaryControl::new(D32HostCanaryMode::CancelBeforeRevalidation);
+            let sender = control
+                .take_cancel_completion_sender()
+                .expect("hang fixture completion sender");
+            let (release_sender, release_receiver) = mpsc::sync_channel(0);
+            let worker_control = Arc::clone(&control);
+            let worker = thread::spawn(move || {
+                let mut completion = D32CancelCompletionGuard::new(sender);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    assert!(worker_control.wait_for_cancel_signal(Duration::from_secs(1)));
+                    release_receiver.recv().expect("hang fixture release");
+                    completion.complete(D32CancelWorkerCompletion::Returned);
+                }));
+                if result.is_err() {
+                    completion.complete(D32CancelWorkerCompletion::Panicked);
+                }
+            });
+            control.signal_cancel_worker();
+            assert!(control
+                .wait_for_cancel_completion(Duration::from_millis(1))
+                .is_err());
+            let D32CancelWorkerObservation::Unobserved(worker) =
+                d32_observe_cancel_worker(worker, Duration::from_millis(1))
+            else {
+                panic!("a blocked cancel worker must not be treated as joined");
+            };
+            assert!(!worker.is_finished());
+
+            release_sender.send(()).expect("release blocked worker");
+            assert_eq!(
+                control
+                    .wait_for_cancel_completion(Duration::from_secs(1))
+                    .expect("released completion"),
+                D32CancelWorkerCompletion::Returned
+            );
+            assert!(matches!(
+                d32_observe_cancel_worker(worker, Duration::from_secs(1)),
+                D32CancelWorkerObservation::Joined(Ok(()))
+            ));
         }
 
         #[cfg(feature = "d32-a-host-canary")]

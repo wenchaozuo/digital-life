@@ -2,74 +2,54 @@
 
 > 本文件是 Codex 每轮进入项目时读取的“短状态页”。
 >
-> 它不是历史文档；它描述**当前**开发位置。
-> 每次 candidate / repair / freeze 后必须更新。
->
-> **禁止把未完成 candidate 写成 FROZEN。**
+> 它描述当前开发位置与尚未关闭的门禁；不得把未完成 candidate 写成 FROZEN。
 
 ## 1. 当前阶段
 
-**Milestone / Task:** D32-A-R2（根据当前交接信息；开始下一轮前 Codex MUST 用 Git 与最新开发报告核验）
+**Milestone / Task:** D32 final-gate readiness（D32-A-R2 implementation line）
 
-## 2. 当前已知 Git 参考
+**Status:** `NOT FROZEN`
 
-**Base:** `4c727ec5ba42e0288400d5847b43b08a1c96bc54`  
-**Candidate:** `2ce28033b4fb4b9013353dfbd9ef648a45cc6f03`  
-**Parent:** `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
+## 2. Git 参考
 
-> 以上只是当前交接状态。Codex MUST 在开始工作时重新读取真实仓库状态。  
-> Candidate **不得因出现在本文件中而被视为 frozen**。
+**Base / merge-base:** `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
 
-## 3. 当前已知状态摘要
+**Implementation parent before this governance sync:** `83c597f32f60c56d5ee81d4b652874479c0a06bf`
 
-### B1 Fresh Source
-- snapshot per action = YES
-- session-start snapshot reused = NO
-- D31 mutation → subsequent cargo observes new source = 设计/回归方向已接入
-- 真实 Host canary = 尚未据交接信息关闭
+本治理同步提交之后的门禁 candidate 必须从执行门禁时的 checkout 读取：
+`git rev-parse HEAD`。该 SHA 应写入对应的 gate evidence；本文件不预填本次提交 SHA。
 
-### B2 Toolchain
-- cargo from `.cargo` rustup proxy = NO
-- Host single exact toolchain root = YES
-- app-owned cached toolchain mirror = YES
-- cargo/rustc/rustdoc exact Host evidence = YES
-- large official compiler file projection = bounded streaming PASS
-- user profile exposed to child = NO
+## 3. 当前阶段状态
 
-### B3 Real Canary
-根据当前交接信息：
-- positive = BLOCKED / NOT YET CLOSED
-- revoke/cancel/Life/migration = 尚未形成最终可冻结证据
+- D32 实现父提交已记录；本次变更只同步治理入口和本状态页。
+- 旧 candidate 的结果不自动适用于治理同步后的 exact candidate。
+- 当前没有据此页关闭任何 D32 final gate。
 
-## 4. 当前冻结状态
+## 4. 尚未关闭的门禁
 
-**D32-A-R2 candidate status:** `NOT FROZEN`
+- [ ] 新鲜 fixture 证据
+- [ ] 完整 local affected matrix
+- [ ] release、bundle 与 provenance 检查
+- [ ] 按规定顺序完成 8 个 real Host canary modes
+- [ ] Codex Red Team review
+- [ ] Luna High Gate
+- [ ] Sol Final Whole-Candidate review / freeze
 
-理由：
+昂贵 build 或 real canary 启动前，必须先完成治理状态、exact SHA 与 clean tree、provenance schema / canonical paths、bundle hashes、provider/tool two-turn contract、mode matrix 和 cleanup/resource lifecycle 的聚合 preflight。
 
-- 真实 Host canary 尚未据当前交接信息完成；
-- 不得仅凭实现报告宣称 HIGH gate 关闭。
+## 5. 冻结状态
 
-## 5. 下一轮 Codex 启动要求
+**D32 candidate status:** `NOT FROZEN`
 
-Codex MUST：
+原因：fresh fixture、完整 local matrix、release/bundle/provenance、8 个有序 real Host canary modes，以及独立 Codex Red Team、Luna High Gate 和 Sol final review 均未在本状态页建立关闭证据。证据缺失不代表 PASS。
 
-1. 核验当前 branch / HEAD / working tree；
-2. 确认上述 Base/Candidate 是否仍是最新；
-3. 读取最新实际测试结果；
-4. 如果 candidate 已变化，立即更新本页；
-5. 不得复用旧 candidate 的 gate 结论；
-6. 按 `AGENTS.md` 做风险分类；
-7. 未完成 real canary 时不得宣称相关 RED/HIGH gate PASS。
+## 6. 后续 gate 顺序
 
-## 6. 当前阻塞项
+1. 记录当前 exact candidate SHA 与 clean working tree。
+2. 建立 fresh fixture 证据并完成完整 local affected matrix。
+3. 核验 release、bundle、provenance 与昂贵 gate 前聚合 preflight。
+4. 按已定义顺序运行全部 8 个 real Host canary modes，并分别记录正向与负向证据。
+5. 对同一 exact candidate 完成 Codex Red Team 与 Luna High Gate。
+6. Luna PASS 后提交 Sol Final Whole-Candidate review；只有 Sol 明确 PASS 才能标为 FROZEN。
 
-开始下一阶段前，Codex 应把本节更新为真实状态：
-
-- [ ] Real Host positive canary closed
-- [ ] Revoke negative evidence closed
-- [ ] Cancel boundary evidence closed
-- [ ] Life/restart behavior closed（若本阶段适用）
-- [ ] Migration/non-migration evidence closed（若本阶段适用）
-- [ ] Luna gate completed（若当前 task 已达到 gate readiness）
-- [ ] Sol Final Freeze completed（仅 HIGH milestone 最终冻结时）
+任何 repair 都会产生新 candidate SHA；受影响证据和后续 gate 必须针对新 SHA 重建。

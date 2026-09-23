@@ -1540,6 +1540,7 @@ fn table<const N: usize>(entries: [(&str, TomlValue); N]) -> TomlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_codex_state::lock_process_env;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -2066,6 +2067,7 @@ mod tests {
 
     #[test]
     fn profile_validation_never_mutates_parent_environment() {
+        let _process_env_lock = lock_process_env();
         let before = std::env::vars_os().collect::<Vec<_>>();
         let (_app_data, _workspace, profile) = test_profile();
         profile.validate_private_namespace().unwrap();

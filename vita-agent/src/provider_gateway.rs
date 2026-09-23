@@ -3047,6 +3047,7 @@ fn map_chat_stream_chunk_to_responses_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_codex_state::lock_process_env;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -4673,6 +4674,7 @@ mod tests {
 
     #[test]
     fn ambient_credentials_do_not_select_or_authorize_a_provider() {
+        let _process_env_lock = lock_process_env();
         let before = std::env::vars_os().collect::<Vec<_>>();
         let authority = VitaProviderAuthority::not_configured();
         assert_eq!(authority.state(), VitaProviderState::NotConfigured);

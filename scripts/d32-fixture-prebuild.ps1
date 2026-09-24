@@ -1760,7 +1760,15 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
     public int ProcessId { get; private set; }
     public bool JobAssigned { get; private set; }
+    public int DebugContinueCallCount { get; private set; }
     public string LaunchMode { get { return (_debugEnabled ? "CreateProcessW(DEBUG_PROCESS|" : "CreateProcessW(") + "CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"; } }
+
+    public static bool DebugCreateProcessIdentityMatches(uint eventProcessId, uint processHandleProcessId, int createProcessReturnedRootProcessId, bool isRootProcessEvent)
+    {
+        if (eventProcessId == 0 || processHandleProcessId == 0 || eventProcessId != processHandleProcessId) return false;
+        if (!isRootProcessEvent) return true;
+        return createProcessReturnedRootProcessId > 0 && eventProcessId == (uint)createProcessReturnedRootProcessId;
+    }
 
     private D32FixtureNativeProcessV2(
         IntPtr job,
@@ -2305,13 +2313,25 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         return value;
     }
 
-    private static uint GetDebugParentPid(IntPtr process)
+    private static DebugProcessBasicInformation GetDebugProcessBasicInformation(IntPtr process)
     {
         DebugProcessBasicInformation info;
         int returned;
         int status = NtQueryInformationProcess(process, 0, out info, Marshal.SizeOf(typeof(DebugProcessBasicInformation)), out returned);
         if (status != 0 || returned < Marshal.SizeOf(typeof(DebugProcessBasicInformation)))
             throw new InvalidOperationException("NtQueryInformationProcess(ProcessBasicInformation) failed: 0x" + status.ToString("x8", CultureInfo.InvariantCulture));
+        return info;
+    }
+
+    private static uint GetDebugProcessPid(DebugProcessBasicInformation info)
+    {
+        ulong value = unchecked((ulong)info.UniqueProcessId.ToInt64());
+        if (value == 0 || value > UInt32.MaxValue) throw new InvalidOperationException("process handle PID is absent or outside the supported range");
+        return (uint)value;
+    }
+
+    private static uint GetDebugParentPid(DebugProcessBasicInformation info)
+    {
         ulong value = unchecked((ulong)info.InheritedFromUniqueProcessId.ToInt64());
         if (value > UInt32.MaxValue) throw new InvalidOperationException("parent PID is outside the supported range");
         return (uint)value;
@@ -2340,7 +2360,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         }
     }
 
-    public D32DebugProcessTraceV2 MonitorDebugEvents(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption)
+    public D32DebugProcessTraceV2 MonitorDebugEvents(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch)
     {
         if (!_debugEnabled) throw new InvalidOperationException("synchronous DEBUG_PROCESS capture is mandatory for this monitor");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
@@ -2409,10 +2429,12 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             trace.DebugEventCount++;
             uint continueStatus = DebugContinue;
             IntPtr processHandleAfterExit = IntPtr.Zero;
+            bool skipContinueForCreateIdentityFailure = false;
             try
             {
                 if (ev.Code == DebugEventCreateProcess)
                 {
+                    skipContinueForCreateIdentityFailure = true;
                     trace.ProcessCreateEventCount++;
                     trace.ProcessEventCount++;
                     long createSequence = ++sequence;
@@ -2430,8 +2452,20 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                         try
                         {
                             if (created.Process == IntPtr.Zero) throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT hProcess is null");
+                            DebugProcessBasicInformation processBasicInformation = GetDebugProcessBasicInformation(created.Process);
+                            uint processHandlePid = GetDebugProcessPid(processBasicInformation);
+                            bool isRootProcessEvent = trace.ProcessCreateEventCount == 1;
+                            if (injectFirstCreateIdentityMismatch && isRootProcessEvent)
+                                processHandlePid = processHandlePid == UInt32.MaxValue ? processHandlePid - 1 : processHandlePid + 1;
+                            if (!DebugCreateProcessIdentityMatches(ev.ProcessId, processHandlePid, ProcessId, isRootProcessEvent))
+                            {
+                                throw new InvalidOperationException(isRootProcessEvent
+                                    ? "CREATE_PROCESS_DEBUG_EVENT PID differs from the actual process handle PID or CreateProcessW returned root PID"
+                                    : "CREATE_PROCESS_DEBUG_EVENT PID differs from the actual process handle PID");
+                            }
+                            skipContinueForCreateIdentityFailure = false;
                             creation = GetDebugProcessCreationTime(created.Process);
-                            parentPid = GetDebugParentPid(created.Process);
+                            parentPid = GetDebugParentPid(processBasicInformation);
                             image = ReadDebugImage(created.File);
                             string identity = ev.ProcessId.ToString(CultureInfo.InvariantCulture) + "@" + creation.ToString(CultureInfo.InvariantCulture);
                             if (creation <= 0 || !identities.Add(identity)) throw new InvalidOperationException("process PID/creation identity is absent or duplicated");
@@ -2595,6 +2629,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 draining = true;
                 cleanupDeadline = DateTime.UtcNow.AddSeconds(15);
             }
+            if (skipContinueForCreateIdentityFailure)
+            {
+                trace.EventChainComplete = false;
+                TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT identity mismatch; the Job was terminated and ContinueDebugEvent was not called");
+                break;
+            }
+            DebugContinueCallCount++;
             if (!ContinueDebugEvent(ev.ProcessId, ev.ThreadId, continueStatus))
             {
                 trace.DebugApiErrorCount++;
@@ -3381,7 +3422,7 @@ function Invoke-D32BoundedProcess {
                 $targetRoots = if ($CandidateImageRoots) { @($CandidateImageRoots | ForEach-Object { [IO.Path]::GetFullPath($_) }) } else { @(Get-D32DebugCandidateTargetRoots -Repository $profileCurrent.Repository) }
                 $traceNative = $nativeProcess.MonitorDebugEvents(
                     (ConvertTo-D32DebugImagePinText -Image $rootImage), [string[]]$approvedPinText, [string[]]$targetRoots,
-                    [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false)
+                    [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false, $false)
                 $traceDocument = ConvertTo-D32DebugProcessTraceDocument -Trace $traceNative
                 $script:D32LastProcessEvidence.process_trace = $traceDocument
                 if ($traceNative.Processes.Count -gt 0) {
@@ -3871,6 +3912,7 @@ function Assert-D32D31RecoverySeederRecordShape {
 }
 
 function Invoke-D32SelfTest {
+    Ensure-D32NativeLauncher
     $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-selftest-' + [Guid]::NewGuid().ToString('N'))
     $passed = 0
     $owned = $false
@@ -3940,6 +3982,62 @@ function Invoke-D32SelfTest {
             throw 'SELFTEST_FAILED: Cargo identity with a parent other than this PowerShell process was accepted'
         }
         catch { if ($_.Exception.Message -notlike 'CARGO_PROCESS_IDENTITY_MISMATCH:*') { throw } }
+        $passed++
+
+        if (-not [D32FixtureNativeProcessV2]::DebugCreateProcessIdentityMatches(713, 713, 713, $true)) {
+            throw 'SELFTEST_FAILED: matching root CREATE event, process handle, and CreateProcessW PID were rejected'
+        }
+        $passed++
+        if ([D32FixtureNativeProcessV2]::DebugCreateProcessIdentityMatches(713, 714, 713, $true)) {
+            throw 'SELFTEST_FAILED: root CREATE event PID differing from the process handle PID was accepted'
+        }
+        $passed++
+        if ([D32FixtureNativeProcessV2]::DebugCreateProcessIdentityMatches(713, 713, 714, $true)) {
+            throw 'SELFTEST_FAILED: root CREATE event PID differing from CreateProcessW returned PID was accepted'
+        }
+        $passed++
+        if ([D32FixtureNativeProcessV2]::DebugCreateProcessIdentityMatches(714, 713, 713, $false)) {
+            throw 'SELFTEST_FAILED: child CREATE event PID differing from the actual process handle PID was accepted'
+        }
+        $passed++
+
+        $debugRootPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $debugRootArtifact = Get-D32BoundArtifactWithFileId -Path $debugRootPath
+        $debugRootImage = [PSCustomObject]@{
+            Path = $debugRootArtifact.path
+            Bytes = $debugRootArtifact.bytes
+            Sha256 = $debugRootArtifact.sha256
+            VolumeSerialHex = $debugRootArtifact.volume_serial_hex
+            FileIdHex = $debugRootArtifact.file_id_hex
+        }
+        $debugRootArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0')
+        $debugRootCommandLine = ConvertTo-D32CommandLine (@($debugRootPath) + $debugRootArguments)
+        $debugRootProcess = $null
+        try {
+            $debugRootProcess = [D32FixtureNativeProcessV2]::StartDebug($debugRootPath, $debugRootCommandLine, $root, $null)
+            $debugIdentityTrace = $debugRootProcess.MonitorDebugEvents(
+                (ConvertTo-D32DebugImagePinText -Image $debugRootImage), [string[]]@(), [string[]]@(), 10000, $false, $true)
+            if ($debugIdentityTrace.State -cne 'BLOCKED' -or
+                [bool]$debugIdentityTrace.EventChainComplete -or
+                [int]$debugRootProcess.DebugContinueCallCount -ne 0 -or
+                $debugIdentityTrace.BlockReason -notmatch 'CREATE_PROCESS_DEBUG_EVENT PID differs') {
+                throw "SELFTEST_FAILED: injected root CREATE PID mismatch did not terminate and stop before ContinueDebugEvent: state=$($debugIdentityTrace.State); chain_complete=$($debugIdentityTrace.EventChainComplete); continue_calls=$($debugRootProcess.DebugContinueCallCount); reason=$($debugIdentityTrace.BlockReason)"
+            }
+        }
+        finally {
+            if ($null -ne $debugRootProcess) {
+                $debugIdentityCleanup = $debugRootProcess.CloseJobAndWait(10000)
+                if (-not [bool]$debugIdentityCleanup.JobCloseSucceeded -or
+                    -not [bool]$debugIdentityCleanup.JobTerminateCallSucceeded -or
+                    -not [bool]$debugIdentityCleanup.JobActiveProcessCountVerified -or
+                    [uint32]$debugIdentityCleanup.JobActiveProcessCount -ne 0 -or
+                    [uint32]$debugIdentityTrace.JobActiveProcesses -ne 0) {
+                    throw "SELFTEST_FAILED: injected root CREATE PID mismatch did not close a zero-active Job: $($debugIdentityCleanup.Detail); process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled); terminate_succeeded=$($debugIdentityCleanup.JobTerminateCallSucceeded); active_count=$($debugIdentityCleanup.JobActiveProcessCount); active_count_verified=$($debugIdentityCleanup.JobActiveProcessCountVerified); active_count_error=$($debugIdentityCleanup.JobActiveProcessCountLastError)"
+                }
+                Write-Host "D32_CREATE_ID_MISMATCH_NEGATIVE=PASS continue_calls=$($debugRootProcess.DebugContinueCallCount) job_total=$($debugIdentityTrace.JobTotalProcesses) job_active=$($debugIdentityCleanup.JobActiveProcessCount) root_process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled)"
+                $debugRootProcess.Dispose()
+            }
+        }
         $passed++
 
         $environmentBlock = ConvertTo-D32EnvironmentBlock ([ordered]@{ zLast = 'second'; AFirst = 'first' })

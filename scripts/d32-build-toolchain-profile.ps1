@@ -691,7 +691,13 @@ function Test-D32BuildToolchainProfile {
             if (-not (Test-D32ProfileExactProperties -Object $record -Expected @('manifest_path', 'lock_sha256'))) { throw "fetch_manifests[$index] has missing/extra fields" }
             if ($record.manifest_path -isnot [string] -or $record.lock_sha256 -isnot [string]) { throw "fetch_manifests[$index] fields must be strings" }
             if ($record.manifest_path.Replace('\', '/') -cne $expectedLocks[$index].ManifestPath -or $record.lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $record.lock_sha256 -cne $expectedLocks[$index].LockSha256) { throw "fetch_manifests[$index] does not bind the exact current manifest/lock SHA" }
-            $validatedLocks.Add([PSCustomObject]@{ ManifestPath = $expectedLocks[$index].ManifestPath; LockPath = $expectedLocks[$index].LockPath; LockSha256 = $expectedLocks[$index].LockSha256; LockBytes = $expectedLocks[$index].LockBytes })
+            $validatedLocks.Add([PSCustomObject]@{
+                ManifestPath = $expectedLocks[$index].ManifestPath
+                ManifestFullPath = $expectedLocks[$index].ManifestFullPath
+                LockPath = $expectedLocks[$index].LockPath
+                LockSha256 = $expectedLocks[$index].LockSha256
+                LockBytes = $expectedLocks[$index].LockBytes
+            })
         }
         if ($null -ne $profile.fetch_git) { throw 'fetch_git must be null: only Cargo in-process libgit2 may fetch locked Git sources; no external Git CLI is admitted' }
         $profileSnapshotAfter = Get-D32ProfileFileSnapshot -Path $profileFull
@@ -797,7 +803,8 @@ function New-D32BuildToolchainProfileSelfTestIdentity {
 function Test-D32BuildToolchainProfileSelfTest {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$Repository
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [AllowNull()][ref]$ValidatedProfileOutput
     )
 
     $cases = [System.Collections.Generic.List[object]]::new()
@@ -917,6 +924,22 @@ function Test-D32BuildToolchainProfileSelfTest {
     $valid = & $runDocument $document $null
     & $case 'valid caller-pinned profile and opened-handle identities' ([bool]$valid.IsValid)
     if (-not $valid.IsValid) { throw "profile self-test baseline profile was rejected: $($valid.Failure)" }
+    $expectedManifestPaths = @($lockInputs | ForEach-Object { [string]$_.ManifestFullPath })
+    $validatedLockShapesExact = @($valid.LockInputs | Where-Object {
+        -not (Test-D32ProfileExactProperties -Object $_ -Expected @('ManifestPath', 'ManifestFullPath', 'LockPath', 'LockSha256', 'LockBytes'))
+    }).Count -eq 0
+    $validatedManifestPaths = @($valid.LockInputs | ForEach-Object {
+        $manifestPathProperty = $_.PSObject.Properties['ManifestFullPath']
+        if ($null -eq $manifestPathProperty) { '' } else { [string]$manifestPathProperty.Value }
+    })
+    $validatedManifestPathsExact = $validatedLockShapesExact -and
+        $valid.LockInputs.Count -eq 3 -and $expectedManifestPaths.Count -eq 3 -and
+        (($validatedManifestPaths -join "`0") -ceq ($expectedManifestPaths -join "`0"))
+    & $case 'validated lock inputs preserve all three trusted full manifest paths' $validatedManifestPathsExact
+    $wireLockShapesExact = @($valid.Profile.fetch_manifests | Where-Object {
+        -not (Test-D32ProfileExactProperties -Object $_ -Expected @('manifest_path', 'lock_sha256'))
+    }).Count -eq 0 -and $valid.Profile.fetch_manifests.Count -eq 3
+    & $case 'profile v2 locked-fetch wire records remain exact two-field entries' $wireLockShapesExact
     $oldV1 = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($document))
     $oldV1.schema_version = 1
     $oldV1.profile_type = 'D32_BUILD_TOOLCHAIN_PROFILE_V1'
@@ -1039,6 +1062,7 @@ function Test-D32BuildToolchainProfileSelfTest {
     [void][IO.Directory]::CreateDirectory($cargoHome)
     [void][IO.Directory]::CreateDirectory($tempRoot)
     $valid = & $runDocument $document $null
+    if ($null -ne $ValidatedProfileOutput) { $ValidatedProfileOutput.Value = $valid }
     $environment = Get-D32BuildToolchainEnvironment -ValidatedProfile $valid -CargoHome $cargoHome -TempRoot $tempRoot -Offline $true
     $allowedEnvironment = @('SystemRoot', 'TEMP', 'TMP', 'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'CARGO_HOME', 'RUSTC', 'RUSTDOC', 'CARGO_NET_OFFLINE', 'VCToolsInstallDir', 'WindowsSdkDir', 'VCToolsVersion', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH')
     & $case 'constructed child environment contains only explicit allowlisted variables' (@($environment.Keys | Where-Object { $allowedEnvironment -cnotcontains $_ }).Count -eq 0 -and $environment.CARGO_NET_OFFLINE -ceq 'true')

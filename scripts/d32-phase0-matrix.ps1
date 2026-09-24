@@ -2174,32 +2174,32 @@ function Test-D32Phase0MatrixRecordSelfTest {
         [IO.File]::WriteAllBytes($emptyLogPath, [byte[]]@())
         $manifestSnapshot = Get-D32ProfileFileSnapshot -Path $manifestPath
         $testRepository = Split-Path -Parent $script:D32Phase0ScriptRoot
-        $profilePath = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1'))
-        $fakeCargoPath = Join-Path $selfTestRoot 'toolchain/cargo.exe'
-        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $fakeCargoPath))
-        [IO.File]::WriteAllBytes($fakeCargoPath, [byte[]](1, 3, 3, 7, 9))
-        $fakeCargoSnapshot = Get-D32ProfileFileSnapshot -Path $fakeCargoPath
-        $fakeCargoIdentity = [ordered]@{
-            path = $fakeCargoSnapshot.Path
-            sha256 = $fakeCargoSnapshot.Sha256
-            bytes = [Int64]$fakeCargoSnapshot.Bytes
-            volume_serial_hex = $fakeCargoSnapshot.VolumeSerialHex
-            file_id_hex = $fakeCargoSnapshot.FileIdHex
+        $fakeProfile = $null
+        $profileSelfTestCases = @(Test-D32BuildToolchainProfileSelfTest `
+            -Root $selfTestRoot `
+            -Repository $testRepository `
+            -ValidatedProfileOutput ([ref]$fakeProfile))
+        $profileSelfTestFailures = @($profileSelfTestCases | Where-Object { -not $_.Passed })
+        if ($profileSelfTestFailures.Count -gt 0 -or $null -eq $fakeProfile -or -not $fakeProfile.IsValid) {
+            $failureNames = @($profileSelfTestFailures | ForEach-Object { $_.Name }) -join ', '
+            throw "PHASE0_SELFTEST_BLOCKED: profile validator did not provide its passing validated test profile ($failureNames)"
         }
-        $fakeLockInputs = @(Get-D32BuildToolchainLockInputs -Repository $testRepository)
-        $fakeProfile = [PSCustomObject]@{
-            ProfilePath = $profilePath
-            Digest = ('b' * 64)
-            Profile = [PSCustomObject]@{
-                target_triple = 'x86_64-pc-windows-msvc'
-                env_policy = 'D32_BUILD_ENV_V1'
-                cargo_policy = 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER'
-                toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]$fakeCargoIdentity }
-            }
-            ExecutableInventory = @([PSCustomObject]@{ Path = $fakeCargoIdentity.path; Sha256 = $fakeCargoIdentity.sha256; Bytes = $fakeCargoIdentity.bytes; VolumeSerialHex = $fakeCargoIdentity.volume_serial_hex; FileIdHex = $fakeCargoIdentity.file_id_hex })
-            WindowsImageInventory = @()
-            LockInputs = @($fakeLockInputs)
+        $profilePath = [string]$fakeProfile.ProfilePath
+        $fakeCargoPath = [string]$fakeProfile.Profile.toolchain.cargo.path
+        $fakeLockInputs = @($fakeProfile.LockInputs)
+        $expectedSelfTestLocks = @(Get-D32BuildToolchainLockInputs -Repository $testRepository)
+        $lockProjectionExact = $fakeLockInputs.Count -eq 3 -and $expectedSelfTestLocks.Count -eq 3
+        for ($lockIndex = 0; $lockIndex -lt [Math]::Min($fakeLockInputs.Count, $expectedSelfTestLocks.Count); $lockIndex++) {
+            $actualLock = $fakeLockInputs[$lockIndex]
+            $expectedLock = $expectedSelfTestLocks[$lockIndex]
+            if (-not (Test-D32ProfileExactProperties -Object $actualLock -Expected @('ManifestPath', 'ManifestFullPath', 'LockPath', 'LockSha256', 'LockBytes')) -or
+                $actualLock.ManifestPath -cne $expectedLock.ManifestPath -or
+                $actualLock.ManifestFullPath -cne $expectedLock.ManifestFullPath -or
+                $actualLock.LockPath -cne $expectedLock.LockPath -or
+                $actualLock.LockSha256 -cne $expectedLock.LockSha256 -or
+                $actualLock.LockBytes -ne $expectedLock.LockBytes) { $lockProjectionExact = $false }
         }
+        & $add 'Phase0 provenance fixture uses all three exact profile-validator lock projections' $lockProjectionExact
         $fakeFetches = [System.Collections.Generic.List[object]]::new()
         $traceRecords = [System.Collections.Generic.List[object]]::new()
         $traceNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch') + @($script:D32Phase0FixtureBuildSpecs | ForEach-Object { [string]$_.name })

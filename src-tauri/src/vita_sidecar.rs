@@ -22065,6 +22065,7 @@ mod windows {
             libpath_dirs: Vec<String>,
             environment: D31UniqueStringMap,
             path_images: Vec<D32BuildProfileIdentity>,
+            path_scripts: Vec<D32BuildProfileIdentity>,
         }
 
         #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
@@ -22076,7 +22077,7 @@ mod windows {
 
         #[derive(Debug, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct D32BuildToolchainProfileV1 {
+        struct D32BuildToolchainProfileV2 {
             schema_version: u32,
             profile_type: String,
             target_triple: String,
@@ -22088,7 +22089,9 @@ mod windows {
             rust_toolchain_bin_images: Vec<D32BuildProfileIdentity>,
             native_roots: Vec<D32BuildProfileNativeRoot>,
             native: D32BuildProfileNative,
+            windows_child_images: Vec<D32BuildProfileIdentity>,
             fetch_manifests: Vec<D32BuildProfileFetchManifest>,
+            #[serde(deserialize_with = "d31_deserialize_required_nullable")]
             fetch_git: D31RequiredNullable<D32BuildProfileIdentity>,
             env_policy: String,
             cargo_policy: String,
@@ -22097,6 +22100,16 @@ mod windows {
         #[derive(Debug, serde::Deserialize)]
         #[serde(transparent)]
         struct D31RequiredNullable<T>(Option<T>);
+
+        fn d31_deserialize_required_nullable<'de, D, T>(
+            deserializer: D,
+        ) -> Result<D31RequiredNullable<T>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+            T: serde::Deserialize<'de>,
+        {
+            <Option<T> as serde::Deserialize>::deserialize(deserializer).map(D31RequiredNullable)
+        }
 
         #[derive(Debug, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -22679,10 +22692,12 @@ mod windows {
                         .extension()
                         .map(|value| value.to_string_lossy().to_ascii_lowercase())
                         .unwrap_or_default();
+                    // Batch files are not executable-image inventory entries.
+                    // Their presence is accepted only when the separate V2
+                    // native.path_scripts inventory pins every current file;
+                    // this does not grant launch authority.
                     if extension == "bat" || extension == "cmd" {
-                        return Err(format!(
-                            "D32 toolchain profile {label} PATH exposes a batch file"
-                        ));
+                        continue;
                     }
                     if extension != "exe" && extension != "com" {
                         continue;
@@ -22708,12 +22723,182 @@ mod windows {
             Ok(actual)
         }
 
+        fn d31_c_validate_profile_script_inventory(
+            records: &[D32BuildProfileIdentity],
+            directories: &[String],
+            allowed_roots: &[PathBuf],
+            label: &str,
+        ) -> Result<HashSet<String>, String> {
+            if directories.is_empty() || allowed_roots.is_empty() {
+                return Err(format!(
+                    "D32 toolchain profile {label} inventory directories/roots must be nonempty"
+                ));
+            }
+            let mut declared = HashMap::new();
+            for record in records {
+                let path = PathBuf::from(&record.path);
+                let canonical = d31_c_canonical_no_reparse(&path, "D32 PATH script identity");
+                let basename = canonical
+                    .file_name()
+                    .ok_or_else(|| format!("D32 toolchain profile {label} script lacks basename"))?
+                    .to_string_lossy()
+                    .into_owned();
+                let extension = canonical
+                    .extension()
+                    .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !matches!(extension.as_str(), "bat" | "cmd")
+                    || basename != record.name
+                    || record.reason != "dormant script inventory only; never launchable"
+                {
+                    return Err(format!(
+                        "D32 toolchain profile {label} contains a noncanonical or launchable script record"
+                    ));
+                }
+                let owners = allowed_roots
+                    .iter()
+                    .filter(|root| d31_c_path_is_within(&canonical, root))
+                    .collect::<Vec<_>>();
+                if owners.len() != 1 {
+                    return Err(format!(
+                        "D32 toolchain profile {label} script is outside exactly one approved root"
+                    ));
+                }
+                let path_owners = directories
+                    .iter()
+                    .filter(|directory| d31_c_path_is_within(&canonical, Path::new(directory)))
+                    .count();
+                if path_owners != 1 {
+                    return Err(format!(
+                        "D32 toolchain profile {label} script is outside exactly one constructed PATH directory"
+                    ));
+                }
+                d31_c_validate_profile_identity(
+                    record,
+                    &record.name,
+                    Some("dormant script inventory only; never launchable"),
+                    owners[0],
+                )?;
+                let key = canonical.to_string_lossy().to_ascii_lowercase();
+                if declared.insert(key, record).is_some() {
+                    return Err(format!(
+                        "D32 toolchain profile {label} contains a duplicate script path"
+                    ));
+                }
+            }
+
+            let mut actual = HashSet::new();
+            let mut normalized_dirs = HashSet::new();
+            for directory in directories {
+                let canonical = d31_c_canonical_no_reparse(
+                    Path::new(directory),
+                    "D32 constructed PATH script directory",
+                );
+                if !fs::metadata(&canonical)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "D32 toolchain profile {label} PATH entry is not a directory"
+                    ));
+                }
+                if !normalized_dirs.insert(canonical.to_string_lossy().to_ascii_lowercase()) {
+                    return Err(format!(
+                        "D32 toolchain profile {label} PATH contains duplicate directories"
+                    ));
+                }
+                let entries = fs::read_dir(&canonical).map_err(|error| {
+                    format!("D32 toolchain profile {label} PATH script enumeration failed: {error}")
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        format!("D32 toolchain profile {label} PATH script read failed: {error}")
+                    })?;
+                    let path = entry.path();
+                    let extension = path
+                        .extension()
+                        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if !matches!(extension.as_str(), "bat" | "cmd") {
+                        continue;
+                    }
+                    host_verify_no_reparse_path(&canonical, &path).map_err(|error| {
+                        format!(
+                            "D32 toolchain profile {label} script has reparse indirection: {error}"
+                        )
+                    })?;
+                    let canonical_script = fs::canonicalize(&path).map_err(|error| {
+                        format!("D32 toolchain profile {label} script cannot canonicalize: {error}")
+                    })?;
+                    if !d31_c_paths_equal(&path, &canonical_script) {
+                        return Err(format!(
+                            "D32 toolchain profile {label} script is not canonical"
+                        ));
+                    }
+                    let key = canonical_script.to_string_lossy().to_ascii_lowercase();
+                    let record = declared.get(&key).ok_or_else(|| {
+                        format!("D32 toolchain profile {label} contains an unpinned PATH script")
+                    })?;
+                    let actual_identity = d31_c_profile_file_evidence(&canonical_script);
+                    if actual_identity.sha256 != record.sha256
+                        || actual_identity.bytes != record.bytes
+                        || actual_identity.volume_serial_hex != record.volume_serial_hex
+                        || actual_identity.file_id_hex != record.file_id_hex
+                    {
+                        return Err(format!(
+                            "D32 toolchain profile {label} script identity changed"
+                        ));
+                    }
+                    if !actual.insert(key) {
+                        return Err(format!(
+                            "D32 toolchain profile {label} contains a duplicate PATH script"
+                        ));
+                    }
+                }
+            }
+            let declared_paths = declared.keys().cloned().collect::<HashSet<_>>();
+            if actual != declared_paths {
+                return Err(format!(
+                    "D32 toolchain profile {label} inventory does not exactly cover current PATH scripts"
+                ));
+            }
+            Ok(actual)
+        }
+
+        fn d31_c_validate_profile_windows_child_images(
+            records: &[D32BuildProfileIdentity],
+            system_root: &Path,
+        ) -> Result<(), String> {
+            if records.len() != 1 {
+                return Err(
+                    "D32 toolchain profile must pin exactly one Windows child image".to_string(),
+                );
+            }
+            let system32 = d31_c_canonical_no_reparse(
+                &system_root.join("System32"),
+                "D32 Windows System32 root",
+            );
+            let conhost = &records[0];
+            d31_c_validate_profile_identity(
+                conhost,
+                "conhost.exe",
+                Some("direct pinned Windows console host child image"),
+                &system32,
+            )?;
+            if !d31_c_paths_equal(Path::new(&conhost.path), &system32.join("conhost.exe")) {
+                return Err(
+                    "D32 Windows child image must be the exact System32 conhost.exe".to_string(),
+                );
+            }
+            Ok(())
+        }
+
         fn d31_c_validate_build_toolchain_profile(
-            profile: &D32BuildToolchainProfileV1,
+            profile: &D32BuildToolchainProfileV2,
             source_repo: &Path,
         ) -> Result<(), String> {
-            if profile.schema_version != 1
-                || profile.profile_type != "D32_BUILD_TOOLCHAIN_PROFILE_V1"
+            if profile.schema_version != 2
+                || profile.profile_type != "D32_BUILD_TOOLCHAIN_PROFILE_V2"
                 || profile.target_triple != "x86_64-pc-windows-msvc"
                 || profile.env_policy != "D32_BUILD_ENV_V1"
                 || profile.cargo_policy != "FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER"
@@ -22966,6 +23151,21 @@ mod windows {
                 return Err("D32 native executable identity inventory is inconsistent".to_string());
             }
 
+            let mut all_path_dirs = vec![rust_bin.to_string_lossy().into_owned()];
+            all_path_dirs.extend(native.path_entries.iter().cloned());
+            let all_path_roots = vec![rust_root.clone(), msvc_root.clone(), sdk_root.clone()];
+            d31_c_validate_profile_script_inventory(
+                &native.path_scripts,
+                &all_path_dirs,
+                &all_path_roots,
+                "native.path_scripts",
+            )?;
+
+            d31_c_validate_profile_windows_child_images(
+                &profile.windows_child_images,
+                &system_root,
+            )?;
+
             let allowed_environment = [
                 "VCINSTALLDIR",
                 "VCToolsInstallDir",
@@ -23045,7 +23245,7 @@ mod windows {
             configured_path: &Path,
             expected_sha256: &str,
             source_repo: &Path,
-        ) -> Result<(PathBuf, D32BuildToolchainProfileV1), String> {
+        ) -> Result<(PathBuf, D32BuildToolchainProfileV2), String> {
             if expected_sha256.len() != 64
                 || !expected_sha256
                     .bytes()
@@ -23088,7 +23288,7 @@ mod windows {
             {
                 return Err("D32 toolchain profile identity changed while reading".to_string());
             }
-            let profile: D32BuildToolchainProfileV1 = serde_json::from_slice(&bytes)
+            let profile: D32BuildToolchainProfileV2 = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("D32 toolchain profile has an invalid/duplicate/unknown schema field: {error}"))?;
             d31_c_validate_build_toolchain_profile(&profile, source_repo)?;
             Ok((path, profile))
@@ -23139,7 +23339,7 @@ mod windows {
             record_fetch_manifests: &[D32BuildProfileFetchManifest],
             expected_profile_path: &Path,
             expected_profile_sha256: &str,
-            profile: &D32BuildToolchainProfileV1,
+            profile: &D32BuildToolchainProfileV2,
         ) -> Result<(), String> {
             let canonical_record_path = d31_c_canonical_no_reparse(
                 Path::new(record_profile_path),
@@ -23159,7 +23359,7 @@ mod windows {
 
         fn d31_c_validate_fetch_phases(
             phases: &[D31RecoverySeederFetchPhase],
-            profile: &D32BuildToolchainProfileV1,
+            profile: &D32BuildToolchainProfileV2,
             cargo_path: &Path,
             source_repo: &Path,
             runner_process_id: u32,
@@ -23878,9 +24078,9 @@ mod windows {
                 manifest_path: "vita-agent/Cargo.toml".to_string(),
                 lock_sha256: "f".repeat(64),
             }];
-            let profile = D32BuildToolchainProfileV1 {
-                schema_version: 1,
-                profile_type: "D32_BUILD_TOOLCHAIN_PROFILE_V1".to_string(),
+            let profile = D32BuildToolchainProfileV2 {
+                schema_version: 2,
+                profile_type: "D32_BUILD_TOOLCHAIN_PROFILE_V2".to_string(),
                 target_triple: "x86_64-pc-windows-msvc".to_string(),
                 system_root: r"C:\Windows".to_string(),
                 powershell_root: r"C:\Pinned PowerShell".to_string(),
@@ -23896,7 +24096,9 @@ mod windows {
                     libpath_dirs: Vec::new(),
                     environment: D31UniqueStringMap(BTreeMap::new()),
                     path_images: Vec::new(),
+                    path_scripts: Vec::new(),
                 },
+                windows_child_images: Vec::new(),
                 fetch_manifests: fetch_manifests.clone(),
                 fetch_git: D31RequiredNullable(None),
                 env_policy: "D32_BUILD_ENV_V1".to_string(),
@@ -23975,25 +24177,37 @@ mod windows {
                     "reason": "test-only pinned image"
                 })
             };
+            let profile_identity_wire = |identity: &D32BuildProfileIdentity| {
+                serde_json::json!({
+                    "name": identity.name,
+                    "path": identity.path,
+                    "sha256": identity.sha256,
+                    "bytes": identity.bytes,
+                    "volume_serial_hex": identity.volume_serial_hex,
+                    "file_id_hex": identity.file_id_hex,
+                    "reason": identity.reason
+                })
+            };
             let profile_wire = serde_json::json!({
-                "schema_version": 1,
-                "profile_type": "D32_BUILD_TOOLCHAIN_PROFILE_V1",
+                "schema_version": 2,
+                "profile_type": "D32_BUILD_TOOLCHAIN_PROFILE_V2",
                 "target_triple": "x86_64-pc-windows-msvc",
                 "system_root": r"C:\Windows",
                 "powershell_root": r"C:\Pinned PowerShell",
-                "powershell": identity_wire("pwsh.exe", r"C:\Pinned PowerShell\pwsh.exe"),
+                "powershell": profile_identity_wire(&powershell),
                 "rust_toolchain_root": r"C:\Pinned Rust",
                 "toolchain": {
-                    "cargo": identity_wire("cargo.exe", r"C:\Pinned Rust\bin\cargo.exe"),
-                    "rustc": identity_wire("rustc.exe", r"C:\Pinned Rust\bin\rustc.exe"),
-                    "rustdoc": identity_wire("rustdoc.exe", r"C:\Pinned Rust\bin\rustdoc.exe")
+                    "cargo": profile_identity_wire(&toolchain.cargo),
+                    "rustc": profile_identity_wire(&toolchain.rustc),
+                    "rustdoc": profile_identity_wire(&toolchain.rustdoc)
                 },
                 "rust_toolchain_bin_images": [],
                 "native_roots": [],
                 "native": {
                     "path_entries": [], "include_dirs": [], "lib_dirs": [], "libpath_dirs": [],
-                    "environment": {}, "path_images": []
+                    "environment": {}, "path_images": [], "path_scripts": []
                 },
+                "windows_child_images": [],
                 "fetch_manifests": [{
                     "manifest_path": "vita-agent/Cargo.toml",
                     "lock_sha256": "f".repeat(64)
@@ -24002,9 +24216,73 @@ mod windows {
                 "env_policy": "D32_BUILD_ENV_V1",
                 "cargo_policy": "FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER"
             });
-            let parsed_profile = serde_json::from_value::<D32BuildToolchainProfileV1>(profile_wire.clone())
-                .expect("D32 profile must explicitly encode fetch_git as null when no external Git is permitted");
+            let parsed_profile = serde_json::from_value::<D32BuildToolchainProfileV2>(profile_wire.clone())
+                .expect("D32 V2 profile must explicitly encode fetch_git as null when no external Git is permitted");
             assert!(parsed_profile.fetch_git.0.is_none());
+
+            let mut legacy_v1 = profile_wire.clone();
+            legacy_v1["schema_version"] = serde_json::json!(1);
+            legacy_v1["profile_type"] = serde_json::json!("D32_BUILD_TOOLCHAIN_PROFILE_V1");
+            legacy_v1
+                .as_object_mut()
+                .expect("profile wire object")
+                .remove("windows_child_images");
+            legacy_v1["native"]
+                .as_object_mut()
+                .expect("native profile wire object")
+                .remove("path_scripts");
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV2>(legacy_v1).is_err(),
+                "legacy V1 profile must not deserialize as the V2 seeder profile"
+            );
+            let mut missing_path_scripts = profile_wire.clone();
+            missing_path_scripts["native"]
+                .as_object_mut()
+                .expect("native profile wire object")
+                .remove("path_scripts");
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV2>(missing_path_scripts).is_err(),
+                "V2 profile missing native.path_scripts must be rejected"
+            );
+            let mut missing_windows_child = profile_wire.clone();
+            missing_windows_child
+                .as_object_mut()
+                .expect("profile wire object")
+                .remove("windows_child_images");
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV2>(missing_windows_child)
+                    .is_err(),
+                "V2 profile missing windows_child_images must be rejected"
+            );
+            let mut unknown_top_field = profile_wire.clone();
+            unknown_top_field["future_authority"] = serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV2>(unknown_top_field).is_err(),
+                "unknown top-level V2 profile fields must be rejected"
+            );
+            let mut unknown_native_field = profile_wire.clone();
+            unknown_native_field["native"]["future_scripts"] = serde_json::json!([]);
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV2>(unknown_native_field).is_err(),
+                "unknown nested native V2 profile fields must be rejected"
+            );
+            let mut wrong_v2_version =
+                serde_json::from_value::<D32BuildToolchainProfileV2>(profile_wire.clone())
+                    .expect("valid V2 shape");
+            wrong_v2_version.schema_version = 1;
+            assert!(d31_c_validate_build_toolchain_profile(
+                &wrong_v2_version,
+                Path::new(r"C:\repo")
+            )
+            .is_err());
+            let mut wrong_v2_type =
+                serde_json::from_value::<D32BuildToolchainProfileV2>(profile_wire.clone())
+                    .expect("valid V2 shape");
+            wrong_v2_type.profile_type = "D32_BUILD_TOOLCHAIN_PROFILE_V1".to_string();
+            assert!(
+                d31_c_validate_build_toolchain_profile(&wrong_v2_type, Path::new(r"C:\repo"))
+                    .is_err()
+            );
 
             let source_root = tempfile::tempdir().expect("D31 producer-shaped source repository");
             let source_repo = source_root.path().join("source");
@@ -24043,12 +24321,12 @@ mod windows {
                 .expect("profile wire object")
                 .remove("fetch_git");
             assert!(
-                serde_json::from_value::<D32BuildToolchainProfileV1>(missing_fetch_git).is_err(),
+                serde_json::from_value::<D32BuildToolchainProfileV2>(missing_fetch_git).is_err(),
                 "missing fetch_git must be rejected rather than defaulted to null"
             );
             let mut non_null_fetch_git = profile_wire.clone();
             non_null_fetch_git["fetch_git"] = identity_wire("git.exe", r"C:\Pinned Git\git.exe");
-            let non_null_profile = serde_json::from_value::<D32BuildToolchainProfileV1>(non_null_fetch_git)
+            let non_null_profile = serde_json::from_value::<D32BuildToolchainProfileV2>(non_null_fetch_git)
                 .expect("non-null fetch_git is structurally parseable for rejection at the profile policy boundary");
             assert!(d31_c_validate_build_toolchain_profile(
                 &non_null_profile,
@@ -24056,13 +24334,6 @@ mod windows {
             )
             .is_err());
 
-            let pinned_image = |name: &str, path: &str, reason: &str| {
-                serde_json::json!({
-                    "name": name, "path": path, "sha256": "a".repeat(64), "bytes": 1,
-                    "volume_serial_hex": "0000000000000001", "file_id_hex": "01".repeat(16),
-                    "reason": reason
-                })
-            };
             let fetch_process_identity_wire = serde_json::json!({
                 "process_id": 1235,
                 "parent_process_id": 456,
@@ -24100,11 +24371,11 @@ mod windows {
                 "toolchain_profile_path": d31_c_path_display(&profile_path),
                 "toolchain_profile_sha256": profile_sha,
                 "target_triple": "x86_64-pc-windows-msvc",
-                "powershell": pinned_image("pwsh.exe", r"C:\Pinned PowerShell\pwsh.exe", "direct pinned PowerShell host executable"),
+                "powershell": profile_identity_wire(&powershell),
                 "toolchain": {
-                    "cargo": pinned_image("cargo.exe", r"C:\Pinned Rust\bin\cargo.exe", "direct pinned cargo executable"),
-                    "rustc": pinned_image("rustc.exe", r"C:\Pinned Rust\bin\rustc.exe", "direct pinned rustc executable"),
-                    "rustdoc": pinned_image("rustdoc.exe", r"C:\Pinned Rust\bin\rustdoc.exe", "direct pinned rustdoc executable")
+                    "cargo": profile_identity_wire(&toolchain.cargo),
+                    "rustc": profile_identity_wire(&toolchain.rustc),
+                    "rustdoc": profile_identity_wire(&toolchain.rustdoc)
                 },
                 "fetch_manifests": [{ "manifest_path": "vita-agent/Cargo.toml", "lock_sha256": "f".repeat(64) }],
                 "fetch_phases": [{
@@ -24284,6 +24555,105 @@ mod windows {
             extra_v2_field["unexpected"] = serde_json::json!(true);
             assert!(
                 serde_json::from_value::<D31RecoverySeederBuildRecord>(extra_v2_field).is_err()
+            );
+        }
+
+        #[test]
+        fn d32_v2_profile_pins_dormant_scripts_and_exact_windows_child_image() {
+            let temp = tempfile::tempdir().expect("D32 V2 profile script inventory root");
+            let tool_root = fs::canonicalize(temp.path()).expect("canonical tool root");
+            let bin = tool_root.join("bin");
+            fs::create_dir(&bin).expect("tool PATH directory");
+            let script = bin.join("rustup.cmd");
+            fs::write(&script, b"@echo off\r\n").expect("dormant script fixture");
+            let script = fs::canonicalize(script).expect("canonical dormant script");
+            let identity_for = |path: &Path, reason: &str| {
+                let evidence = d31_c_profile_file_evidence(path);
+                D32BuildProfileIdentity {
+                    name: path
+                        .file_name()
+                        .expect("profile identity basename")
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: d31_c_path_display(path),
+                    sha256: evidence.sha256,
+                    bytes: evidence.bytes,
+                    volume_serial_hex: evidence.volume_serial_hex,
+                    file_id_hex: evidence.file_id_hex,
+                    reason: reason.to_string(),
+                }
+            };
+            let script_record =
+                identity_for(&script, "dormant script inventory only; never launchable");
+            let path_dirs = vec![d31_c_path_display(&bin)];
+            let allowed_roots = vec![tool_root.clone()];
+            assert!(d31_c_validate_profile_script_inventory(
+                std::slice::from_ref(&script_record),
+                &path_dirs,
+                &allowed_roots,
+                "native.path_scripts",
+            )
+            .is_ok());
+
+            let mut wrong_reason = script_record.clone();
+            wrong_reason.reason = "launchable command wrapper".to_string();
+            assert!(d31_c_validate_profile_script_inventory(
+                &[wrong_reason],
+                &path_dirs,
+                &allowed_roots,
+                "native.path_scripts",
+            )
+            .is_err());
+            assert!(d31_c_validate_profile_script_inventory(
+                &[],
+                &path_dirs,
+                &allowed_roots,
+                "native.path_scripts",
+            )
+            .is_err());
+
+            let unpinned = bin.join("unrecorded.cmd");
+            fs::write(&unpinned, b"@echo off\r\n").expect("unrecorded script fixture");
+            assert!(d31_c_validate_profile_script_inventory(
+                std::slice::from_ref(&script_record),
+                &path_dirs,
+                &allowed_roots,
+                "native.path_scripts",
+            )
+            .is_err());
+            fs::remove_file(&unpinned).expect("remove exact temporary unpinned script");
+            fs::write(&script, b"@echo off\r\necho changed\r\n")
+                .expect("mutate exact temporary script fixture");
+            assert!(d31_c_validate_profile_script_inventory(
+                std::slice::from_ref(&script_record),
+                &path_dirs,
+                &allowed_roots,
+                "native.path_scripts",
+            )
+            .is_err());
+
+            let system_root =
+                PathBuf::from(std::env::var_os("SystemRoot").expect("current Windows system root"));
+            let system_root = d31_c_canonical_no_reparse(&system_root, "test Windows root");
+            let conhost_path = d31_c_canonical_no_reparse(
+                &system_root.join("System32").join("conhost.exe"),
+                "test System32 conhost image",
+            );
+            let conhost = identity_for(
+                &conhost_path,
+                "direct pinned Windows console host child image",
+            );
+            assert!(d31_c_validate_profile_windows_child_images(
+                std::slice::from_ref(&conhost),
+                &system_root,
+            )
+            .is_ok());
+            assert!(d31_c_validate_profile_windows_child_images(&[], &system_root).is_err());
+            let mut stale_conhost = conhost;
+            stale_conhost.sha256 = "0".repeat(64);
+            assert!(
+                d31_c_validate_profile_windows_child_images(&[stale_conhost], &system_root,)
+                    .is_err()
             );
         }
 

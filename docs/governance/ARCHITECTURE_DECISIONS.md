@@ -260,6 +260,10 @@ The bootstrap exception requires a trustworthy Phase 0 matrix before the two rel
 
 - Supersedes only conflicting implementation detail in ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP where necessary to permit the declared Phase 0 local fixture/test compilation. It does not expand Phase 1 beyond the two fixed release commands, alter the bundle manifest schema, or relax any downstream gate.
 
+#### Approved schema supersession clarification (2026-09-24)
+
+The V1 profile identifier and field list above are retained as historical decision text. Under the later approved ADR-D32-PROCESS-EVENT-TRACE-V1 strict-migration decision and its V2 continuation, the current caller-pinned profile wire is exactly `D32_BUILD_TOOLCHAIN_PROFILE_V2` schema 2. It requires `native.path_scripts` (identity pins for every dormant `.bat`/`.cmd` in the constructed Rust/native PATH) and top-level `windows_child_images` (the exact pinned System32 `conhost.exe` image); V1 or unknown/missing/extra-field profiles are rejected. The D31 recovery seeder producer and Host consumer use this same V2 schema and verifier. This clarification supersedes only the historical profile wire version/field list above; it does not change D31 seeder argv, the caller-pinned profile path/SHA binding, process-parent identity checks, or any Host/build authority.
+
 ### ADR-D32-PROCESS-EVENT-TRACE-V1 — D32 Phase0/Release Evidence Batch Execution Boundary
 
 - **Status:** SUPERSEDED

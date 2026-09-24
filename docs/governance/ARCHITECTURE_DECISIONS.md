@@ -16,6 +16,7 @@
 | ADR-D32-FIXTURE-TRUST-D31-SEEDER | APPROVED | D32 fixture Git trust 与 D31 recovery seeder evidence | GPT-6 Sol | D32 fixture tooling 与 D31 test-helper evidence only |
 | ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP | APPROVED WITH CONDITIONS | D32-A release evidence bundle 两阶段 bootstrap | GPT-6 Sol | D32-A bundle bootstrap ordering only |
 | ADR-D32-PHASE0-TOOLCHAIN-PROFILE | APPROVED WITH CONDITIONS | D32 Phase 0 本地矩阵与 caller-pinned build toolchain | GPT-6 Sol | D32 Phase 0 与紧邻 bundle evidence build only |
+| ADR-D32-PROCESS-EVENT-TRACE-V1 | APPROVED WITH CONDITIONS | D32 Phase 0/release evidence command-processor denial and complete process trace | GPT-6 Sol Max | D32 Phase 0、release evidence build 与相应 provenance only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -257,6 +258,57 @@ The bootstrap exception requires a trustworthy Phase 0 matrix before the two rel
 #### Supersedes / Superseded by
 
 - Supersedes only conflicting implementation detail in ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP where necessary to permit the declared Phase 0 local fixture/test compilation. It does not expand Phase 1 beyond the two fixed release commands, alter the bundle manifest schema, or relax any downstream gate.
+
+### ADR-D32-PROCESS-EVENT-TRACE-V1 — D32 Phase0/Release Evidence Batch Execution Boundary
+
+- **Status:** APPROVED WITH CONDITIONS
+- **Decision authority:** GPT-6 Sol Max
+- **Decision date:** 2026-09-24
+- **Related milestone:** D32-A final-gate evidence
+- **Related decisions:** ADR-D32-PHASE0-TOOLCHAIN-PROFILE, ADR-D32-EVIDENCE-BUNDLE-V1
+
+#### Context
+
+The installed Rust toolchain and the only complete Windows SDK x64 tool directory contain dormant `.cmd` files. Their presence is distinct from launching a command processor, but the existing profile inventory rejects any such file before it inventories executable images. The existing Phase0 descendant check samples CIM process state after resume and cannot prove that a short-lived process was never started or that a trace had no lost events.
+
+#### Decision
+
+1. **Dormant scripts do not grant launch authority.** The caller-pinned Rust, MSVC, and Windows SDK constructed PATH directories may contain dormant `.bat`/`.cmd` files. Each such resident script must be recorded with its canonical absolute path, byte count, SHA-256, and opened-handle volume serial/file ID, and those identities must be revalidated at the required evidence boundaries. This is not permission to execute a script, command processor, or shell.
+2. **Complete OS process events are required.** A Phase0 or release-evidence PASS requires a lossless OS process start/exit event stream beginning before the first pinned Cargo invocation and continuing until each associated Job Object has been confirmed to contain zero active processes. The evidence must bind exact parent lineage, non-recycled process identity, canonical image path and opened-handle image identity, plus the trace source’s event/buffer loss counters. It must cover locked fetches, all five fixture phases, Phase0 suites/focused tests, and both fixed release builds. CIM polling is not an acceptable source or fallback.
+3. **Fail closed on any ambiguity or prohibited launch.** Any missing start/exit event, nonzero loss counter, unknown or ambiguous parent chain, PID reuse not disambiguated by a non-recycled process key, image path/identity mismatch, or launch of `cmd.exe`, another command processor, a `.bat`/`.cmd` script, Git/SSH/credential helper, or other unapproved image makes the evidence `BLOCKED`. A trace source that cannot establish complete coverage is not PASS evidence.
+4. **Negative evidence is mandatory.** The implementation must test fast-exit command-processor launches; `.cmd` invocation by PATH resolution and absolute path; unknown child/helper images; PID reuse and ambiguous ancestry; trace loss and missing events; resident dormant-script acceptance; resident script/executable identity tampering; and the normal pinned toolchain/build/test child processes. These tests do not authorize a production Host sandbox change.
+5. **No host-policy or tool-image workaround.** Do not change OS audit policy, ETW permissions/ACLs, user/group privileges, or other host configuration. Do not copy or mirror installed tool images to avoid resident scripts. Candidate source/build inputs remain an explicit trust premise; the production D32 Host sandbox authority is unchanged.
+6. **Strict evidence-schema migration.** Any profile, fixture-provenance, Phase0 record, release attestation, or aggregate record whose exact fields or validation meaning changes must receive an explicit schema/type version bump. Validators and SelfTests must reject the previous/unknown versions; evidence from prior candidates or old schemas cannot inherit PASS.
+7. **Controlled profile candidate creation.** A code-owned generator may emit a profile candidate only to a new external path and must refuse overwrite. Generation does not authorize use: the Coordinator independently reviews and supplies the exact expected profile SHA-256 to the evidence runner.
+
+#### Frozen invariants
+
+1. Dormant script presence is allowed only when its file identity is caller-pinned and current; script or command-processor execution remains prohibited.
+2. An incomplete or lossy process event source is missing required evidence and therefore `BLOCKED`.
+3. No changes are made to production Host sandbox authority, product behavior, manifest v3 semantics, or fixed command argv.
+
+#### Allowed implementation space
+
+- Update D32 profile, Phase0, fixture-provenance, release-attestation, and aggregate tooling only as required to represent pinned resident scripts and complete process event evidence.
+- Add an external create-new profile candidate generator whose output requires independent caller pinning.
+- Apply strict version bumps and old-version rejection to all affected records.
+
+#### Forbidden implementation
+
+- No 150ms CIM polling fallback or best-effort/loss-tolerant process trace.
+- No execution allowance for `.bat`/`.cmd`, `cmd.exe`, shells, Git/SSH/credential helpers, or other unapproved images.
+- No OS policy/ACL/group/privilege changes and no copied/mirrored toolchain images.
+- No change to production D32 Host sandbox authority or fixed Cargo argv.
+
+#### Required tests and evidence
+
+- Negative coverage listed in Decision 4, with exact trace start/stop/loss counters and parent/non-recycled process identities.
+- Exact profile/script identity tests, strict schema/version tests rejecting all previous record versions, and exact-SHA runner evidence.
+- If a complete supported process event source is unavailable without host-policy changes, report `BLOCKED_ARCHITECTURE`; do not run Phase0/release evidence or claim PASS.
+
+#### Supersedes / Superseded by
+
+- Clarifies the dormant-script and process-launch meaning of ADR-D32-PHASE0-TOOLCHAIN-PROFILE. It adds a required process-event evidence boundary; it does not authorize any batch/command-processor launch or alter downstream D32 gates.
 
 ---
 

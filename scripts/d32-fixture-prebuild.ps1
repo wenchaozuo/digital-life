@@ -1311,6 +1311,15 @@ public sealed class D32NativeCleanupEvidenceV2
     public bool JobCloseSucceeded { get; internal set; }
     public bool CleanupSucceeded { get; internal set; }
     public bool AlreadyClosed { get; internal set; }
+    public uint DebuggerThreadId { get; internal set; }
+    public bool DebuggerThreadExited { get; internal set; }
+    public bool DebuggerThreadJoined { get; internal set; }
+    public bool DebuggerKillOnExitEnabled { get; internal set; }
+    public int RetainedProcessHandleCount { get; internal set; }
+    public bool RetainedProcessHandlesSignaled { get; internal set; }
+    public bool DebuggerAssociationQueryVerified { get; internal set; }
+    public bool DebuggerAssociationAbsent { get; internal set; }
+    public string RetainedProcessHandleStates { get; internal set; }
     public string Detail { get; internal set; }
 }
 
@@ -1354,6 +1363,18 @@ public sealed class D32DebugProcessTraceV2
     public string State { get; set; }
     public string BlockReason { get; set; }
     public int DebuggerProcessId { get; set; }
+    public uint UncontinuedCreateProcessId { get; set; }
+    public int UncontinuedCreateContinueCallCount { get; set; }
+    public uint DebuggerThreadId { get; set; }
+    public bool DedicatedDebuggerThread { get; set; }
+    public bool DebuggerKillOnExitEnabled { get; set; }
+    public bool RootResumedAfterKillOnExit { get; set; }
+    public bool DebuggerThreadExited { get; set; }
+    public bool DebuggerThreadJoined { get; set; }
+    public int RetainedProcessHandleCount { get; set; }
+    public bool RetainedProcessHandlesSignaled { get; set; }
+    public bool DebuggerAssociationQueryVerified { get; set; }
+    public bool DebuggerAssociationAbsent { get; set; }
     public long DebuggerCreationFileTime { get; set; }
     public string DebuggerCreatedAtUtc { get; set; }
     public string StartedAtUtc { get; set; }
@@ -1378,6 +1399,24 @@ public sealed class D32DebugProcessTraceV2
     public bool InjectedInterruption { get; set; }
     public List<D32DebugProcessEventV2> ProcessEvents { get; set; }
     public List<D32DebugProcessRecordV2> Processes { get; set; }
+}
+
+internal sealed class D32DebugLaunchCoordinator
+{
+    public readonly ManualResetEvent ProcessReady = new ManualResetEvent(false);
+    public readonly ManualResetEvent CapturePlanReady = new ManualResetEvent(false);
+    public readonly ManualResetEvent CaptureCompleted = new ManualResetEvent(false);
+    public D32FixtureNativeProcessV2 Process;
+    public Thread WorkerThread;
+    public Exception Failure;
+    public bool AbortRequested;
+    public string ExpectedRootPin;
+    public string[] ApprovedImagePins;
+    public string[] CandidateImageRoots;
+    public int TimeoutMilliseconds;
+    public bool InjectFirstCreateInterruption;
+    public bool InjectFirstCreateIdentityMismatch;
+    public string FailureInjection;
 }
 
 public sealed class D32FixtureNativeProcessV2 : IDisposable
@@ -1409,6 +1448,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private const uint StatusBreakpoint = 0x80000003;
     private const int ErrorSemTimeout = 121;
     private const uint DuplicateSameAccess = 0x00000002;
+    private const uint ProcessQueryInformation = 0x00000400;
+    private const uint Synchronize = 0x00100000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes
@@ -1689,6 +1730,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private static extern bool ContinueDebugEvent(uint processId, uint threadId, uint continueStatus);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DebugSetProcessKillOnExit(bool killOnExit);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessTimes(IntPtr process, out DebugFileTime creation, out DebugFileTime exit, out DebugFileTime kernel, out DebugFileTime user);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -1703,11 +1747,20 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr sourceHandle, IntPtr targetProcess, out IntPtr targetHandle, uint desiredAccess, bool inheritHandle, uint options);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
 
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentProcessId();
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CheckRemoteDebuggerPresent(IntPtr process, out bool debuggerPresent);
 
     [DllImport("ntdll.dll")]
     private static extern int NtQueryInformationProcess(IntPtr process, int informationClass, out DebugProcessBasicInformation information, int length, out int returnLength);
@@ -1746,7 +1799,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         out ProcessInformation processInformation);
 
     private IntPtr _job;
+    private IntPtr _parentJob;
     private IntPtr _process;
+    private IntPtr _parentProcess;
     private IntPtr _thread;
     private SafeFileHandle _stdoutHandle;
     private SafeFileHandle _stderrHandle;
@@ -1757,11 +1812,27 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private uint _closedJobActiveProcessCount;
     private int _closedJobActiveProcessCountError;
     private bool _debugEnabled;
+    private bool _debugKillOnExitEnabled;
+    private bool _debugRootResumedAfterKillOnExit;
+    private bool _debugCleanupVerified;
+    private bool _debugThreadJoined;
+    private bool _debugRetainedProcessHandlesSignaled;
+    private bool _debugAssociationQueryVerified;
+    private bool _debugAssociationAbsent;
+    private int _debugRetainedProcessHandleCount;
+    private string _debugRetainedProcessHandleStates;
+    private D32DebugLaunchCoordinator _debugCoordinator;
+    private readonly object _observedProcessLock = new object();
+    private readonly List<IntPtr> _observedProcessHandles = new List<IntPtr>();
+    private readonly List<uint> _observedProcessIds = new List<uint>();
+    private readonly List<string> _observedHandleDuplicationAudit = new List<string>();
+    private D32DebugProcessTraceV2 _debugTrace;
 
     public int ProcessId { get; private set; }
     public bool JobAssigned { get; private set; }
     public int DebugContinueCallCount { get; private set; }
-    public string LaunchMode { get { return (_debugEnabled ? "CreateProcessW(DEBUG_PROCESS|" : "CreateProcessW(") + "CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"; } }
+    public uint DebuggerThreadId { get; private set; }
+    public string LaunchMode { get { return (_debugEnabled ? "DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)" : "CreateProcessW(CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread"); } }
 
     public static bool DebugCreateProcessIdentityMatches(uint eventProcessId, uint processHandleProcessId, int createProcessReturnedRootProcessId, bool isRootProcessEvent)
     {
@@ -1786,6 +1857,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         _stderrHandle = new SafeFileHandle(stderrRead, true);
         ProcessId = checked((int)processId);
         _debugEnabled = debugEnabled;
+        if (debugEnabled)
+        {
+            if (!DuplicateHandle(GetCurrentProcess(), job, GetCurrentProcess(), out _parentJob, 0, false, DuplicateSameAccess))
+                ThrowLastError("DuplicateHandle(parent retained Job) failed");
+            if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), out _parentProcess, 0, false, DuplicateSameAccess))
+            {
+                int error = Marshal.GetLastWin32Error();
+                CloseIfOpen(ref _parentJob, "CloseHandle(parent retained Job after duplicate failure)");
+                throw new Win32Exception(error, "DuplicateHandle(parent retained root process) failed");
+            }
+        }
         JobAssigned = true;
     }
 
@@ -1915,7 +1997,212 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         string workingDirectory,
         string environmentBlock)
     {
-        return StartInternal(filePath, commandLine, workingDirectory, environmentBlock, null, true);
+        D32DebugLaunchCoordinator coordinator = new D32DebugLaunchCoordinator();
+        Thread worker = new Thread(delegate() {
+            try
+            {
+                D32FixtureNativeProcessV2 process = StartInternal(filePath, commandLine, workingDirectory, environmentBlock, null, true, true);
+                process._debugCoordinator = coordinator;
+                process.DebuggerThreadId = GetCurrentThreadId();
+                coordinator.Process = process;
+                coordinator.ProcessReady.Set();
+                if (!coordinator.CapturePlanReady.WaitOne(30000))
+                {
+                    process.RequestDebugAbort("caller did not provide a capture plan before the bounded startup deadline");
+                    return;
+                }
+                if (coordinator.AbortRequested)
+                {
+                    process.RequestDebugAbort("caller aborted before the debug capture plan was accepted");
+                    return;
+                }
+                process._debugTrace = process.MonitorDebugEvents(
+                    coordinator.ExpectedRootPin,
+                    coordinator.ApprovedImagePins,
+                    coordinator.CandidateImageRoots,
+                    coordinator.TimeoutMilliseconds,
+                    coordinator.InjectFirstCreateInterruption,
+                    coordinator.InjectFirstCreateIdentityMismatch);
+            }
+            catch (Exception error)
+            {
+                coordinator.Failure = error;
+                if (coordinator.Process == null) coordinator.ProcessReady.Set();
+                else coordinator.Process.RequestDebugAbort("dedicated debugger worker failed: " + error.Message);
+            }
+            finally { coordinator.CaptureCompleted.Set(); }
+        });
+        worker.IsBackground = true;
+        worker.Name = "D32-dedicated-debugger";
+        coordinator.WorkerThread = worker;
+        worker.Start();
+        if (!coordinator.ProcessReady.WaitOne(30000))
+        {
+            coordinator.AbortRequested = true;
+            coordinator.CapturePlanReady.Set();
+            if (!worker.Join(5000)) throw new TimeoutException("dedicated debugger thread did not finish bounded process startup");
+            throw new TimeoutException("dedicated debugger process startup deadline exceeded");
+        }
+        if (coordinator.Process == null)
+        {
+            worker.Join(5000);
+            throw new InvalidOperationException("dedicated debugger process startup failed", coordinator.Failure);
+        }
+        return coordinator.Process;
+    }
+
+    public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch)
+    {
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds, injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, null);
+    }
+
+    public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection)
+    {
+        if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
+        if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
+            throw new ArgumentException("expected root pin, image inventories, and a positive deadline are mandatory");
+        lock (_debugCoordinator)
+        {
+            if (_debugCoordinator.CapturePlanReady.WaitOne(0)) throw new InvalidOperationException("debug capture plan was already supplied");
+            _debugCoordinator.ExpectedRootPin = expectedRootPin;
+            _debugCoordinator.ApprovedImagePins = (string[])approvedImagePins.Clone();
+            _debugCoordinator.CandidateImageRoots = (string[])candidateImageRoots.Clone();
+            _debugCoordinator.TimeoutMilliseconds = timeoutMilliseconds;
+            _debugCoordinator.InjectFirstCreateInterruption = injectFirstCreateInterruption;
+            _debugCoordinator.InjectFirstCreateIdentityMismatch = injectFirstCreateIdentityMismatch;
+            _debugCoordinator.FailureInjection = failureInjection;
+            _debugCoordinator.CapturePlanReady.Set();
+        }
+    }
+
+    public D32DebugProcessTraceV2 WaitForDebugTrace(int timeoutMilliseconds)
+    {
+        if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
+        if (timeoutMilliseconds <= 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        if (!_debugCoordinator.CapturePlanReady.WaitOne(0)) RequestDebugAbort("capture plan was not supplied before waiting for the trace");
+        Thread worker = _debugCoordinator.WorkerThread;
+        bool joined = worker != null && worker.Join(timeoutMilliseconds);
+        if (!joined)
+        {
+            RequestDebugAbort("dedicated debugger thread join deadline exceeded");
+            joined = worker != null && worker.Join(5000);
+        }
+        if (!joined) throw new TimeoutException("dedicated debugger thread failed to exit and join after Job termination");
+        D32DebugProcessTraceV2 trace = _debugTrace;
+        if (trace == null)
+        {
+            trace = CreateBlockedDebugTrace(_debugCoordinator.Failure == null ? "dedicated debugger worker returned without a trace" : _debugCoordinator.Failure.Message);
+            _debugTrace = trace;
+        }
+        PopulatePostJoinDebugEvidence(trace, joined);
+        return trace;
+    }
+
+    private static D32DebugProcessTraceV2 CreateBlockedDebugTrace(string reason)
+    {
+        DateTime now = DateTime.UtcNow;
+        long debuggerCreation = GetDebugProcessCreationTime(GetCurrentProcess());
+        return new D32DebugProcessTraceV2 {
+            RecordType = "D32_DEBUG_JOB_PROCESS_TRACE_V2", SchemaVersion = 2,
+            EventSource = "Win32-WaitForDebugEvent-dedicated-OS-thread", State = "BLOCKED", BlockReason = reason,
+            DebuggerProcessId = (int)GetCurrentProcessId(), UncontinuedCreateProcessId = 0,
+            UncontinuedCreateContinueCallCount = 0, DebuggerCreationFileTime = debuggerCreation,
+            DebuggerCreatedAtUtc = DebugFileTimeUtc(debuggerCreation), StartedAtUtc = now.ToString("o", CultureInfo.InvariantCulture),
+            CompletedAtUtc = now.ToString("o", CultureInfo.InvariantCulture), DebuggerThreadId = 0,
+            DedicatedDebuggerThread = false, DebuggerKillOnExitEnabled = false, RootResumedAfterKillOnExit = false,
+            DebuggerThreadExited = false, DebuggerThreadJoined = false, RetainedProcessHandleCount = 0,
+            RetainedProcessHandlesSignaled = false, DebuggerAssociationQueryVerified = false, DebuggerAssociationAbsent = false,
+            EventChainComplete = false, ProcessEvents = new List<D32DebugProcessEventV2>(), Processes = new List<D32DebugProcessRecordV2>()
+        };
+    }
+
+    private void RequestDebugAbort(string reason)
+    {
+        if (_debugCoordinator != null)
+        {
+            lock (_debugCoordinator) _debugCoordinator.AbortRequested = true;
+            _debugCoordinator.CapturePlanReady.Set();
+        }
+        IntPtr job = _parentJob != IntPtr.Zero ? _parentJob : _job;
+        if (job != IntPtr.Zero && !TerminateJobObject(job, 0xD32010FF))
+        {
+            if (_debugCoordinator != null && _debugCoordinator.Failure == null)
+                _debugCoordinator.Failure = new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject during debug abort failed: " + reason);
+        }
+    }
+
+    private void PopulatePostJoinDebugEvidence(D32DebugProcessTraceV2 trace, bool joined)
+    {
+        Thread worker = _debugCoordinator == null ? null : _debugCoordinator.WorkerThread;
+        trace.DebuggerThreadId = DebuggerThreadId;
+        trace.DedicatedDebuggerThread = worker != null && worker != Thread.CurrentThread && worker.Name == "D32-dedicated-debugger";
+        trace.DebuggerKillOnExitEnabled = _debugKillOnExitEnabled;
+        trace.RootResumedAfterKillOnExit = _debugRootResumedAfterKillOnExit;
+        trace.DebuggerThreadExited = worker != null && !worker.IsAlive;
+        trace.DebuggerThreadJoined = joined && trace.DebuggerThreadExited;
+        _debugThreadJoined = trace.DebuggerThreadJoined;
+
+        List<IntPtr> handles = new List<IntPtr>();
+        List<uint> processIds = new List<uint>();
+        if (_parentProcess != IntPtr.Zero) { handles.Add(_parentProcess); processIds.Add((uint)ProcessId); }
+        lock (_observedProcessLock) { handles.AddRange(_observedProcessHandles); processIds.AddRange(_observedProcessIds); }
+        _debugRetainedProcessHandleCount = handles.Count;
+        _debugRetainedProcessHandlesSignaled = handles.Count > 0;
+        _debugAssociationQueryVerified = handles.Count > 0;
+        _debugAssociationAbsent = handles.Count > 0;
+        List<string> handleStates = new List<string>();
+        for (int i = 0; i < handles.Count; i++)
+        {
+            IntPtr handle = handles[i];
+            uint pid = i < processIds.Count ? processIds[i] : 0;
+            uint waitResult = handle == IntPtr.Zero ? UInt32.MaxValue : WaitForSingleObject(handle, 0);
+            int waitError = waitResult == UInt32.MaxValue ? Marshal.GetLastWin32Error() : 0;
+            bool present = true;
+            bool debuggerQueryOk = handle != IntPtr.Zero && CheckRemoteDebuggerPresent(handle, out present);
+            int debuggerQueryError = debuggerQueryOk ? 0 : Marshal.GetLastWin32Error();
+            handleStates.Add(pid.ToString(CultureInfo.InvariantCulture) + ":h=0x" + handle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":wait=" + waitResult.ToString(CultureInfo.InvariantCulture) + ":waitError=" + waitError.ToString(CultureInfo.InvariantCulture) + ":debuggerQuery=" + debuggerQueryOk.ToString() + ":queryError=" + debuggerQueryError.ToString(CultureInfo.InvariantCulture) + ":present=" + present.ToString());
+            if (handle == IntPtr.Zero || waitResult != WaitObject0)
+                _debugRetainedProcessHandlesSignaled = false;
+            if (!debuggerQueryOk)
+            {
+                _debugAssociationQueryVerified = false;
+                _debugAssociationAbsent = false;
+            }
+            else if (present) _debugAssociationAbsent = false;
+        }
+        _debugRetainedProcessHandleStates = String.Join(";", handleStates.ToArray());
+
+        trace.RetainedProcessHandleCount = _debugRetainedProcessHandleCount;
+        trace.RetainedProcessHandlesSignaled = _debugRetainedProcessHandlesSignaled;
+        trace.DebuggerAssociationQueryVerified = _debugAssociationQueryVerified;
+        trace.DebuggerAssociationAbsent = _debugAssociationAbsent;
+
+        JobObjectBasicAccountingInformation accounting;
+        if (_parentJob != IntPtr.Zero && TryGetDebugJobAccounting(_parentJob, out accounting))
+        {
+            DateTime settleDeadline = DateTime.UtcNow.AddSeconds(5);
+            while (accounting.ActiveProcesses != 0 && DateTime.UtcNow < settleDeadline && TryGetDebugJobAccounting(_parentJob, out accounting))
+                Thread.Sleep(20);
+            trace.JobAccountingVerified = true;
+            trace.JobTotalProcesses = accounting.TotalProcesses;
+            trace.JobActiveProcesses = accounting.ActiveProcesses;
+        }
+        else
+        {
+            trace.DebugApiErrorCount++;
+            trace.JobAccountingVerified = false;
+            TraceBlock(trace, "independent post-join QueryInformationJobObject accounting was unavailable");
+        }
+        trace.AccountingConsistent = trace.JobAccountingVerified && trace.EventChainComplete && trace.DebugApiErrorCount == 0 &&
+            trace.ProcessCreateEventCount == trace.ProcessExitEventCount && trace.ProcessCreateEventCount == trace.Processes.Count &&
+            trace.ProcessEvents.Count == trace.ProcessCreateEventCount + trace.ProcessExitEventCount &&
+            trace.ProcessCreateEventCount == trace.JobTotalProcesses && trace.JobActiveProcesses == 0 &&
+            trace.DedicatedDebuggerThread && trace.DebuggerKillOnExitEnabled && trace.RootResumedAfterKillOnExit &&
+            trace.DebuggerThreadExited && trace.DebuggerThreadJoined && trace.RetainedProcessHandlesSignaled &&
+            trace.DebuggerAssociationQueryVerified && trace.DebuggerAssociationAbsent;
+        if (!trace.AccountingConsistent) TraceBlock(trace, "CREATE/EXIT, dedicated-thread cleanup, retained handles, debugger association, and independent Job accounting do not reconcile");
+        if (trace.State == "RUNNING") trace.State = trace.AccountingConsistent ? "COMPLETED" : "BLOCKED";
+        trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
     }
 
     private static D32FixtureNativeProcessV2 StartInternal(
@@ -1924,7 +2211,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         string workingDirectory,
         string environmentBlock,
         string testFailure,
-        bool debugEnabled)
+        bool debugEnabled,
+        bool deferDebugResume = false)
     {
         if (String.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("filePath");
         if (String.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory");
@@ -1940,6 +2228,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         IntPtr nativeEnvironment = IntPtr.Zero;
         ProcessInformation pi = new ProcessInformation();
         bool transferred = false;
+        bool debugKillOnExitEnabled = false;
         Exception failure = null;
         string cleanupErrors = null;
         D32FixtureNativeProcessV2 result = null;
@@ -2051,9 +2340,18 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 throw new Win32Exception(assignError, "SELFTEST_INJECTED_ASSIGN_API_FAILURE (win32=" + assignError.ToString() + ")");
             }
 
-            uint resumeResult = ResumeThread(pi.Thread);
-            if (resumeResult == UInt32.MaxValue)
-                ThrowLastError("ResumeThread failed");
+            if (debugEnabled)
+            {
+                if (!DebugSetProcessKillOnExit(true)) ThrowLastError("DebugSetProcessKillOnExit(TRUE) failed on the dedicated debugger thread");
+                debugKillOnExitEnabled = true;
+            }
+
+            if (!deferDebugResume)
+            {
+                uint resumeResult = ResumeThread(pi.Thread);
+                if (resumeResult == UInt32.MaxValue)
+                    ThrowLastError("ResumeThread failed");
+            }
 
             result = new D32FixtureNativeProcessV2(
                 job,
@@ -2063,6 +2361,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 stderrRead,
                 pi.ProcessId,
                 debugEnabled);
+            result._debugKillOnExitEnabled = debugKillOnExitEnabled;
             job = IntPtr.Zero;
             pi.Process = IntPtr.Zero;
             pi.Thread = IntPtr.Zero;
@@ -2153,13 +2452,36 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
    public bool HasExited
     {
-        get { return WaitForSingleObject(_process, 0) == WaitObject0; }
+        get { IntPtr process = _debugEnabled && _parentProcess != IntPtr.Zero ? _parentProcess : _process; return WaitForSingleObject(process, 0) == WaitObject0; }
     }
 
     public bool WaitForExit(int timeoutMilliseconds)
     {
         if (timeoutMilliseconds < 0) timeoutMilliseconds = 0;
-        return WaitForSingleObject(_process, (uint)timeoutMilliseconds) == WaitObject0;
+        IntPtr process = _debugEnabled && _parentProcess != IntPtr.Zero ? _parentProcess : _process;
+        return WaitForSingleObject(process, (uint)timeoutMilliseconds) == WaitObject0;
+    }
+
+    public string GetDebugHandleDuplicationAudit()
+    {
+        lock (_observedProcessLock) return String.Join(";", _observedHandleDuplicationAudit.ToArray());
+    }
+
+    private bool VerifyObservedProcessHandles(out string invalidHandles)
+    {
+        List<string> invalid = new List<string>();
+        lock (_observedProcessLock)
+        {
+            for (int i = 0; i < _observedProcessHandles.Count; i++)
+            {
+                uint flags;
+                IntPtr handle = _observedProcessHandles[i];
+                if (handle == IntPtr.Zero || !GetHandleInformation(handle, out flags))
+                    invalid.Add(_observedProcessIds[i].ToString(CultureInfo.InvariantCulture) + ":0x" + handle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture));
+            }
+        }
+        invalidHandles = String.Join(";", invalid.ToArray());
+        return invalid.Count == 0;
     }
 
     public int ExitCode
@@ -2167,7 +2489,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         get
         {
             uint code;
-            if (!GetExitCodeProcess(_process, out code)) ThrowLastError("GetExitCodeProcess failed");
+            IntPtr process = _debugEnabled && _parentProcess != IntPtr.Zero ? _parentProcess : _process;
+            if (!GetExitCodeProcess(process, out code)) ThrowLastError("GetExitCodeProcess failed");
             return unchecked((int)code);
         }
     }
@@ -2351,18 +2674,46 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         trace.State = "BLOCKED";
     }
 
-    private static void TraceCloseHandle(IntPtr handle, D32DebugProcessTraceV2 trace, string label)
+    private void TraceCloseHandle(IntPtr handle, D32DebugProcessTraceV2 trace, string label)
     {
-        if (handle != IntPtr.Zero && handle != new IntPtr(-1) && !CloseHandle(handle))
+        if (handle != IntPtr.Zero)
         {
-            trace.DebugApiErrorCount++;
-            TraceBlock(trace, "CloseHandle(" + label + ") failed: " + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture));
+            lock (_observedProcessLock)
+            {
+                for (int i = 0; i < _observedProcessHandles.Count; i++)
+                {
+                    if (_observedProcessHandles[i] == handle)
+                    {
+                        _observedHandleDuplicationAudit.Add("CLOSE_ALIAS:" + label + ":handle=0x" + handle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":retained_pid=" + _observedProcessIds[i].ToString(CultureInfo.InvariantCulture));
+                        TraceBlock(trace, "debug event cleanup handle aliases a parent-retained process handle: " + label);
+                        return;
+                    }
+                }
+            }
+        }
+        if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+        {
+            if (!CloseHandle(handle))
+            {
+                trace.DebugApiErrorCount++;
+                TraceBlock(trace, "CloseHandle(" + label + ") failed: " + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                string invalidRetainedHandles;
+                if (_debugEnabled && !VerifyObservedProcessHandles(out invalidRetainedHandles))
+                {
+                    lock (_observedProcessLock) _observedHandleDuplicationAudit.Add("INVALID_AFTER_CLOSE:" + label + ":" + invalidRetainedHandles);
+                    TraceBlock(trace, "a parent-retained process handle became invalid while closing " + label + ": " + invalidRetainedHandles);
+                }
+            }
         }
     }
 
     public D32DebugProcessTraceV2 MonitorDebugEvents(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch)
     {
-        if (!_debugEnabled) throw new InvalidOperationException("synchronous DEBUG_PROCESS capture is mandatory for this monitor");
+        if (!_debugEnabled || _debugCoordinator == null || Thread.CurrentThread != _debugCoordinator.WorkerThread)
+            throw new InvalidOperationException("CreateProcessW, WaitForDebugEvent, and ContinueDebugEvent must run on the dedicated joinable debugger OS thread");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
             throw new ArgumentException("expected root pin, image inventories, and a positive deadline are mandatory");
         string[] expectedRoot = ParseDebugPin(expectedRootPin);
@@ -2375,10 +2726,16 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             if (!Path.IsPathRooted(roots[i])) throw new InvalidOperationException("candidate image root is not absolute");
         }
         DateTime start = DateTime.UtcNow;
+        string failureInjection = _debugCoordinator.FailureInjection ?? String.Empty;
         long debuggerCreation = GetDebugProcessCreationTime(GetCurrentProcess());
         D32DebugProcessTraceV2 trace = new D32DebugProcessTraceV2 {
-            RecordType = "D32_DEBUG_JOB_PROCESS_TRACE_V2", SchemaVersion = 2, EventSource = "Win32-WaitForDebugEvent-synchronous",
+            RecordType = "D32_DEBUG_JOB_PROCESS_TRACE_V2", SchemaVersion = 2, EventSource = "Win32-WaitForDebugEvent-dedicated-OS-thread",
             State = "RUNNING", StartedAtUtc = start.ToString("o", CultureInfo.InvariantCulture), DebuggerProcessId = (int)GetCurrentProcessId(),
+            UncontinuedCreateProcessId = 0, UncontinuedCreateContinueCallCount = 0,
+            DebuggerThreadId = GetCurrentThreadId(), DedicatedDebuggerThread = true,
+            DebuggerKillOnExitEnabled = _debugKillOnExitEnabled, RootResumedAfterKillOnExit = false,
+            DebuggerThreadExited = false, DebuggerThreadJoined = false, RetainedProcessHandleCount = 0,
+            RetainedProcessHandlesSignaled = false, DebuggerAssociationQueryVerified = false, DebuggerAssociationAbsent = false,
             DebuggerCreationFileTime = debuggerCreation, DebuggerCreatedAtUtc = DebugFileTimeUtc(debuggerCreation),
             EventChainComplete = true, InjectedInterruption = injectFirstCreateInterruption,
             ProcessEvents = new List<D32DebugProcessEventV2>(), Processes = new List<D32DebugProcessRecordV2>()
@@ -2387,35 +2744,66 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         HashSet<string> identities = new HashSet<string>(StringComparer.Ordinal);
         HashSet<uint> startupBreakpoints = new HashSet<uint>();
         DateTime deadline = start.AddMilliseconds(timeoutMilliseconds);
-        DateTime cleanupDeadline = DateTime.MaxValue;
-        bool draining = false;
         long sequence = 0;
+
+        if (!_debugKillOnExitEnabled)
+        {
+            TraceBlock(trace, "DebugSetProcessKillOnExit(TRUE) was not established before root resume");
+            trace.DebugApiErrorCount++;
+            if (!TerminateJobObject(_job, 0xD3201000)) trace.DebugApiErrorCount++;
+            trace.EventChainComplete = false;
+            trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            return trace;
+        }
+        uint resumeResult = ResumeThread(_thread);
+        if (resumeResult == UInt32.MaxValue || resumeResult != 1)
+        {
+            int resumeError = resumeResult == UInt32.MaxValue ? Marshal.GetLastWin32Error() : 0;
+            TraceBlock(trace, "root ResumeThread did not observe exactly one CREATE_SUSPENDED count after DebugSetProcessKillOnExit(TRUE); previous=" + resumeResult.ToString(CultureInfo.InvariantCulture) + "; win32=" + resumeError.ToString(CultureInfo.InvariantCulture));
+            trace.DebugApiErrorCount++;
+            if (!TerminateJobObject(_job, 0xD3201000)) trace.DebugApiErrorCount++;
+            trace.EventChainComplete = false;
+            trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            return trace;
+        }
+        _debugRootResumedAfterKillOnExit = true;
+        trace.RootResumedAfterKillOnExit = true;
 
         while (true)
         {
-            if (trace.State == "BLOCKED" && !draining)
-            {
-                if (!TerminateJobObject(_job, 0xD3201001)) trace.DebugApiErrorCount++;
-                draining = true;
-                cleanupDeadline = DateTime.UtcNow.AddSeconds(15);
-            }
-            if (!draining && DateTime.UtcNow >= deadline)
-            {
-                TraceBlock(trace, "WaitForDebugEvent deadline exceeded; the owned Job was terminated");
-                if (!TerminateJobObject(_job, 0xD3201002)) trace.DebugApiErrorCount++;
-                draining = true;
-                cleanupDeadline = DateTime.UtcNow.AddSeconds(15);
-            }
-            if (draining && DateTime.UtcNow >= cleanupDeadline)
+            if (_debugCoordinator.AbortRequested)
             {
                 trace.EventChainComplete = false;
-                TraceBlock(trace, "debug event chain did not close after Job termination");
+                TraceBlock(trace, "debugger session was aborted before the pending event could be continued");
+                if (!TerminateJobObject(_job, 0xD3201001)) trace.DebugApiErrorCount++;
+                break;
+            }
+            if (DateTime.UtcNow >= deadline)
+            {
+                TraceBlock(trace, "WaitForDebugEvent deadline exceeded; the owned Job was terminated and debugger thread will exit without continuing a pending event");
+                if (!TerminateJobObject(_job, 0xD3201002)) trace.DebugApiErrorCount++;
+                trace.EventChainComplete = false;
+                break;
+            }
+            if (failureInjection == "wait-timeout" && trace.DebugEventCount == 0)
+            {
+                TraceBlock(trace, "injected WaitForDebugEvent timeout before the first event");
+                if (!TerminateJobObject(_job, 0xD3201002)) trace.DebugApiErrorCount++;
+                trace.EventChainComplete = false;
                 break;
             }
             if (trace.ProcessCreateEventCount > 0 && active.Count == 0 && trace.ProcessCreateEventCount == trace.ProcessExitEventCount && WaitForSingleObject(_process, 0) == WaitObject0)
                 break;
 
             DebugEvent ev;
+            if (failureInjection == "wait-api-failure" && trace.DebugEventCount == 0)
+            {
+                trace.DebugApiErrorCount++;
+                TraceBlock(trace, "injected WaitForDebugEvent API failure before the first event");
+                if (!TerminateJobObject(_job, 0xD3201003)) trace.DebugApiErrorCount++;
+                trace.EventChainComplete = false;
+                break;
+            }
             if (!WaitForDebugEvent(out ev, 250))
             {
                 int error = Marshal.GetLastWin32Error();
@@ -2428,7 +2816,6 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             }
             trace.DebugEventCount++;
             uint continueStatus = DebugContinue;
-            IntPtr processHandleAfterExit = IntPtr.Zero;
             bool skipContinueForCreateIdentityFailure = false;
             try
             {
@@ -2446,9 +2833,12 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                     bool verified = false;
                     DebugActiveProcess parent;
                     DebugActiveProcess retained = null;
+                    IntPtr retainedHandle = IntPtr.Zero;
                     try
                     {
                         DebugCreateProcessInfo created = ev.Data.CreateProcess;
+                        IntPtr eventImageHandle = created.File;
+                        if (failureInjection == "null-image-file" && trace.ProcessCreateEventCount == 1) created.File = IntPtr.Zero;
                         try
                         {
                             if (created.Process == IntPtr.Zero) throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT hProcess is null");
@@ -2463,9 +2853,38 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                     ? "CREATE_PROCESS_DEBUG_EVENT PID differs from the actual process handle PID or CreateProcessW returned root PID"
                                     : "CREATE_PROCESS_DEBUG_EVENT PID differs from the actual process handle PID");
                             }
-                            skipContinueForCreateIdentityFailure = false;
                             creation = GetDebugProcessCreationTime(created.Process);
                             parentPid = GetDebugParentPid(processBasicInformation);
+                            IntPtr independentProcessHandle = OpenProcess(ProcessQueryInformation | Synchronize, false, ev.ProcessId);
+                            if (independentProcessHandle == IntPtr.Zero)
+                                ThrowLastError("OpenProcess(parent-retained observed process identity) failed");
+                            try
+                            {
+                                DebugProcessBasicInformation independentInformation = GetDebugProcessBasicInformation(independentProcessHandle);
+                                uint independentPid = GetDebugProcessPid(independentInformation);
+                                long independentCreation = GetDebugProcessCreationTime(independentProcessHandle);
+                                uint independentParentPid = GetDebugParentPid(independentInformation);
+                                if (independentPid != processHandlePid || independentCreation != creation || independentParentPid != parentPid)
+                                    throw new InvalidOperationException("OpenProcess PID/creation/parent identity differs from the actual CREATE_PROCESS_DEBUG_EVENT hProcess identity");
+                                retainedHandle = independentProcessHandle;
+                                independentProcessHandle = IntPtr.Zero;
+                                lock (_observedProcessLock)
+                                    _observedHandleDuplicationAudit.Add(ev.ProcessId.ToString(CultureInfo.InvariantCulture) + ":open=parent-owned-retained-handle:retained=0x" + retainedHandle.ToInt64().ToString("x", CultureInfo.InvariantCulture));
+                            }
+                            finally
+                            {
+                                string openProcessCloseError = CloseIfOpen(ref independentProcessHandle, "CloseHandle(temporary OpenProcess identity)");
+                                if (openProcessCloseError != null) throw new InvalidOperationException(openProcessCloseError);
+                            }
+                            lock (_observedProcessLock)
+                            {
+                                bool priorCollision = retainedHandle == _parentProcess || _observedProcessHandles.Contains(retainedHandle);
+                            _observedHandleDuplicationAudit.Add(ev.ProcessId.ToString(CultureInfo.InvariantCulture) + ":source=0x" + created.Process.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":thread=0x" + created.Thread.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":file=0x" + eventImageHandle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":retained=0x" + retainedHandle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":same=" + (retainedHandle == created.Process).ToString() + ":priorCollision=" + priorCollision.ToString());
+                                _observedProcessHandles.Add(retainedHandle);
+                                _observedProcessIds.Add(ev.ProcessId);
+                            }
+                            if (failureInjection == "root-parent-mismatch" && isRootProcessEvent)
+                                parentPid = parentPid == UInt32.MaxValue ? parentPid - 1 : parentPid + 1;
                             image = ReadDebugImage(created.File);
                             string identity = ev.ProcessId.ToString(CultureInfo.InvariantCulture) + "@" + creation.ToString(CultureInfo.InvariantCulture);
                             if (creation <= 0 || !identities.Add(identity)) throw new InvalidOperationException("process PID/creation identity is absent or duplicated");
@@ -2504,12 +2923,10 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                         }
                         finally
                         {
-                            TraceCloseHandle(created.File, trace, "CREATE_PROCESS_DEBUG_EVENT.hFile");
-                            TraceCloseHandle(created.Thread, trace, "CREATE_PROCESS_DEBUG_EVENT.hThread");
+                            // CREATE_PROCESS_DEBUG_EVENT owns the process and initial-thread handles
+                            // until their matching EXIT events are continued. Only hFile is debugger-owned.
+                            TraceCloseHandle(eventImageHandle, trace, "CREATE_PROCESS_DEBUG_EVENT.hFile");
                         }
-                        IntPtr retainedHandle;
-                        if (!DuplicateHandle(GetCurrentProcess(), ev.Data.CreateProcess.Process, GetCurrentProcess(), out retainedHandle, 0, false, DuplicateSameAccess))
-                            throw new Win32Exception(Marshal.GetLastWin32Error(), "DuplicateHandle(retain process identity) failed");
                         D32DebugProcessRecordV2 record = new D32DebugProcessRecordV2 {
                             ProcessId = ev.ProcessId, ParentProcessId = parentPid, CreationFileTime = creation, ParentCreationFileTime = parentCreation,
                             ImagePath = image == null ? null : image.Path, Bytes = image == null ? 0 : image.Bytes, Sha256 = image == null ? null : image.Sha256,
@@ -2522,32 +2939,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                         trace.Processes.Add(record);
                         trace.ProcessEvents.Add(new D32DebugProcessEventV2 { Sequence = createSequence, Kind = "CREATE", ProcessId = ev.ProcessId,
                             ParentProcessId = parentPid, CreationFileTime = creation, ParentCreationFileTime = parentCreation, ExitCode = 0 });
+                        if (trace.State != "BLOCKED") skipContinueForCreateIdentityFailure = false;
                     }
                     catch (Exception error)
                     {
                         trace.DebugApiErrorCount++;
                         TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT verification failed: " + error.Message);
-                        if (creation > 0 && !active.ContainsKey(ev.ProcessId))
-                        {
-                            IntPtr retainedHandle;
-                            if (ev.Data.CreateProcess.Process != IntPtr.Zero && DuplicateHandle(GetCurrentProcess(), ev.Data.CreateProcess.Process, GetCurrentProcess(), out retainedHandle, 0, false, DuplicateSameAccess))
-                            {
-                                D32DebugProcessRecordV2 record = new D32DebugProcessRecordV2 {
-                                    ProcessId = ev.ProcessId, ParentProcessId = parentPid, CreationFileTime = creation, ParentCreationFileTime = parentCreation,
-                                    ImagePath = image == null ? null : image.Path, Bytes = image == null ? 0 : image.Bytes,
-                                    Sha256 = image == null ? null : image.Sha256, VolumeSerialHex = image == null ? null : image.VolumeSerialHex,
-                                    FileIdHex = image == null ? null : image.FileIdHex, AllowedImageReason = null, ImageVerified = false,
-                                    Exited = false, CreateSequence = createSequence, CreatedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
-                                };
-                                retained = new DebugActiveProcess { Record = record, Handle = retainedHandle };
-                                active.Add(ev.ProcessId, retained);
-                                trace.Processes.Add(record);
-                                trace.ProcessEvents.Add(new D32DebugProcessEventV2 { Sequence = createSequence, Kind = "CREATE", ProcessId = ev.ProcessId,
-                                    ParentProcessId = parentPid, CreationFileTime = creation, ParentCreationFileTime = parentCreation, ExitCode = 0 });
-                            }
-                        }
                     }
-                    finally { TraceCloseHandle(ev.Data.CreateProcess.Process, trace, "CREATE_PROCESS_DEBUG_EVENT.hProcess"); }
                     if (injectFirstCreateInterruption && trace.ProcessCreateEventCount == 1)
                     {
                         TraceBlock(trace, "debug chain interruption injected before ContinueDebugEvent; Job termination was requested");
@@ -2556,6 +2954,14 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 }
                 else if (ev.Code == DebugEventExitProcess)
                 {
+                    if (failureInjection == "missing-exit")
+                    {
+                        trace.EventChainComplete = false;
+                        TraceBlock(trace, "injected missing EXIT_PROCESS_DEBUG_EVENT ledger record; the received event was not continued");
+                        if (!TerminateJobObject(_job, 0xD3201005)) trace.DebugApiErrorCount++;
+                    }
+                    else
+                    {
                     trace.ProcessExitEventCount++;
                     trace.ProcessEventCount++;
                     long exitSequence = ++sequence;
@@ -2574,7 +2980,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                             ParentProcessId = process.Record.ParentProcessId, CreationFileTime = process.Record.CreationFileTime,
                             ParentCreationFileTime = process.Record.ParentCreationFileTime, ExitCode = ev.Data.ExitProcess.ExitCode });
                         active.Remove(ev.ProcessId);
-                        processHandleAfterExit = process.Handle;
+                    }
                     }
                 }
                 else if (ev.Code == DebugEventException)
@@ -2605,7 +3011,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 else if (ev.Code == DebugEventCreateThread)
                 {
                     trace.ThreadCreateEventCount++;
-                    TraceCloseHandle(ev.Data.CreateThread.Thread, trace, "CREATE_THREAD_DEBUG_EVENT.hThread");
+                    // hThread is closed by the system when ContinueDebugEvent processes EXIT_THREAD_DEBUG_EVENT.
                 }
                 else if (ev.Code == DebugEventExitThread) trace.ThreadExitEventCount++;
                 else if (ev.Code == DebugEventLoadDll)
@@ -2623,16 +3029,34 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 TraceBlock(trace, "debug event processing failed: " + error.Message);
             }
 
-            if (trace.State == "BLOCKED" && !draining)
-            {
-                if (!TerminateJobObject(_job, 0xD3201007)) trace.DebugApiErrorCount++;
-                draining = true;
-                cleanupDeadline = DateTime.UtcNow.AddSeconds(15);
-            }
             if (skipContinueForCreateIdentityFailure)
             {
                 trace.EventChainComplete = false;
-                TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT identity mismatch; the Job was terminated and ContinueDebugEvent was not called");
+                TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT was not fully validated; the Job was terminated and ContinueDebugEvent was not called");
+                trace.UncontinuedCreateProcessId = ev.ProcessId;
+                trace.UncontinuedCreateContinueCallCount = 0;
+                if (!TerminateJobObject(_job, 0xD3201008)) trace.DebugApiErrorCount++;
+                break;
+            }
+            if (failureInjection == "continue-api-failure" && ev.Code == DebugEventCreateProcess)
+            {
+                trace.DebugApiErrorCount++;
+                trace.EventChainComplete = false;
+                TraceBlock(trace, "injected ContinueDebugEvent API failure before continuation");
+                trace.UncontinuedCreateProcessId = ev.ProcessId;
+                trace.UncontinuedCreateContinueCallCount = 0;
+                if (!TerminateJobObject(_job, 0xD3201009)) trace.DebugApiErrorCount++;
+                break;
+            }
+            if (trace.State == "BLOCKED")
+            {
+                trace.EventChainComplete = false;
+                if (ev.Code == DebugEventCreateProcess)
+                {
+                    trace.UncontinuedCreateProcessId = ev.ProcessId;
+                    trace.UncontinuedCreateContinueCallCount = 0;
+                }
+                if (!TerminateJobObject(_job, 0xD320100A)) trace.DebugApiErrorCount++;
                 break;
             }
             DebugContinueCallCount++;
@@ -2641,55 +3065,27 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 trace.DebugApiErrorCount++;
                 trace.EventChainComplete = false;
                 TraceBlock(trace, "ContinueDebugEvent failed; no polling fallback is permitted: " + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture));
-                if (!TerminateJobObject(_job, 0xD3201008)) trace.DebugApiErrorCount++;
-                if (processHandleAfterExit != IntPtr.Zero) TraceCloseHandle(processHandleAfterExit, trace, "retained exited process");
+                if (!TerminateJobObject(_job, 0xD3201009)) trace.DebugApiErrorCount++;
                 break;
             }
-            if (processHandleAfterExit != IntPtr.Zero)
+            string invalidRetainedHandles;
+            if (!VerifyObservedProcessHandles(out invalidRetainedHandles))
             {
-                if (WaitForSingleObject(processHandleAfterExit, 5000) != WaitObject0)
-                {
-                    trace.DebugApiErrorCount++;
-                    TraceBlock(trace, "process handle did not signal after EXIT_PROCESS_DEBUG_EVENT");
-                }
-                TraceCloseHandle(processHandleAfterExit, trace, "retained exited process");
+                trace.DebugApiErrorCount++;
+                trace.EventChainComplete = false;
+                TraceBlock(trace, "a parent-retained process handle became invalid after ContinueDebugEvent(event=" + ev.Code.ToString(CultureInfo.InvariantCulture) + ",pid=" + ev.ProcessId.ToString(CultureInfo.InvariantCulture) + ",tid=" + ev.ThreadId.ToString(CultureInfo.InvariantCulture) + "): " + invalidRetainedHandles);
+                if (!TerminateJobObject(_job, 0xD320100B)) trace.DebugApiErrorCount++;
+                break;
             }
         }
-
-        foreach (KeyValuePair<uint, DebugActiveProcess> remaining in active) TraceCloseHandle(remaining.Value.Handle, trace, "retained process identity");
-        active.Clear();
-        JobObjectBasicAccountingInformation accounting;
-        if (TryGetDebugJobAccounting(_job, out accounting))
-        {
-            trace.JobAccountingVerified = true;
-            trace.JobTotalProcesses = accounting.TotalProcesses;
-            trace.JobActiveProcesses = accounting.ActiveProcesses;
-            DateTime settleDeadline = DateTime.UtcNow.AddSeconds(5);
-            while (trace.JobActiveProcesses != 0 && DateTime.UtcNow < settleDeadline && TryGetDebugJobAccounting(_job, out accounting))
-            {
-                Thread.Sleep(20);
-                trace.JobTotalProcesses = accounting.TotalProcesses;
-                trace.JobActiveProcesses = accounting.ActiveProcesses;
-            }
-        }
-        else
-        {
-            trace.DebugApiErrorCount++;
-            trace.JobAccountingVerified = false;
-            TraceBlock(trace, "independent QueryInformationJobObject accounting was unavailable");
-        }
-        trace.AccountingConsistent = trace.JobAccountingVerified && trace.EventChainComplete && trace.DebugApiErrorCount == 0 &&
-            trace.ProcessCreateEventCount == trace.ProcessExitEventCount && trace.ProcessCreateEventCount == trace.Processes.Count &&
-            trace.ProcessEvents.Count == trace.ProcessCreateEventCount + trace.ProcessExitEventCount &&
-            trace.ProcessCreateEventCount == trace.JobTotalProcesses && trace.JobActiveProcesses == 0;
-        if (!trace.AccountingConsistent) TraceBlock(trace, "process CREATE/EXIT ledger does not reconcile with retained identities and independent Job counts");
-        if (trace.State == "RUNNING") trace.State = "COMPLETED";
+        trace.ProcessEventCount = trace.ProcessEvents.Count;
         trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
         return trace;
     }
 
     public D32NativeCleanupEvidenceV2 CloseJobAndWait(int timeoutMilliseconds)
     {
+        if (_debugEnabled) return CloseDebugJobAndWait(timeoutMilliseconds);
         D32NativeCleanupEvidenceV2 evidence = new D32NativeCleanupEvidenceV2();
         if (_job == IntPtr.Zero)
         {
@@ -2759,15 +3155,165 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         return evidence;
     }
 
+    private D32NativeCleanupEvidenceV2 CloseDebugJobAndWait(int timeoutMilliseconds)
+    {
+        D32NativeCleanupEvidenceV2 evidence = new D32NativeCleanupEvidenceV2();
+        evidence.DebuggerThreadId = DebuggerThreadId;
+        evidence.DebuggerKillOnExitEnabled = _debugKillOnExitEnabled;
+        if (timeoutMilliseconds <= 0) timeoutMilliseconds = 1;
+
+        Thread worker = _debugCoordinator == null ? null : _debugCoordinator.WorkerThread;
+        bool joined = worker != null && !worker.IsAlive;
+        if (!joined)
+        {
+            RequestDebugAbort("CloseJobAndWait requested fail-closed debugger shutdown");
+            joined = worker != null && worker.Join(timeoutMilliseconds);
+        }
+        evidence.DebuggerThreadExited = worker != null && !worker.IsAlive;
+        evidence.DebuggerThreadJoined = joined && evidence.DebuggerThreadExited;
+        evidence.DebuggerThreadId = DebuggerThreadId;
+        evidence.DebuggerKillOnExitEnabled = _debugKillOnExitEnabled;
+        if (!evidence.DebuggerThreadJoined)
+        {
+            evidence.Detail = "dedicated debugger thread did not exit and join; retained Job and process handles were not closed";
+            return evidence;
+        }
+
+        if (_debugTrace == null)
+            _debugTrace = CreateBlockedDebugTrace(_debugCoordinator == null || _debugCoordinator.Failure == null
+                ? "capture did not produce a trace before cleanup"
+                : _debugCoordinator.Failure.Message);
+        PopulatePostJoinDebugEvidence(_debugTrace, true);
+
+        uint activeCount = UInt32.MaxValue;
+        int activeError = 0;
+        evidence.JobActiveProcessCountVerified = TryGetActiveProcessCountFromJob(
+            _parentJob != IntPtr.Zero ? _parentJob : _job, out activeCount, out activeError);
+        evidence.JobActiveProcessCount = activeCount;
+        evidence.JobActiveProcessCountLastError = activeError;
+        bool traceBlocked = _debugTrace.State != "COMPLETED" || !_debugTrace.AccountingConsistent;
+        if (traceBlocked || !evidence.JobActiveProcessCountVerified || activeCount != 0)
+        {
+            IntPtr jobForTermination = _parentJob != IntPtr.Zero ? _parentJob : _job;
+            evidence.JobTerminateCallSucceeded = jobForTermination != IntPtr.Zero && TerminateJobObject(jobForTermination, 0xD32010FE);
+            if (!evidence.JobTerminateCallSucceeded && jobForTermination != IntPtr.Zero)
+                evidence.JobTerminateLastError = Marshal.GetLastWin32Error();
+        }
+        else evidence.JobTerminateCallSucceeded = true;
+
+        evidence.ProcessWaitSignaled = _parentProcess != IntPtr.Zero && WaitForSingleObject(_parentProcess, (uint)timeoutMilliseconds) == WaitObject0;
+        List<IntPtr> handles = new List<IntPtr>();
+        List<uint> processIds = new List<uint>();
+        if (_parentProcess != IntPtr.Zero) { handles.Add(_parentProcess); processIds.Add((uint)ProcessId); }
+        lock (_observedProcessLock) { handles.AddRange(_observedProcessHandles); processIds.AddRange(_observedProcessIds); }
+        evidence.RetainedProcessHandleCount = handles.Count;
+        evidence.RetainedProcessHandlesSignaled = handles.Count > 0;
+        evidence.DebuggerAssociationQueryVerified = handles.Count > 0;
+        evidence.DebuggerAssociationAbsent = handles.Count > 0;
+        List<string> handleStates = new List<string>();
+        DateTime waitDeadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+        for (int i = 0; i < handles.Count; i++)
+        {
+            IntPtr handle = handles[i];
+            uint pid = i < processIds.Count ? processIds[i] : 0;
+            int remaining = Math.Max(0, (int)(waitDeadline - DateTime.UtcNow).TotalMilliseconds);
+            uint waitResult = handle == IntPtr.Zero ? UInt32.MaxValue : WaitForSingleObject(handle, (uint)remaining);
+            int waitError = waitResult == UInt32.MaxValue ? Marshal.GetLastWin32Error() : 0;
+            bool present = true;
+            bool debuggerQueryOk = handle != IntPtr.Zero && CheckRemoteDebuggerPresent(handle, out present);
+            int debuggerQueryError = debuggerQueryOk ? 0 : Marshal.GetLastWin32Error();
+            handleStates.Add(pid.ToString(CultureInfo.InvariantCulture) + ":h=0x" + handle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":wait=" + waitResult.ToString(CultureInfo.InvariantCulture) + ":waitError=" + waitError.ToString(CultureInfo.InvariantCulture) + ":debuggerQuery=" + debuggerQueryOk.ToString() + ":queryError=" + debuggerQueryError.ToString(CultureInfo.InvariantCulture) + ":present=" + present.ToString());
+            if (handle == IntPtr.Zero || waitResult != WaitObject0)
+                evidence.RetainedProcessHandlesSignaled = false;
+            if (!debuggerQueryOk)
+            {
+                evidence.DebuggerAssociationQueryVerified = false;
+                evidence.DebuggerAssociationAbsent = false;
+            }
+            else if (present) evidence.DebuggerAssociationAbsent = false;
+        }
+        evidence.RetainedProcessHandleStates = String.Join(";", handleStates.ToArray());
+
+        uint finalActive = UInt32.MaxValue;
+        int finalActiveError = 0;
+        bool finalJobVerified = TryGetActiveProcessCountFromJob(
+            _parentJob != IntPtr.Zero ? _parentJob : _job, out finalActive, out finalActiveError);
+        evidence.JobActiveProcessCountVerified = finalJobVerified;
+        evidence.JobActiveProcessCount = finalActive;
+        evidence.JobActiveProcessCountLastError = finalActiveError;
+        bool cleanBeforeClose = evidence.DebuggerThreadExited && evidence.DebuggerThreadJoined &&
+            evidence.DebuggerKillOnExitEnabled && evidence.ProcessWaitSignaled && evidence.RetainedProcessHandlesSignaled &&
+            evidence.DebuggerAssociationQueryVerified && evidence.DebuggerAssociationAbsent &&
+            finalJobVerified && finalActive == 0;
+        if (cleanBeforeClose)
+        {
+            string parentJobError = CloseIfOpen(ref _parentJob, "CloseHandle(parent retained Job)");
+            string debuggerJobError = CloseIfOpen(ref _job, "CloseHandle(debugger retained Job)");
+            evidence.JobCloseSucceeded = parentJobError == null && debuggerJobError == null;
+            if (evidence.JobCloseSucceeded)
+            {
+                lock (_observedProcessLock)
+                {
+                    foreach (IntPtr handle in _observedProcessHandles)
+                    {
+                        IntPtr observedHandle = handle;
+                        string closeError = CloseIfOpen(ref observedHandle, "CloseHandle(observed process)");
+                        if (closeError != null) evidence.JobCloseSucceeded = false;
+                    }
+                    _observedProcessHandles.Clear();
+                }
+                string rootCloseError = CloseIfOpen(ref _parentProcess, "CloseHandle(parent retained root process)");
+                if (rootCloseError != null) evidence.JobCloseSucceeded = false;
+            }
+        }
+        evidence.CleanupSucceeded = cleanBeforeClose && evidence.JobCloseSucceeded;
+        _debugCleanupVerified = evidence.CleanupSucceeded;
+        if (evidence.CleanupSucceeded)
+        {
+            _closedJobActiveProcessCountVerified = true;
+            _closedJobActiveProcessCount = 0;
+            _closedJobActiveProcessCountError = 0;
+            evidence.Detail = "dedicated debugger thread exited and joined; kill-on-exit was enabled; retained process handles signaled; debugger association absent; Job ActiveProcesses=0; handles closed only after verification";
+        }
+        else
+        {
+            evidence.Detail = "dedicated debugger cleanup proof incomplete; TerminateJobObject result and/or Job ActiveProcesses=0 alone are insufficient; retained handles remain open; retained_handle_states=" + evidence.RetainedProcessHandleStates;
+        }
+        return evidence;
+    }
+
+    private static bool TryGetActiveProcessCountFromJob(IntPtr job, out uint count, out int error)
+    {
+        count = UInt32.MaxValue;
+        error = 0;
+        if (job == IntPtr.Zero) { error = 6; return false; }
+        JobObjectBasicAccountingInformation accounting;
+        if (!TryGetDebugJobAccounting(job, out accounting))
+        {
+            error = Marshal.GetLastWin32Error();
+            return false;
+        }
+        count = accounting.ActiveProcesses;
+        return true;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
+        if (_debugEnabled && !_debugCleanupVerified)
+        {
+            D32NativeCleanupEvidenceV2 cleanup = CloseDebugJobAndWait(15000);
+            if (!cleanup.CleanupSucceeded)
+                throw new InvalidOperationException("DEBUG_CLEANUP_UNVERIFIED: retained Job/process handles remain open: " + cleanup.Detail);
+        }
         _disposed = true;
         string closeErrors = null;
+        string parentJobError = CloseIfOpen(ref _parentJob, "CloseHandle(parent retained Job)");
+        if (parentJobError != null) closeErrors = parentJobError;
         if (_job != IntPtr.Zero)
         {
             string closeError = CloseIfOpen(ref _job, "CloseHandle(job)");
-            if (closeError != null) closeErrors = closeError;
+            if (closeError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? closeError : closeErrors + "; " + closeError;
         }
         if (_stdoutStream != null) _stdoutStream.Dispose();
         if (_stderrStream != null) _stderrStream.Dispose();
@@ -2777,6 +3323,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (threadError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? threadError : closeErrors + "; " + threadError;
         string processError = CloseIfOpen(ref _process, "CloseHandle(process)");
         if (processError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? processError : closeErrors + "; " + processError;
+        string parentProcessError = CloseIfOpen(ref _parentProcess, "CloseHandle(parent retained process)");
+        if (parentProcessError != null) closeErrors = String.IsNullOrEmpty(closeErrors) ? parentProcessError : closeErrors + "; " + parentProcessError;
         if (!String.IsNullOrEmpty(closeErrors))
             throw new InvalidOperationException("NATIVE_HANDLE_CLOSE_FAILED: " + closeErrors);
     }
@@ -2875,6 +3423,18 @@ function ConvertTo-D32DebugProcessTraceDocument {
         state = [string]$Trace.State
         block_reason = $Trace.BlockReason
         debugger_process_id = [int]$Trace.DebuggerProcessId
+        uncontinued_create_process_id = [uint32]$Trace.UncontinuedCreateProcessId
+        uncontinued_create_continue_call_count = [int]$Trace.UncontinuedCreateContinueCallCount
+        debugger_thread_id = [uint32]$Trace.DebuggerThreadId
+        dedicated_debugger_thread = [bool]$Trace.DedicatedDebuggerThread
+        debugger_kill_on_exit_enabled = [bool]$Trace.DebuggerKillOnExitEnabled
+        root_resumed_after_kill_on_exit = [bool]$Trace.RootResumedAfterKillOnExit
+        debugger_thread_exited = [bool]$Trace.DebuggerThreadExited
+        debugger_thread_joined = [bool]$Trace.DebuggerThreadJoined
+        retained_process_handle_count = [int]$Trace.RetainedProcessHandleCount
+        retained_process_handles_signaled = [bool]$Trace.RetainedProcessHandlesSignaled
+        debugger_association_query_verified = [bool]$Trace.DebuggerAssociationQueryVerified
+        debugger_association_absent = [bool]$Trace.DebuggerAssociationAbsent
         debugger_creation_filetime = [Int64]$Trace.DebuggerCreationFileTime
         debugger_created_at_utc = [string]$Trace.DebuggerCreatedAtUtc
         started_at_utc = [string]$Trace.StartedAtUtc
@@ -3420,9 +3980,11 @@ function Invoke-D32BoundedProcess {
                 $approvedImages = @($profileCurrent.ExecutableInventory) + @($profileCurrent.WindowsImageInventory)
                 $approvedPinText = @($approvedImages | ForEach-Object { ConvertTo-D32DebugImagePinText -Image $_ })
                 $targetRoots = if ($CandidateImageRoots) { @($CandidateImageRoots | ForEach-Object { [IO.Path]::GetFullPath($_) }) } else { @(Get-D32DebugCandidateTargetRoots -Repository $profileCurrent.Repository) }
-                $traceNative = $nativeProcess.MonitorDebugEvents(
+                $nativeProcess.ConfigureDebugCapture(
                     (ConvertTo-D32DebugImagePinText -Image $rootImage), [string[]]$approvedPinText, [string[]]$targetRoots,
                     [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false, $false)
+                $debugJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
+                $traceNative = $nativeProcess.WaitForDebugTrace($debugJoinTimeout)
                 $traceDocument = ConvertTo-D32DebugProcessTraceDocument -Trace $traceNative
                 $script:D32LastProcessEvidence.process_trace = $traceDocument
                 if ($traceNative.Processes.Count -gt 0) {
@@ -3689,7 +4251,9 @@ function Assert-D32FixtureDebugTraceShape {
     $expectedNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch',
         'd29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
     if ($Traces -isnot [Array] -or $Traces.Count -ne $expectedNames.Count) { throw 'FIXTURE_PROVENANCE_INVALID: process trace inventory must contain exactly three locked fetches and five fixture Cargo roots' }
-    $traceFields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'debugger_creation_filetime',
+    $traceFields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id',
+        'dedicated_debugger_thread', 'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit', 'debugger_thread_exited', 'debugger_thread_joined',
+        'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'debugger_creation_filetime',
         'debugger_created_at_utc', 'started_at_utc', 'completed_at_utc', 'debug_event_count', 'process_create_event_count', 'process_exit_event_count',
         'process_event_count', 'thread_create_event_count', 'thread_exit_event_count', 'image_load_event_count', 'image_unload_event_count',
         'exception_event_count', 'debug_string_event_count', 'wait_timeout_count', 'debug_api_error_count', 'event_chain_complete',
@@ -3709,7 +4273,13 @@ function Assert-D32FixtureDebugTraceShape {
         $traceActualFields = @(Get-D32ObjectFieldNames -Object $trace)
         if ($traceActualFields.Count -ne $traceFields.Count -or @($traceActualFields | Where-Object { $_ -notin $traceFields }).Count -ne 0 -or @($traceFields | Where-Object { $_ -notin $traceActualFields }).Count -ne 0 -or
             $trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or [int]$trace.schema_version -ne 2 -or
-            $trace.event_source -cne 'Win32-WaitForDebugEvent-synchronous' -or $trace.state -cne 'COMPLETED' -or $null -ne $trace.block_reason -or
+            $trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or $trace.state -cne 'COMPLETED' -or $null -ne $trace.block_reason -or
+            [int]$trace.debugger_thread_id -le 0 -or -not [bool]$trace.dedicated_debugger_thread -or
+            [uint32]$trace.uncontinued_create_process_id -ne 0 -or [int]$trace.uncontinued_create_continue_call_count -ne 0 -or
+            -not [bool]$trace.debugger_kill_on_exit_enabled -or -not [bool]$trace.root_resumed_after_kill_on_exit -or
+            -not [bool]$trace.debugger_thread_exited -or -not [bool]$trace.debugger_thread_joined -or
+            [int]$trace.retained_process_handle_count -lt ([int]$trace.process_create_event_count + 1) -or
+            -not [bool]$trace.retained_process_handles_signaled -or -not [bool]$trace.debugger_association_query_verified -or -not [bool]$trace.debugger_association_absent -or
             [int]$trace.debug_api_error_count -ne 0 -or -not [bool]$trace.event_chain_complete -or -not [bool]$trace.job_accounting_verified -or
             -not [bool]$trace.accounting_consistent -or [bool]$trace.injected_interruption -or
             [int]$trace.process_create_event_count -le 0 -or [int]$trace.process_exit_event_count -ne [int]$trace.process_create_event_count -or
@@ -3911,6 +4481,52 @@ function Assert-D32D31RecoverySeederRecordShape {
     }
 }
 
+function Invoke-D32DebugSelfTestProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPin,
+        [string[]]$ApprovedImagePins = @(),
+        [string[]]$CandidateImageRoots = @(),
+        [AllowNull()][string]$EnvironmentBlock,
+        [bool]$InjectFirstCreateInterruption = $false,
+        [bool]$InjectFirstCreateIdentityMismatch = $false,
+        [AllowNull()][string]$FailureInjection,
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    $commandLine = ConvertTo-D32CommandLine (@($FilePath) + $Arguments)
+    $native = $null
+    $trace = $null
+    $cleanup = $null
+    try {
+        $native = [D32FixtureNativeProcessV2]::StartDebug($FilePath, $commandLine, $WorkingDirectory, $EnvironmentBlock)
+        $native.ConfigureDebugCapture($ExpectedRootPin, [string[]]$ApprovedImagePins, [string[]]$CandidateImageRoots,
+            $TimeoutMilliseconds, $InjectFirstCreateInterruption, $InjectFirstCreateIdentityMismatch, $FailureInjection)
+        $trace = $native.WaitForDebugTrace([int]($TimeoutMilliseconds + 20000))
+        $cleanup = $native.CloseJobAndWait(10000)
+        return [PSCustomObject]@{
+            Trace = $trace
+            Cleanup = $cleanup
+            ContinueCalls = [int]$native.DebugContinueCallCount
+            LaunchMode = [string]$native.LaunchMode
+        }
+    }
+    finally {
+        if ($null -ne $native) {
+            try { $native.Dispose() }
+            catch {
+                if ($null -ne $trace) {
+                    $processDetails = @($trace.Processes | ForEach-Object { "$($_.ProcessId):$($_.ImagePath):parent=$($_.ParentProcessId):exited=$($_.Exited)" }) -join ';'
+                    throw "DEBUG_SELFTEST_NATIVE_DISPOSE_FAILED: trace_state=$($trace.State); block_reason=$($trace.BlockReason); cleanup=$($cleanup.Detail); job_active=$($cleanup.JobActiveProcessCount); job_verified=$($cleanup.JobActiveProcessCountVerified); handles=$($cleanup.RetainedProcessHandleCount); handles_signaled=$($cleanup.RetainedProcessHandlesSignaled); debugger_absent=$($cleanup.DebuggerAssociationAbsent); processes=$processDetails; handle_audit=$($native.GetDebugHandleDuplicationAudit()); error=$($_.Exception.Message)"
+                }
+                throw
+            }
+        }
+    }
+}
+
 function Invoke-D32SelfTest {
     Ensure-D32NativeLauncher
     $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -4010,16 +4626,25 @@ function Invoke-D32SelfTest {
             VolumeSerialHex = $debugRootArtifact.volume_serial_hex
             FileIdHex = $debugRootArtifact.file_id_hex
         }
-        $debugRootArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0')
+        $debugIdentityMarker = Join-Path $root 'debug-create-mismatch-user-code.marker'
+        $debugRootArguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "Set-Content -LiteralPath '$debugIdentityMarker' -Value ran")
         $debugRootCommandLine = ConvertTo-D32CommandLine (@($debugRootPath) + $debugRootArguments)
         $debugRootProcess = $null
+        $debugIdentityTrace = $null
         try {
             $debugRootProcess = [D32FixtureNativeProcessV2]::StartDebug($debugRootPath, $debugRootCommandLine, $root, $null)
-            $debugIdentityTrace = $debugRootProcess.MonitorDebugEvents(
+            $debugRootProcess.ConfigureDebugCapture(
                 (ConvertTo-D32DebugImagePinText -Image $debugRootImage), [string[]]@(), [string[]]@(), 10000, $false, $true)
+            $debugIdentityTrace = $debugRootProcess.WaitForDebugTrace(15000)
             if ($debugIdentityTrace.State -cne 'BLOCKED' -or
                 [bool]$debugIdentityTrace.EventChainComplete -or
+                -not [bool]$debugIdentityTrace.DebuggerKillOnExitEnabled -or
+                -not [bool]$debugIdentityTrace.DebuggerThreadExited -or
+                -not [bool]$debugIdentityTrace.DebuggerThreadJoined -or
+                [uint32]$debugIdentityTrace.UncontinuedCreateProcessId -le 0 -or
+                [int]$debugIdentityTrace.UncontinuedCreateContinueCallCount -ne 0 -or
                 [int]$debugRootProcess.DebugContinueCallCount -ne 0 -or
+                (Test-Path -LiteralPath $debugIdentityMarker) -or
                 $debugIdentityTrace.BlockReason -notmatch 'CREATE_PROCESS_DEBUG_EVENT PID differs') {
                 throw "SELFTEST_FAILED: injected root CREATE PID mismatch did not terminate and stop before ContinueDebugEvent: state=$($debugIdentityTrace.State); chain_complete=$($debugIdentityTrace.EventChainComplete); continue_calls=$($debugRootProcess.DebugContinueCallCount); reason=$($debugIdentityTrace.BlockReason)"
             }
@@ -4027,16 +4652,240 @@ function Invoke-D32SelfTest {
         finally {
             if ($null -ne $debugRootProcess) {
                 $debugIdentityCleanup = $debugRootProcess.CloseJobAndWait(10000)
-                if (-not [bool]$debugIdentityCleanup.JobCloseSucceeded -or
+                if (-not [bool]$debugIdentityCleanup.CleanupSucceeded -or
+                    -not [bool]$debugIdentityCleanup.ProcessWaitSignaled -or
+                    -not [bool]$debugIdentityCleanup.DebuggerThreadExited -or
+                    -not [bool]$debugIdentityCleanup.DebuggerThreadJoined -or
+                    -not [bool]$debugIdentityCleanup.DebuggerKillOnExitEnabled -or
+                    -not [bool]$debugIdentityCleanup.RetainedProcessHandlesSignaled -or
+                    -not [bool]$debugIdentityCleanup.DebuggerAssociationQueryVerified -or
+                    -not [bool]$debugIdentityCleanup.DebuggerAssociationAbsent -or
+                    -not [bool]$debugIdentityCleanup.JobCloseSucceeded -or
                     -not [bool]$debugIdentityCleanup.JobTerminateCallSucceeded -or
                     -not [bool]$debugIdentityCleanup.JobActiveProcessCountVerified -or
                     [uint32]$debugIdentityCleanup.JobActiveProcessCount -ne 0 -or
-                    [uint32]$debugIdentityTrace.JobActiveProcesses -ne 0) {
-                    throw "SELFTEST_FAILED: injected root CREATE PID mismatch did not close a zero-active Job: $($debugIdentityCleanup.Detail); process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled); terminate_succeeded=$($debugIdentityCleanup.JobTerminateCallSucceeded); active_count=$($debugIdentityCleanup.JobActiveProcessCount); active_count_verified=$($debugIdentityCleanup.JobActiveProcessCountVerified); active_count_error=$($debugIdentityCleanup.JobActiveProcessCountLastError)"
+                    [uint32]$debugIdentityTrace.JobActiveProcesses -ne 0 -or
+                    (Test-Path -LiteralPath $debugIdentityMarker)) {
+                    throw "SELFTEST_FAILED: injected root CREATE PID mismatch did not prove joined thread/process/debugger/Job cleanup with no user-code marker: $($debugIdentityCleanup.Detail); process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled); debugger_joined=$($debugIdentityCleanup.DebuggerThreadJoined); handles_signaled=$($debugIdentityCleanup.RetainedProcessHandlesSignaled); debugger_absent=$($debugIdentityCleanup.DebuggerAssociationAbsent); terminate_succeeded=$($debugIdentityCleanup.JobTerminateCallSucceeded); active_count=$($debugIdentityCleanup.JobActiveProcessCount); active_count_verified=$($debugIdentityCleanup.JobActiveProcessCountVerified); active_count_error=$($debugIdentityCleanup.JobActiveProcessCountLastError)"
                 }
-                Write-Host "D32_CREATE_ID_MISMATCH_NEGATIVE=PASS continue_calls=$($debugRootProcess.DebugContinueCallCount) job_total=$($debugIdentityTrace.JobTotalProcesses) job_active=$($debugIdentityCleanup.JobActiveProcessCount) root_process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled)"
+                Write-Host "D32_CREATE_ID_MISMATCH_NEGATIVE=PASS continue_calls=$($debugRootProcess.DebugContinueCallCount) marker_absent=$(-not (Test-Path -LiteralPath $debugIdentityMarker)) debugger_joined=$($debugIdentityCleanup.DebuggerThreadJoined) retained_process_handles_signaled=$($debugIdentityCleanup.RetainedProcessHandlesSignaled) debugger_absent=$($debugIdentityCleanup.DebuggerAssociationAbsent) job_active=$($debugIdentityCleanup.JobActiveProcessCount) root_process_signaled=$($debugIdentityCleanup.ProcessWaitSignaled)"
                 $debugRootProcess.Dispose()
             }
+        }
+        $passed++
+
+        $windowsDirectory = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows))
+        $systemDirectory = Join-Path $windowsDirectory 'System32'
+        $compilerPath = Join-Path $windowsDirectory 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+        if (-not (Test-Path -LiteralPath $compilerPath -PathType Leaf)) { $compilerPath = Join-Path $windowsDirectory 'Microsoft.NET/Framework/v4.0.30319/csc.exe' }
+        $compilerPath = Assert-D32NoReparsePath -Path $compilerPath
+        $debugLauncherSourcePath = Join-Path $root 'd32-debug-selftest-launcher.cs'
+        $debugLauncherPath = Join-Path $root 'd32-debug-selftest-launcher.exe'
+        $debugLauncherSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+public static class D32DebugSelfTestLauncher
+{
+    private static string Quote(string value)
+    {
+        if (value.Length > 0 && value.IndexOfAny(new char[] { ' ', '\t', '"' }) < 0) return value;
+        StringBuilder output = new StringBuilder();
+        output.Append('"');
+        int slashes = 0;
+        foreach (char c in value)
+        {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') { output.Append('\\', slashes * 2 + 1); output.Append('"'); slashes = 0; continue; }
+            output.Append('\\', slashes); slashes = 0; output.Append(c);
+        }
+        output.Append('\\', slashes * 2); output.Append('"');
+        return output.ToString();
+    }
+
+    private static Process Start(string image, string[] arguments)
+    {
+        StringBuilder command = new StringBuilder();
+        for (int i = 0; i < arguments.Length; i++)
+        {
+            if (i != 0) command.Append(' ');
+            command.Append(Quote(arguments[i]));
+        }
+        ProcessStartInfo start = new ProcessStartInfo();
+        start.FileName = image;
+        start.Arguments = command.ToString();
+        start.WorkingDirectory = Environment.CurrentDirectory;
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        return Process.Start(start);
+    }
+
+    public static int Main(string[] args)
+    {
+        if (args == null || args.Length < 2) return 41;
+        string mode = args[0];
+        File.WriteAllText(args[1], "root-ran");
+        string system = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32");
+        if (mode == "spawn-churn")
+        {
+            Process[] children = new Process[16];
+            for (int i = 0; i < children.Length; i++)
+                children[i] = Start(Path.Combine(system, "where.exe"), new string[] { "D32_SELFTEST_NO_MATCH" });
+            foreach (Process child in children)
+            {
+                if (!child.WaitForExit(10000)) return 42;
+                child.Dispose();
+            }
+            return 0;
+        }
+        if (mode == "spawn-unknown")
+        {
+            using (Process child = Start(Path.Combine(system, "whoami.exe"), new string[0]))
+                return child.WaitForExit(10000) ? 0 : 43;
+        }
+        if (mode == "spawn-cmd")
+        {
+            if (args.Length < 3) return 44;
+            using (Process child = Start(Path.Combine(system, "cmd.exe"), new string[] { "/d", "/c", args[2] }))
+                return child.WaitForExit(10000) ? 0 : 45;
+        }
+        return 0;
+    }
+}
+'@
+        [IO.File]::WriteAllText($debugLauncherSourcePath, $debugLauncherSource, [Text.UTF8Encoding]::new($false))
+        $savedCompilerLib = [Environment]::GetEnvironmentVariable('LIB', 'Process')
+        try {
+            [Environment]::SetEnvironmentVariable('LIB', $null, 'Process')
+            $compilerStart = [Diagnostics.ProcessStartInfo]::new()
+            $compilerStart.FileName = $compilerPath
+            $compilerStart.Arguments = ConvertTo-D32CommandLine @('/nologo', "/out:$debugLauncherPath", $debugLauncherSourcePath)
+            $compilerStart.WorkingDirectory = $root
+            $compilerStart.UseShellExecute = $false
+            $compilerStart.CreateNoWindow = $true
+            $compilerProcess = [Diagnostics.Process]::Start($compilerStart)
+            if (-not $compilerProcess.WaitForExit(30000) -or $compilerProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $debugLauncherPath -PathType Leaf)) {
+                throw 'SELFTEST_FAILED: pinned local .NET Framework compiler did not create the debug-abort test launcher'
+            }
+            $compilerProcess.Dispose()
+        }
+        finally { [Environment]::SetEnvironmentVariable('LIB', $savedCompilerLib, 'Process') }
+        $debugLauncherArtifact = Get-D32BoundArtifactWithFileId -Path $debugLauncherPath
+        $debugLauncherImage = [PSCustomObject]@{
+            Path = $debugLauncherArtifact.path; Bytes = $debugLauncherArtifact.bytes; Sha256 = $debugLauncherArtifact.sha256
+            VolumeSerialHex = $debugLauncherArtifact.volume_serial_hex; FileIdHex = $debugLauncherArtifact.file_id_hex
+        }
+        $debugLauncherPin = ConvertTo-D32DebugImagePinText -Image $debugLauncherImage
+        $wherePath = Join-Path $systemDirectory 'where.exe'
+        $whereArtifact = Get-D32BoundArtifactWithFileId -Path $wherePath
+        $whereImage = [PSCustomObject]@{
+            Path = $whereArtifact.path; Bytes = $whereArtifact.bytes; Sha256 = $whereArtifact.sha256
+            VolumeSerialHex = $whereArtifact.volume_serial_hex; FileIdHex = $whereArtifact.file_id_hex
+        }
+        $wherePin = ConvertTo-D32DebugImagePinText -Image $whereImage
+        $consoleHostArtifact = Get-D32BoundArtifactWithFileId -Path (Join-Path $systemDirectory 'conhost.exe')
+        $consoleHostImage = [PSCustomObject]@{
+            Path = $consoleHostArtifact.path; Bytes = $consoleHostArtifact.bytes; Sha256 = $consoleHostArtifact.sha256
+            VolumeSerialHex = $consoleHostArtifact.volume_serial_hex; FileIdHex = $consoleHostArtifact.file_id_hex
+        }
+        $consoleHostPin = ConvertTo-D32DebugImagePinText -Image $consoleHostImage
+        $debugScriptDirectory = Join-Path $root 'script-bin'
+        [void](New-Item -ItemType Directory -Path $debugScriptDirectory)
+        $cmdScriptPath = Join-Path $debugScriptDirectory 'd32-debug-no-launch.cmd'
+        $cmdScriptMarker = Join-Path $root 'd32-debug-cmd-user-code.marker'
+        [IO.File]::WriteAllText($cmdScriptPath, "@echo off`r`necho ran > `"$cmdScriptMarker`"`r`n", [Text.UTF8Encoding]::new($false))
+        $debugTestEnvironment = ConvertTo-D32EnvironmentBlock ([ordered]@{
+            SystemRoot = $windowsDirectory
+            TEMP = $root
+            TMP = $root
+            PATH = $debugScriptDirectory + ';' + $systemDirectory
+        })
+
+        $debugAbortCases = @(
+            [PSCustomObject]@{ Name = 'null-image-file'; Injection = 'null-image-file'; Interruption = $false; ExpectUncontinuedCreate = $true; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-null-hfile-root.marker')); Marker = (Join-Path $root 'd32-null-hfile-root.marker') },
+            [PSCustomObject]@{ Name = 'unknown-root-image'; Injection = $null; Interruption = $false; ExpectUncontinuedCreate = $true; ExpectedPin = $wherePin; Args = @('exit', (Join-Path $root 'd32-unknown-image-root.marker')); Marker = (Join-Path $root 'd32-unknown-image-root.marker') },
+            [PSCustomObject]@{ Name = 'root-parent-mismatch'; Injection = 'root-parent-mismatch'; Interruption = $false; ExpectUncontinuedCreate = $true; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-parent-mismatch-root.marker')); Marker = (Join-Path $root 'd32-parent-mismatch-root.marker') },
+            [PSCustomObject]@{ Name = 'debug-chain-interruption'; Injection = $null; Interruption = $true; ExpectUncontinuedCreate = $true; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-interruption-root.marker')); Marker = (Join-Path $root 'd32-interruption-root.marker') },
+            [PSCustomObject]@{ Name = 'WaitForDebugEvent-API-error'; Injection = 'wait-api-failure'; Interruption = $false; ExpectUncontinuedCreate = $false; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-wait-error-root.marker')); Marker = (Join-Path $root 'd32-wait-error-root.marker') },
+            [PSCustomObject]@{ Name = 'WaitForDebugEvent-timeout'; Injection = 'wait-timeout'; Interruption = $false; ExpectUncontinuedCreate = $false; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-wait-timeout-root.marker')); Marker = (Join-Path $root 'd32-wait-timeout-root.marker') },
+            [PSCustomObject]@{ Name = 'ContinueDebugEvent-API-error'; Injection = 'continue-api-failure'; Interruption = $false; ExpectUncontinuedCreate = $true; ExpectedPin = $debugLauncherPin; Args = @('exit', (Join-Path $root 'd32-continue-error-root.marker')); Marker = (Join-Path $root 'd32-continue-error-root.marker') }
+        )
+        foreach ($case in $debugAbortCases) {
+            $caseResult = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath -Arguments $case.Args -WorkingDirectory $root `
+                -ExpectedRootPin $case.ExpectedPin -EnvironmentBlock $debugTestEnvironment -InjectFirstCreateInterruption $case.Interruption `
+                -FailureInjection $case.Injection
+            $cleanup = $caseResult.Cleanup
+            $uncontinuedCreateRequired = [bool]$case.ExpectUncontinuedCreate
+            if ($caseResult.Trace.State -cne 'BLOCKED' -or $caseResult.ContinueCalls -ne 0 -or
+                ($uncontinuedCreateRequired -and [uint32]$caseResult.Trace.UncontinuedCreateProcessId -le 0) -or
+                (-not $uncontinuedCreateRequired -and [uint32]$caseResult.Trace.UncontinuedCreateProcessId -ne 0) -or
+                [int]$caseResult.Trace.UncontinuedCreateContinueCallCount -ne 0 -or
+                (Test-Path -LiteralPath $case.Marker) -or
+                -not $cleanup.CleanupSucceeded -or -not $cleanup.ProcessWaitSignaled -or -not $cleanup.DebuggerThreadExited -or
+                -not $cleanup.DebuggerThreadJoined -or -not $cleanup.DebuggerKillOnExitEnabled -or
+                -not $cleanup.RetainedProcessHandlesSignaled -or -not $cleanup.DebuggerAssociationQueryVerified -or
+                -not $cleanup.DebuggerAssociationAbsent -or -not $cleanup.JobActiveProcessCountVerified -or
+                [uint32]$cleanup.JobActiveProcessCount -ne 0) {
+                throw "SELFTEST_FAILED: debug abort case '$($case.Name)' lacks zero-Continue/no-user-code/thread/handle/debugger/Job proof: trace=$($caseResult.Trace.BlockReason); cleanup=$($cleanup.Detail); continues=$($caseResult.ContinueCalls); uncontinued=$($caseResult.Trace.UncontinuedCreateProcessId); marker=$([bool](Test-Path -LiteralPath $case.Marker))"
+            }
+            Write-Host "D32_DEBUG_ABORT_NEGATIVE=$($case.Name):PASS uncontinued_create_calls=$($caseResult.Trace.UncontinuedCreateContinueCallCount) debugger_joined=$($cleanup.DebuggerThreadJoined) handles_signaled=$($cleanup.RetainedProcessHandlesSignaled) debugger_absent=$($cleanup.DebuggerAssociationAbsent) job_active=$($cleanup.JobActiveProcessCount)"
+            $passed++
+        }
+
+        $unknownRootMarker = Join-Path $root 'd32-unknown-child-root.marker'
+        $unknownChild = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath -Arguments @('spawn-unknown', $unknownRootMarker) -WorkingDirectory $root `
+            -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
+        if ($unknownChild.Trace.State -cne 'BLOCKED' -or $unknownChild.Trace.BlockReason -notmatch 'unknown child/helper image' -or
+            [uint32]$unknownChild.Trace.UncontinuedCreateProcessId -le 0 -or [int]$unknownChild.Trace.UncontinuedCreateContinueCallCount -ne 0 -or
+            $unknownChild.ContinueCalls -le 0 -or -not (Test-Path -LiteralPath $unknownRootMarker) -or
+            -not $unknownChild.Cleanup.CleanupSucceeded -or -not $unknownChild.Cleanup.DebuggerThreadJoined -or
+            -not $unknownChild.Cleanup.RetainedProcessHandlesSignaled -or -not $unknownChild.Cleanup.DebuggerAssociationAbsent -or
+            [uint32]$unknownChild.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: unknown child/helper was not blocked at its unvalidated CREATE with full cleanup: $($unknownChild.Trace.BlockReason); $($unknownChild.Cleanup.Detail)"
+        }
+        $passed++
+
+        foreach ($commandTarget in @([PSCustomObject]@{ Name = 'absolute-cmd'; Command = $cmdScriptPath }, [PSCustomObject]@{ Name = 'PATH-cmd'; Command = 'd32-debug-no-launch.cmd' })) {
+            $rootMarker = Join-Path $root ("d32-$($commandTarget.Name)-root.marker")
+            $commandCase = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath -Arguments @('spawn-cmd', $rootMarker, $commandTarget.Command) `
+                -WorkingDirectory $root -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
+            if ($commandCase.Trace.State -cne 'BLOCKED' -or $commandCase.Trace.BlockReason -notmatch 'never launchable' -or
+                [uint32]$commandCase.Trace.UncontinuedCreateProcessId -le 0 -or [int]$commandCase.Trace.UncontinuedCreateContinueCallCount -ne 0 -or
+                $commandCase.ContinueCalls -le 0 -or -not (Test-Path -LiteralPath $rootMarker) -or
+                (Test-Path -LiteralPath $cmdScriptMarker) -or -not $commandCase.Cleanup.CleanupSucceeded -or
+                -not $commandCase.Cleanup.DebuggerThreadJoined -or -not $commandCase.Cleanup.RetainedProcessHandlesSignaled -or
+                -not $commandCase.Cleanup.DebuggerAssociationAbsent -or [uint32]$commandCase.Cleanup.JobActiveProcessCount -ne 0) {
+                throw "SELFTEST_FAILED: $($commandTarget.Name) command processor/script launched or lacked debugger cleanup proof: $($commandCase.Trace.BlockReason); $($commandCase.Cleanup.Detail)"
+            }
+            $passed++
+        }
+
+        $missingExitRootMarker = Join-Path $root 'd32-missing-exit-root.marker'
+        $missingExitCase = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath -Arguments @('exit', $missingExitRootMarker) -WorkingDirectory $root `
+            -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment -FailureInjection 'missing-exit'
+        if ($missingExitCase.Trace.State -cne 'BLOCKED' -or $missingExitCase.Trace.ProcessCreateEventCount -le 0 -or
+            $missingExitCase.Trace.ProcessExitEventCount -ge $missingExitCase.Trace.ProcessCreateEventCount -or -not (Test-Path -LiteralPath $missingExitRootMarker) -or
+            -not $missingExitCase.Cleanup.CleanupSucceeded -or -not $missingExitCase.Cleanup.DebuggerThreadJoined -or
+            -not $missingExitCase.Cleanup.RetainedProcessHandlesSignaled -or -not $missingExitCase.Cleanup.DebuggerAssociationAbsent -or
+            [uint32]$missingExitCase.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: missing EXIT event did not block and fully clean the actual process: $($missingExitCase.Trace.BlockReason); $($missingExitCase.Cleanup.Detail)"
+        }
+        $passed++
+
+        $churnRootMarker = Join-Path $root 'd32-spawn-exit-churn-root.marker'
+        $churnCase = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath -Arguments @('spawn-churn', $churnRootMarker) -WorkingDirectory $root `
+            -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($wherePin, $consoleHostPin) -EnvironmentBlock $debugTestEnvironment -TimeoutMilliseconds 20000
+        if ($churnCase.Trace.State -cne 'COMPLETED' -or -not $churnCase.Trace.AccountingConsistent -or
+            $churnCase.Trace.ProcessCreateEventCount -lt 10 -or $churnCase.Trace.ProcessCreateEventCount -ne $churnCase.Trace.ProcessExitEventCount -or
+            $churnCase.Trace.JobTotalProcesses -ne $churnCase.Trace.ProcessCreateEventCount -or $churnCase.Trace.JobActiveProcesses -ne 0 -or
+            -not $churnCase.Cleanup.CleanupSucceeded -or -not $churnCase.Cleanup.DebuggerThreadJoined -or
+            -not $churnCase.Cleanup.RetainedProcessHandlesSignaled -or -not $churnCase.Cleanup.DebuggerAssociationAbsent -or
+            [uint32]$churnCase.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: normal rapid spawn/exit process identities did not reconcile with retained handles and Job accounting: $($churnCase.Trace.BlockReason); $($churnCase.Cleanup.Detail)"
         }
         $passed++
 
@@ -4446,7 +5295,9 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
-        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $currentPowerShellProcess = [Diagnostics.Process]::GetCurrentProcess()
+        try { $powershell = [string]$currentPowerShellProcess.MainModule.FileName }
+        finally { $currentPowerShellProcess.Dispose() }
         $encodedExitZero = [Convert]::ToBase64String(
             [Text.Encoding]::Unicode.GetBytes('exit 0')
         )
@@ -4662,10 +5513,22 @@ function Invoke-D32SelfTest {
         $fakeProcessTrace = [ordered]@{
             record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
             schema_version = 2
-            event_source = 'Win32-WaitForDebugEvent-synchronous'
+            event_source = 'Win32-WaitForDebugEvent-dedicated-OS-thread'
             state = 'COMPLETED'
             block_reason = $null
             debugger_process_id = [int]$PID
+            uncontinued_create_process_id = 0
+            uncontinued_create_continue_call_count = 0
+            debugger_thread_id = [int]$PID + 1
+            dedicated_debugger_thread = $true
+            debugger_kill_on_exit_enabled = $true
+            root_resumed_after_kill_on_exit = $true
+            debugger_thread_exited = $true
+            debugger_thread_joined = $true
+            retained_process_handle_count = 2
+            retained_process_handles_signaled = $true
+            debugger_association_query_verified = $true
+            debugger_association_absent = $true
             debugger_creation_filetime = [Int64]$debuggerCreation
             debugger_created_at_utc = $debuggerCreated
             started_at_utc = $traceStarted
@@ -4727,6 +5590,34 @@ function Invoke-D32SelfTest {
             process_traces = @($traceRecords.ToArray())
         }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
+        $oldTraceProvenance = [ordered]@{}
+        foreach ($field in $provenanceDocument.Keys) { $oldTraceProvenance[$field] = $provenanceDocument[$field] }
+        $oldTraceProvenance.process_traces = @($provenanceDocument.process_traces | ForEach-Object {
+            $oldTraceEntry = [ordered]@{}
+            foreach ($entryField in $_.Keys) { $oldTraceEntry[$entryField] = $_[$entryField] }
+            $oldTrace = [ordered]@{}
+            foreach ($traceField in $_.process_trace.Keys) { $oldTrace[$traceField] = $_.process_trace[$traceField] }
+            $oldTrace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
+            $oldTrace.schema_version = 2
+            $oldTrace.event_source = 'Win32-WaitForDebugEvent-synchronous'
+            foreach ($traceField in @('uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id', 'dedicated_debugger_thread', 'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit',
+                    'debugger_thread_exited', 'debugger_thread_joined', 'retained_process_handle_count', 'retained_process_handles_signaled',
+                    'debugger_association_query_verified', 'debugger_association_absent')) { $oldTrace.Remove($traceField) }
+            $oldTraceEntry.process_trace = $oldTrace
+            $oldTraceEntry
+        })
+        try {
+            Assert-D32FixtureBuildProvenanceShape -Document $oldTraceProvenance
+            throw 'SELFTEST_FAILED: previous synchronous process trace V2 shape was accepted under the approved dedicated-thread trace V2 contract'
+        }
+        catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
+        $oldTraceProvenance.process_traces[0].process_trace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V1'
+        $oldTraceProvenance.process_traces[0].process_trace.schema_version = 1
+        try {
+            Assert-D32FixtureBuildProvenanceShape -Document $oldTraceProvenance
+            throw 'SELFTEST_FAILED: previous process trace V1 was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
         $oldProvenance = [ordered]@{}
         foreach ($field in $provenanceDocument.Keys) { $oldProvenance[$field] = $provenanceDocument[$field] }
         $oldProvenance.schema_version = 1

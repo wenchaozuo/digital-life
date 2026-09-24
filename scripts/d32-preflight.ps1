@@ -2545,10 +2545,18 @@ function Test-D32ReleaseEvidenceBundle {
             catch { Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.process-trace" -Message $_.Exception.Message }
 
             $cleanup = Get-D32JsonProperty -Object $commandRecord -Name 'process_tree_cleanup'
-            if (-not (Test-D32Phase0ExactProperties -Object $cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'cleanup_succeeded', 'detail')) -or
-                $cleanup.launch_mode -cne 'CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread' -or
+            if (-not (Test-D32Phase0ExactProperties -Object $cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'debugger_thread_id', 'debugger_thread_exited', 'debugger_thread_joined', 'debugger_kill_on_exit_enabled', 'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'cleanup_succeeded', 'detail')) -or
+                $cleanup.launch_mode -cne 'DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)' -or
                 $cleanup.job_close_succeeded -isnot [bool] -or -not $cleanup.job_close_succeeded -or $cleanup.process_wait_signaled -isnot [bool] -or -not $cleanup.process_wait_signaled -or
                 $cleanup.active_process_count_verified -isnot [bool] -or -not $cleanup.active_process_count_verified -or -not (Test-D32Phase0Integer -Value $cleanup.active_process_count) -or $cleanup.active_process_count -ne 0 -or
+                $cleanup.debugger_thread_id -ne $commandRecord.process_trace.debugger_thread_id -or
+                $cleanup.debugger_thread_exited -isnot [bool] -or -not $cleanup.debugger_thread_exited -or
+                $cleanup.debugger_thread_joined -isnot [bool] -or -not $cleanup.debugger_thread_joined -or
+                $cleanup.debugger_kill_on_exit_enabled -isnot [bool] -or -not $cleanup.debugger_kill_on_exit_enabled -or
+                $cleanup.retained_process_handle_count -ne $commandRecord.process_trace.retained_process_handle_count -or
+                $cleanup.retained_process_handles_signaled -isnot [bool] -or -not $cleanup.retained_process_handles_signaled -or
+                $cleanup.debugger_association_query_verified -isnot [bool] -or -not $cleanup.debugger_association_query_verified -or
+                $cleanup.debugger_association_absent -isnot [bool] -or -not $cleanup.debugger_association_absent -or
                 $cleanup.cleanup_succeeded -isnot [bool] -or -not $cleanup.cleanup_succeeded -or $cleanup.detail -isnot [string]) {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.process-tree" -Message 'release command lacks verified native Job Object cleanup and zero active-process proof'
             }
@@ -4246,11 +4254,19 @@ function Invoke-D32SelfTest {
                 descendant_processes = [object[]]::new(0)
                 process_trace = $selftestProcessTrace
                 process_tree_cleanup = [ordered]@{
-                    launch_mode = 'CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread'
+                    launch_mode = 'DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)'
                     job_close_succeeded = $true
                     process_wait_signaled = $true
                     active_process_count_verified = $true
                     active_process_count = 0
+                    debugger_thread_id = [uint32]$selftestProcessTrace.debugger_thread_id
+                    debugger_thread_exited = $true
+                    debugger_thread_joined = $true
+                    debugger_kill_on_exit_enabled = $true
+                    retained_process_handle_count = [int]$selftestProcessTrace.retained_process_handle_count
+                    retained_process_handles_signaled = $true
+                    debugger_association_query_verified = $true
+                    debugger_association_absent = $true
                     cleanup_succeeded = $true
                     detail = ''
                 }

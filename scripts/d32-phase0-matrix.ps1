@@ -240,6 +240,18 @@ function ConvertTo-D32Phase0DebugProcessTraceDocument {
         state = [string]$Trace.State
         block_reason = $Trace.BlockReason
         debugger_process_id = [int]$Trace.DebuggerProcessId
+        uncontinued_create_process_id = [uint32]$Trace.UncontinuedCreateProcessId
+        uncontinued_create_continue_call_count = [int]$Trace.UncontinuedCreateContinueCallCount
+        debugger_thread_id = [uint32]$Trace.DebuggerThreadId
+        dedicated_debugger_thread = [bool]$Trace.DedicatedDebuggerThread
+        debugger_kill_on_exit_enabled = [bool]$Trace.DebuggerKillOnExitEnabled
+        root_resumed_after_kill_on_exit = [bool]$Trace.RootResumedAfterKillOnExit
+        debugger_thread_exited = [bool]$Trace.DebuggerThreadExited
+        debugger_thread_joined = [bool]$Trace.DebuggerThreadJoined
+        retained_process_handle_count = [int]$Trace.RetainedProcessHandleCount
+        retained_process_handles_signaled = [bool]$Trace.RetainedProcessHandlesSignaled
+        debugger_association_query_verified = [bool]$Trace.DebuggerAssociationQueryVerified
+        debugger_association_absent = [bool]$Trace.DebuggerAssociationAbsent
         debugger_creation_filetime = [Int64]$Trace.DebuggerCreationFileTime
         debugger_created_at_utc = [string]$Trace.DebuggerCreatedAtUtc
         started_at_utc = [string]$Trace.StartedAtUtc
@@ -322,15 +334,30 @@ function Test-D32Phase0DebugProcessTrace {
         [Parameter(Mandatory = $true)][string]$Repository
     )
 
-    $fields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'debugger_creation_filetime',
+    $fields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id',
+        'dedicated_debugger_thread', 'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit', 'debugger_thread_exited', 'debugger_thread_joined',
+        'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'debugger_creation_filetime',
         'debugger_created_at_utc', 'started_at_utc', 'completed_at_utc', 'debug_event_count', 'process_create_event_count', 'process_exit_event_count',
         'process_event_count', 'thread_create_event_count', 'thread_exit_event_count', 'image_load_event_count', 'image_unload_event_count',
         'exception_event_count', 'debug_string_event_count', 'wait_timeout_count', 'debug_api_error_count', 'event_chain_complete',
         'job_accounting_verified', 'job_total_processes', 'job_active_processes', 'accounting_consistent', 'injected_interruption', 'process_events', 'processes')
     if (-not (Test-D32Phase0ExactProperties -Object $Trace -Expected $fields) -or
         $Trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or -not (Test-D32Phase0Integer -Value $Trace.schema_version) -or $Trace.schema_version -ne 2 -or
-        $Trace.event_source -cne 'Win32-WaitForDebugEvent-synchronous' -or $Trace.state -cne 'COMPLETED' -or $null -ne $Trace.block_reason -or
+        $Trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or $Trace.state -cne 'COMPLETED' -or $null -ne $Trace.block_reason -or
         -not (Test-D32Phase0Integer -Value $Trace.debugger_process_id -Positive) -or $Trace.debugger_process_id -ne $ExpectedParentProcessId -or
+        -not (Test-D32Phase0Integer -Value $Trace.debugger_thread_id -Positive) -or
+        -not (Test-D32Phase0Integer -Value $Trace.uncontinued_create_process_id) -or $Trace.uncontinued_create_process_id -ne 0 -or
+        -not (Test-D32Phase0Integer -Value $Trace.uncontinued_create_continue_call_count) -or $Trace.uncontinued_create_continue_call_count -ne 0 -or
+        $Trace.dedicated_debugger_thread -isnot [bool] -or -not $Trace.dedicated_debugger_thread -or
+        $Trace.debugger_kill_on_exit_enabled -isnot [bool] -or -not $Trace.debugger_kill_on_exit_enabled -or
+        $Trace.root_resumed_after_kill_on_exit -isnot [bool] -or -not $Trace.root_resumed_after_kill_on_exit -or
+        $Trace.debugger_thread_exited -isnot [bool] -or -not $Trace.debugger_thread_exited -or
+        $Trace.debugger_thread_joined -isnot [bool] -or -not $Trace.debugger_thread_joined -or
+        -not (Test-D32Phase0Integer -Value $Trace.retained_process_handle_count -Positive) -or
+        $Trace.retained_process_handle_count -lt ([int]$Trace.process_create_event_count + 1) -or
+        $Trace.retained_process_handles_signaled -isnot [bool] -or -not $Trace.retained_process_handles_signaled -or
+        $Trace.debugger_association_query_verified -isnot [bool] -or -not $Trace.debugger_association_query_verified -or
+        $Trace.debugger_association_absent -isnot [bool] -or -not $Trace.debugger_association_absent -or
         -not (Test-D32Phase0Integer -Value $Trace.debugger_creation_filetime -Positive) -or
         $Trace.event_chain_complete -isnot [bool] -or -not $Trace.event_chain_complete -or
         $Trace.job_accounting_verified -isnot [bool] -or -not $Trace.job_accounting_verified -or
@@ -640,9 +667,11 @@ function Invoke-D32Phase0PinnedProcess {
             (Join-Path $Repository 'vita-agent-protocol\target\debug'),
             (Join-Path $Repository 'vita-agent-protocol\target\release')
         ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
-        $traceNative = $native.MonitorDebugEvents(
+        $native.ConfigureDebugCapture(
             (@([string]$image.Path, [string]$image.Bytes, [string]$image.Sha256, [string]$image.VolumeSerialHex, [string]$image.FileIdHex) -join "`t"),
-            [string[]]$approvedPinText, [string[]]$candidateRoots, [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false)
+            [string[]]$approvedPinText, [string[]]$candidateRoots, [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false, $false)
+        $traceJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
+        $traceNative = $native.WaitForDebugTrace($traceJoinTimeout)
         $processTrace = ConvertTo-D32Phase0DebugProcessTraceDocument -Trace $traceNative
         $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository
         if ($traceNative.State -cne 'COMPLETED' -or -not $traceNative.AccountingConsistent) { throw "PHASE0_PROCESS_TRACE_BLOCKED: $($traceNative.BlockReason)" }
@@ -717,6 +746,14 @@ function Invoke-D32Phase0PinnedProcess {
             process_wait_signaled = [bool]$cleanup.ProcessWaitSignaled
             active_process_count_verified = [bool]$cleanup.JobActiveProcessCountVerified
             active_process_count = [uint32]$cleanup.JobActiveProcessCount
+            debugger_thread_id = [uint32]$cleanup.DebuggerThreadId
+            debugger_thread_exited = [bool]$cleanup.DebuggerThreadExited
+            debugger_thread_joined = [bool]$cleanup.DebuggerThreadJoined
+            debugger_kill_on_exit_enabled = [bool]$cleanup.DebuggerKillOnExitEnabled
+            retained_process_handle_count = [int]$cleanup.RetainedProcessHandleCount
+            retained_process_handles_signaled = [bool]$cleanup.RetainedProcessHandlesSignaled
+            debugger_association_query_verified = [bool]$cleanup.DebuggerAssociationQueryVerified
+            debugger_association_absent = [bool]$cleanup.DebuggerAssociationAbsent
             cleanup_succeeded = [bool]$cleanup.CleanupSucceeded
             detail = [string]$cleanup.Detail
         }
@@ -1132,12 +1169,20 @@ function Test-D32Phase0MatrixRecord {
             if ($command.executable_sha256 -cne $toolRecord.sha256 -or [Int64]$command.executable_bytes -ne [Int64]$toolRecord.bytes -or $command.executable_volume_serial_hex -cne $toolRecord.volume_serial_hex -or $command.executable_file_id_hex -cne $toolRecord.file_id_hex) { throw "Phase0 command[$i] executable does not match current pinned tool identity" }
             $null = Test-D32Phase0FileReference -Reference $command.stdout -AllowedRoot $outputRoot
             $null = Test-D32Phase0FileReference -Reference $command.stderr -AllowedRoot $outputRoot
-            if (-not (Test-D32Phase0ExactProperties -Object $command.process_tree_cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'cleanup_succeeded', 'detail')) -or
-                $command.process_tree_cleanup.launch_mode -cne 'CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread' -or
+            if (-not (Test-D32Phase0ExactProperties -Object $command.process_tree_cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'debugger_thread_id', 'debugger_thread_exited', 'debugger_thread_joined', 'debugger_kill_on_exit_enabled', 'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'cleanup_succeeded', 'detail')) -or
+                $command.process_tree_cleanup.launch_mode -cne 'DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)' -or
                 $command.process_tree_cleanup.job_close_succeeded -isnot [bool] -or -not $command.process_tree_cleanup.job_close_succeeded -or
                 $command.process_tree_cleanup.process_wait_signaled -isnot [bool] -or -not $command.process_tree_cleanup.process_wait_signaled -or
                 $command.process_tree_cleanup.active_process_count_verified -isnot [bool] -or -not $command.process_tree_cleanup.active_process_count_verified -or
                 -not (Test-D32Phase0Integer -Value $command.process_tree_cleanup.active_process_count) -or $command.process_tree_cleanup.active_process_count -ne 0 -or
+                $command.process_tree_cleanup.debugger_thread_id -ne $command.process_trace.debugger_thread_id -or
+                $command.process_tree_cleanup.debugger_thread_exited -isnot [bool] -or -not $command.process_tree_cleanup.debugger_thread_exited -or
+                $command.process_tree_cleanup.debugger_thread_joined -isnot [bool] -or -not $command.process_tree_cleanup.debugger_thread_joined -or
+                $command.process_tree_cleanup.debugger_kill_on_exit_enabled -isnot [bool] -or -not $command.process_tree_cleanup.debugger_kill_on_exit_enabled -or
+                $command.process_tree_cleanup.retained_process_handle_count -ne $command.process_trace.retained_process_handle_count -or
+                $command.process_tree_cleanup.retained_process_handles_signaled -isnot [bool] -or -not $command.process_tree_cleanup.retained_process_handles_signaled -or
+                $command.process_tree_cleanup.debugger_association_query_verified -isnot [bool] -or -not $command.process_tree_cleanup.debugger_association_query_verified -or
+                $command.process_tree_cleanup.debugger_association_absent -isnot [bool] -or -not $command.process_tree_cleanup.debugger_association_absent -or
                 $command.process_tree_cleanup.cleanup_succeeded -isnot [bool] -or -not $command.process_tree_cleanup.cleanup_succeeded) { throw "Phase0 command[$i] lacks verified process-tree cleanup" }
             $rootProcess = $command.root_process
             if (-not (Test-D32Phase0ExactProperties -Object $rootProcess -Expected @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'identity_verified')) -or
@@ -1634,10 +1679,22 @@ function New-D32Phase0SelfTestDebugTrace {
     return [ordered]@{
         record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
         schema_version = 2
-        event_source = 'Win32-WaitForDebugEvent-synchronous'
+        event_source = 'Win32-WaitForDebugEvent-dedicated-OS-thread'
         state = 'COMPLETED'
         block_reason = $null
         debugger_process_id = $RunnerProcessId
+        uncontinued_create_process_id = 0
+        uncontinued_create_continue_call_count = 0
+        debugger_thread_id = $RunnerProcessId + 1
+        dedicated_debugger_thread = $true
+        debugger_kill_on_exit_enabled = $true
+        root_resumed_after_kill_on_exit = $true
+        debugger_thread_exited = $true
+        debugger_thread_joined = $true
+        retained_process_handle_count = 2
+        retained_process_handles_signaled = $true
+        debugger_association_query_verified = $true
+        debugger_association_absent = $true
         debugger_creation_filetime = [Int64]$debuggerCreation
         debugger_created_at_utc = $debuggerAt
         started_at_utc = $started
@@ -1975,13 +2032,35 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'debug process event count rejects numeric string coercion' $stringProcessEventCountRejected
 
         $oldTraceRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
-        $oldTraceRecord.process_traces[0].process_trace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V1'
-        $oldTraceRecord.process_traces[0].process_trace.schema_version = 1
+        $oldTrace = $oldTraceRecord.process_traces[0].process_trace
+        $oldTrace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
+        $oldTrace.schema_version = 2
+        $oldTrace.event_source = 'Win32-WaitForDebugEvent-synchronous'
+        foreach ($field in @('uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id', 'dedicated_debugger_thread', 'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit',
+                'debugger_thread_exited', 'debugger_thread_joined', 'retained_process_handle_count', 'retained_process_handles_signaled',
+                'debugger_association_query_verified', 'debugger_association_absent')) { $oldTrace.Remove($field) }
         & $writeSidecar $oldTraceRecord
         $oldTraceRejected = $false
         try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
         catch { $oldTraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
-        & $add 'synchronized process trace V1 is rejected' $oldTraceRejected
+        & $add 'previous synchronous process trace V2 shape is rejected under approved dedicated-thread trace V2 contract' $oldTraceRejected
+
+        $v1TraceRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $v1TraceRecord.process_traces[0].process_trace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V1'
+        $v1TraceRecord.process_traces[0].process_trace.schema_version = 1
+        & $writeSidecar $v1TraceRecord
+        $v1TraceRejected = $false
+        try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
+        catch { $v1TraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
+        & $add 'previous process trace V1 is rejected' $v1TraceRejected
+
+        $missingThreadProof = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $missingThreadProof.process_traces[0].process_trace.debugger_kill_on_exit_enabled = $false
+        & $writeSidecar $missingThreadProof
+        $missingThreadProofRejected = $false
+        try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
+        catch { $missingThreadProofRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
+        & $add 'process trace rejects a missing debugger kill-on-exit proof' $missingThreadProofRejected
 
         $missingExitTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
         $missingExitTrace.process_traces[0].process_trace.process_events = @($missingExitTrace.process_traces[0].process_trace.process_events[0])

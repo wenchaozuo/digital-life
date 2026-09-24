@@ -381,6 +381,16 @@ The 2026-09-24 feasibility prototype was run as the ordinary user on candidate `
 
 - Supersedes only V1's loss-counter-bearing trace-source requirement. All V1 launch-denial, dormant-script, no-policy-change, no-image-copy, and no-downstream-gate relaxations remain operative unless explicitly changed by a later architecture decision.
 
+#### Approved dedicated-thread and abort-cleanup clarification (2026-09-24)
+
+This clarification is approved under ADR-D32-PROCESS-EVENT-TRACE-V2 and retains the V2 process-trace record contract; it does not authorize a trace V3 record or alter production Host authority.
+
+1. `CreateProcessW`, `WaitForDebugEvent`, and `ContinueDebugEvent` for each fixed Cargo root run on one dedicated, joinable debugger OS thread. After the debug connection is established, that thread must successfully call `DebugSetProcessKillOnExit(TRUE)` before resuming the root with `ResumeThread`.
+2. On any image/identity validation, debug API, timeout, missing-EXIT, or other event-chain failure, evidence is BLOCKED. Terminate the owned Job through a retained Job handle; the debugger thread exits without continuing an unvalidated CREATE event and is joined. Never call `DebugActiveProcessStop` and never Continue an unvalidated CREATE event.
+3. Cleanup succeeds only after the debugger thread has exited and joined within its bound, every independently retained process handle is signaled, the Job's active-process count is independently verified as zero, and the debugger association is verified absent where queryable. Then close the retained Job, `PROCESS_INFORMATION`, `OpenProcess`, duplicate root, and other owned handles. A successful termination call or Job ActiveProcesses=0 by itself is not cleanup proof. Event-owned CREATE/CREATE_THREAD process and thread handles are not manually closed; matching continued EXIT events retire them. Explicitly debugger-owned image-file handles are closed by the debugger.
+4. A completed trace still requires every CREATE image and parent identity to be validated before continuation; CREATE and EXIT identities reconcile exactly, Job total equals unique CREATE count, and Job active count is zero. On blocked CREATE paths, record zero Continue calls for the offending CREATE and establish no user-code marker, joined debugger thread, signaled retained process handles, zero Job active count, and no remaining debugger association/orphan.
+5. Same-user runtime negative evidence covers root PID mismatch, null image handle, unknown image/parent/helper, forbidden command processor and PATH/absolute script launches, debug-chain interruption, Wait/Continue error or timeout, missing EXIT, and rapid spawn/exit/PID-reuse races. Normal pinned toolchain/build/test descendants must remain accepted. Any missing cleanup or identity proof is BLOCKED; no polling or policy fallback is allowed.
+
 ---
 
 ## ADR 模板

@@ -612,19 +612,6 @@ public static class D32NativeProcessIdentityV1 {
     [StructLayout(LayoutKind.Sequential)]
     private struct FILETIME { public uint Low; public uint High; }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct PROCESS_BASIC_INFORMATION {
-        public int ExitStatus;
-        public IntPtr PebBaseAddress;
-        public UIntPtr AffinityMask;
-        public int BasePriority;
-        public UIntPtr UniqueProcessId;
-        public UIntPtr InheritedFromUniqueProcessId;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
-
     [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
     private static extern uint GetProcessId(IntPtr process);
 
@@ -634,20 +621,16 @@ public static class D32NativeProcessIdentityV1 {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder imagePath, ref uint size);
 
-    [DllImport("ntdll.dll", EntryPoint = "NtQueryInformationProcess")]
-    private static extern int NtQueryInformationProcess(IntPtr process, int informationClass, IntPtr information, int length, out int returnedLength);
-
-    private static int CheckedProcessId(ulong value, string field) {
-        if (value == 0 || value > Int32.MaxValue) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: invalid " + field);
-        return (int)value;
-    }
-
-    public static D32NativeProcessIdentityRecordV1 Query(IntPtr processHandle) {
+    public static D32NativeProcessIdentityRecordV1 Query(IntPtr processHandle, int parentProcessId, string commandLine) {
         if (IntPtr.Size != 8) throw new PlatformNotSupportedException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: x64 PowerShell is required");
         if (processHandle == IntPtr.Zero || processHandle == new IntPtr(-1)) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: retained process handle is invalid");
+        if (parentProcessId <= 0) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: caller parent process ID is invalid");
+        if (String.IsNullOrWhiteSpace(commandLine)) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: caller launch command line is empty");
 
         uint handlePid = GetProcessId(processHandle);
-        if (handlePid == 0) throw new Win32Exception(Marshal.GetLastWin32Error(), "D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: GetProcessId failed");
+        if (handlePid == 0 || handlePid > Int32.MaxValue)
+            throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: GetProcessId returned an invalid value for the retained process handle");
+        int nativePid = (int)handlePid;
         FILETIME creation, exit, kernel, user;
         if (!GetProcessTimes(processHandle, out creation, out exit, out kernel, out user))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: GetProcessTimes failed");
@@ -663,49 +646,12 @@ public static class D32NativeProcessIdentityV1 {
         if (String.IsNullOrWhiteSpace(imagePath) || String.IsNullOrWhiteSpace(imageName))
             throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: process image name or path is empty");
 
-        int pbiSize = Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION));
-        IntPtr pbiBuffer = Marshal.AllocHGlobal(pbiSize);
-        PROCESS_BASIC_INFORMATION pbi;
-        try {
-            int returned;
-            int status = NtQueryInformationProcess(processHandle, 0, pbiBuffer, pbiSize, out returned);
-            if (status != 0 || returned != pbiSize)
-                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: ProcessBasicInformation query failed or returned an unexpected size");
-            pbi = (PROCESS_BASIC_INFORMATION)Marshal.PtrToStructure(pbiBuffer, typeof(PROCESS_BASIC_INFORMATION));
-        }
-        finally { Marshal.FreeHGlobal(pbiBuffer); }
-
-        int nativePid = CheckedProcessId(pbi.UniqueProcessId.ToUInt64(), "native PID");
-        int parentPid = CheckedProcessId(pbi.InheritedFromUniqueProcessId.ToUInt64(), "native parent PID");
-        if (nativePid != (int)handlePid)
-            throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: native PID queries disagree for the retained process handle");
-
-        // ProcessCommandLineInformation is queried synchronously against the same retained handle.
-        // This undocumented information class has no fallback: unsupported/unknown results block.
-        const int ProcessCommandLineInformation = 60;
-        const int CommandLineBufferBytes = 65536;
-        IntPtr commandBuffer = Marshal.AllocHGlobal(CommandLineBufferBytes);
-        string commandLine;
-        try {
-            int returned;
-            int status = NtQueryInformationProcess(processHandle, ProcessCommandLineInformation, commandBuffer, CommandLineBufferBytes, out returned);
-            if (status != 0 || returned < Marshal.SizeOf(typeof(UNICODE_STRING)) || returned > CommandLineBufferBytes)
-                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: ProcessCommandLineInformation query failed or returned an invalid size");
-            UNICODE_STRING value = (UNICODE_STRING)Marshal.PtrToStructure(commandBuffer, typeof(UNICODE_STRING));
-            long bufferStart = commandBuffer.ToInt64();
-            long stringStart = value.Buffer.ToInt64();
-            long bufferEnd = checked(bufferStart + returned);
-            if (value.Length == 0 || (value.Length & 1) != 0 || value.MaximumLength < value.Length ||
-                stringStart < bufferStart || checked(stringStart + value.Length) > bufferEnd)
-                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: command-line buffer is incomplete or out of bounds");
-            commandLine = Marshal.PtrToStringUni(value.Buffer, value.Length / 2);
-            if (String.IsNullOrWhiteSpace(commandLine)) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: process command line is empty");
-        }
-        finally { Marshal.FreeHGlobal(commandBuffer); }
-
+        // PID, image path, and creation time are read through stable handle-based Kernel32 APIs.
+        // Parent PID and argv come from this caller's exact ProcessStartInfo launch inputs; no
+        // undocumented PEB/process-information class is used as identity evidence.
         return new D32NativeProcessIdentityRecordV1 {
             ProcessId = nativePid,
-            ParentProcessId = parentPid,
+            ParentProcessId = parentProcessId,
             Name = imageName,
             ImagePath = imagePath,
             CommandLine = commandLine,
@@ -775,10 +721,18 @@ function Assert-D32PinnedGitProcessIdentity {
     $expectedStartTime = $null
     try {
         if ($Process.HasExited) { throw 'process exited before identity verification' }
+        $expectedArguments = ConvertTo-D32CommandLine $Arguments
+        $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+        $startInfo = $Process.StartInfo
+        if ($null -eq $startInfo -or
+            -not [string]::Equals((Get-D32FullPath ([string]$startInfo.FileName)), $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$startInfo.Arguments, $expectedArguments, [StringComparison]::OrdinalIgnoreCase) -or
+            [bool]$startInfo.UseShellExecute) {
+            throw 'PROCESS_IDENTITY_MISMATCH: ProcessStartInfo image, direct-launch mode, or exact requested arguments changed before identity verification'
+        }
         $expectedStartTime = $Process.StartTime
         Initialize-D32NativeProcessIdentityType
-        $observed = [D32NativeProcessIdentityV1]::Query($Process.Handle)
-        $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+        $observed = [D32NativeProcessIdentityV1]::Query($Process.Handle, [int]$PID, $expectedCommand)
         $null = Assert-D32NativeProcessIdentityRecord `
             -ProcessIdentity $observed `
             -ExpectedProcessId ([int]$Process.Id) `
@@ -2102,6 +2056,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     {
         if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return true;
         return CloseHandle(handle);
+    }
+
+    public static bool IsInheritableTestHandleSignaled(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            throw new ArgumentException("test event handle is invalid", "handle");
+        uint result = WaitForSingleObject(handle, 0);
+        if (result == WaitObject0) return true;
+        if (result == 0x00000102) return false;
+        ThrowLastError("WaitForSingleObject(test event) failed (result=" + result.ToString(CultureInfo.InvariantCulture) + ")");
+        return false;
     }
 
     private static void RequireHandleInheritance(IntPtr handle, bool expected, string label)
@@ -5607,26 +5572,54 @@ public static class D32DebugSelfTestLauncher
         $passed++
 
         $normalChildScript = Join-Path $root 'descendant-normal.ps1'
-        [IO.File]::WriteAllText(
-            $normalChildScript,
-            "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null`nStart-Sleep -Milliseconds 750`nexit 0`n",
-            [Text.UTF8Encoding]::new($false)
-        )
+        $normalChildWorkerScript = Join-Path $root 'descendant-normal-worker.ps1'
+        $normalChildReadyPath = Join-Path $root 'descendant-normal-ready.marker'
+        $normalChildWorkerContent = @(
+            ('[IO.File]::WriteAllText(''{0}'', ''D32_NORMAL_CHILD_READY_V1'', [Text.UTF8Encoding]::new($false))' -f $normalChildReadyPath)
+            'Start-Sleep -Seconds 5'
+        ) -join [Environment]::NewLine
+        [IO.File]::WriteAllText($normalChildWorkerScript, $normalChildWorkerContent, [Text.UTF8Encoding]::new($false))
+        $normalChildParentContent = @(
+            '$null = Start-Process -FilePath ''__POWERSHELL__'' -ArgumentList ''-NoLogo'',''-NoProfile'',''-NonInteractive'',''-File'',''__WORKER__'' -WindowStyle Hidden -PassThru'
+            '$deadline = [DateTimeOffset]::UtcNow.AddSeconds(4)'
+            'while (-not (Test-Path -LiteralPath ''__READY__'' -PathType Leaf)) {'
+            '    if ([DateTimeOffset]::UtcNow -ge $deadline) { throw ''SELFTEST_FAILED: normal child did not reach its ready barrier'' }'
+            '    Start-Sleep -Milliseconds 10'
+            '}'
+            'exit 0'
+        ) -join [Environment]::NewLine
+        $normalChildParentContent = $normalChildParentContent.Replace('__POWERSHELL__', $powershell).Replace('__WORKER__', $normalChildWorkerScript).Replace('__READY__', $normalChildReadyPath)
+        [IO.File]::WriteAllText($normalChildScript, $normalChildParentContent, [Text.UTF8Encoding]::new($false))
         $normalWithChild = Invoke-D32BoundedProcess `
             -FilePath $powershell `
             -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $normalChildScript) `
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'normal-descendant-phase') `
             -TimeoutSeconds 5
+        $normalChildIdentityCount = @($normalWithChild.descendant_identities).Count
+        $normalChildReadyObserved = (Test-Path -LiteralPath $normalChildReadyPath -PathType Leaf) -and
+            ([IO.File]::ReadAllText($normalChildReadyPath) -ceq 'D32_NORMAL_CHILD_READY_V1')
         if ($normalWithChild.status -ne 'succeeded' -or
             $normalWithChild.exit_code -ne 0 -or
-            @($normalWithChild.descendant_identities).Count -lt 1 -or
+            -not $normalChildReadyObserved -or
+            $normalChildIdentityCount -lt 1 -or
             @($normalWithChild.descendant_pids).Count -ne 0 -or
             $null -eq $normalWithChild.native_cleanup -or
+            -not [bool]$normalWithChild.native_cleanup.cleanup_succeeded -or
             -not [bool]$normalWithChild.native_cleanup.job_active_process_count_verified -or
             [uint32]$normalWithChild.native_cleanup.job_active_process_count -ne 0 -or
             $null -ne $normalWithChild.error) {
-            throw 'SELFTEST_FAILED: normal exit with captured child was not cleanly reaped'
+            $normalDiagnostic = [ordered]@{
+                status = $normalWithChild.status
+                exit_code = $normalWithChild.exit_code
+                child_ready_marker_observed = $normalChildReadyObserved
+                captured_descendant_count = $normalChildIdentityCount
+                residual_descendant_pids = @($normalWithChild.descendant_pids)
+                native_cleanup = $normalWithChild.native_cleanup
+                error = $normalWithChild.error
+                elapsed_ms = $normalWithChild.elapsed_ms
+            }
+            throw "SELFTEST_FAILED: normal exit with captured child was not cleanly reaped: $($normalDiagnostic | ConvertTo-Json -Compress -Depth 8)"
         }
         $normalIdentity = @($normalWithChild.descendant_identities)[0]
         foreach ($field in @('process_id', 'parent_process_id', 'name', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified')) {
@@ -5910,11 +5903,17 @@ public static class D32DebugSelfTestLauncher
         $ambientHandle = [IntPtr]::Zero
         try {
             $ambientHandle = [D32FixtureNativeProcessV2]::CreateInheritableTestHandle()
+            if ([D32FixtureNativeProcessV2]::IsInheritableTestHandleSignaled($ambientHandle)) {
+                throw 'SELFTEST_FAILED: ambient inheritable test event unexpectedly started signaled'
+            }
             $ambientProbeScript = Join-Path $root 'ambient-handle-probe.ps1'
+            $ambientProbeResult = Join-Path $root 'ambient-handle-probe-result.txt'
             $ambientProbeContent = @(
-                'Add-Type -TypeDefinition ''using System; using System.Runtime.InteropServices; public static class D32AmbientHandleProbe { [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetHandleInformation(IntPtr handle, out uint flags); }'' -Language CSharp'
-                '$flags = 0'
-                ('if ([D32AmbientHandleProbe]::GetHandleInformation([IntPtr]{0}, [ref]$flags)) {{ exit 17 }} else {{ exit 0 }}' -f $ambientHandle.ToInt64())
+                'Add-Type -TypeDefinition ''using System; using System.Runtime.InteropServices; public static class D32AmbientHandleProbe { [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetEvent(IntPtr handle); }'' -Language CSharp'
+                ('$handle = [IntPtr]{0}' -f $ambientHandle.ToInt64())
+                '$setEventSucceeded = [D32AmbientHandleProbe]::SetEvent($handle)'
+                ('[IO.File]::WriteAllText(''{0}'', [string]$setEventSucceeded)' -f $ambientProbeResult)
+                'exit 0'
             ) -join [Environment]::NewLine
             [IO.File]::WriteAllText($ambientProbeScript, $ambientProbeContent, [Text.UTF8Encoding]::new($false))
             $ambient = Invoke-D32BoundedProcess `
@@ -5923,9 +5922,15 @@ public static class D32DebugSelfTestLauncher
                 -WorkingDirectory $root `
                 -PhaseLog (Join-Path $root 'ambient-handle-phase') `
                 -TimeoutSeconds 5
-            if ($ambient.status -ne 'succeeded' -or $ambient.exit_code -ne 0) {
-                throw "SELFTEST_FAILED: ambient inheritable handle escaped explicit handle list (status=$($ambient.status), exit=$($ambient.exit_code), error=$($ambient.error))"
+            $ambientEventSignaled = [D32FixtureNativeProcessV2]::IsInheritableTestHandleSignaled($ambientHandle)
+            $ambientChildSetEvent = if (Test-Path -LiteralPath $ambientProbeResult -PathType Leaf) {
+                [IO.File]::ReadAllText($ambientProbeResult).Trim()
+            } else { '' }
+            $ambientProbeCompleted = $ambientChildSetEvent -ceq 'True' -or $ambientChildSetEvent -ceq 'False'
+            if ($ambient.status -ne 'succeeded' -or $ambient.exit_code -ne 0 -or -not $ambientProbeCompleted -or $ambientEventSignaled) {
+                throw "SELFTEST_FAILED: ambient inheritable event escaped explicit handle list (status=$($ambient.status), exit=$($ambient.exit_code), parent_event_signaled=$ambientEventSignaled, child_set_event_return=$ambientChildSetEvent, error=$($ambient.error))"
             }
+            Write-Host "D32_AMBIENT_HANDLE_NEGATIVE=PASS parent_event_signaled=$ambientEventSignaled child_set_event_return=$ambientChildSetEvent"
             $passed++
         }
         finally {
@@ -6168,7 +6173,7 @@ function Invoke-D32PinnedGitProcessIdentitySelfTest {
     }
     finally { $shortProcess.Dispose() }
 
-    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (live pinned Git=$liveIdentityRuns; native retained-handle identity; exited Git fail-closed)"
+    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (live pinned Git=$liveIdentityRuns; public handle-bound PID/image/time plus exact caller StartInfo argv; exited Git fail-closed)"
 }
 
 if ($D32LauncherLibraryOnly) {

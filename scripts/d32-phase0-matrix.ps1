@@ -506,7 +506,7 @@ function Test-D32Phase0SuiteCounts {
 }
 
 function Get-D32Phase0FixtureGitStates {
-    param([Parameter(Mandatory = $true)][string[]]$Lines, [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines, [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha)
     if ($ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$') { throw 'Phase0 fixture Git-state expected SHA is malformed' }
     $states = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Lines) {
@@ -529,12 +529,13 @@ function Get-D32Phase0FixtureGitStates {
 function Get-D32Phase0FixtureLogPaths {
     param(
         [Parameter(Mandatory = $true)][string]$OutputRoot,
-        [Parameter(Mandatory = $true)][object[]]$FixtureRecords,
-        [Parameter(Mandatory = $true)][object[]]$LockInputs
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$FixtureRecords,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$LockInputs
     )
 
     $expectedNames = @('d29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
     if ($FixtureRecords.Count -ne $expectedNames.Count) { throw 'PHASE0_LOG_BLOCKED: fixture log inventory must contain exactly the five fixed fixture phases' }
+    if ($LockInputs.Count -ne 3) { throw 'PHASE0_LOG_BLOCKED: fixture log inventory must contain exactly three fixed locked-fetch captures' }
     $paths = [System.Collections.Generic.List[string]]::new()
     $logsRoot = Join-Path $OutputRoot 'logs'
     for ($index = 0; $index -lt $expectedNames.Count; $index++) {
@@ -784,7 +785,7 @@ function Invoke-D32Phase0LoggedCommand {
         [Parameter(Mandatory = $true)][string]$Executable,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][ref]$Ordinal,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Records,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Records,
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
@@ -1321,7 +1322,8 @@ function Get-D32Phase0TestCommand {
 }
 
 function Get-D32Phase0ListedTests {
-    param([Parameter(Mandatory = $true)][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    if ($Lines.Count -eq 0) { throw 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
     $tests = [System.Collections.Generic.List[string]]::new()
     foreach ($line in $Lines) {
         if ($line -match '^\s*(.+): test\s*$') { $tests.Add([string]$Matches[1]) }
@@ -1330,18 +1332,19 @@ function Get-D32Phase0ListedTests {
 }
 
 function Get-D32Phase0IgnoredTests {
-    param([Parameter(Mandatory = $true)][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
     return @(Get-D32Phase0ListedTests -Lines $Lines)
 }
 
 function Test-D32Phase0ExactTestListOutput {
-    param([Parameter(Mandatory = $true)][string[]]$Lines, [Parameter(Mandatory = $true)][string[]]$Expected, [switch]$Ignored)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected, [switch]$Ignored)
+    if ($Lines.Count -eq 0) { return $false }
     $observed = if ($Ignored) { @(Get-D32Phase0IgnoredTests -Lines $Lines) } else { @(Get-D32Phase0ListedTests -Lines $Lines) }
     return (($observed -join "`0") -ceq ($Expected -join "`0"))
 }
 
 function Get-D32Phase0Summaries {
-    param([Parameter(Mandatory = $true)][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
     $records = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Lines) {
         if ($line -match '^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;') {
@@ -1481,7 +1484,7 @@ function Get-D32Phase0FixtureFailureSummary {
 }
 
 function Test-D32Phase0FixedInventory {
-    param([Parameter(Mandatory = $true)][hashtable]$Inventories)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Inventories)
     foreach ($package in @('protocol', 'vita', 'host')) {
         if (-not $Inventories.ContainsKey($package)) { throw "PHASE0_INVENTORY_BLOCKED: missing package inventory $package" }
         $names = @($Inventories[$package].all)
@@ -1897,6 +1900,50 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $governanceErrorChecks = @($governanceErrors | ForEach-Object { [string]$_.Check })
     & $add 'direct-runner governance dependency executes read-only and validates the candidate inputs' ($governanceErrors.Count -eq 0) ($governanceErrorChecks -join ', ')
 
+    function Invoke-D32Phase0EmptyRecordAccumulatorProbe {
+        function Invoke-D32Phase0PinnedProcess {
+            param(
+                [string]$Name,
+                [string]$Executable,
+                [string[]]$Arguments,
+                [string]$WorkingDirectory,
+                [string]$LogPath,
+                [System.Collections.IDictionary]$Environment,
+                [int]$TimeoutSeconds,
+                [object]$ValidatedProfile,
+                [string]$Repository,
+                [string]$ExpectedCandidateSha,
+                [string]$GitPath,
+                [string]$GitSha256
+            )
+            return [PSCustomObject]@{ name = $Name; command_line = ($Arguments -join ' '); log_path = $LogPath }
+        }
+
+        $records = [System.Collections.Generic.List[object]]::new()
+        $ordinal = 0
+        $result = Invoke-D32Phase0LoggedCommand `
+            -Name 'empty-record-accumulator-selftest' `
+            -Executable 'C:\d32-selftest\cargo.exe' `
+            -Arguments @('test') `
+            -Ordinal ([ref]$ordinal) `
+            -Records $records `
+            -LogRoot 'C:\d32-selftest\logs' `
+            -Repository 'C:\d32-selftest\repo' `
+            -ValidatedProfile ([PSCustomObject]@{}) `
+            -Environment @{ CARGO_HOME = 'C:\d32-selftest\cargo-home' } `
+            -TimeoutSeconds 60 `
+            -ExpectedCandidateSha ('a' * 40) `
+            -GitPath 'C:\d32-selftest\git.exe' `
+            -GitSha256 ('b' * 64)
+        return [PSCustomObject]@{ Result = $result; Count = $records.Count; Ordinal = $ordinal; StoredName = if ($records.Count -eq 1) { $records[0].name } else { $null } }
+    }
+
+    $emptyRecordProbe = Invoke-D32Phase0EmptyRecordAccumulatorProbe
+    & $add 'Phase0 logged-command helper enters with an empty accumulator and records the bounded result' `
+        ($emptyRecordProbe.Count -eq 1 -and $emptyRecordProbe.Ordinal -eq 1 -and
+            $emptyRecordProbe.StoredName -ceq 'empty-record-accumulator-selftest' -and
+            $emptyRecordProbe.Result.name -ceq 'empty-record-accumulator-selftest')
+
     $inventory = New-D32Phase0SelfTestInventory
     try { $null = Test-D32Phase0FixedInventory -Inventories $inventory; & $add 'approved test inventory is accepted exactly' $true }
     catch { & $add 'approved test inventory is accepted exactly' $false }
@@ -1915,6 +1962,10 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $null = $missingPackage.Remove('host')
     try { $null = Test-D32Phase0FixedInventory -Inventories $missingPackage; & $add 'missing package inventory is rejected' $false }
     catch { & $add 'missing package inventory is rejected' ($_.Exception.Message -match 'missing package') }
+    $emptyInventoryRejected = $false
+    try { $null = Test-D32Phase0FixedInventory -Inventories @{} }
+    catch { $emptyInventoryRejected = $_.Exception.Message -like 'PHASE0_INVENTORY_BLOCKED: missing package inventory*' }
+    & $add 'empty package inventory reaches the validator and fails closed' $emptyInventoryRejected
 
     $extraIgnored = New-D32Phase0SelfTestInventory
     $extraIgnored.vita.ignored = @($extraIgnored.vita.ignored) + @('vita::tests::unapproved_ignored_test')
@@ -1940,6 +1991,18 @@ function Test-D32Phase0MatrixRecordSelfTest {
     & $add 'captured test list rejects a missing declared name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test') -Expected @('module::a', 'module::b')))
     & $add 'captured test list rejects an extra name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::b: test') -Expected @('module::a')))
     & $add 'captured test list rejects a duplicate name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::a: test') -Expected @('module::a')))
+    $emptyTestListOutputRejected = $false
+    try { $null = Get-D32Phase0ListedTests -Lines @() }
+    catch { $emptyTestListOutputRejected = $_.Exception.Message -ceq 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
+    & $add 'empty Cargo test-list output is explicit blocked evidence' $emptyTestListOutputRejected
+    $emptyIgnoredListOutputRejected = $false
+    try { $null = Get-D32Phase0IgnoredTests -Lines @() }
+    catch { $emptyIgnoredListOutputRejected = $_.Exception.Message -ceq 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
+    & $add 'empty Cargo ignored-list output is explicit blocked evidence' $emptyIgnoredListOutputRejected
+    & $add 'zero expected ignored tests require a nonempty captured Cargo list transcript' `
+        (Test-D32Phase0ExactTestListOutput -Lines @('0 tests, 0 benchmarks') -Expected @() -Ignored)
+    & $add 'empty captured Cargo list transcript never matches even an empty expected inventory' `
+        (-not (Test-D32Phase0ExactTestListOutput -Lines @() -Expected @() -Ignored))
 
     $candidate = ('a' * 40) -join ''
     $gitStateLines = [System.Collections.Generic.List[string]]::new()
@@ -1976,6 +2039,14 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'fixture log inventory binds only the exact ten fixture and six fetch stdout/stderr captures' ($fakeLogPaths.Count -eq 16 -and ($actualLogNames -join '|') -ceq ($expectedLogNames.ToArray() -join '|'))
     }
     catch { & $add 'fixture log inventory binds only the exact ten fixture and six fetch stdout/stderr captures' $false $_.Exception.Message }
+    $emptyFixtureLogInventoryRejected = $false
+    try { $null = Get-D32Phase0FixtureLogPaths -OutputRoot $fakeOutputRoot -FixtureRecords @() -LockInputs $fakeLockInputs }
+    catch { $emptyFixtureLogInventoryRejected = $_.Exception.Message -like 'PHASE0_LOG_BLOCKED: fixture log inventory must contain exactly the five*' }
+    & $add 'empty fixture log inventory reaches the exact-five validator and fails closed' $emptyFixtureLogInventoryRejected
+    $emptyFetchLogInventoryRejected = $false
+    try { $null = Get-D32Phase0FixtureLogPaths -OutputRoot $fakeOutputRoot -FixtureRecords $fakeFixtureRecords -LockInputs @() }
+    catch { $emptyFetchLogInventoryRejected = $_.Exception.Message -like 'PHASE0_LOG_BLOCKED: fixture log inventory must contain exactly three*' }
+    & $add 'empty fetch log inventory reaches the exact-three validator and fails closed' $emptyFetchLogInventoryRejected
     $wrongFixtureLogRecords = @($fakeFixtureRecords)
     $wrongFixtureLogRecords[0] = [PSCustomObject]@{ name = $fakeFixtureNames[0]; phase_log = $fakeFixtureRecords[0].phase_log; stdout_log = $fakeFixtureRecords[1].stdout_log; stderr_log = $fakeFixtureRecords[0].stderr_log }
     $wrongFixtureLogsRejected = $false
@@ -1985,6 +2056,10 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $missingGitState = @($gitStateLines.ToArray() | Select-Object -SkipLast 1)
     try { $null = Get-D32Phase0FixtureGitStates -Lines $missingGitState -ExpectedCandidateSha $candidate; & $add 'missing fixture per-phase Git state is rejected' $false }
     catch { & $add 'missing fixture per-phase Git state is rejected' ($_.Exception.Message -match 'expected 10') }
+    $emptyGitStatesRejected = $false
+    try { $null = Get-D32Phase0FixtureGitStates -Lines @() -ExpectedCandidateSha $candidate }
+    catch { $emptyGitStatesRejected = $_.Exception.Message -ceq 'PHASE0_FIXTURE_STATE_BLOCKED: expected 10 per-phase Git-state lines, observed 0' }
+    & $add 'empty fixture Git-state input reaches the exact-ten validator and fails closed' $emptyGitStatesRejected
     $dirtyGitState = @($gitStateLines.ToArray())
     $dirtyGitState[1] = $dirtyGitState[1].Replace('clean=true', 'clean=false')
     try { $null = Get-D32Phase0FixtureGitStates -Lines $dirtyGitState -ExpectedCandidateSha $candidate; & $add 'dirty fixture per-phase Git state is rejected' $false }
@@ -2073,6 +2148,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $failedSummary = @(Get-D32Phase0Summaries -Lines @('test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.03s'))
     & $add 'summary parser preserves integer counts' ($goodSummary.Count -eq 1 -and $goodSummary[0].passed -is [Int64] -and $goodSummary[0].ignored -eq 1 -and $goodSummary[0].filtered_out -eq 1)
     & $add 'summary parser preserves FAILED status' ($failedSummary.Count -eq 1 -and $failedSummary[0].status -ceq 'FAILED' -and $failedSummary[0].failed -eq 1)
+    $emptySummaryRecords = @(Get-D32Phase0Summaries -Lines @())
+    & $add 'empty test output yields no summary records for the caller to reject' ($emptySummaryRecords.Count -eq 0)
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)

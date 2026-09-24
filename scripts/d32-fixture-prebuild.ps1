@@ -1319,7 +1319,7 @@ function Invoke-D32LockedCargoFetches {
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][string]$LogPrefix,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$PhaseEvidence
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$PhaseEvidence
     )
 
     $fetchEnvironment = New-D32ProfileChildEnvironment `
@@ -3757,9 +3757,10 @@ function ConvertTo-D32NativeCleanupDocument {
 
 function Get-D32DescendantProcessRecordsFromSnapshot {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Snapshot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Snapshot,
         [Parameter(Mandatory = $true)][int]$RootPid
     )
+    if ($Snapshot.Count -eq 0) { throw 'PROCESS_TREE_REAP_FAILED: process identity snapshot is empty' }
 
     $byParent = @{}
     foreach ($record in $Snapshot) {
@@ -3937,9 +3938,19 @@ function Stop-D32ProcessTreeAndVerify {
 
 function Test-D32NoOwnedCargoDescendants {
     param(
-        [Parameter(Mandatory = $true)][object[]]$PhaseEvidence,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$PhaseEvidence,
         [Parameter(Mandatory = $true)][string]$CheckName
     )
+    if ($PhaseEvidence.Count -eq 0) { throw "PROCESS_TREE_REAP_FAILED: $CheckName has no captured process identity evidence" }
+    foreach ($evidence in $PhaseEvidence) {
+        $rootRecord = if ($null -eq $evidence) { $null } else { $evidence.root_record }
+        $identityVerified = if ($null -eq $rootRecord) { $null } else { $rootRecord.PSObject.Properties['IdentityVerified'] }
+        if ($null -eq $identityVerified -or $identityVerified.Value -isnot [bool] -or -not $identityVerified.Value -or
+            [int]$rootRecord.ProcessId -le 0 -or [String]::IsNullOrWhiteSpace([string]$rootRecord.CreationDate) -or
+            [String]::IsNullOrWhiteSpace([string]$rootRecord.Name)) {
+            throw "PROCESS_TREE_REAP_FAILED: $CheckName has a phase without verified root process identity evidence"
+        }
+    }
 
     $tracked = [System.Collections.Generic.List[object]]::new()
     foreach ($evidence in $PhaseEvidence) {
@@ -4365,7 +4376,7 @@ function Write-D32Manifest {
 }
 
 function Assert-D32FixtureManifestEnvironmentShape {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.IDictionary]$Environment)
 
     $required = @('original_userprofile', 'codex_home', 'userprofile', 'cargo_home', 'rustup_home', 'rustup_toolchain')
     $actual = @($Environment.Keys | ForEach-Object { [string]$_ })
@@ -4408,7 +4419,7 @@ function Write-D32NewFixtureBuildProvenance {
 }
 
 function Assert-D32FixtureDebugTraceShape {
-    param([Parameter(Mandatory = $true)][object[]]$Traces)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Traces)
 
     $expectedNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch',
         'd29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
@@ -4455,7 +4466,7 @@ function Assert-D32FixtureDebugTraceShape {
 }
 
 function Assert-D32FixtureBuildProvenanceShape {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.IDictionary]$Document)
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
@@ -4698,6 +4709,77 @@ function Invoke-D32SelfTest {
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
         Write-Host 'D32_FIXTURE_TRUST_CONTRACT=pins:-PinnedGitPath,-PinnedGitSha256,-ExpectedCandidateSha,-ToolchainProfilePath,-ExpectedToolchainProfileSha256; d31-target:OutputRoot\d31-recovery-seeder-target; d31-record:sibling-d31-recovery-seeder-build.json; d31-env:D31_RECOVERY_SEEDER_RECORD_PATH,D31_RECOVERY_SEEDER_RECORD_SHA256,D31_RECOVERY_SEEDER_RUN_ID,D32_BUILD_TOOLCHAIN_PROFILE_PATH,D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256; profile:D32_BUILD_TOOLCHAIN_PROFILE_V2'
+
+        function Invoke-D32EmptyFetchEvidenceBindingProbe {
+            function New-D32ProfileChildEnvironment { throw 'D32_SELFTEST_EMPTY_PHASE_EVIDENCE_BODY_REACHED' }
+            $phaseEvidence = [System.Collections.Generic.List[object]]::new()
+            try {
+                $null = Invoke-D32LockedCargoFetches `
+                    -ValidatedProfile ([PSCustomObject]@{ LockInputs = @() }) `
+                    -CargoPath 'C:\d32-selftest\cargo.exe' `
+                    -CargoHome 'C:\d32-selftest\cargo-home' `
+                    -TempRoot 'C:\d32-selftest\temp' `
+                    -RepoRoot 'C:\d32-selftest\repo' `
+                    -LogRoot 'C:\d32-selftest\logs' `
+                    -TimeoutSeconds 1 `
+                    -LogPrefix 'empty-phase-evidence' `
+                    -PhaseEvidence $phaseEvidence
+                throw 'SELFTEST_FAILED: empty locked-fetch evidence accumulator unexpectedly returned'
+            }
+            catch {
+                if ($_.Exception.Message -cne 'D32_SELFTEST_EMPTY_PHASE_EVIDENCE_BODY_REACHED') {
+                    throw "SELFTEST_FAILED: empty locked-fetch evidence did not reach the bounded pre-process seam: $($_.Exception.Message)"
+                }
+            }
+        }
+        Invoke-D32EmptyFetchEvidenceBindingProbe
+        $passed++
+
+        $emptyCleanupEvidenceRejected = $false
+        try {
+            $null = Test-D32NoOwnedCargoDescendants -PhaseEvidence @() -CheckName 'empty-evidence selftest'
+        }
+        catch {
+            $emptyCleanupEvidenceRejected = $_.Exception.Message -ceq 'PROCESS_TREE_REAP_FAILED: empty-evidence selftest has no captured process identity evidence'
+        }
+        if (-not $emptyCleanupEvidenceRejected) { throw 'SELFTEST_FAILED: empty process evidence was accepted as cleanup proof or failed before the explicit fail-closed check' }
+        $passed++
+
+        $incompleteCleanupEvidenceRejected = $false
+        try {
+            $null = Test-D32NoOwnedCargoDescendants `
+                -PhaseEvidence @([PSCustomObject]@{ root_record = $null; descendant_records = @() }) `
+                -CheckName 'incomplete-evidence selftest'
+        }
+        catch {
+            $incompleteCleanupEvidenceRejected = $_.Exception.Message -ceq 'PROCESS_TREE_REAP_FAILED: incomplete-evidence selftest has a phase without verified root process identity evidence'
+        }
+        if (-not $incompleteCleanupEvidenceRejected) { throw 'SELFTEST_FAILED: incomplete process evidence was accepted as cleanup proof' }
+        $passed++
+
+        $emptySnapshotRejected = $false
+        try { $null = Get-D32DescendantProcessRecordsFromSnapshot -Snapshot @() -RootPid 1 }
+        catch { $emptySnapshotRejected = $_.Exception.Message -ceq 'PROCESS_TREE_REAP_FAILED: process identity snapshot is empty' }
+        if (-not $emptySnapshotRejected) { throw 'SELFTEST_FAILED: an empty process snapshot was accepted as descendant evidence' }
+        $passed++
+
+        $emptyEnvironmentRejected = $false
+        try { Assert-D32FixtureManifestEnvironmentShape -Environment @{} }
+        catch { $emptyEnvironmentRejected = $_.Exception.Message -ceq 'FIXTURE_MANIFEST_ENVIRONMENT_INVALID: schema-v3 environment must retain exactly the six consumer wire fields' }
+        if (-not $emptyEnvironmentRejected) { throw 'SELFTEST_FAILED: an empty fixture environment bypassed the exact schema check' }
+        $passed++
+
+        $emptyTraceInventoryRejected = $false
+        try { Assert-D32FixtureDebugTraceShape -Traces @() }
+        catch { $emptyTraceInventoryRejected = $_.Exception.Message -ceq 'FIXTURE_PROVENANCE_INVALID: process trace inventory must contain exactly three locked fetches and five fixture Cargo roots' }
+        if (-not $emptyTraceInventoryRejected) { throw 'SELFTEST_FAILED: an empty process trace inventory bypassed the required eight-root check' }
+        $passed++
+
+        $emptyProvenanceRejected = $false
+        try { Assert-D32FixtureBuildProvenanceShape -Document @{} }
+        catch { $emptyProvenanceRejected = $_.Exception.Message -like 'FIXTURE_PROVENANCE_INVALID:*' }
+        if (-not $emptyProvenanceRejected) { throw 'SELFTEST_FAILED: an empty fixture provenance document bypassed strict shape validation' }
+        $passed++
 
         $fixedSeederPaths = Get-D32D31RecoverySeederPaths -OutputRoot $root
         if ((Split-Path -Parent $fixedSeederPaths.target) -ne (Split-Path -Parent $fixedSeederPaths.record) -or

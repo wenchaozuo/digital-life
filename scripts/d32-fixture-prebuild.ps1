@@ -587,33 +587,231 @@ function Open-D32PinnedGitHandle {
     }
 }
 
+function Initialize-D32NativeProcessIdentityType {
+    if ('D32NativeProcessIdentityV1' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class D32NativeProcessIdentityRecordV1 {
+    public int ProcessId;
+    public int ParentProcessId;
+    public string Name;
+    public string ImagePath;
+    public string CommandLine;
+    public string CreationDate;
+    public string ObservedAtUtc;
+    public bool IdentityVerified;
+}
+
+public static class D32NativeProcessIdentityV1 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_BASIC_INFORMATION {
+        public int ExitStatus;
+        public IntPtr PebBaseAddress;
+        public UIntPtr AffinityMask;
+        public int BasePriority;
+        public UIntPtr UniqueProcessId;
+        public UIntPtr InheritedFromUniqueProcessId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    private static extern uint GetProcessId(IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder imagePath, ref uint size);
+
+    [DllImport("ntdll.dll", EntryPoint = "NtQueryInformationProcess")]
+    private static extern int NtQueryInformationProcess(IntPtr process, int informationClass, IntPtr information, int length, out int returnedLength);
+
+    private static int CheckedProcessId(ulong value, string field) {
+        if (value == 0 || value > Int32.MaxValue) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: invalid " + field);
+        return (int)value;
+    }
+
+    public static D32NativeProcessIdentityRecordV1 Query(IntPtr processHandle) {
+        if (IntPtr.Size != 8) throw new PlatformNotSupportedException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: x64 PowerShell is required");
+        if (processHandle == IntPtr.Zero || processHandle == new IntPtr(-1)) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: retained process handle is invalid");
+
+        uint handlePid = GetProcessId(processHandle);
+        if (handlePid == 0) throw new Win32Exception(Marshal.GetLastWin32Error(), "D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: GetProcessId failed");
+        FILETIME creation, exit, kernel, user;
+        if (!GetProcessTimes(processHandle, out creation, out exit, out kernel, out user))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: GetProcessTimes failed");
+        long creationFileTime = unchecked((long)(((ulong)creation.High << 32) | creation.Low));
+        if (creationFileTime <= 0) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: process creation time is invalid");
+
+        StringBuilder path = new StringBuilder(32768);
+        uint pathLength = (uint)path.Capacity;
+        if (!QueryFullProcessImageNameW(processHandle, 0, path, ref pathLength) || pathLength == 0)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: QueryFullProcessImageNameW failed");
+        string imagePath = path.ToString();
+        string imageName = Path.GetFileName(imagePath);
+        if (String.IsNullOrWhiteSpace(imagePath) || String.IsNullOrWhiteSpace(imageName))
+            throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: process image name or path is empty");
+
+        int pbiSize = Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION));
+        IntPtr pbiBuffer = Marshal.AllocHGlobal(pbiSize);
+        PROCESS_BASIC_INFORMATION pbi;
+        try {
+            int returned;
+            int status = NtQueryInformationProcess(processHandle, 0, pbiBuffer, pbiSize, out returned);
+            if (status != 0 || returned != pbiSize)
+                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: ProcessBasicInformation query failed or returned an unexpected size");
+            pbi = (PROCESS_BASIC_INFORMATION)Marshal.PtrToStructure(pbiBuffer, typeof(PROCESS_BASIC_INFORMATION));
+        }
+        finally { Marshal.FreeHGlobal(pbiBuffer); }
+
+        int nativePid = CheckedProcessId(pbi.UniqueProcessId.ToUInt64(), "native PID");
+        int parentPid = CheckedProcessId(pbi.InheritedFromUniqueProcessId.ToUInt64(), "native parent PID");
+        if (nativePid != (int)handlePid)
+            throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: native PID queries disagree for the retained process handle");
+
+        // ProcessCommandLineInformation is queried synchronously against the same retained handle.
+        // This undocumented information class has no fallback: unsupported/unknown results block.
+        const int ProcessCommandLineInformation = 60;
+        const int CommandLineBufferBytes = 65536;
+        IntPtr commandBuffer = Marshal.AllocHGlobal(CommandLineBufferBytes);
+        string commandLine;
+        try {
+            int returned;
+            int status = NtQueryInformationProcess(processHandle, ProcessCommandLineInformation, commandBuffer, CommandLineBufferBytes, out returned);
+            if (status != 0 || returned < Marshal.SizeOf(typeof(UNICODE_STRING)) || returned > CommandLineBufferBytes)
+                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: ProcessCommandLineInformation query failed or returned an invalid size");
+            UNICODE_STRING value = (UNICODE_STRING)Marshal.PtrToStructure(commandBuffer, typeof(UNICODE_STRING));
+            long bufferStart = commandBuffer.ToInt64();
+            long stringStart = value.Buffer.ToInt64();
+            long bufferEnd = checked(bufferStart + returned);
+            if (value.Length == 0 || (value.Length & 1) != 0 || value.MaximumLength < value.Length ||
+                stringStart < bufferStart || checked(stringStart + value.Length) > bufferEnd)
+                throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: command-line buffer is incomplete or out of bounds");
+            commandLine = Marshal.PtrToStringUni(value.Buffer, value.Length / 2);
+            if (String.IsNullOrWhiteSpace(commandLine)) throw new InvalidOperationException("D32_NATIVE_PROCESS_IDENTITY_UNAVAILABLE: process command line is empty");
+        }
+        finally { Marshal.FreeHGlobal(commandBuffer); }
+
+        return new D32NativeProcessIdentityRecordV1 {
+            ProcessId = nativePid,
+            ParentProcessId = parentPid,
+            Name = imageName,
+            ImagePath = imagePath,
+            CommandLine = commandLine,
+            CreationDate = DateTime.FromFileTimeUtc(creationFileTime).ToString("o", CultureInfo.InvariantCulture),
+            ObservedAtUtc = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+            IdentityVerified = true
+        };
+    }
+}
+'@ -ErrorAction Stop | Out-Null
+}
+
+function Assert-D32NativeProcessIdentityRecord {
+    param(
+        [Parameter(Mandatory = $true)][object]$ProcessIdentity,
+        [Parameter(Mandatory = $true)][int]$ExpectedProcessId,
+        [Parameter(Mandatory = $true)][int]$ExpectedParentProcessId,
+        [Parameter(Mandatory = $true)][string]$ExpectedImagePath,
+        [Parameter(Mandatory = $true)][string]$ExpectedCommandLine,
+        [Parameter(Mandatory = $true)][DateTime]$ExpectedStartTime
+    )
+
+    if ($ExpectedProcessId -le 0 -or $ExpectedParentProcessId -le 0 -or
+        $ProcessIdentity.IdentityVerified -isnot [bool] -or -not $ProcessIdentity.IdentityVerified -or
+        $ProcessIdentity.ProcessId -isnot [int] -or [int]$ProcessIdentity.ProcessId -ne $ExpectedProcessId -or
+        $ProcessIdentity.ParentProcessId -isnot [int] -or [int]$ProcessIdentity.ParentProcessId -ne $ExpectedParentProcessId -or
+        $ProcessIdentity.Name -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.Name) -or
+        $ProcessIdentity.ImagePath -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.ImagePath) -or
+        $ProcessIdentity.CommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.CommandLine) -or
+        $ProcessIdentity.CreationDate -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.CreationDate) -or
+        $ProcessIdentity.ObservedAtUtc -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.ObservedAtUtc)) {
+        throw 'PROCESS_IDENTITY_MISMATCH: handle-bound process identity is incomplete or PID/parent differs'
+    }
+
+    $expectedFullPath = Get-D32FullPath $ExpectedImagePath
+    if (-not [string]::Equals([string]$ProcessIdentity.Name, [IO.Path]::GetFileName($expectedFullPath), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Get-D32FullPath ([string]$ProcessIdentity.ImagePath)), $expectedFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'PROCESS_IDENTITY_MISMATCH: handle-bound process image name or path differs from the pinned image'
+    }
+    if (-not [string]::Equals([string]$ProcessIdentity.CommandLine, $ExpectedCommandLine, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'PROCESS_IDENTITY_MISMATCH: handle-bound process command line differs from the exact requested argv'
+    }
+
+    try {
+        $observedStart = [DateTime]::Parse([string]$ProcessIdentity.CreationDate,
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        $observedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse([string]$ProcessIdentity.ObservedAtUtc,
+                [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$observedAt)) {
+            throw 'invalid observation timestamp'
+        }
+    }
+    catch { throw 'PROCESS_IDENTITY_MISMATCH: handle-bound creation or observation timestamp is malformed' }
+    $expectedStartUtc = $ExpectedStartTime.ToUniversalTime()
+    if ($observedStart.Kind -ne [DateTimeKind]::Utc -or
+        [Math]::Abs(($observedStart - $expectedStartUtc).Ticks) -gt [TimeSpan]::TicksPerMillisecond -or
+        $observedAt.UtcDateTime -lt $observedStart -or $observedAt -gt [DateTimeOffset]::UtcNow.AddSeconds(1)) {
+        throw 'PROCESS_IDENTITY_MISMATCH: handle-bound creation time differs from the retained Process handle or observation time is invalid'
+    }
+    return $ProcessIdentity
+}
+
 function Assert-D32PinnedGitProcessIdentity {
     param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process, [Parameter(Mandatory = $true)][string[]]$Arguments)
 
     $expectedPath = Get-D32FullPath $script:PinnedGit.path
+    $expectedStartTime = $null
     try {
-        $modulePath = [string]$Process.MainModule.FileName
+        if ($Process.HasExited) { throw 'process exited before identity verification' }
+        $expectedStartTime = $Process.StartTime
+        Initialize-D32NativeProcessIdentityType
+        $observed = [D32NativeProcessIdentityV1]::Query($Process.Handle)
+        $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+        $null = Assert-D32NativeProcessIdentityRecord `
+            -ProcessIdentity $observed `
+            -ExpectedProcessId ([int]$Process.Id) `
+            -ExpectedParentProcessId ([int]$PID) `
+            -ExpectedImagePath $expectedPath `
+            -ExpectedCommandLine $expectedCommand `
+            -ExpectedStartTime $expectedStartTime
     }
     catch {
-        throw "GIT_PROCESS_IDENTITY_UNAVAILABLE: cannot observe started Git process image: $($_.Exception.Message)"
+        $identityError = $_.Exception.Message
+        if ($identityError -like 'PROCESS_IDENTITY_MISMATCH:*') {
+            throw "GIT_PROCESS_IDENTITY_MISMATCH: $identityError"
+        }
+        if ($identityError -like 'GIT_PROCESS_IDENTITY_UNAVAILABLE:*') { throw }
+        throw "GIT_PROCESS_IDENTITY_UNVERIFIED: $identityError"
     }
-    if (-not [string]::Equals((Get-D32FullPath $modulePath), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+
+    # Capture handle-bound process identity before hashing the pinned image. Short
+    # read-only Git commands can exit during the file hash; the caller-owned image
+    # handle was already retained and locked before Process.Start.
+    if (-not [string]::Equals((Get-D32FullPath ([string]$observed.ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image path does not match the caller-pinned Git executable'
     }
-    $image = Get-D32BoundArtifact $modulePath
+    $image = Get-D32BoundArtifact $expectedPath
     if ($image.sha256 -cne $script:PinnedGit.sha256 -or
         -not (Test-D32SameArtifactFileIdentity -Left $image.file_identity -Right $script:PinnedGit.file_identity)) {
         throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image hash or native file identity differs from pinned Git'
     }
-    $snapshot = @(Get-D32ProcessSnapshot -ProcessId $Process.Id)
-    if ($snapshot.Count -ne 1 -or -not [bool]$snapshot[0].IdentityVerified -or
-        -not [string]::Equals([string]$snapshot[0].Name, (Split-Path -Leaf $expectedPath), [StringComparison]::OrdinalIgnoreCase) -or
-        -not [string]::Equals((Get-D32FullPath ([string]$snapshot[0].ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started Git process name, PID, or observed image path is unverified'
+    try {
+        Assert-D32PinnedGitCurrent
     }
-    $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
-    if (-not [string]::Equals([string]$snapshot[0].CommandLine, $expectedCommand, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started Git process argv differs from the requested pinned command'
+    catch {
+        throw "GIT_PROCESS_IDENTITY_MISMATCH: caller-pinned Git changed after the process identity query: $($_.Exception.Message)"
     }
 }
 
@@ -920,9 +1118,8 @@ function Get-D32GitOutput {
         Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
         $pinnedGitHandle = Open-D32PinnedGitHandle
         Assert-D32PinnedGitCurrent
+        Initialize-D32NativeProcessIdentityType
         if (-not $process.Start()) { throw 'GIT_FAILED: pinned Git process did not start' }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
         try {
             Assert-D32PinnedGitProcessIdentity -Process $process -Arguments (@(
                     '-c', 'core.fsmonitor=false',
@@ -942,10 +1139,10 @@ function Get-D32GitOutput {
                 }
             }
             catch { }
-            try { $null = $stdoutTask.GetAwaiter().GetResult() } catch { }
-            try { $null = $stderrTask.GetAwaiter().GetResult() } catch { }
             throw
         }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         $process.WaitForExit()
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
@@ -4556,6 +4753,49 @@ function Invoke-D32SelfTest {
         }
         $passed++
 
+        $nativeIdentityStart = [DateTime]::UtcNow.AddSeconds(-2)
+        $nativeIdentityImage = Join-Path $root 'pinned-git-selftest.exe'
+        $nativeIdentityExpectedCommand = ConvertTo-D32CommandLine @($nativeIdentityImage, 'rev-parse', '--verify', 'HEAD')
+        $nativeIdentityRecord = [PSCustomObject]@{
+            IdentityVerified = $true
+            ProcessId = 2147483000
+            ParentProcessId = [int]$PID
+            Name = 'pinned-git-selftest.exe'
+            ImagePath = $nativeIdentityImage
+            CommandLine = $nativeIdentityExpectedCommand
+            CreationDate = $nativeIdentityStart.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+            ObservedAtUtc = [DateTimeOffset]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        }
+        $null = Assert-D32NativeProcessIdentityRecord -ProcessIdentity $nativeIdentityRecord `
+            -ExpectedProcessId 2147483000 -ExpectedParentProcessId ([int]$PID) `
+            -ExpectedImagePath $nativeIdentityImage -ExpectedCommandLine $nativeIdentityExpectedCommand `
+            -ExpectedStartTime $nativeIdentityStart
+        $passed++
+        $identityMismatchCases = @(
+            [PSCustomObject]@{ Name = 'PID'; Property = 'ProcessId'; Value = 2147482999 },
+            [PSCustomObject]@{ Name = 'parent PID'; Property = 'ParentProcessId'; Value = ([int]$PID + 1) },
+            [PSCustomObject]@{ Name = 'image path'; Property = 'ImagePath'; Value = (Join-Path $root 'other.exe') },
+            [PSCustomObject]@{ Name = 'command line'; Property = 'CommandLine'; Value = ($nativeIdentityExpectedCommand + ' --extra') },
+            [PSCustomObject]@{ Name = 'creation time'; Property = 'CreationDate'; Value = $nativeIdentityStart.AddMilliseconds(5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) },
+            [PSCustomObject]@{ Name = 'verified flag'; Property = 'IdentityVerified'; Value = $false }
+        )
+        foreach ($case in $identityMismatchCases) {
+            $mismatchedIdentity = [PSCustomObject]@{}
+            foreach ($property in $nativeIdentityRecord.PSObject.Properties) {
+                $mismatchedIdentity | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value
+            }
+            $mismatchedIdentity.($case.Property) = $case.Value
+            try {
+                $null = Assert-D32NativeProcessIdentityRecord -ProcessIdentity $mismatchedIdentity `
+                    -ExpectedProcessId 2147483000 -ExpectedParentProcessId ([int]$PID) `
+                    -ExpectedImagePath $nativeIdentityImage -ExpectedCommandLine $nativeIdentityExpectedCommand `
+                    -ExpectedStartTime $nativeIdentityStart
+                throw "SELFTEST_FAILED: native process identity mismatch for $($case.Name) was accepted"
+            }
+            catch { if ($_.Exception.Message -notlike 'PROCESS_IDENTITY_MISMATCH:*') { throw } }
+            $passed++
+        }
+
         $identityCargoPath = Join-Path $root 'cargo-identity-test.exe'
         [IO.File]::WriteAllBytes($identityCargoPath, [byte[]](0x4D, 0x5A, 0x11, 0x22))
         $identityCargoArtifact = Get-D32BoundArtifact -Path $identityCargoPath
@@ -5865,6 +6105,72 @@ public static class D32DebugSelfTestLauncher
     }
 }
 
+function Invoke-D32PinnedGitProcessIdentitySelfTest {
+    param(
+        [Parameter(Mandatory = $true)][string]$PinnedPath,
+        [Parameter(Mandatory = $true)][string]$PinnedSha256,
+        [Parameter(Mandatory = $true)][string]$Repository
+    )
+
+    if ($PSVersionTable.PSVersion -lt [version]'7.5') { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: pinned Git identity test requires PowerShell 7.5 or newer' }
+    $repo = Assert-D32NoReparsePath -Path $Repository
+    if (-not (Test-Path -LiteralPath (Join-Path $repo '.git'))) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: supplied repository root is not a Git repository' }
+    $script:PinnedGit = Get-D32PinnedGit -Path $PinnedPath -ExpectedSha256 $PinnedSha256
+
+    # Repeat a fast read-only command to exercise process-start identity binding
+    # across short-lived PIDs and the retained Git image handle.
+    $liveIdentityRuns = 0
+    for ($attempt = 1; $attempt -le 16; $attempt++) {
+        $head = Get-D32GitOutput -Root $repo -Arguments @('rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}')
+        if ($head -notmatch '^[0-9a-fA-F]{40}$') { throw "SELFTEST_GIT_IDENTITY_BLOCKED: pinned Git read-only command $attempt returned no exact commit identity" }
+        $liveIdentityRuns++
+    }
+
+    # A process that has already exited before identity capture must not be accepted
+    # from a path, exit code, or stale PID alone.
+    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+    if ([String]::IsNullOrWhiteSpace($systemRoot)) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: Windows SystemRoot is unavailable' }
+    $systemRoot = Assert-D32NoReparsePath -Path $systemRoot
+    $searchPath = @((Split-Path -Parent $script:PinnedGit.path), (Join-Path $systemRoot 'System32')) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+        ForEach-Object { Assert-D32NoReparsePath -Path $_ }
+    if ($searchPath.Count -lt 2) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: pinned Git and Windows system executable roots are unavailable' }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:PinnedGit.path
+    $startInfo.Arguments = ConvertTo-D32CommandLine @('--version')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    Clear-D32ChildEnvironment -StartInfo $startInfo
+    $startInfo.EnvironmentVariables['PATH'] = $searchPath -join [IO.Path]::PathSeparator
+    $startInfo.EnvironmentVariables['SystemRoot'] = $systemRoot
+    $startInfo.EnvironmentVariables['WINDIR'] = $systemRoot
+    $shortProcess = [Diagnostics.Process]::new()
+    $shortProcess.StartInfo = $startInfo
+    try {
+        if (-not $shortProcess.Start()) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: short-lived pinned Git process did not start' }
+        $stdoutTask = $shortProcess.StandardOutput.ReadToEndAsync()
+        $stderrTask = $shortProcess.StandardError.ReadToEndAsync()
+        if (-not $shortProcess.WaitForExit(5000)) {
+            try { $shortProcess.Kill(); $shortProcess.WaitForExit() } catch { }
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: bounded --version process did not exit'
+        }
+        $null = $stdoutTask.GetAwaiter().GetResult()
+        $null = $stderrTask.GetAwaiter().GetResult()
+        if ($shortProcess.ExitCode -ne 0) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: bounded pinned Git --version did not exit successfully' }
+        try {
+            Assert-D32PinnedGitProcessIdentity -Process $shortProcess -Arguments @('--version')
+            throw 'SELFTEST_FAILED: already-exited pinned Git was accepted without a live handle-bound identity capture'
+        }
+        catch { if ($_.Exception.Message -notlike 'GIT_PROCESS_IDENTITY_UNVERIFIED:*') { throw } }
+    }
+    finally { $shortProcess.Dispose() }
+
+    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (live pinned Git=$liveIdentityRuns; native retained-handle identity; exited Git fail-closed)"
+}
+
 if ($D32LauncherLibraryOnly) {
     if ($SelfTest) {
         throw 'D32_LAUNCHER_LIBRARY_MODE_INVALID: -D32LauncherLibraryOnly and -SelfTest are mutually exclusive'
@@ -5875,6 +6181,15 @@ if ($D32LauncherLibraryOnly) {
 
 if ($SelfTest) {
     Invoke-D32SelfTest
+    $hasPinnedGitPath = -not [String]::IsNullOrWhiteSpace($PinnedGitPath)
+    $hasPinnedGitSha = -not [String]::IsNullOrWhiteSpace($PinnedGitSha256)
+    if ($hasPinnedGitPath -ne $hasPinnedGitSha) {
+        throw 'SELFTEST_GIT_IDENTITY_BLOCKED: -PinnedGitPath and -PinnedGitSha256 must be supplied together'
+    }
+    if ($hasPinnedGitPath) {
+        if ([String]::IsNullOrWhiteSpace($RepoRoot)) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: -RepoRoot is required with Git identity selftest pins' }
+        Invoke-D32PinnedGitProcessIdentitySelfTest -PinnedPath $PinnedGitPath -PinnedSha256 $PinnedGitSha256 -Repository $RepoRoot
+    }
     exit 0
 }
 

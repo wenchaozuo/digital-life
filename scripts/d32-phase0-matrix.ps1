@@ -21,6 +21,8 @@ $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 
 $script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V2'
 $script:D32Phase0SchemaVersion = 2
+$script:D32Phase0FixtureOwnerMarkerName = '.d32-fixture-prebuild-owned'
+$script:D32Phase0FixtureOwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:D32Phase0FixtureBuildSpecs = @(
     [PSCustomObject]@{ name = 'd29h1-authority-fixture'; manifest = 'src-tauri/Cargo.toml'; binary = 'd29h1-authority-fixture'; features = @('d29-h1-host-fixture') },
     [PSCustomObject]@{ name = 'd29h7-authority-fixture'; manifest = 'src-tauri/Cargo.toml'; binary = 'd29h7-authority-fixture'; features = @('d29-h7-host-fixture') },
@@ -1376,6 +1378,108 @@ function Assert-D32Phase0OutputRoot {
     return $full
 }
 
+function New-D32Phase0FixtureOutputRoot {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Repository)
+
+    $full = Assert-D32Phase0OutputRoot -Path $Path -Repository $Repository
+    try {
+        New-Item -ItemType Directory -Path $full -ErrorAction Stop | Out-Null
+        if (-not (Test-D32ProfileNoReparsePath -Path $full) -or -not (Test-Path -LiteralPath $full -PathType Container)) {
+            throw 'new output root is missing or reparse-backed'
+        }
+        $markerPath = Join-Path $full $script:D32Phase0FixtureOwnerMarkerName
+        $markerBytes = [Text.UTF8Encoding]::new($false).GetBytes($script:D32Phase0FixtureOwnerMarker)
+        $markerStream = [IO.File]::Open($markerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        try {
+            $markerStream.Write($markerBytes, 0, $markerBytes.Length)
+            $markerStream.Flush()
+        }
+        finally { $markerStream.Dispose() }
+
+        if (-not (Test-D32ProfileNoReparsePath -Path $markerPath) -or
+            [IO.File]::ReadAllText($markerPath).Trim() -cne $script:D32Phase0FixtureOwnerMarker) {
+            throw 'fixture ownership marker failed exact byte/text revalidation'
+        }
+        $items = @(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop)
+        if ($items.Count -ne 1 -or $items[0].Name -cne $script:D32Phase0FixtureOwnerMarkerName -or
+            ($items[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'new output root contains unexpected content or a reparse-backed owner marker'
+        }
+        return $full
+    }
+    catch {
+        throw "PHASE0_OUTPUT_BLOCKED: could not initialize the new fixture-owned evidence root; any partial directory is preserved: $($_.Exception.Message)"
+    }
+}
+
+function Write-D32Phase0FixtureTranscript {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [AllowEmptyString()][string]$FixtureText,
+        [AllowNull()][string]$PrimaryFailure
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-D32ProfileCanonicalPathString -Path $Path) -or
+        -not (Test-D32ProfilePathWithin -Child $full -Parent $OutputRoot) -or
+        -not (Test-D32ProfileNoReparsePath -Path $OutputRoot) -or
+        (Test-Path -LiteralPath $full)) {
+        throw 'PHASE0_LOG_BLOCKED: startup transcript path is non-canonical, outside the new evidence root, reparse-backed, or already exists'
+    }
+
+    $builder = [Text.StringBuilder]::new()
+    if (-not [String]::IsNullOrEmpty($FixtureText)) { [void]$builder.Append($FixtureText).Append([Environment]::NewLine) }
+    if (-not [String]::IsNullOrWhiteSpace($PrimaryFailure)) {
+        [void]$builder.AppendLine('D32_PHASE0_FIXTURE_PRIMARY_EXCEPTION_BEGIN')
+        [void]$builder.AppendLine($PrimaryFailure)
+        [void]$builder.AppendLine('D32_PHASE0_FIXTURE_PRIMARY_EXCEPTION_END')
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($builder.ToString())
+    $stream = [IO.File]::Open($full, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+    }
+    finally { $stream.Dispose() }
+    return (Get-D32Phase0FileReference -Path $full)
+}
+
+function Add-D32Phase0FixtureTranscriptDiagnostic {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$OutputRoot, [Parameter(Mandatory = $true)][string]$Message)
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-D32ProfilePathWithin -Child $full -Parent $OutputRoot) -or
+        -not (Test-D32ProfileNoReparsePath -Path $full)) {
+        throw 'PHASE0_LOG_BLOCKED: cannot append a secondary startup diagnostic outside the verified transcript'
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes("D32_PHASE0_FIXTURE_SECONDARY_DIAGNOSTIC_BEGIN`r`n$Message`r`nD32_PHASE0_FIXTURE_SECONDARY_DIAGNOSTIC_END`r`n")
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+    }
+    finally { $stream.Dispose() }
+    return (Get-D32Phase0FileReference -Path $full)
+}
+
+function Get-D32Phase0FixtureFailureSummary {
+    param(
+        [AllowNull()][string]$FixtureFailure,
+        [AllowNull()][string]$GitStateFailure,
+        [AllowNull()][string]$TranscriptFailure
+    )
+
+    if (-not [String]::IsNullOrWhiteSpace($FixtureFailure)) {
+        $message = "PHASE0_FIXTURE_BLOCKED: $FixtureFailure"
+        if (-not [String]::IsNullOrWhiteSpace($GitStateFailure)) { $message += "; secondary Git-state validation failure: $GitStateFailure" }
+        if (-not [String]::IsNullOrWhiteSpace($TranscriptFailure)) { $message += "; secondary transcript persistence failure: $TranscriptFailure" }
+        return $message
+    }
+    if (-not [String]::IsNullOrWhiteSpace($GitStateFailure)) { return $GitStateFailure }
+    if (-not [String]::IsNullOrWhiteSpace($TranscriptFailure)) { return "PHASE0_LOG_BLOCKED: $TranscriptFailure" }
+    return $null
+}
+
 function Test-D32Phase0FixedInventory {
     param([Parameter(Mandatory = $true)][hashtable]$Inventories)
     foreach ($package in @('protocol', 'vita', 'host')) {
@@ -1422,6 +1526,10 @@ function Invoke-D32Phase0Matrix {
     Test-D32Governance -Repository $repo -Findings $findings
     if (@($findings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'PHASE0_GOVERNANCE_BLOCKED: current governance inputs failed preflight' }
 
+    # Claim the already caller-pinned, previously absent evidence root before
+    # invoking the fixture producer. This lets the runner preserve the exact
+    # producer failure even when the producer cannot reach its own root setup.
+    $output = New-D32Phase0FixtureOutputRoot -Path $output -Repository $repo
     $started = [DateTimeOffset]::UtcNow
     $phaseCommands = [System.Collections.Generic.List[object]]::new()
     $fixtureScript = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'))
@@ -1446,12 +1554,32 @@ function Invoke-D32Phase0Matrix {
         $fixtureOutput += [string]$_
     }
     $fixtureText = ($fixtureOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    if ($fixtureText.Length -gt 16000000) { throw 'PHASE0_FIXTURE_BLOCKED: in-process fixture output exceeded 16 MB bound' }
-    $fixtureGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($fixtureText -split "`r?`n") -ExpectedCandidateSha $ExpectedSha)
-    if (Test-Path -LiteralPath $output -PathType Container) {
-        [IO.File]::WriteAllText($fixtureTranscriptPath, $fixtureText + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    $fixtureOutputTooLarge = $fixtureText.Length -gt 16000000
+    if ($fixtureOutputTooLarge) {
+        $fixtureText = $fixtureText.Substring(0, 15900000) + [Environment]::NewLine + '[fixture output truncated at the 16 MB evidence bound]'
+        if ($null -eq $fixtureFailure) { $fixtureFailure = 'in-process fixture output exceeded the 16 MB evidence bound' }
     }
-    if ($null -ne $fixtureFailure) { throw "PHASE0_FIXTURE_BLOCKED: in-process fixed fixture runner failed: $fixtureFailure" }
+    $transcriptFailure = $null
+    try {
+        $null = Write-D32Phase0FixtureTranscript -Path $fixtureTranscriptPath -OutputRoot $output -FixtureText $fixtureText -PrimaryFailure $fixtureFailure
+    }
+    catch { $transcriptFailure = $_.Exception.Message }
+
+    $fixtureGitStates = @()
+    $fixtureGitStateFailure = $null
+    try {
+        $fixtureGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($fixtureText -split "`r?`n") -ExpectedCandidateSha $ExpectedSha)
+    }
+    catch { $fixtureGitStateFailure = $_.Exception.Message }
+    if (-not [String]::IsNullOrWhiteSpace($fixtureGitStateFailure) -and [String]::IsNullOrWhiteSpace($transcriptFailure)) {
+        try { $null = Add-D32Phase0FixtureTranscriptDiagnostic -Path $fixtureTranscriptPath -OutputRoot $output -Message $fixtureGitStateFailure }
+        catch { $transcriptFailure = $_.Exception.Message }
+    }
+    $fixtureFailureSummary = Get-D32Phase0FixtureFailureSummary `
+        -FixtureFailure $fixtureFailure `
+        -GitStateFailure $fixtureGitStateFailure `
+        -TranscriptFailure $transcriptFailure
+    if ($null -ne $fixtureFailureSummary) { throw $fixtureFailureSummary }
     if (-not (Test-Path -LiteralPath $fixtureManifestPath -PathType Leaf)) { throw 'PHASE0_FIXTURE_BLOCKED: fixed fixture runner did not create its manifest' }
     $fixtureRaw = [IO.File]::ReadAllText($fixtureManifestPath, [Text.Encoding]::UTF8)
     if (Test-D32Phase0JsonDuplicateKeys -Json $fixtureRaw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture manifest contains duplicate or invalid JSON structure' }
@@ -1869,6 +1997,41 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $duplicateGitState[1] = $duplicateGitState[0]
     try { $null = Get-D32Phase0FixtureGitStates -Lines $duplicateGitState -ExpectedCandidateSha $candidate; & $add 'duplicate fixture state edge is rejected' $false }
     catch { & $add 'duplicate fixture state edge is rejected' ($_.Exception.Message -match 'missing, duplicated, reordered, or extra') }
+
+    $originalFixtureFailure = 'GIT_PROCESS_IDENTITY_UNVERIFIED: retained Git process handle had no complete identity record'
+    $secondaryFixtureStateFailure = 'PHASE0_FIXTURE_STATE_BLOCKED: expected 10 per-phase Git-state lines, observed 0'
+    $prioritizedFailure = Get-D32Phase0FixtureFailureSummary `
+        -FixtureFailure $originalFixtureFailure `
+        -GitStateFailure $secondaryFixtureStateFailure `
+        -TranscriptFailure $null
+    & $add 'original fixture exception is primary and missing Git-state markers remain secondary' `
+        ($prioritizedFailure.StartsWith("PHASE0_FIXTURE_BLOCKED: $originalFixtureFailure", [StringComparison]::Ordinal) -and
+            $prioritizedFailure.Contains("secondary Git-state validation failure: $secondaryFixtureStateFailure"))
+
+    $transcriptRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $transcriptPath = Join-Path $transcriptRoot ('d32-phase0-fixture-failure-selftest-' + [Guid]::NewGuid().ToString('N') + '.log')
+    $transcriptDiagnostic = 'secondary Git-state marker check failed after the captured producer exception'
+    $expectedPrimaryTranscript = "fixture producer output captured before marker parsing`r`nD32_PHASE0_FIXTURE_PRIMARY_EXCEPTION_BEGIN`r`n$originalFixtureFailure`r`nD32_PHASE0_FIXTURE_PRIMARY_EXCEPTION_END`r`n"
+    $expectedTranscript = $expectedPrimaryTranscript + "D32_PHASE0_FIXTURE_SECONDARY_DIAGNOSTIC_BEGIN`r`n$transcriptDiagnostic`r`nD32_PHASE0_FIXTURE_SECONDARY_DIAGNOSTIC_END`r`n"
+    try {
+        $null = Write-D32Phase0FixtureTranscript -Path $transcriptPath -OutputRoot $transcriptRoot `
+            -FixtureText 'fixture producer output captured before marker parsing' -PrimaryFailure $originalFixtureFailure
+        $null = Add-D32Phase0FixtureTranscriptDiagnostic -Path $transcriptPath -OutputRoot $transcriptRoot -Message $transcriptDiagnostic
+        $actualTranscript = [IO.File]::ReadAllText($transcriptPath)
+        & $add 'failure transcript preserves the exact original exception before secondary marker diagnostics' ($actualTranscript -ceq $expectedTranscript)
+    }
+    catch { & $add 'failure transcript preserves the exact original exception before secondary marker diagnostics' $false $_.Exception.Message }
+    finally {
+        if (Test-Path -LiteralPath $transcriptPath -PathType Leaf) {
+            try {
+                $exactTestFile = (Test-D32ProfileCanonicalPathString -Path $transcriptPath) -and
+                    (Test-D32ProfileNoReparsePath -Path $transcriptPath) -and
+                    [IO.File]::ReadAllText($transcriptPath) -in @($expectedPrimaryTranscript, $expectedTranscript)
+                if ($exactTestFile) { Remove-Item -LiteralPath $transcriptPath -Force -ErrorAction Stop }
+            }
+            catch { }
+        }
+    }
 
     $goodShape = [PSCustomObject][ordered]@{ name = 'cargo.exe'; path = 'C:\\pinned\\cargo.exe' }
     & $add 'strict phase0 object schema accepts exact shape' (Test-D32Phase0ExactProperties -Object $goodShape -Expected @('name', 'path'))

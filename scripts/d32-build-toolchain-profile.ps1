@@ -340,10 +340,27 @@ function Get-D32ProfileCurrentExecutableInventory {
         $fullDirectory = Assert-D32ProfileDirectory -Path $directory
         foreach ($item in @(Get-ChildItem -LiteralPath $fullDirectory -Force -File -ErrorAction Stop)) {
             $extension = [IO.Path]::GetExtension($item.Name)
-            if ($extension -in @('.bat', '.cmd')) { throw "batch files are not permitted in constructed PATH: $($item.FullName)" }
             if ($extension -notin @('.exe', '.com')) { continue }
             $path = [IO.Path]::GetFullPath($item.FullName)
             if (-not $seen.Add($path)) { throw "duplicate PATH executable directory entry: $path" }
+            $records.Add((Get-D32ProfileFileSnapshot -Path $path))
+        }
+    }
+    return @($records.ToArray())
+}
+
+function Get-D32ProfileCurrentScriptInventory {
+    param([string[]]$Directories)
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($directory in $Directories) {
+        $fullDirectory = Assert-D32ProfileDirectory -Path $directory
+        foreach ($item in @(Get-ChildItem -LiteralPath $fullDirectory -Force -File -ErrorAction Stop)) {
+            $extension = [IO.Path]::GetExtension($item.Name)
+            if ($extension -notin @('.bat', '.cmd')) { continue }
+            $path = [IO.Path]::GetFullPath($item.FullName)
+            if (-not $seen.Add($path)) { throw "duplicate PATH script directory entry: $path" }
             $records.Add((Get-D32ProfileFileSnapshot -Path $path))
         }
     }
@@ -394,6 +411,45 @@ function Test-D32ProfileImageInventory {
         if ($snapshot.Sha256 -cne $declared.Sha256 -or $snapshot.Bytes -ne $declared.Bytes -or
             $snapshot.VolumeSerialHex -cne $declared.VolumeSerialHex -or $snapshot.FileIdHex -cne $declared.FileIdHex) {
             throw "$InventoryName executable identity changed: $($snapshot.Path)"
+        }
+    }
+    return $actual
+}
+
+function Test-D32ProfileScriptInventory {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$DeclaredRecords,
+        [Parameter(Mandatory = $true)][string[]]$Directories,
+        [Parameter(Mandatory = $true)][string[]]$AllowedRoots,
+        [Parameter(Mandatory = $true)][string]$InventoryName
+    )
+
+    if ($DeclaredRecords -isnot [Array]) { throw "$InventoryName must be an array" }
+    $expected = @{}
+    foreach ($record in $DeclaredRecords) {
+        if ($null -eq $record) { throw "$InventoryName contains null" }
+        $declaredName = Get-D32ProfileProperty -Object $record -Name 'name'
+        $declaredPath = Get-D32ProfileProperty -Object $record -Name 'path'
+        if ($declaredName -isnot [string] -or $declaredPath -isnot [string]) { throw "$InventoryName record name/path must be strings" }
+        $extension = [IO.Path]::GetExtension([string]$declaredPath)
+        if ($extension -notin @('.bat', '.cmd') -or [IO.Path]::GetFileName([string]$declaredPath) -cne [string]$declaredName) { throw "$InventoryName may contain only exact .bat/.cmd basenames" }
+        $matchingRoots = @($AllowedRoots | Where-Object { Test-D32ProfilePathWithin -Child $declaredPath -Parent $_ })
+        if ($matchingRoots.Count -ne 1) { throw "$InventoryName script is not beneath exactly one approved toolchain/native root: $declaredPath" }
+        $validated = Test-D32ProfileIdentityRecord -Declared $record -ExpectedName ([string]$declaredName) -ExpectedReason 'dormant script inventory only; never launchable' -AllowedRoot $matchingRoots[0]
+        if (-not ($Directories | Where-Object { Test-D32ProfilePathWithin -Child $validated.Path -Parent $_ })) { throw "$InventoryName script is outside the constructed PATH directories: $($validated.Path)" }
+        $key = $validated.Path.ToLowerInvariant()
+        if ($expected.ContainsKey($key)) { throw "$InventoryName contains a duplicate script path" }
+        $expected[$key] = $validated
+    }
+    $actual = @(Get-D32ProfileCurrentScriptInventory -Directories $Directories)
+    if ($actual.Count -ne $expected.Count) { throw "$InventoryName does not exactly cover every dormant .bat/.cmd reachable through its directories" }
+    foreach ($snapshot in $actual) {
+        $key = $snapshot.Path.ToLowerInvariant()
+        if (-not $expected.ContainsKey($key)) { throw "$InventoryName contains an unpinned resident script: $($snapshot.Path)" }
+        $declared = $expected[$key].Snapshot
+        if ($snapshot.Sha256 -cne $declared.Sha256 -or $snapshot.Bytes -ne $declared.Bytes -or
+            $snapshot.VolumeSerialHex -cne $declared.VolumeSerialHex -or $snapshot.FileIdHex -cne $declared.FileIdHex) {
+            throw "$InventoryName script identity changed: $($snapshot.Path)"
         }
     }
     return $actual
@@ -498,7 +554,7 @@ function Test-D32BuildToolchainProfile {
         [string]$ExpectedTargetTriple = 'x86_64-pc-windows-msvc'
     )
 
-    $result = [ordered]@{ IsValid = $false; Failure = $null; Profile = $null; ProfilePath = $null; Repository = $null; EvidenceRoot = $null; ExpectedTargetTriple = $null; Digest = $null; Identity = $null; ExecutableInventory = @(); LockInputs = @() }
+    $result = [ordered]@{ IsValid = $false; Failure = $null; Profile = $null; ProfilePath = $null; Repository = $null; EvidenceRoot = $null; ExpectedTargetTriple = $null; Digest = $null; Identity = $null; ExecutableInventory = @(); ScriptInventory = @(); LockInputs = @() }
     try {
         if (-not (Test-D32ProfileWindows)) { throw 'caller-pinned MSVC toolchain profile is Windows-only' }
         if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'independent expected toolchain profile SHA-256 must be lowercase 64-hex' }
@@ -514,11 +570,11 @@ function Test-D32BuildToolchainProfile {
         }
         finally { $document.Dispose() }
         $profile = $raw | ConvertFrom-Json -DateKind String
-        $topFields = @('schema_version', 'profile_type', 'target_triple', 'system_root', 'powershell_root', 'powershell', 'rust_toolchain_root', 'toolchain', 'rust_toolchain_bin_images', 'native_roots', 'native', 'fetch_manifests', 'fetch_git', 'env_policy', 'cargo_policy')
+        $topFields = @('schema_version', 'profile_type', 'target_triple', 'system_root', 'powershell_root', 'powershell', 'rust_toolchain_root', 'toolchain', 'rust_toolchain_bin_images', 'native_roots', 'native', 'windows_child_images', 'fetch_manifests', 'fetch_git', 'env_policy', 'cargo_policy')
         if (-not (Test-D32ProfileExactProperties -Object $profile -Expected $topFields)) { throw 'profile top-level schema has missing or extra fields' }
         if ($profile.schema_version -isnot [int] -and $profile.schema_version -isnot [long]) { throw 'profile schema_version must be a JSON integer' }
-        if ([Int64]$profile.schema_version -ne 1) { throw 'profile schema_version is not supported' }
-        if ((Assert-D32ProfileString -Object $profile -Name 'profile_type') -cne 'D32_BUILD_TOOLCHAIN_PROFILE_V1') { throw 'profile profile_type is not supported' }
+        if ([Int64]$profile.schema_version -ne 2) { throw 'profile schema_version is not supported; legacy v1 has no dormant-script identity inventory' }
+        if ((Assert-D32ProfileString -Object $profile -Name 'profile_type') -cne 'D32_BUILD_TOOLCHAIN_PROFILE_V2') { throw 'profile profile_type is not supported' }
         if ((Assert-D32ProfileString -Object $profile -Name 'target_triple') -cne $ExpectedTargetTriple) { throw "profile target_triple must equal $ExpectedTargetTriple" }
         if ((Assert-D32ProfileString -Object $profile -Name 'env_policy') -cne 'D32_BUILD_ENV_V1' -or (Assert-D32ProfileString -Object $profile -Name 'cargo_policy') -cne 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER') { throw 'profile env_policy or cargo_policy is not the fixed D32 policy' }
 
@@ -569,7 +625,7 @@ function Test-D32BuildToolchainProfile {
         if ((Test-D32ProfilePathWithin -Child $nativeRoots['msvc'] -Parent $nativeRoots['windows-sdk']) -or (Test-D32ProfilePathWithin -Child $nativeRoots['windows-sdk'] -Parent $nativeRoots['msvc'])) { throw 'MSVC and Windows SDK roots must be distinct and non-overlapping' }
 
         $native = $profile.native
-        if (-not (Test-D32ProfileExactProperties -Object $native -Expected @('path_entries', 'include_dirs', 'lib_dirs', 'libpath_dirs', 'environment', 'path_images'))) { throw 'profile.native has missing or extra fields' }
+        if (-not (Test-D32ProfileExactProperties -Object $native -Expected @('path_entries', 'include_dirs', 'lib_dirs', 'libpath_dirs', 'environment', 'path_images', 'path_scripts'))) { throw 'profile.native has missing or extra fields' }
         foreach ($field in @('path_entries', 'include_dirs', 'lib_dirs', 'libpath_dirs')) {
             $values = Get-D32ProfileProperty -Object $native -Name $field
             if ($values -isnot [Array] -or $values.Count -eq 0) { throw "native.$field must be a non-empty array" }
@@ -607,8 +663,18 @@ function Test-D32BuildToolchainProfile {
         $nativePathDirs = @($native.path_entries | ForEach-Object { Assert-D32ProfileDirectory -Path ([string]$_) })
         if ($profile.rust_toolchain_bin_images -isnot [Array]) { throw 'rust_toolchain_bin_images must be a JSON array' }
         if ($native.path_images -isnot [Array]) { throw 'native.path_images must be a JSON array' }
+        if ($native.path_scripts -isnot [Array]) { throw 'native.path_scripts must be a JSON array; every dormant .bat/.cmd in PATH requires an identity pin' }
+        if ($profile.windows_child_images -isnot [Array]) { throw 'windows_child_images must be a JSON array' }
         $toolchainImages = Test-D32ProfileImageInventory -DeclaredRecords $profile.rust_toolchain_bin_images -Directories @($rustBin) -AllowedRoots @($rustRoot) -InventoryName 'rust_toolchain_bin_images'
         $nativeImages = Test-D32ProfileImageInventory -DeclaredRecords $native.path_images -Directories $nativePathDirs -AllowedRoots @($nativeRoots.Values) -InventoryName 'native.path_images'
+        $allPathDirs = @($rustBin) + @($nativePathDirs)
+        $allPathRoots = @($rustRoot) + @($nativeRoots.Values)
+        $scriptInventory = Test-D32ProfileScriptInventory -DeclaredRecords $native.path_scripts -Directories $allPathDirs -AllowedRoots $allPathRoots -InventoryName 'native.path_scripts'
+        if ($profile.windows_child_images.Count -ne 1) { throw 'windows_child_images must contain exactly one pinned System32 conhost.exe image' }
+        $windowsRecord = $profile.windows_child_images[0]
+        $windowsIdentity = Test-D32ProfileIdentityRecord -Declared $windowsRecord -ExpectedName 'conhost.exe' -ExpectedReason 'direct pinned Windows console host child image' -AllowedRoot (Join-Path $systemRoot 'System32')
+        if ([IO.Path]::GetFileName($windowsIdentity.Path) -ine 'conhost.exe') { throw 'windows_child_images must identify System32 conhost.exe' }
+        $windowsImages = @($windowsIdentity.Snapshot)
         foreach ($toolName in @('cargo', 'rustc', 'rustdoc')) {
             $match = @($toolchainImages | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $direct[$toolName].Path })
             if ($match.Count -ne 1 -or $match[0].Sha256 -cne $direct[$toolName].Snapshot.Sha256 -or $match[0].FileIdHex -cne $direct[$toolName].Snapshot.FileIdHex) { throw "direct $toolName identity is not present exactly in the Rust PATH inventory" }
@@ -640,6 +706,8 @@ function Test-D32BuildToolchainProfile {
         $result.Digest = $profileSnapshot.Sha256
         $result.Identity = $profileSnapshot
         $result.ExecutableInventory = @($toolchainImages) + @($nativeImages)
+        $result.ScriptInventory = @($scriptInventory)
+        $result.WindowsImageInventory = @($windowsImages)
         $result.LockInputs = @($validatedLocks.ToArray())
         return [PSCustomObject]$result
     }
@@ -656,6 +724,8 @@ function Assert-D32BuildToolchainProfileCurrent {
     $again = Test-D32BuildToolchainProfile -ProfilePath ([string]$ValidatedProfile.ProfilePath) -ExpectedSha256 ([string]$ValidatedProfile.Digest) -Repository ([string]$ValidatedProfile.Repository) -EvidenceRoot ([string]$ValidatedProfile.EvidenceRoot) -ExpectedTargetTriple ([string]$ValidatedProfile.ExpectedTargetTriple)
     if (-not $again.IsValid) { throw "build toolchain profile changed or failed current identity validation: $($again.Failure)" }
     if ($again.ExecutableInventory.Count -ne $ValidatedProfile.ExecutableInventory.Count) { throw 'build executable inventory count changed' }
+    if ($again.ScriptInventory.Count -ne $ValidatedProfile.ScriptInventory.Count) { throw 'dormant PATH script inventory count changed' }
+    if ($again.WindowsImageInventory.Count -ne $ValidatedProfile.WindowsImageInventory.Count) { throw 'Windows child-image inventory count changed' }
     return $again
 }
 
@@ -769,6 +839,24 @@ function Test-D32BuildToolchainProfileSelfTest {
         $nativeImagePaths[$name] = $path
         $nativeImages.Add((New-D32BuildToolchainProfileSelfTestIdentity -Name $name -Path $path -Reason "self-test pinned $name"))
     }
+    $scriptPaths = @(
+        (Join-Path $rustBin 'rust-windbg.cmd'),
+        (Join-Path $sdkBin 'sdk-setup.cmd'),
+        (Join-Path $sdkBin 'sdk-debug.cmd')
+    )
+    foreach ($scriptPath in $scriptPaths) { [IO.File]::WriteAllText($scriptPath, '@rem dormant profile self-test') }
+    $scriptRecords = [System.Collections.Generic.List[object]]::new()
+    foreach ($scriptSnapshot in @(Get-D32ProfileCurrentScriptInventory -Directories @($rustBin, $msvcBin, $sdkBin))) {
+        $scriptRecords.Add([ordered]@{
+            name = [IO.Path]::GetFileName($scriptSnapshot.Path)
+            path = $scriptSnapshot.Path
+            sha256 = $scriptSnapshot.Sha256
+            bytes = [Int64]$scriptSnapshot.Bytes
+            volume_serial_hex = $scriptSnapshot.VolumeSerialHex
+            file_id_hex = $scriptSnapshot.FileIdHex
+            reason = 'dormant script inventory only; never launchable'
+        })
+    }
 
     $lockInputs = @(Get-D32BuildToolchainLockInputs -Repository $Repository)
     $gitSourceCount = ($lockInputs | Measure-Object -Property GitSourceCount -Sum).Sum
@@ -778,12 +866,13 @@ function Test-D32BuildToolchainProfileSelfTest {
     catch { $badGitLockRejected = $_.Exception.Message -like '*without a full immutable*' }
     & $case 'Cargo.lock Git sources require an immutable full commit ID' ($validGitLockCount -eq 1 -and $badGitLockRejected -and $gitSourceCount -gt 0)
     $windowsRoot = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows))
+    $conhost = New-D32BuildToolchainProfileSelfTestIdentity -Name 'conhost.exe' -Path (Join-Path $windowsRoot 'System32\conhost.exe') -Reason 'direct pinned Windows console host child image'
     $currentPowerShellPath = Get-D32CurrentPowerShellImagePath
     $powershellRoot = [IO.Path]::GetDirectoryName($currentPowerShellPath)
     $powershellIdentity = New-D32BuildToolchainProfileSelfTestIdentity -Name 'pwsh.exe' -Path $currentPowerShellPath -Reason 'direct pinned PowerShell host executable'
     $document = [ordered]@{
-        schema_version = 1
-        profile_type = 'D32_BUILD_TOOLCHAIN_PROFILE_V1'
+        schema_version = 2
+        profile_type = 'D32_BUILD_TOOLCHAIN_PROFILE_V2'
         target_triple = 'x86_64-pc-windows-msvc'
         system_root = $windowsRoot
         powershell_root = $powershellRoot
@@ -808,7 +897,9 @@ function Test-D32BuildToolchainProfileSelfTest {
                 VSCMD_ARG_TGT_ARCH = 'x64'
             }
             path_images = @($nativeImages.ToArray())
+            path_scripts = @($scriptRecords.ToArray())
         }
+        windows_child_images = @($conhost)
         fetch_manifests = @($lockInputs | ForEach-Object { [ordered]@{ manifest_path = $_.ManifestPath; lock_sha256 = $_.LockSha256 } })
         fetch_git = $null
         env_policy = 'D32_BUILD_ENV_V1'
@@ -826,6 +917,20 @@ function Test-D32BuildToolchainProfileSelfTest {
     $valid = & $runDocument $document $null
     & $case 'valid caller-pinned profile and opened-handle identities' ([bool]$valid.IsValid)
     if (-not $valid.IsValid) { throw "profile self-test baseline profile was rejected: $($valid.Failure)" }
+    $oldV1 = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($document))
+    $oldV1.schema_version = 1
+    $oldV1.profile_type = 'D32_BUILD_TOOLCHAIN_PROFILE_V1'
+    $oldResult = & $runDocument $oldV1 $null
+    & $case 'profile rejects legacy v1 without dormant-script authority separation' (-not $oldResult.IsValid -and $oldResult.Failure -like '*legacy v1*')
+    & $case 'profile accepts pinned resident .cmd/.bat files as dormant-only identities' ($valid.ScriptInventory.Count -eq 3 -and @($valid.ScriptInventory | Where-Object { [IO.Path]::GetExtension($_.Path) -notin @('.cmd', '.bat') }).Count -eq 0)
+    $dormantScriptPath = $scriptPaths[0]
+    $dormantScriptBytes = [IO.File]::ReadAllBytes($dormantScriptPath)
+    [IO.File]::AppendAllText($dormantScriptPath, "`r`n@rem changed after pin")
+    try {
+        $scriptChanged = & $runDocument $document $null
+        & $case 'profile revalidates dormant script bytes and file identity' (-not $scriptChanged.IsValid -and $scriptChanged.Failure -like '*does not match current opened-handle bytes/file ID*')
+    }
+    finally { [IO.File]::WriteAllBytes($dormantScriptPath, $dormantScriptBytes) }
     & $case 'profile rejects same-bytes replacement with restored metadata' $false
     $cargoPath = Join-Path $rustBin 'cargo.exe'
     $cargoOriginalSnapshot = Get-D32ProfileFileSnapshot -Path $cargoPath
@@ -887,7 +992,7 @@ function Test-D32BuildToolchainProfileSelfTest {
     $result = & $runDocument $wrongArray $null
     & $case 'profile rejects wrong PATH-image array type' (-not $result.IsValid -and $result.Failure -like '*must be a JSON array*')
     $duplicateJson = $document | ConvertTo-Json -Depth 20 -Compress
-    $duplicateJson = $duplicateJson.Replace('"schema_version":1', '"schema_version":1,"schema_version":1')
+    $duplicateJson = $duplicateJson.Replace('"schema_version":2', '"schema_version":2,"schema_version":2')
     $result = & $runDocument $null $duplicateJson
     & $case 'profile rejects duplicate JSON object keys' (-not $result.IsValid -and $result.Failure -like '*duplicate object keys*')
 
@@ -924,7 +1029,7 @@ function Test-D32BuildToolchainProfileSelfTest {
     [IO.File]::WriteAllText($batchPath, '@echo off')
     try {
         $result = & $runDocument $document $null
-        & $case 'profile rejects batch files reachable through PATH' (-not $result.IsValid -and $result.Failure -like '*batch files are not permitted*')
+        & $case 'profile rejects an unpinned dormant command script reachable through PATH' (-not $result.IsValid -and $result.Failure -like '*does not exactly cover every dormant*')
     }
     finally { if (Test-Path -LiteralPath $batchPath) { [IO.File]::Delete($batchPath) } }
 

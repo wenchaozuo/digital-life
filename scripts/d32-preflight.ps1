@@ -111,10 +111,10 @@ $script:D32ReleaseBuildCommands = @(
     }
 )
 $script:D32BundleSchemaVersion = 1
-$script:D32AttestationSchemaVersion = 2
-$script:D32PostBundleAggregateSchemaVersion = 1
+$script:D32AttestationSchemaVersion = 3
+$script:D32PostBundleAggregateSchemaVersion = 2
 $script:D32PostBundleAggregateRecordName = 'D32-POST-BUNDLE-AGGREGATE.json'
-$script:D32PostBundleAggregateRecordType = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V1'
+$script:D32PostBundleAggregateRecordType = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V2'
 $script:D32PostBundleAggregateScope = 'PRE_DOWNSTREAM_LOCAL_SCOPE'
 $script:D32BundleDirectoryName = 'd32-gate-bundle'
 $script:D32BundleManifestName = 'BUNDLE-MANIFEST.json'
@@ -2219,7 +2219,7 @@ function Test-D32ReleaseEvidenceBundle {
     $attestationFields = @('schema_version', 'attestation_type', 'runner_process_id', 'candidate_sha', 'source_clone', 'git_status', 'build_profile', 'started_at_utc', 'completed_at_utc', 'cargo_path', 'cargo_sha256', 'cargo_identity', 'toolchain_profile', 'phase0_matrix', 'cargo_home', 'fresh_outputs', 'commands', 'artifacts')
     $artifactFields = @('name', 'build_path', 'bundle_path', 'build_bytes', 'bundle_bytes', 'build_sha256', 'bundle_sha256', 'build_identity', 'bundle_identity', 'exact_match')
     $attestedArtifactFields = @('name', 'build_path', 'build_bytes', 'build_sha256', 'build_identity')
-    $commandFields = @('name', 'command', 'working_directory', 'argv', 'candidate_sha_before', 'git_status_before', 'started_at_utc', 'completed_at_utc', 'exit_code', 'process_id', 'root_process', 'descendant_processes', 'process_tree_cleanup', 'stdout', 'stderr', 'candidate_sha_after', 'git_status_after')
+    $commandFields = @('name', 'command', 'working_directory', 'argv', 'candidate_sha_before', 'git_status_before', 'started_at_utc', 'completed_at_utc', 'exit_code', 'process_id', 'root_process', 'descendant_processes', 'process_trace', 'process_tree_cleanup', 'stdout', 'stderr', 'candidate_sha_after', 'git_status_after')
     $freshOutputFields = @('name', 'build_path', 'absent_before_build')
 
     if ($null -eq $Bundle) {
@@ -2243,7 +2243,7 @@ function Test-D32ReleaseEvidenceBundle {
     $attestationSchemaVersion = Get-D32JsonProperty -Object $Attestation -Name 'schema_version'
     $attestationSchemaValue = [Int64]0
     $attestationSchemaIsInteger = $null -ne $attestationSchemaVersion -and @([byte], [sbyte], [uint16], [int16], [uint32], [int32], [uint64], [int64]) -contains $attestationSchemaVersion.GetType()
-    if (-not $attestationSchemaIsInteger -or -not (Test-D32NonNegativeInt64 -Value $attestationSchemaVersion -Parsed ([ref]$attestationSchemaValue)) -or $attestationSchemaValue -ne $script:D32AttestationSchemaVersion -or (Get-D32JsonProperty -Object $Attestation -Name 'attestation_type') -cne 'D32_RELEASE_BUILD_ATTESTATION') {
+    if (-not $attestationSchemaIsInteger -or -not (Test-D32NonNegativeInt64 -Value $attestationSchemaVersion -Parsed ([ref]$attestationSchemaValue)) -or $attestationSchemaValue -ne $script:D32AttestationSchemaVersion -or (Get-D32JsonProperty -Object $Attestation -Name 'attestation_type') -cne 'D32_RELEASE_BUILD_ATTESTATION_V3') {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'attestation.schema' -Message 'attestation schema version or type is not the fixed D32 release-build format'
     }
     $attestationRunnerPid = Get-D32JsonProperty -Object $Attestation -Name 'runner_process_id'
@@ -2367,6 +2367,7 @@ function Test-D32ReleaseEvidenceBundle {
 
     $phase0OutputRoot = $null
     $phase0Document = $null
+    $releaseToolchainProfile = $null
     $toolchainProfileReference = Get-D32JsonProperty -Object $Attestation -Name 'toolchain_profile'
     $phase0MatrixReference = Get-D32JsonProperty -Object $Attestation -Name 'phase0_matrix'
     $cargoHomeEvidence = Get-D32JsonProperty -Object $Attestation -Name 'cargo_home'
@@ -2388,14 +2389,20 @@ function Test-D32ReleaseEvidenceBundle {
         if (Test-D32JsonDuplicateKeys -Json $phase0Raw) { throw 'referenced Phase0 matrix has duplicate/invalid JSON keys' }
         $phase0Document = $phase0Raw | ConvertFrom-D32Json
         $phase0Fields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
-        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or $phase0Document.schema_version -ne 1 -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V1' -or $phase0Document.candidate_sha -cne $candidate -or $phase0Document.final_candidate_sha -cne $candidate -or $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'referenced Phase0 matrix has unsupported schema, candidate, status, clean state, or bundle-hash status' }
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or $phase0Document.schema_version -ne 2 -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V2' -or $phase0Document.candidate_sha -cne $candidate -or $phase0Document.final_candidate_sha -cne $candidate -or $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'referenced Phase0 matrix has unsupported schema, candidate, status, clean state, or bundle-hash status' }
         if (-not (Test-D32ProfilePathEqual -Left $phase0Document.source_repo -Right $Repository) -or -not (Test-D32ProfilePathEqual -Left $phase0Document.output_root -Right $phase0OutputRoot)) { throw "referenced Phase0 source/output roots do not match current candidate and record path (source=$($phase0Document.source_repo); repository=$Repository; output=$($phase0Document.output_root); record_parent=$phase0OutputRoot)" }
-        if (-not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 1 -or
-            -not (Test-D32Phase0ExactProperties -Object $phase0Document.toolchain_profile -Expected @('path', 'sha256', 'file_identity', 'target_triple', 'toolchain', 'executable_inventory', 'lock_inputs', 'env_policy')) -or
+        if (-not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 2 -or
+            -not (Test-D32Phase0ExactProperties -Object $phase0Document.toolchain_profile -Expected @('path', 'sha256', 'file_identity', 'target_triple', 'toolchain', 'executable_inventory', 'script_inventory', 'windows_image_inventory', 'lock_inputs', 'env_policy')) -or
             -not (Test-D32Phase0ExactProperties -Object $phase0Document.toolchain_profile.file_identity -Expected @('bytes', 'volume_serial_hex', 'file_id_hex')) -or
             -not (Test-D32Phase0Integer -Value $phase0Document.toolchain_profile.file_identity.bytes -Positive) -or
             -not (Test-D32ProfilePathEqual -Left $phase0Document.toolchain_profile.path -Right $toolchainProfileReference.path) -or $phase0Document.toolchain_profile.sha256 -cne $toolchainProfileReference.sha256 -or
             $phase0Document.toolchain_profile.file_identity.bytes -ne $toolchainProfileReference.bytes -or $phase0Document.toolchain_profile.file_identity.volume_serial_hex -cne $toolchainProfileReference.volume_serial_hex -or $phase0Document.toolchain_profile.file_identity.file_id_hex -cne $toolchainProfileReference.file_id_hex) { throw 'Phase0 matrix does not bind the attested caller-pinned toolchain profile reference' }
+        $releaseToolchainProfile = Test-D32BuildToolchainProfile -ProfilePath ([string]$toolchainProfileReference.path) -ExpectedSha256 ([string]$toolchainProfileReference.sha256) -Repository $Repository
+        if (-not $releaseToolchainProfile.IsValid) { throw "caller-pinned v2 toolchain profile is not current: $($releaseToolchainProfile.Failure)" }
+        $expectedScripts = @($releaseToolchainProfile.ScriptInventory | ForEach-Object { [ordered]@{ path = $_.Path; sha256 = $_.Sha256; bytes = [Int64]$_.Bytes; volume_serial_hex = $_.VolumeSerialHex; file_id_hex = $_.FileIdHex } })
+        $expectedWindowsImages = @($releaseToolchainProfile.WindowsImageInventory | ForEach-Object { [ordered]@{ path = $_.Path; sha256 = $_.Sha256; bytes = [Int64]$_.Bytes; volume_serial_hex = $_.VolumeSerialHex; file_id_hex = $_.FileIdHex } })
+        if ((ConvertTo-Json -InputObject $phase0Document.toolchain_profile.script_inventory -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $expectedScripts -Depth 12 -Compress) -or
+            (ConvertTo-Json -InputObject $phase0Document.toolchain_profile.windows_image_inventory -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $expectedWindowsImages -Depth 12 -Compress)) { throw 'Phase0 matrix dormant-script/Windows-child inventory differs from the independently revalidated profile' }
         if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.cargo_home -Expected @('path', 'temp_root', 'run_id', 'nonempty_after_fetch')) -or $phase0Document.cargo_home.nonempty_after_fetch -isnot [bool] -or -not $phase0Document.cargo_home.nonempty_after_fetch -or
             -not (Test-D32Phase0ExactProperties -Object $cargoHomeEvidence -Expected @('path', 'temp_root', 'run_id')) -or $cargoHomeEvidence.path -isnot [string] -or $cargoHomeEvidence.temp_root -isnot [string] -or $cargoHomeEvidence.run_id -isnot [string] -or
             -not (Test-D32ProfileCanonicalPathString -Path $cargoHomeEvidence.path) -or -not (Test-D32ProfileCanonicalPathString -Path $cargoHomeEvidence.temp_root) -or
@@ -2507,9 +2514,39 @@ function Test-D32ReleaseEvidenceBundle {
             }
             if (-not $rootValid) { Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.process" -Message 'direct Cargo root-process path/hash/bytes/native ID/argv/parent identity does not match caller-pinned release evidence' }
 
+            $descendants = Get-D32JsonProperty -Object $commandRecord -Name 'descendant_processes'
+            try {
+                if ($null -eq $releaseToolchainProfile -or -not $releaseToolchainProfile.IsValid) { throw 'caller-pinned v2 profile was not validated for the release process trace' }
+                $null = Test-D32Phase0DebugProcessTrace -Trace (Get-D32JsonProperty -Object $commandRecord -Name 'process_trace') -ExpectedRootPath $cargoPath -ExpectedRootIdentity $releaseToolchainProfile.Profile.toolchain.cargo -ExpectedParentProcessId ([int]$attestationRunnerPidValue) -ValidatedProfile $releaseToolchainProfile -Repository $Repository
+                $trace = Get-D32JsonProperty -Object $commandRecord -Name 'process_trace'
+                $traceRoot = @($trace.processes | Where-Object { $_.create_sequence -eq 1 })
+                $rootFileTime = [DateTime]::Parse([string]$rootProcess.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
+                if ($traceRoot.Count -ne 1 -or $traceRoot[0].process_id -ne $rootProcess.process_id -or $traceRoot[0].creation_filetime -ne $rootFileTime -or
+                    $traceRoot[0].parent_process_id -ne $rootProcess.parent_process_id -or $traceRoot[0].exit_code -ne $exitValue -or
+                    -not (Test-D32ProfilePathEqual -Left $traceRoot[0].image_path -Right $rootProcess.image_path) -or
+                    $traceRoot[0].sha256 -cne $rootProcess.sha256 -or $traceRoot[0].bytes -ne $rootProcess.bytes -or
+                    $traceRoot[0].volume_serial_hex -cne $rootProcess.volume_serial_hex -or $traceRoot[0].file_id_hex -cne $rootProcess.file_id_hex) { throw 'release root process projection/exit differs from synchronized CREATE/EXIT evidence' }
+                $traceChildren = @($trace.processes | Where-Object { $_.create_sequence -ne 1 })
+                if ($descendants -isnot [Array] -or $descendants.Count -ne $traceChildren.Count) { throw 'legacy release descendant projection count differs from synchronized trace' }
+                foreach ($traceChild in $traceChildren) {
+                    $traceChildFileTime = [Int64]$traceChild.creation_filetime
+                    $legacyChild = @($descendants | Where-Object {
+                        $_.process_id -eq $traceChild.process_id -and
+                        [DateTime]::Parse([string]$_.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc() -eq $traceChildFileTime
+                    })
+                    if ($legacyChild.Count -ne 1 -or
+                        -not (Test-D32ProfilePathEqual -Left $legacyChild[0].image_path -Right $traceChild.image_path) -or
+                        $legacyChild[0].parent_process_id -ne $traceChild.parent_process_id -or
+                        $legacyChild[0].sha256 -cne $traceChild.sha256 -or $legacyChild[0].bytes -ne $traceChild.bytes -or
+                        $legacyChild[0].volume_serial_hex -cne $traceChild.volume_serial_hex -or $legacyChild[0].file_id_hex -cne $traceChild.file_id_hex -or
+                        $legacyChild[0].allowed_image_reason -cne $traceChild.allowed_image_reason) { throw 'legacy release descendant projection differs from synchronized CREATE evidence' }
+                }
+            }
+            catch { Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.process-trace" -Message $_.Exception.Message }
+
             $cleanup = Get-D32JsonProperty -Object $commandRecord -Name 'process_tree_cleanup'
             if (-not (Test-D32Phase0ExactProperties -Object $cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'cleanup_succeeded', 'detail')) -or
-                $cleanup.launch_mode -cne 'CreateProcessW(CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread' -or
+                $cleanup.launch_mode -cne 'CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread' -or
                 $cleanup.job_close_succeeded -isnot [bool] -or -not $cleanup.job_close_succeeded -or $cleanup.process_wait_signaled -isnot [bool] -or -not $cleanup.process_wait_signaled -or
                 $cleanup.active_process_count_verified -isnot [bool] -or -not $cleanup.active_process_count_verified -or -not (Test-D32Phase0Integer -Value $cleanup.active_process_count) -or $cleanup.active_process_count -ne 0 -or
                 $cleanup.cleanup_succeeded -isnot [bool] -or -not $cleanup.cleanup_succeeded -or $cleanup.detail -isnot [string]) {
@@ -2520,8 +2557,10 @@ function Test-D32ReleaseEvidenceBundle {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.descendants" -Message "descendant_processes must be an array of observed child process identities (actual_type=$(if($null -eq $descendants){'null'}else{$descendants.GetType().FullName}))"
             }
             else {
-                $seenPids = [System.Collections.Generic.HashSet[int]]::new()
-                if ($rootProcess -and (Test-D32Phase0Integer -Value $rootProcess.process_id -Positive)) { [void]$seenPids.Add([int]$rootProcess.process_id) }
+                $seenProcessIdentities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                if ($rootProcess -and (Test-D32Phase0Integer -Value $rootProcess.process_id -Positive) -and $rootProcess.creation_date -is [string]) {
+                    try { [void]$seenProcessIdentities.Add("$($rootProcess.process_id)|$([DateTime]::Parse([string]$rootProcess.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc())") } catch { }
+                }
                 foreach ($child in $descendants) {
                     $childFields = @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'identity_verified')
                     $childValid = Test-D32Phase0ExactProperties -Object $child -Expected $childFields
@@ -2530,11 +2569,13 @@ function Test-D32ReleaseEvidenceBundle {
                         if (-not (Test-D32Phase0Integer -Value $child.process_id -Positive) -or -not (Test-D32Phase0Integer -Value $child.parent_process_id -Positive) -or -not (Test-D32Phase0Integer -Value $child.bytes -Positive) -or $child.identity_verified -isnot [bool] -or -not $child.identity_verified) { $childValid = $false }
                         if ($child.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $child.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or $child.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { $childValid = $false }
                     }
-                    if (-not $childValid -or -not $seenPids.Add([int]$child.process_id)) { Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.descendants" -Message 'release descendant identity is malformed or duplicated'; continue }
+                    $childIdentityKey = $null
+                    if ($childValid) { try { $childIdentityKey = "$($child.process_id)|$([DateTime]::Parse([string]$child.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc())" } catch { $childValid = $false } }
+                    if (-not $childValid -or -not $seenProcessIdentities.Add([string]$childIdentityKey)) { Add-D32Finding -Findings $Findings -Severity ERROR -Check "attestation.command.$i.descendants" -Message 'release descendant non-recycled identity is malformed or duplicated'; continue }
                     try {
                         $childImage = Get-D32ProfileFileSnapshot -Path $child.image_path
                         if ($childImage.Sha256 -cne $child.sha256 -or $childImage.Bytes -ne [Int64]$child.bytes -or $childImage.VolumeSerialHex -cne $child.volume_serial_hex -or $childImage.FileIdHex -cne $child.file_id_hex) { throw 'current child image identity mismatch' }
-                        $phase0ToolInventory = @($phase0Document.toolchain_profile.executable_inventory | ForEach-Object { [PSCustomObject]@{ Path = $_.path; Sha256 = $_.sha256; Bytes = $_.bytes; VolumeSerialHex = $_.volume_serial_hex; FileIdHex = $_.file_id_hex } })
+                        $phase0ToolInventory = @($phase0Document.toolchain_profile.executable_inventory + $phase0Document.toolchain_profile.windows_image_inventory | ForEach-Object { [PSCustomObject]@{ Path = $_.path; Sha256 = $_.sha256; Bytes = $_.bytes; VolumeSerialHex = $_.volume_serial_hex; FileIdHex = $_.file_id_hex } })
                         $pinnedChild = @($phase0ToolInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $child.image_path })
                         if ($pinnedChild.Count -eq 0 -and -not ((Test-D32ProfilePathWithin -Child $child.image_path -Parent (Join-Path $Repository 'vita-agent\target\release')) -or (Test-D32ProfilePathWithin -Child $child.image_path -Parent (Join-Path $Repository 'src-tauri\target\release')))) { throw 'child image is not pinned or under a fixed candidate release target' }
                         if ($pinnedChild.Count -gt 1) { throw 'child image occurs multiple times in pinned executable inventory' }
@@ -3531,6 +3572,7 @@ function Invoke-D32GenerateBundle {
                 process_id = [int]$result.root_process.process_id
                 root_process = $result.root_process
                 descendant_processes = @($result.descendant_processes)
+                process_trace = $result.process_trace
                 process_tree_cleanup = $result.process_tree_cleanup
                 stdout = $result.stdout
                 stderr = $result.stderr
@@ -3613,7 +3655,7 @@ function Invoke-D32GenerateBundle {
         $bundleManifestPath = Join-Path $bundleDirectory $script:D32BundleManifestName
         $attestationDocument = [ordered]@{
             schema_version = $script:D32AttestationSchemaVersion
-            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION'
+            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V3'
             runner_process_id = [int]$PID
             candidate_sha = $ExpectedCandidateSha
             source_clone = $repoCanonical
@@ -3822,6 +3864,16 @@ function Invoke-D32SelfTest {
         foreach ($profileCase in $profileSelfTestCases) {
             if (-not $profileCase.Passed -and -not [String]::IsNullOrWhiteSpace([string]$profileCase.Detail)) { Write-Host "SELFTEST DETAIL: $($profileCase.Name): $($profileCase.Detail)" }
             Assert-D32SelfTest -Condition ([bool]$profileCase.Passed) -Name "build toolchain profile: $($profileCase.Name)" -Failures $failures
+        }
+        $candidateRepository = Split-Path -Parent $PSScriptRoot
+        foreach ($lockInput in @(Get-D32BuildToolchainLockInputs -Repository $candidateRepository)) {
+            foreach ($relativePath in @($lockInput.ManifestPath, $lockInput.LockPath)) {
+                $sourcePath = Join-Path $candidateRepository $relativePath
+                $fixturePath = Join-Path $fixture $relativePath
+                if (Test-Path -LiteralPath $fixturePath) { throw "self-test fixture unexpectedly already contains profile-bound Cargo input: $relativePath" }
+                [void][IO.Directory]::CreateDirectory((Split-Path -Parent $fixturePath))
+                [IO.File]::WriteAllBytes($fixturePath, [IO.File]::ReadAllBytes($sourcePath))
+            }
         }
         [void](New-Item -ItemType Directory -Path $bundleRoot -Force)
         [void](New-Item -ItemType Directory -Path $buildRoot -Force)
@@ -4079,14 +4131,32 @@ function Invoke-D32SelfTest {
                         file_id_hex = $_.FileIdHex
                     }
                 })
+            script_inventory = @($profileValidation.ScriptInventory | ForEach-Object {
+                    [ordered]@{
+                        path = $_.Path
+                        sha256 = $_.Sha256
+                        bytes = [Int64]$_.Bytes
+                        volume_serial_hex = $_.VolumeSerialHex
+                        file_id_hex = $_.FileIdHex
+                    }
+                })
+            windows_image_inventory = @($profileValidation.WindowsImageInventory | ForEach-Object {
+                    [ordered]@{
+                        path = $_.Path
+                        sha256 = $_.Sha256
+                        bytes = [Int64]$_.Bytes
+                        volume_serial_hex = $_.VolumeSerialHex
+                        file_id_hex = $_.FileIdHex
+                    }
+                })
             lock_inputs = @($profileValidation.LockInputs | ForEach-Object { [ordered]@{ manifest_path = $_.ManifestPath; lock_sha256 = $_.LockSha256 } })
             env_policy = $profileValidation.Profile.env_policy
         }
         $phase0RecordPath = Join-Path $phase0Root 'D32-PHASE0-MATRIX.json'
         $phase0Started = [DateTimeOffset]::UtcNow.ToString('o')
         $phase0Document = [ordered]@{
-            schema_version = 1
-            record_type = 'D32_PHASE0_MATRIX_RECORD_V1'
+            schema_version = 2
+            record_type = 'D32_PHASE0_MATRIX_RECORD_V2'
             runner_process_id = [int]$PID
             candidate_sha = $head
             source_repo = [IO.Path]::GetFullPath($fixture)
@@ -4137,6 +4207,9 @@ function Invoke-D32SelfTest {
         foreach ($fixedCommand in $script:D32ReleaseBuildCommands) {
             $selftestCommandIndex++
             $commandTime = [DateTimeOffset]::UtcNow.ToString('o')
+            $selftestRootPid = 1000 + $selftestCommandIndex
+            $selftestProcessTrace = New-D32Phase0SelfTestDebugTrace -Profile $profileValidation -RunnerProcessId $PID -RootProcessId $selftestRootPid
+            $selftestTraceRoot = $selftestProcessTrace.processes[0]
             $selftestCargoPath = [IO.Path]::GetFullPath($fakeCargo)
             $expectedArgv = @($selftestCargoPath) + @($fixedCommand.arguments)
             $stdoutPath = Join-Path $releaseLogRoot ("release-{0:D2}-{1}.stdout.log" -f $selftestCommandIndex, $fixedCommand.name)
@@ -4144,13 +4217,13 @@ function Invoke-D32SelfTest {
             [System.IO.File]::WriteAllText($stdoutPath, "D32 selftest simulated command $($fixedCommand.name)`n")
             [System.IO.File]::WriteAllText($stderrPath, '')
             $processIdentity = [ordered]@{
-                process_id = 1000 + $selftestCommandIndex
+                process_id = $selftestRootPid
                 parent_process_id = [int]$PID
                 name = 'cargo.exe'
                 image_path = $selftestCargoPath
                 command_line = ConvertTo-D32Phase0CommandLine -Arguments $expectedArgv
-                creation_date = $commandTime
-                observed_at_utc = $commandTime
+                creation_date = [DateTime]::FromFileTimeUtc([Int64]$selftestTraceRoot.creation_filetime).ToString('o')
+                observed_at_utc = [string]$selftestTraceRoot.created_at_utc
                 sha256 = $fakeCargoDigest.Hash
                 bytes = [Int64]$fakeCargoDigest.Length
                 volume_serial_hex = $fakeCargoDigest.Identity.VolumeSerialHex
@@ -4168,11 +4241,12 @@ function Invoke-D32SelfTest {
                 started_at_utc = $commandTime
                 completed_at_utc = $commandTime
                 exit_code = 0
-                process_id = 1000 + $selftestCommandIndex
+                process_id = $selftestRootPid
                 root_process = $processIdentity
                 descendant_processes = [object[]]::new(0)
+                process_trace = $selftestProcessTrace
                 process_tree_cleanup = [ordered]@{
-                    launch_mode = 'CreateProcessW(CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread'
+                    launch_mode = 'CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED|EXTENDED_STARTUP_INFO)+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)+ResumeThread'
                     job_close_succeeded = $true
                     process_wait_signaled = $true
                     active_process_count_verified = $true
@@ -4188,7 +4262,7 @@ function Invoke-D32SelfTest {
         }
         $attestationDocument = [ordered]@{
             schema_version = $script:D32AttestationSchemaVersion
-            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION'
+            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V3'
             candidate_sha = $head
             source_clone = Get-D32CanonicalPath -Path $fixture
             git_status = 'clean'
@@ -4277,6 +4351,15 @@ function Invoke-D32SelfTest {
             foreach ($finding in $aggregateRecordFindings) { Write-Host ("  AGGREGATE RECORD SELFTEST [{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message) }
         }
         Assert-D32SelfTest -Condition ($aggregateRecordValidation.IsValid -and @($aggregateRecordFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'PASS' }).Count -eq 1) -Name 'exact-SHA aggregate record schema binds current sources and explicitly defers downstream gates' -Failures $failures
+        $legacyAggregateRecord = [System.IO.File]::ReadAllText($aggregateRecordPath) | ConvertFrom-D32Json
+        $legacyAggregateRecord.schema_version = 1
+        $legacyAggregateRecord.record_type = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V1'
+        Write-D32Json -Path $aggregateRecordPath -Value $legacyAggregateRecord
+        $legacyAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $legacyAggregateFindings = New-D32FindingList
+        $legacyAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $legacyAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $legacyAggregateFindings
+        Assert-D32SelfTest -Condition (-not $legacyAggregateValidation.IsValid -and @($legacyAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects legacy V1 after the synchronized process-trace schema upgrade' -Failures $failures
+        Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
         $invalidAggregateRecord = [System.IO.File]::ReadAllText($aggregateRecordPath) | ConvertFrom-D32Json
         $invalidAggregateRecord.status = 'ARTIFACT_ONLY'
         Write-D32Json -Path $aggregateRecordPath -Value $invalidAggregateRecord
@@ -4301,6 +4384,41 @@ function Invoke-D32SelfTest {
         $validBundleJson = [System.IO.File]::ReadAllText($bundleManifest)
         $validAttestationObject = ([System.IO.File]::ReadAllText($attestationPath) | ConvertFrom-D32Json)
         $attestationSha = (Get-D32EvidenceFileDigest -Path $attestationPath).Hash
+
+        $legacyAttestationObject = ([System.IO.File]::ReadAllText($attestationPath) | ConvertFrom-D32Json)
+        $legacyAttestationObject.schema_version = 2
+        $legacyAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V2'
+        $legacyAttestationFindings = Get-D32ReleaseBundleSelfTestFindings -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleManifest $bundleManifest -Attestation $legacyAttestationObject -AttestationPath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture
+        Assert-D32SelfTest -Condition (@($legacyAttestationFindings | Where-Object { $_.Check -eq 'attestation.schema' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'release attestation rejects legacy V2 without synchronized process traces' -Failures $failures
+
+        $phase0OriginalRaw = [System.IO.File]::ReadAllText($phase0RecordPath)
+        $attestationOriginalRaw = [System.IO.File]::ReadAllText($attestationPath)
+        $bundleOriginalRaw = [System.IO.File]::ReadAllText($bundleManifest)
+        try {
+            $legacyPhase0 = $phase0OriginalRaw | ConvertFrom-D32Json
+            $legacyPhase0.schema_version = 1
+            $legacyPhase0.record_type = 'D32_PHASE0_MATRIX_RECORD_V1'
+            Write-D32Json -Path $phase0RecordPath -Value $legacyPhase0
+            $legacyPhase0Snapshot = Get-D32ProfileFileSnapshot -Path $phase0RecordPath
+            $legacyPhase0Attestation = $attestationOriginalRaw | ConvertFrom-D32Json
+            $legacyPhase0Attestation.phase0_matrix.sha256 = $legacyPhase0Snapshot.Sha256
+            $legacyPhase0Attestation.phase0_matrix.bytes = [Int64]$legacyPhase0Snapshot.Bytes
+            $legacyPhase0Attestation.phase0_matrix.volume_serial_hex = [string]$legacyPhase0Snapshot.VolumeSerialHex
+            $legacyPhase0Attestation.phase0_matrix.file_id_hex = [string]$legacyPhase0Snapshot.FileIdHex
+            Write-D32Json -Path $attestationPath -Value $legacyPhase0Attestation
+            $legacyAttestationSnapshot = Get-D32EvidenceFileDigest -Path $attestationPath
+            $legacyBundle = $bundleOriginalRaw | ConvertFrom-D32Json
+            $legacyBundle.attestation_sha256 = $legacyAttestationSnapshot.Hash
+            Write-D32Json -Path $bundleManifest -Value $legacyBundle
+            $legacyPhase0Findings = New-D32FindingList
+            Test-D32ReleaseEvidenceBundle -Bundle $legacyBundle -BundleFilePath $bundleManifest -Attestation $legacyPhase0Attestation -AttestationFilePath $attestationPath -AttestationSha256 $legacyAttestationSnapshot.Hash -Head $head -Repository $fixture -ExpectedPhase0RecordPath $legacyPhase0Snapshot.Path -ExpectedPhase0RecordSha256 $legacyPhase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $legacyPhase0Findings
+            Assert-D32SelfTest -Condition (@($legacyPhase0Findings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*unsupported schema*' }).Count -gt 0) -Name 'Phase0 matrix rejects legacy V1 even when its current bytes are re-pinned' -Failures $failures
+        }
+        finally {
+            [System.IO.File]::WriteAllText($phase0RecordPath, $phase0OriginalRaw, [Text.UTF8Encoding]::new($false))
+            [System.IO.File]::WriteAllText($attestationPath, $attestationOriginalRaw, [Text.UTF8Encoding]::new($false))
+            [System.IO.File]::WriteAllText($bundleManifest, $bundleOriginalRaw, [Text.UTF8Encoding]::new($false))
+        }
 
         $pinnedBundleFindings = New-D32FindingList
         Test-D32ReleaseEvidenceBundle -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleFilePath $bundleManifest -Attestation $validAttestationObject -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $pinnedBundleFindings

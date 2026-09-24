@@ -16,7 +16,8 @@
 | ADR-D32-FIXTURE-TRUST-D31-SEEDER | APPROVED | D32 fixture Git trust 与 D31 recovery seeder evidence | GPT-6 Sol | D32 fixture tooling 与 D31 test-helper evidence only |
 | ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP | APPROVED WITH CONDITIONS | D32-A release evidence bundle 两阶段 bootstrap | GPT-6 Sol | D32-A bundle bootstrap ordering only |
 | ADR-D32-PHASE0-TOOLCHAIN-PROFILE | APPROVED WITH CONDITIONS | D32 Phase 0 本地矩阵与 caller-pinned build toolchain | GPT-6 Sol | D32 Phase 0 与紧邻 bundle evidence build only |
-| ADR-D32-PROCESS-EVENT-TRACE-V1 | APPROVED WITH CONDITIONS | D32 Phase 0/release evidence command-processor denial and complete process trace | GPT-6 Sol Max | D32 Phase 0、release evidence build 与相应 provenance only |
+| ADR-D32-PROCESS-EVENT-TRACE-V1 | SUPERSEDED | D32 Phase 0/release evidence command-processor denial and complete process trace (historical trace-source conditions) | GPT-6 Sol Max | Historical; superseded for implementation by V2 |
+| ADR-D32-PROCESS-EVENT-TRACE-V2 | APPROVED | Synchronous Win32 debug events plus independent Job accounting | GPT-6 Sol Max | D32 Phase 0、release evidence build 与相应 provenance only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -261,7 +262,7 @@ The bootstrap exception requires a trustworthy Phase 0 matrix before the two rel
 
 ### ADR-D32-PROCESS-EVENT-TRACE-V1 — D32 Phase0/Release Evidence Batch Execution Boundary
 
-- **Status:** APPROVED WITH CONDITIONS
+- **Status:** SUPERSEDED
 - **Decision authority:** GPT-6 Sol Max
 - **Decision date:** 2026-09-24
 - **Related milestone:** D32-A final-gate evidence
@@ -309,6 +310,76 @@ The installed Rust toolchain and the only complete Windows SDK x64 tool director
 #### Supersedes / Superseded by
 
 - Clarifies the dormant-script and process-launch meaning of ADR-D32-PHASE0-TOOLCHAIN-PROFILE. It adds a required process-event evidence boundary; it does not authorize any batch/command-processor launch or alter downstream D32 gates.
+- The trace-source condition in this historical V1 decision is superseded by ADR-D32-PROCESS-EVENT-TRACE-V2. Its dormant-script identity rule, launch denials, negative evidence, no-policy-change rule, and downstream-gate limits remain in force.
+
+### ADR-D32-PROCESS-EVENT-TRACE-V2 — Synchronous Win32 Debug Events and Independent Job Accounting
+
+- **Status:** APPROVED
+- **Decision authority:** GPT-6 Sol Max
+- **Decision date:** 2026-09-24
+- **Related milestone:** D32-A final-gate evidence
+- **Related decisions:** ADR-D32-PHASE0-TOOLCHAIN-PROFILE, ADR-D32-EVIDENCE-BUNDLE-V1, ADR-D32-PROCESS-EVENT-TRACE-V1
+
+#### Context
+
+The approved V1 boundary correctly prohibited command-processor execution, polling fallback, host-policy changes, and copied tool images, but its requirement for a loss-counter-bearing OS event source was stricter than necessary. A bounded same-user Windows prototype established that `CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)`, synchronous `WaitForDebugEvent` processing, and a non-breakaway Job can gate the initial image before user code and independently reconcile process events against Job accounting without ETW or elevation.
+
+The 2026-09-24 feasibility prototype was run as the ordinary user on candidate `24f93c6b776988cb935aedb6527834fa943fed1f`. Fast `cmd.exe`, PATH-resolved `.cmd`, absolute `.cmd`, an unpinned PowerShell helper, executable-byte mutation, and injected debug-chain interruption were all blocked; marker files remained absent. A pinned offline Cargo check completed with 7 CREATE / 7 EXIT events and Job total/active counts 7/0. Synthetic ledger negatives rejected overlapping PID reuse, missing exit, mismatched exit identity, ambiguous parent, and dropped-exit accounting. The dormant `.cmd` was allowed as inventory-only, while its byte mutation changed its SHA. This is feasibility evidence only, not Phase 0, release-build, canary, or gate evidence.
+
+#### Decision
+
+1. **Use synchronous Win32 debug events for each fixed Cargo root.** The existing fixed Cargo executable and argv remain caller-pinned. Start it with `CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)` inside a Job configured with `KILL_ON_JOB_CLOSE` and without breakaway allowance. The runner must retain process handles so the PID/creation identity cannot be recycled while its events are reconciled.
+2. **Verify before continuation.** For every `CREATE_PROCESS_DEBUG_EVENT`, require a valid image file handle; obtain the canonical final image path, volume/file ID, bytes, and SHA-256 from the opened image handle; bind exact parent PID and retained parent creation identity; and validate the approved root/toolchain/Windows image or candidate-owned target-image classification before `ContinueDebugEvent`. Any null/invalid image handle, path/identity mismatch, unknown parent, duplicate/overlapping identity, or unapproved image blocks and terminates the owned Job before the event is continued. Reconcile every process EXIT event with the retained live identity.
+3. **Close with independent Job accounting.** Evidence is acceptable only when the synchronous debug chain closes without API errors/interruption, every CREATE has exactly one matching EXIT, all image identities are approved, `Job.TotalProcesses` equals unique CREATE count, and `Job.ActiveProcesses` is verified as zero. Win32 debug events have no ETW-style loss counter; exact event/identity accounting plus the independent Job counters are the required completeness proof. There is no CIM polling or other fallback.
+4. **Fail closed on uncertainty or prohibited launch.** Unknown/ambiguous parentage, PID reuse ambiguity, missing/duplicate event, missing EXIT, mismatched process handle/event identity, null `hFile`, debug-chain interruption, Job escape/count mismatch, unknown image, or launch of `cmd.exe`, another command processor, `.bat`/`.cmd`, shells, Git/SSH/credential helpers, or other unapproved executable means BLOCKED. No command processor or script is granted launch authority.
+5. **Dormant script policy is unchanged.** Canonical path, bytes, SHA-256, opened-handle volume serial/file ID are pinned for resident `.bat`/`.cmd` entries and revalidated. Their presence grants no invocation permission. Pinned direct Rust/MSVC/SDK directories remain allowed; tool images are not copied or mirrored.
+6. **Keep the trust boundary and downstream requirements unchanged.** This decision changes only the D32 Phase 0/release-evidence harness. It does not change production Host sandbox authority, frozen product/protocol/authority semantics, source/build-input trust premise, OS policy/ACL/privileges, fixed Cargo argv, manifest v3, shipping resources, required D32 gates, or formal independent gate.
+7. **Use strict schema migration and create-new profile generation.** Bump and reject previous/unknown versions for affected records: profile V2, fixture build provenance V2, Phase0 record V2, release build attestation V3, post-bundle aggregate record V2, and synchronized debug/Job process trace V2. Fixture manifest v3 remains unchanged. The profile candidate generator may write only a new external file, refuses overwrite, copies no images, and emits no use authorization; the Coordinator independently reviews and pins its exact SHA-256.
+
+#### Frozen invariants
+
+1. `WaitForDebugEvent` synchronous event handling plus exact process identities and independent Job accounting is the only accepted D32 Phase 0/release process-trace source under this decision; incomplete evidence is BLOCKED.
+2. Image validation precedes `ContinueDebugEvent`; handles stay retained through EXIT; all launched process images and parent identities must reconcile exactly.
+3. No process-launch permission is granted to dormant scripts or command processors, and production Host authority is unchanged.
+
+#### Allowed implementation space
+
+- Implement the synchronized trace and Job accounting in D32 PowerShell/native launcher tooling, with exact versioned records and validator coverage.
+- Add an external create-new profile-candidate generator and identity-revalidation logic for resident dormant scripts and Windows child images.
+- Run bounded ordinary-user feasibility checks and D32-specific negative tests without changing host policy or installation files.
+
+#### Forbidden implementation
+
+- No ETW/CIM fallback, best-effort event-loss tolerance, or reporting a missing/incomplete event source as PASS.
+- No OS audit policy, ACL, privilege, group, security-policy, or machine configuration changes.
+- No copied/mirrored Rust, MSVC, SDK, or Windows executable images; no `.bat`/`.cmd`, command processor, shell, Git/SSH/credential helper launch permission.
+- No production Host sandbox authority change, no fixed argv change, and no claim that focused tests equal Phase 0, release, canary, or stage PASS.
+
+#### Required tests and evidence
+
+- Negative evidence must cover fast-exit command processors, PATH and absolute `.cmd`, unknown child/helper, PID reuse and ambiguous ancestry, missing CREATE/EXIT and debug-chain interruption, Job accounting mismatch, dormant-script acceptance plus script/image mutation, and normal pinned Cargo/toolchain/build/test descendants.
+- Exact profile, fixture provenance, Phase0, release attestation, and aggregate schema tests must reject each previous version and unknown fields/types. Evidence must bind exact candidate SHA and the Coordinator-pinned profile SHA.
+- Phase 0 must cover all three locked fetches, all five fixture phases, required Phase0 suites/focused tests, and both fixed release builds; it remains blocked if any event/accounting/image/parent check is missing.
+
+#### Required real canary
+
+- This decision closes no D32 real Host canary or downstream gate. All previously required ordered real Host modes, negative evidence, independent Luna High review, and stage closure remain outstanding until separately evidenced.
+
+#### Required negative evidence
+
+- Null/unknown image handle, image path/hash/file-ID tamper, unknown helper, root parent PID mismatch, unknown or ambiguous parent, overlapping PID reuse, missing/mismatched EXIT, event-chain interruption, Job escape/account mismatch, forbidden command-processor/script/Git/SSH/credential-helper launch, and stale dormant script identity must block.
+
+#### Compatibility constraints
+
+- Keep the root governance protocol v1.1 role boundaries, exact-SHA gate binding, single Build Owner, no-worktree rule, no-push default, no-`cargo clean`, and Coordinator-owned profile pin. Preserve the historical V1 ADR and other approved D32 ADRs; this V2 supersedes only the V1 trace-source condition.
+
+#### Escalation triggers
+
+- If current-user debug-event delivery, pre-continuation image-handle verification, or independent Job accounting cannot be established, stop Phase 0/release evidence as BLOCKED_ARCHITECTURE; do not weaken this decision or change OS policy.
+
+#### Supersedes / Superseded by
+
+- Supersedes only V1's loss-counter-bearing trace-source requirement. All V1 launch-denial, dormant-script, no-policy-change, no-image-copy, and no-downstream-gate relaxations remain operative unless explicitly changed by a later architecture decision.
 
 ---
 

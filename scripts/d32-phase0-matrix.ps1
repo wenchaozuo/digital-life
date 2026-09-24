@@ -14,7 +14,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
+if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'PHASE0_LOCATION_BLOCKED: the Phase0 runner must be loaded from its exact script file' }
+$script:D32Phase0ScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
+$script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
+. (Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1')
 
 $script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V2'
 $script:D32Phase0SchemaVersion = 2
@@ -64,6 +67,15 @@ $script:D32Phase0FocusedHost = @(
     'vita_sidecar::tests::d32_cancel_worker_hang_is_bounded_without_detach_and_can_cleanup',
     'vita_sidecar::tests::d32_a_same_valid_host_grant_replay_is_denied',
     'vita_sidecar::tests::d32_cargo_binding_requires_the_fixed_non_git_marker'
+)
+$script:D32Phase0PreflightDependencyFunctionNames = @(
+    'Get-D32Head',
+    'New-D32FindingList',
+    'Test-D32FixtureManifest',
+    'Test-D32GitClean',
+    'Test-D32Governance',
+    'Test-D32Sha40',
+    'Test-D32TrustedGitImage'
 )
 
 function ConvertTo-D32Phase0WindowsArgument {
@@ -1412,7 +1424,7 @@ function Invoke-D32Phase0Matrix {
 
     $started = [DateTimeOffset]::UtcNow
     $phaseCommands = [System.Collections.Generic.List[object]]::new()
-    $fixtureScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
+    $fixtureScript = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'))
     $fixtureManifestPath = Join-Path $output 'fixture-manifest.json'
     $fixtureTranscriptPath = Join-Path $output 'phase0-fixture-in-process.log'
     $fixtureArguments = @{
@@ -1747,6 +1759,16 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $cases = [System.Collections.Generic.List[object]]::new()
     $add = { param([string]$Name, [bool]$Passed, [AllowNull()][string]$Detail = $null) $cases.Add([PSCustomObject]@{ name = $Name; passed = $Passed; detail = $Detail }) }.GetNewClosure()
 
+    $preflightLibraryPath = Join-Path $script:D32Phase0ScriptRoot 'd32-preflight.ps1'
+    $preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
+    & $add 'Phase0 imports the exact preflight helper library in runner scope' ($preflightDependencyFailures.Count -eq 0) ($preflightDependencyFailures -join ', ')
+
+    $governanceFindings = New-D32FindingList
+    Test-D32Governance -Repository (Split-Path -Parent $script:D32Phase0ScriptRoot) -Findings $governanceFindings
+    $governanceErrors = @($governanceFindings | Where-Object { $_.Severity -eq 'ERROR' })
+    $governanceErrorChecks = @($governanceErrors | ForEach-Object { [string]$_.Check })
+    & $add 'direct-runner governance dependency executes read-only and validates the candidate inputs' ($governanceErrors.Count -eq 0) ($governanceErrorChecks -join ', ')
+
     $inventory = New-D32Phase0SelfTestInventory
     try { $null = Test-D32Phase0FixedInventory -Inventories $inventory; & $add 'approved test inventory is accepted exactly' $true }
     catch { & $add 'approved test inventory is accepted exactly' $false }
@@ -1911,8 +1933,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
         [IO.File]::WriteAllText($manifestPath, '{}', [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllBytes($emptyLogPath, [byte[]]@())
         $manifestSnapshot = Get-D32ProfileFileSnapshot -Path $manifestPath
-        $testRepository = Split-Path -Parent $PSScriptRoot
-        $profilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'))
+        $testRepository = Split-Path -Parent $script:D32Phase0ScriptRoot
+        $profilePath = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1'))
         $fakeCargoPath = Join-Path $selfTestRoot 'toolchain/cargo.exe'
         [void][IO.Directory]::CreateDirectory((Split-Path -Parent $fakeCargoPath))
         [IO.File]::WriteAllBytes($fakeCargoPath, [byte[]](1, 3, 3, 7, 9))
@@ -2192,7 +2214,43 @@ function Test-D32Phase0MatrixRecordSelfTest {
     return @($cases.ToArray())
 }
 
+function Get-D32Phase0PreflightDependencyFailures {
+    param([Parameter(Mandatory = $true)][string]$PreflightLibraryPath)
+
+    $expectedPath = [IO.Path]::GetFullPath($PreflightLibraryPath)
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $script:D32Phase0PreflightDependencyFunctionNames) {
+        $command = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $command) {
+            $failures.Add("missing:$name")
+            continue
+        }
+        $sourcePath = [string]$command.ScriptBlock.Ast.Extent.File
+        if ([String]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-D32ProfilePathEqual -Left $sourcePath -Right $expectedPath)) {
+            $failures.Add("wrong-source:$name")
+        }
+    }
+    return @($failures.ToArray())
+}
+
 if ($Phase0LibraryOnly) { return }
+
+try {
+    $preflightLibraryPath = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-preflight.ps1'))
+    if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
+        throw 'PHASE0_DEPENDENCY_BLOCKED: exact d32-preflight.ps1 library path is missing or reparse-backed'
+    }
+    . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+    $preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
+    if ($preflightDependencyFailures.Count -gt 0) {
+        throw "PHASE0_DEPENDENCY_BLOCKED: preflight helper library is incomplete or shadowed ($($preflightDependencyFailures -join ', '))"
+    }
+}
+catch {
+    Write-Output "D32 Phase0: BLOCKED — $($_.Exception.Message)"
+    exit 1
+}
+
 if ($Phase0SelfTest) {
     $cases = @(Test-D32Phase0MatrixRecordSelfTest)
     foreach ($case in $cases) {
@@ -2204,7 +2262,7 @@ if ($Phase0SelfTest) {
     exit 0
 }
 
-if ([String]::IsNullOrWhiteSpace($Phase0RepoRoot)) { $Phase0RepoRoot = Split-Path -Parent $PSScriptRoot }
+if ([String]::IsNullOrWhiteSpace($Phase0RepoRoot)) { $Phase0RepoRoot = Split-Path -Parent $script:D32Phase0ScriptRoot }
 foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256))) {
     if ([String]::IsNullOrWhiteSpace([string]$required[1])) { Write-Output "D32 Phase0: BLOCKED — -$($required[0]) is required"; exit 2 }
 }

@@ -28,6 +28,9 @@ param(
 
     [switch]$LibraryOnly,
 
+    [Parameter(DontShow = $true)]
+    [switch]$Phase0DependencyLibraryOnly,
+
     [string]$EvidenceRoot,
 
     [string]$Phase0RecordPath,
@@ -71,7 +74,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
-. (Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly
+if ($Phase0DependencyLibraryOnly -and -not $LibraryOnly) {
+    throw 'PHASE0_DEPENDENCY_IMPORT_INVALID: dependency-only import requires -LibraryOnly'
+}
+if (-not $Phase0DependencyLibraryOnly) {
+    . (Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly
+}
 
 # This is the exact D32-A Host mode spelling.  Do not add aliases here: the
 # preflight is deliberately the place where mode drift is reported before an

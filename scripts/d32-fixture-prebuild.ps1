@@ -1275,7 +1275,11 @@ function Restore-D32Environment {
 }
 
 function ConvertTo-D32EnvironmentBlock {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment)
+    param([Parameter(Mandatory = $true)][AllowNull()][object]$Environment)
+
+    if ($null -eq $Environment -or $Environment -isnot [System.Collections.IDictionary]) {
+        throw 'CHILD_ENVIRONMENT_INVALID: environment must be an IDictionary; values omitted'
+    }
 
     $names = @($Environment.Keys | ForEach-Object { [string]$_ })
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1306,7 +1310,28 @@ function New-D32ProfileChildEnvironment {
         -CargoHome $CargoHome `
         -TempRoot $TempRoot `
         -Offline $Offline
-    return ConvertTo-D32EnvironmentBlock -Environment $variables
+    if ($variables -isnot [System.Collections.IDictionary]) {
+        throw 'CHILD_ENVIRONMENT_INVALID: profile builder did not return an IDictionary; values omitted'
+    }
+    return ,$variables
+}
+
+function Start-D32FixtureBoundedNativeProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [AllowNull()][string]$EnvironmentBlock,
+        [AllowNull()][string]$NativeTestFailure,
+        [Parameter(Mandatory = $true)][bool]$RequireDebugEvents
+    )
+
+    $fullFilePath = Get-D32FullPath $FilePath
+    $fullWorkingDirectory = Get-D32FullPath $WorkingDirectory
+    if ($RequireDebugEvents) {
+        return [D32FixtureNativeProcessV2]::StartDebug($fullFilePath, $CommandLine, $fullWorkingDirectory, $EnvironmentBlock)
+    }
+    return [D32FixtureNativeProcessV2]::Start($fullFilePath, $CommandLine, $fullWorkingDirectory, $EnvironmentBlock, $NativeTestFailure)
 }
 
 function Invoke-D32LockedCargoFetches {
@@ -4016,13 +4041,16 @@ function Invoke-D32BoundedProcess {
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$PhaseLog,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
-        [AllowNull()][System.Collections.IDictionary]$ChildEnvironment,
+        [AllowNull()][object]$ChildEnvironment,
         [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init', 'api-failure', 'attribute-failure', 'pipe-timeout')]
         [string]$FailureInjection = 'none',
         [switch]$RequireDebugEvents,
         [string[]]$CandidateImageRoots
     )
 
+    if ($null -ne $ChildEnvironment -and $ChildEnvironment -isnot [System.Collections.IDictionary]) {
+        throw 'CHILD_ENVIRONMENT_INVALID: ChildEnvironment must be an IDictionary; values omitted'
+    }
     Ensure-D32NativeLauncher
     $stdoutPath = "$PhaseLog.stdout.log"
     $stderrPath = "$PhaseLog.stderr.log"
@@ -4052,6 +4080,15 @@ function Invoke-D32BoundedProcess {
         process_trace = $null
         native_launch = $null
         native_cleanup = $null
+        launch_request = [ordered]@{
+            executable = [IO.Path]::GetFullPath($FilePath)
+            arguments = @($Arguments)
+            working_directory = [IO.Path]::GetFullPath($WorkingDirectory)
+            phase_log = [IO.Path]::GetFullPath($PhaseLog)
+            timeout_seconds = [int]$TimeoutSeconds
+            child_environment_type = if ($null -eq $ChildEnvironment) { $null } else { $ChildEnvironment.GetType().FullName }
+            require_debug_events = [bool]$RequireDebugEvents
+        }
         started_at_utc = $started.ToString('o')
     }
 
@@ -4064,12 +4101,22 @@ function Invoke-D32BoundedProcess {
         $environmentBlock = if ($null -eq $ChildEnvironment) { $null } else { ConvertTo-D32EnvironmentBlock -Environment $ChildEnvironment }
         if ($RequireDebugEvents) {
             if ($FailureInjection -ne 'none') { throw 'DEBUG_PROCESS_TRACE_BLOCKED: failure injection is not permitted in an operational process trace' }
-            $nativeProcess = [D32FixtureNativeProcessV2]::StartDebug(
-                (Get-D32FullPath $FilePath), $commandLine, (Get-D32FullPath $WorkingDirectory), $environmentBlock)
+            $nativeProcess = Start-D32FixtureBoundedNativeProcess `
+                -FilePath $FilePath `
+                -CommandLine $commandLine `
+                -WorkingDirectory $WorkingDirectory `
+                -EnvironmentBlock $environmentBlock `
+                -NativeTestFailure $nativeTestFailure `
+                -RequireDebugEvents $true
         }
         else {
-            $nativeProcess = [D32FixtureNativeProcessV2]::Start(
-                (Get-D32FullPath $FilePath), $commandLine, (Get-D32FullPath $WorkingDirectory), $environmentBlock, $nativeTestFailure)
+            $nativeProcess = Start-D32FixtureBoundedNativeProcess `
+                -FilePath $FilePath `
+                -CommandLine $commandLine `
+                -WorkingDirectory $WorkingDirectory `
+                -EnvironmentBlock $environmentBlock `
+                -NativeTestFailure $nativeTestFailure `
+                -RequireDebugEvents $false
         }
         $processId = [int]$nativeProcess.ProcessId
         $script:D32LastProcessEvidence.native_launch = [ordered]@{
@@ -4709,6 +4756,232 @@ function Invoke-D32SelfTest {
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
         Write-Host 'D32_FIXTURE_TRUST_CONTRACT=pins:-PinnedGitPath,-PinnedGitSha256,-ExpectedCandidateSha,-ToolchainProfilePath,-ExpectedToolchainProfileSha256; d31-target:OutputRoot\d31-recovery-seeder-target; d31-record:sibling-d31-recovery-seeder-build.json; d31-env:D31_RECOVERY_SEEDER_RECORD_PATH,D31_RECOVERY_SEEDER_RECORD_SHA256,D31_RECOVERY_SEEDER_RUN_ID,D32_BUILD_TOOLCHAIN_PROFILE_PATH,D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256; profile:D32_BUILD_TOOLCHAIN_PROFILE_V2'
+
+        $profileTestRepository = Get-D32FullPath (Join-Path $script:ScriptRoot '..')
+        $validatedInterfaceProfile = $null
+        $profileSelfTestCases = @(Test-D32BuildToolchainProfileSelfTest `
+            -Root $root `
+            -Repository $profileTestRepository `
+            -ValidatedProfileOutput ([ref]$validatedInterfaceProfile))
+        $profileSelfTestFailures = @($profileSelfTestCases | Where-Object { -not [bool]$_.Passed })
+        if ($profileSelfTestFailures.Count -ne 0 -or $null -eq $validatedInterfaceProfile -or -not [bool]$validatedInterfaceProfile.IsValid) {
+            $failedNames = @($profileSelfTestFailures | ForEach-Object { [string]$_.Name }) -join ', '
+            throw "SELFTEST_FAILED: real validated profile fixture is unavailable for the child-launcher interface check: $failedNames"
+        }
+        $passed += $profileSelfTestCases.Count
+
+        $interfaceRunRoot = Join-Path $root 'profile-child-launcher-interface'
+        $interfaceCargoHome = Join-Path $interfaceRunRoot 'cargo-home'
+        $interfaceTempRoot = Join-Path $interfaceRunRoot 'temp'
+        $interfaceLogRoot = Join-Path $root 'profile-child-launcher-logs'
+        [void][IO.Directory]::CreateDirectory($interfaceRunRoot)
+        [void][IO.Directory]::CreateDirectory($interfaceCargoHome)
+        [void][IO.Directory]::CreateDirectory($interfaceTempRoot)
+        [void][IO.Directory]::CreateDirectory($interfaceLogRoot)
+        foreach ($interfaceDirectory in @($interfaceRunRoot, $interfaceCargoHome, $interfaceTempRoot, $interfaceLogRoot)) {
+            $null = Assert-D32NoReparsePath -Path $interfaceDirectory
+        }
+
+        $ambientName = 'D32_SELFTEST_AMBIENT_ENV_SENTINEL'
+        $previousAmbientValue = [Environment]::GetEnvironmentVariable($ambientName, 'Process')
+        $profileChildEnvironment = $null
+        $expectedProfileChildEnvironment = $null
+        try {
+            [Environment]::SetEnvironmentVariable($ambientName, 'must-not-cross-the-child-boundary', 'Process')
+            $profileChildEnvironment = New-D32ProfileChildEnvironment `
+                -ValidatedProfile $validatedInterfaceProfile `
+                -CargoHome $interfaceCargoHome `
+                -TempRoot $interfaceTempRoot `
+                -Offline $false
+            $expectedProfileChildEnvironment = Get-D32BuildToolchainEnvironment `
+                -ValidatedProfile $validatedInterfaceProfile `
+                -CargoHome $interfaceCargoHome `
+                -TempRoot $interfaceTempRoot `
+                -Offline $false
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable($ambientName, $previousAmbientValue, 'Process')
+        }
+        if ($profileChildEnvironment -isnot [System.Collections.IDictionary] -or
+            $profileChildEnvironment -is [string] -or
+            $profileChildEnvironment.Count -ne $expectedProfileChildEnvironment.Count -or
+            @($profileChildEnvironment.Keys | Where-Object { $ambientName -ceq [string]$_ }).Count -ne 0) {
+            throw 'SELFTEST_FAILED: profile fetch child environment is not the exact scrubbed IDictionary contract'
+        }
+        foreach ($environmentKey in $expectedProfileChildEnvironment.Keys) {
+            if (-not $profileChildEnvironment.Contains($environmentKey) -or
+                [string]$profileChildEnvironment[$environmentKey] -cne [string]$expectedProfileChildEnvironment[$environmentKey]) {
+                throw 'SELFTEST_FAILED: profile fetch child environment changed an allowlisted value'
+            }
+        }
+        $passed++
+
+        function Invoke-D32ProfileChildFetchLauncherProbe {
+            param(
+                [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+                [Parameter(Mandatory = $true)][string]$CargoHome,
+                [Parameter(Mandatory = $true)][string]$TempRoot,
+                [Parameter(Mandatory = $true)][string]$Repository,
+                [Parameter(Mandatory = $true)][string]$LogRoot,
+                [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+            )
+
+            $script:D32SelfTestFixtureLaunchCapture = [System.Collections.Generic.List[object]]::new()
+            function Assert-D32PinnedCleanCandidate {
+                param([Parameter(Mandatory = $true)][string]$Root)
+                return ('a' * 40)
+            }
+            function Start-D32FixtureBoundedNativeProcess {
+                param(
+                    [string]$FilePath,
+                    [string]$CommandLine,
+                    [string]$WorkingDirectory,
+                    [AllowNull()][string]$EnvironmentBlock,
+                    [AllowNull()][string]$NativeTestFailure,
+                    [bool]$RequireDebugEvents
+                )
+                $script:D32SelfTestFixtureLaunchCapture.Add([PSCustomObject]@{
+                    FilePath = $FilePath
+                    CommandLine = $CommandLine
+                    WorkingDirectory = $WorkingDirectory
+                    EnvironmentBlock = $EnvironmentBlock
+                    NativeTestFailure = $NativeTestFailure
+                    RequireDebugEvents = $RequireDebugEvents
+                })
+                throw 'D32_SELFTEST_NATIVE_LAUNCH_CAPTURED_WITHOUT_START'
+            }
+
+            $phaseEvidence = [System.Collections.Generic.List[object]]::new()
+            $failure = $null
+            try {
+                $null = Invoke-D32LockedCargoFetches `
+                    -ValidatedProfile $ValidatedProfile `
+                    -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) `
+                    -CargoHome $CargoHome `
+                    -TempRoot $TempRoot `
+                    -RepoRoot $Repository `
+                    -LogRoot $LogRoot `
+                    -TimeoutSeconds $TimeoutSeconds `
+                    -LogPrefix 'interface-fetch' `
+                    -PhaseEvidence $phaseEvidence
+            }
+            catch {
+                $failure = $_.Exception.Message
+            }
+            $captures = @($script:D32SelfTestFixtureLaunchCapture.ToArray())
+            Remove-Variable -Name D32SelfTestFixtureLaunchCapture -Scope Script -ErrorAction SilentlyContinue
+            return [PSCustomObject]@{
+                PhaseEvidence = @($phaseEvidence.ToArray())
+                Failure = $failure
+                Captures = $captures
+            }
+        }
+
+        $interfaceProbe = Invoke-D32ProfileChildFetchLauncherProbe `
+            -ValidatedProfile $validatedInterfaceProfile `
+            -CargoHome $interfaceCargoHome `
+            -TempRoot $interfaceTempRoot `
+            -Repository $profileTestRepository `
+            -LogRoot $interfaceLogRoot `
+            -TimeoutSeconds 17
+        $firstFetch = $validatedInterfaceProfile.LockInputs[0]
+        $firstFetchName = 'interface-fetch-01-fetch'
+        $firstFetchLog = Get-D32FullPath (Join-Path $interfaceLogRoot $firstFetchName)
+        $firstFetchArguments = @(
+            'fetch', '--locked', '--manifest-path', [string]$firstFetch.ManifestFullPath,
+            '--target', [string]$validatedInterfaceProfile.Profile.target_triple
+        )
+        $firstFetchCommandLine = ConvertTo-D32CommandLine (@([string]$validatedInterfaceProfile.Profile.toolchain.cargo.path) + $firstFetchArguments)
+        $capturedFetchEnvironmentBlock = ConvertTo-D32EnvironmentBlock -Environment $profileChildEnvironment
+        $expectedCapturedFilePath = Get-D32FullPath ([string]$validatedInterfaceProfile.Profile.toolchain.cargo.path)
+        $capturedEnvironmentMatches = $false
+        if ($interfaceProbe.Captures.Count -eq 1 -and
+            $interfaceProbe.Captures[0].EnvironmentBlock -is [string] -and
+            $interfaceProbe.Captures[0].EnvironmentBlock.EndsWith("`0`0") -and
+            $interfaceProbe.Captures[0].EnvironmentBlock -ceq $capturedFetchEnvironmentBlock) {
+            $serializedBody = $interfaceProbe.Captures[0].EnvironmentBlock.Substring(0, $interfaceProbe.Captures[0].EnvironmentBlock.Length - 2)
+            $serializedEnvironment = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $serializedBody.Split([char]0)) {
+                $separator = $entry.IndexOf('=')
+                if ($separator -le 0) { throw 'SELFTEST_FAILED: launcher received a malformed serialized child environment entry' }
+                $serializedEnvironment.Add($entry.Substring(0, $separator), $entry.Substring($separator + 1))
+            }
+            $capturedEnvironmentMatches = $serializedEnvironment.Count -eq $profileChildEnvironment.Count
+            foreach ($environmentKey in $profileChildEnvironment.Keys) {
+                if (-not $serializedEnvironment.Contains($environmentKey) -or
+                    [string]$serializedEnvironment[$environmentKey] -cne [string]$profileChildEnvironment[$environmentKey]) {
+                    $capturedEnvironmentMatches = $false
+                }
+            }
+        }
+        $launchRequest = $script:D32LastProcessEvidence.launch_request
+        if ($interfaceProbe.Failure -notlike 'CARGO_FETCH_FAILED:*status=spawn_failed*' -or
+            $interfaceProbe.Captures.Count -ne 1 -or
+            $interfaceProbe.PhaseEvidence.Count -ne 1 -or
+            $interfaceProbe.PhaseEvidence[0].name -cne $firstFetchName -or
+            $interfaceProbe.PhaseEvidence[0].executable -cne $expectedCapturedFilePath -or
+            (@($interfaceProbe.PhaseEvidence[0].arguments) -join "`0") -cne ($firstFetchArguments -join "`0") -or
+            $interfaceProbe.PhaseEvidence[0].command_line -cne $firstFetchCommandLine -or
+            $interfaceProbe.PhaseEvidence[0].working_directory -cne $profileTestRepository -or
+            $null -ne $interfaceProbe.PhaseEvidence[0].root_record -or
+            $null -eq $launchRequest -or
+            $launchRequest.executable -cne $expectedCapturedFilePath -or
+            (@($launchRequest.arguments) -join "`0") -cne ($firstFetchArguments -join "`0") -or
+            $launchRequest.working_directory -cne $profileTestRepository -or
+            $launchRequest.phase_log -cne $firstFetchLog -or
+            $launchRequest.timeout_seconds -ne 17 -or
+            $launchRequest.child_environment_type -cne $profileChildEnvironment.GetType().FullName -or
+            -not [bool]$launchRequest.require_debug_events -or
+            $interfaceProbe.Captures[0].FilePath -cne $expectedCapturedFilePath -or
+            $interfaceProbe.Captures[0].CommandLine -cne $firstFetchCommandLine -or
+            $interfaceProbe.Captures[0].WorkingDirectory -cne $profileTestRepository -or
+            -not [bool]$interfaceProbe.Captures[0].RequireDebugEvents -or
+            -not $capturedEnvironmentMatches -or
+            $interfaceProbe.Captures[0].EnvironmentBlock.Contains($ambientName)) {
+            throw 'SELFTEST_FAILED: profile fetch did not preserve the typed bounded-launch request, exact argv/environment, timeout/log, and empty-list evidence semantics'
+        }
+        $passed++
+
+        $cleanupFailureRejected = $false
+        try {
+            $null = Test-D32NoOwnedCargoDescendants -PhaseEvidence $interfaceProbe.PhaseEvidence -CheckName 'captured spawn-failure interface selftest'
+        }
+        catch {
+            $cleanupFailureRejected = $_.Exception.Message -ceq 'PROCESS_TREE_REAP_FAILED: captured spawn-failure interface selftest has a phase without verified root process identity evidence'
+        }
+        if (-not $cleanupFailureRejected) {
+            throw 'SELFTEST_FAILED: cleanup/error path did not bind captured fetch evidence and fail closed without root identity'
+        }
+        $passed++
+
+        $badEnvironmentSentinel = 'D32_SELFTEST_CHILD_ENVIRONMENT_TYPE_SENTINEL'
+        $invalidBoundedLog = Join-Path $root 'invalid-child-environment-type'
+        $boundedTypeMismatchRejected = $false
+        try {
+            $null = Invoke-D32BoundedProcess `
+                -FilePath $expectedCapturedFilePath `
+                -Arguments @('version') `
+                -WorkingDirectory $profileTestRepository `
+                -PhaseLog $invalidBoundedLog `
+                -TimeoutSeconds 1 `
+                -ChildEnvironment $badEnvironmentSentinel
+        }
+        catch {
+            $boundedTypeMismatchRejected = $_.Exception.Message -clike 'CHILD_ENVIRONMENT_INVALID:*' -and
+                $_.Exception.Message -cnotlike "*$badEnvironmentSentinel*"
+        }
+        $serializerTypeMismatchRejected = $false
+        try { $null = ConvertTo-D32EnvironmentBlock -Environment $badEnvironmentSentinel }
+        catch {
+            $serializerTypeMismatchRejected = $_.Exception.Message -clike 'CHILD_ENVIRONMENT_INVALID:*' -and
+                $_.Exception.Message -cnotlike "*$badEnvironmentSentinel*"
+        }
+        if (-not $boundedTypeMismatchRejected -or -not $serializerTypeMismatchRejected -or
+            (Test-Path -LiteralPath "$invalidBoundedLog.stdout.log") -or
+            (Test-Path -LiteralPath "$invalidBoundedLog.stderr.log")) {
+            throw 'SELFTEST_FAILED: mismatched child-environment type was not safely rejected before launch/log creation'
+        }
+        $passed++
 
         function Invoke-D32EmptyFetchEvidenceBindingProbe {
             function New-D32ProfileChildEnvironment { throw 'D32_SELFTEST_EMPTY_PHASE_EVIDENCE_BODY_REACHED' }

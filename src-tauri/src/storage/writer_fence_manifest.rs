@@ -1355,9 +1355,61 @@ mod tests {
         (root, path)
     }
 
+    fn downgrade_initialized_database_to_schema_twenty_eight_for_fixture(connection: &Connection) {
+        for spec in super::capability_authorization_writer_fence_trigger_specs() {
+            connection
+                .execute_batch(&format!("DROP TRIGGER IF EXISTS {}", spec.name))
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS life_capability_authorization_event_immutable_guard;
+                 DROP TRIGGER IF EXISTS life_capability_authorization_immutable_guard;
+                 DROP INDEX IF EXISTS idx_life_capability_authorization_capability;
+                 DROP TABLE IF EXISTS life_capability_authorization_event;
+                 DROP TABLE IF EXISTS life_capability_authorization;
+                 DELETE FROM schema_migration WHERE version = 30;",
+            )
+            .unwrap();
+
+        let vision_profiles: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_profile WHERE purpose = 'vision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_vision_profiles: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM active_model_profile WHERE purpose = 'vision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (vision_profiles, active_vision_profiles),
+            (0, 0),
+            "schema 29 fixture rollback must not discard vision-profile data"
+        );
+        connection
+            .execute_batch(include_str!(
+                "migrations/011_candidate_extraction_model_profiles.sql"
+            ))
+            .unwrap();
+        connection
+            .execute("DELETE FROM schema_migration WHERE version = 29", [])
+            .unwrap();
+        assert_eq!(
+            super::super::connection::read_schema_version(connection).unwrap(),
+            28,
+            "schema fixture must begin its legacy rollback at exact schema 28"
+        );
+    }
+
     fn initialized_schema_twenty_two_database() -> (tempfile::TempDir, PathBuf) {
         let (root, path) = initialized_fenced_database();
         let connection = authorized_connection(&path);
+        downgrade_initialized_database_to_schema_twenty_eight_for_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_screen_vision_outbound_policy_event_insert;
@@ -1433,6 +1485,11 @@ mod tests {
                  DELETE FROM schema_migration WHERE version = 23;",
             )
             .unwrap();
+        assert_eq!(
+            super::super::connection::read_schema_version(&connection).unwrap(),
+            22,
+            "schema 22 fixture must retain exactly the requested migration version"
+        );
         drop(connection);
         (root, path)
     }
@@ -1440,6 +1497,7 @@ mod tests {
     fn initialized_schema_twenty_three_database() -> (tempfile::TempDir, PathBuf) {
         let (root, path) = initialized_fenced_database();
         let connection = authorized_connection(&path);
+        downgrade_initialized_database_to_schema_twenty_eight_for_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TRIGGER IF EXISTS digital_life_writer_epoch_life_screen_vision_outbound_policy_event_insert;
@@ -1494,6 +1552,11 @@ mod tests {
                  DELETE FROM schema_migration WHERE version = 24;",
             )
             .unwrap();
+        assert_eq!(
+            super::super::connection::read_schema_version(&connection).unwrap(),
+            23,
+            "schema 23 fixture must retain exactly the requested migration version"
+        );
         drop(connection);
         (root, path)
     }

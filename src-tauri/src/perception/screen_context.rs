@@ -2406,7 +2406,7 @@ mod tests {
 
     #[test]
     fn production_source_has_no_frame_native_target_window_or_process_fields() {
-        let source = include_str!("screen_context.rs");
+        let source = include_str!("screen_context.rs").replace("\r\n", "\n");
         let (production_source, _) = source
             .split_once("#[cfg(test)]\nmod tests")
             .expect("the production/test module boundary must remain explicit");

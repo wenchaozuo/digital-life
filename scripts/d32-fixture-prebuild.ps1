@@ -1,12 +1,58 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+Builds D32 fixture artifacts for one independently pinned clean candidate.
+
+.DESCRIPTION
+Operational runs require -PinnedGitPath, -PinnedGitSha256,
+-ExpectedCandidateSha, -ToolchainProfilePath, and
+-ExpectedToolchainProfileSha256. Git is invoked only from that absolute executable after
+path, identity, and SHA-256 verification; inherited GIT_* variables and user
+Git configuration are excluded. The expected SHA must be the exact clean HEAD.
+
+Optional D31 recovery-helper build:
+  -BuildD31RecoverySeeder
+The fixed build is `cargo build --quiet --locked --manifest-path
+<repo>/vita-agent/Cargo.toml --bin vita-agent --features d29-h9-test-helper
+--target-dir <OutputRoot>\d31-recovery-seeder-target`. The script writes the
+sibling `d31-recovery-seeder-build.json` and reports its path, SHA-256, and a
+unique run ID; pass them independently to the D31 test as
+D31_RECOVERY_SEEDER_RECORD_PATH, D31_RECOVERY_SEEDER_RECORD_SHA256, and
+D31_RECOVERY_SEEDER_RUN_ID.
+
+.PARAMETER PinnedGitPath
+Absolute path to the caller-selected Git executable.
+.PARAMETER PinnedGitSha256
+Caller-computed SHA-256 of PinnedGitPath.
+.PARAMETER ExpectedCandidateSha
+Exact lowercase 40-character candidate HEAD SHA.
+.PARAMETER ToolchainProfilePath
+Absolute path to the caller-pinned D32_BUILD_TOOLCHAIN_PROFILE_V1 document.
+.PARAMETER ExpectedToolchainProfileSha256
+Independent lowercase SHA-256 pin for the toolchain profile bytes.
+.PARAMETER BuildD31RecoverySeeder
+Build the test-only D31 recovery seeder using the fixed feature and external target,
+after a pinned locked fetch into a fresh external Cargo home.
+.PARAMETER D32LauncherLibraryOnly
+Load the native bounded-process launcher and retain this script's helper functions
+in the dot-sourcing caller, then return without starting fixture builds.
+#>
 [CmdletBinding()]
 param(
     [string]$RepoRoot,
     [string]$OutputRoot,
     [string]$ManifestPath,
+    [string]$PinnedGitPath,
+    [string]$PinnedGitSha256,
+    [string]$ExpectedCandidateSha,
+    [string]$ToolchainProfilePath,
+    [string]$ExpectedToolchainProfileSha256,
+    [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 600,
     [ValidateRange(1, 16)]
     [int]$BuildJobs = 1,
+    [switch]$D32LauncherLibraryOnly,
     [switch]$SelfTest
 )
 
@@ -137,28 +183,877 @@ function Remove-D32OwnedDirectory {
     Remove-Item -LiteralPath $full -Recurse -Force
 }
 
+function Assert-D32NoReparsePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$AllowMissingLeaf
+    )
+
+    if (-not [IO.Path]::IsPathRooted($Path)) {
+        throw "PATH_INVALID: path must be absolute: $Path"
+    }
+    $full = Get-D32FullPath $Path
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([String]::IsNullOrWhiteSpace($root)) {
+        throw "PATH_INVALID: path has no volume root: $full"
+    }
+    $current = $root
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "PATH_REPARSE: path root is a reparse point: $root"
+    }
+    $relative = $full.Substring($root.Length)
+    $components = @($relative -split '[\\/]+' | Where-Object { -not [String]::IsNullOrWhiteSpace($_) })
+    for ($index = 0; $index -lt $components.Count; $index++) {
+        $current = Join-Path $current $components[$index]
+        try {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch {
+            if ($AllowMissingLeaf -and $index -eq ($components.Count - 1) -and
+                -not (Test-Path -LiteralPath $current)) {
+                return $full
+            }
+            throw "PATH_INVALID: path component is unavailable: $current"
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "PATH_REPARSE: path contains a reparse component: $current"
+        }
+        if ($index -lt ($components.Count - 1) -and
+            ($item.Attributes -band [IO.FileAttributes]::Directory) -eq 0) {
+            throw "PATH_INVALID: non-directory path component: $current"
+        }
+    }
+    return $full
+}
+
+function Get-D32D31RecoverySeederPaths {
+    param([Parameter(Mandatory = $true)][string]$OutputRoot)
+
+    $root = Assert-D32NoReparsePath -Path $OutputRoot
+    $target = Assert-D32NoReparsePath -Path (Join-Path $root 'd31-recovery-seeder-target') -AllowMissingLeaf
+    $record = Assert-D32NoReparsePath -Path (Join-Path $root 'd31-recovery-seeder-build.json') -AllowMissingLeaf
+    if ((Split-Path -Parent $target) -ne (Split-Path -Parent $record)) {
+        throw 'D31_RECOVERY_SEEDER_OUTPUT_INVALID: target and build record must be canonical siblings beneath OutputRoot'
+    }
+    return [ordered]@{
+        target = $target
+        record = $record
+    }
+}
+
+function Initialize-D32ArtifactIdentityType {
+    if ($null -ne ([System.Management.Automation.PSTypeName]'D32FixtureArtifactIdentityV1').Type) {
+        return
+    }
+    $savedLib = [Environment]::GetEnvironmentVariable('LIB', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('LIB', $null, 'Process')
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct D32NativeFileIdentityV1
+{
+    public uint volume_serial;
+    public ulong file_index;
+    public ulong file_size;
+    public uint file_attributes;
+    public uint link_count;
+}
+
+public struct D32NativeFileIdInfoV1
+{
+    public ulong volume_serial;
+    public string file_id_hex;
+}
+
+public static class D32FixtureArtifactIdentityV1
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public FileTime CreationTime;
+        public FileTime LastAccessTime;
+        public FileTime LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle handle, out ByHandleFileInformation information);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle handle, int fileInformationClass, IntPtr information, uint bufferSize);
+
+    public static D32NativeFileIdentityV1 Read(SafeFileHandle handle)
+    {
+        ByHandleFileInformation information;
+        if (!GetFileInformationByHandle(handle, out information))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return new D32NativeFileIdentityV1 {
+            volume_serial = information.VolumeSerialNumber,
+            file_index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow,
+            file_size = ((ulong)information.FileSizeHigh << 32) | information.FileSizeLow,
+            file_attributes = information.FileAttributes,
+            link_count = information.NumberOfLinks
+        };
+    }
+
+    public static D32NativeFileIdInfoV1 ReadFileId(SafeFileHandle handle)
+    {
+        const int FileIdInfo = 18;
+        const int BufferSize = 24;
+        IntPtr buffer = Marshal.AllocHGlobal(BufferSize);
+        try
+        {
+            if (!GetFileInformationByHandleEx(handle, FileIdInfo, buffer, BufferSize))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            ulong volume = unchecked((ulong)Marshal.ReadInt64(buffer, 0));
+            byte[] id = new byte[16];
+            Marshal.Copy(IntPtr.Add(buffer, 8), id, 0, id.Length);
+            string hex = BitConverter.ToString(id).Replace("-", "").ToLowerInvariant();
+            return new D32NativeFileIdInfoV1 { volume_serial = volume, file_id_hex = hex };
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+}
+'@
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('LIB', $savedLib, 'Process')
+    }
+}
+
+function Get-D32NativeFileIdentity {
+    param([Parameter(Mandatory = $true)][IO.FileStream]$Stream)
+
+    Initialize-D32ArtifactIdentityType
+    return [D32FixtureArtifactIdentityV1]::Read($Stream.SafeFileHandle)
+}
+
+function Get-D32NativeFileIdInfo {
+    param([Parameter(Mandatory = $true)][IO.FileStream]$Stream)
+
+    Initialize-D32ArtifactIdentityType
+    return [D32FixtureArtifactIdentityV1]::ReadFileId($Stream.SafeFileHandle)
+}
+
+function Test-D32SameNativeFileIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object]$Left,
+        [Parameter(Mandatory = $true)][object]$Right
+    )
+
+    return ([uint32]$Left.volume_serial -eq [uint32]$Right.volume_serial -and
+        [uint64]$Left.file_index -eq [uint64]$Right.file_index -and
+        [uint64]$Left.file_size -eq [uint64]$Right.file_size -and
+        [uint32]$Left.file_attributes -eq [uint32]$Right.file_attributes -and
+        [uint32]$Left.link_count -eq [uint32]$Right.link_count)
+}
+
+function Test-D32SameArtifactFileIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object]$Left,
+        [Parameter(Mandatory = $true)][object]$Right
+    )
+
+    return ([uint32]$Left.volume_serial -eq [uint32]$Right.volume_serial -and
+        [uint64]$Left.file_index -eq [uint64]$Right.file_index -and
+        [uint64]$Left.file_size -eq [uint64]$Right.file_size -and
+        [bool]$Left.directory -eq [bool]$Right.directory -and
+        [bool]$Left.reparse -eq [bool]$Right.reparse)
+}
+
+function ConvertTo-D32FileIdentityRecord {
+    param([Parameter(Mandatory = $true)][object]$Identity)
+
+    $reparse = ([uint32]$Identity.file_attributes -band [uint32][IO.FileAttributes]::ReparsePoint) -ne 0
+    $directory = ([uint32]$Identity.file_attributes -band [uint32][IO.FileAttributes]::Directory) -ne 0
+    if ($reparse -or $directory) {
+        throw 'ARTIFACT_IDENTITY_INVALID: artifact handle is not a non-reparse regular file'
+    }
+    return [ordered]@{
+        volume_serial = [uint32]$Identity.volume_serial
+        file_index = [uint64]$Identity.file_index
+        file_size = [uint64]$Identity.file_size
+        directory = $false
+        reparse = $false
+    }
+}
+
+function Get-D32BoundArtifact {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $full = Assert-D32NoReparsePath -Path $Path
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $before = Get-D32NativeFileIdentity $stream
+        $beforeRecord = ConvertTo-D32FileIdentityRecord $before
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $hasher.ComputeHash($stream)
+        }
+        finally {
+            $hasher.Dispose()
+        }
+        $length = [uint64]$stream.Length
+        $after = Get-D32NativeFileIdentity $stream
+        if (-not (Test-D32SameNativeFileIdentity -Left $before -Right $after) -or
+            $length -ne [uint64]$after.file_size) {
+            throw "ARTIFACT_IDENTITY_CHANGED: file identity changed while hashing: $full"
+        }
+        $stream.Dispose()
+        $reopened = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $rebound = Get-D32NativeFileIdentity $reopened
+        }
+        finally {
+            $reopened.Dispose()
+        }
+        [void](Assert-D32NoReparsePath -Path $full)
+        if (-not (Test-D32SameNativeFileIdentity -Left $before -Right $rebound)) {
+            throw "ARTIFACT_IDENTITY_CHANGED: path rebound to another file after hashing: $full"
+        }
+        return [ordered]@{
+            path = $full
+            bytes = $length
+            sha256 = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+            file_identity = $beforeRecord
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Get-D32BoundArtifactWithFileId {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $full = Assert-D32NoReparsePath -Path $Path
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $before = Get-D32NativeFileIdentity $stream
+        $beforeRecord = ConvertTo-D32FileIdentityRecord $before
+        $beforeFileId = Get-D32NativeFileIdInfo -Stream $stream
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $hasher.ComputeHash($stream) }
+        finally { $hasher.Dispose() }
+        $length = [uint64]$stream.Length
+        $after = Get-D32NativeFileIdentity $stream
+        $afterFileId = Get-D32NativeFileIdInfo -Stream $stream
+        if (-not (Test-D32SameNativeFileIdentity -Left $before -Right $after) -or
+            $length -ne [uint64]$after.file_size -or
+            [uint64]$beforeFileId.volume_serial -ne [uint64]$afterFileId.volume_serial -or
+            [string]$beforeFileId.file_id_hex -cne [string]$afterFileId.file_id_hex) {
+            throw "ARTIFACT_IDENTITY_CHANGED: file identity changed while hashing: $full"
+        }
+        $pathSnapshot = Get-D32BoundArtifact -Path $full
+        if ($pathSnapshot.sha256 -cne [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant() -or
+            -not (Test-D32SameArtifactFileIdentity -Left $pathSnapshot.file_identity -Right $beforeRecord)) {
+            throw "ARTIFACT_IDENTITY_CHANGED: path did not remain bound to the opened manifest handle: $full"
+        }
+        return [ordered]@{
+            path = $full
+            bytes = $length
+            sha256 = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+            file_identity = $beforeRecord
+            volume_serial_hex = ([uint64]$beforeFileId.volume_serial).ToString('x16')
+            file_id_hex = [string]$beforeFileId.file_id_hex
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Get-D32PinnedGit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256
+    )
+
+    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'GIT_PIN_INVALID: PinnedGitSha256 must be a 64-character SHA-256 hex digest'
+    }
+    $full = Assert-D32NoReparsePath -Path $Path
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        throw "GIT_PIN_INVALID: pinned Git executable is not a file: $full"
+    }
+    $artifact = Get-D32BoundArtifact $full
+    $expected = $ExpectedSha256.ToLowerInvariant()
+    if ($artifact.sha256 -ne $expected) {
+        throw 'GIT_PIN_INVALID: pinned Git executable did not match its independent SHA-256'
+    }
+    return [ordered]@{
+        path = $full
+        sha256 = $expected
+        file_identity = $artifact.file_identity
+    }
+}
+
+function Assert-D32PinnedGitCurrent {
+    if ($null -eq $script:PinnedGit) {
+        throw 'GIT_PIN_REQUIRED: operational Git calls require the caller-supplied path and SHA-256 pins'
+    }
+    $artifact = Get-D32BoundArtifact $script:PinnedGit.path
+    if ($artifact.sha256 -ne $script:PinnedGit.sha256 -or
+        -not (Test-D32SameArtifactFileIdentity -Left $artifact.file_identity -Right $script:PinnedGit.file_identity)) {
+        throw 'GIT_PIN_CHANGED: pinned Git executable identity or SHA-256 changed'
+    }
+}
+
+function Initialize-D32PinnedGitHandleType {
+    if ('D32PinnedGitImageHandleV1' -as [type]) { return }
+    $savedLib = [Environment]::GetEnvironmentVariable('LIB', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('LIB', $null, 'Process')
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class D32PinnedGitImageHandleV1
+{
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    public static FileStream OpenReadLocked(string path)
+    {
+        SafeFileHandle handle = CreateFileW(
+            path, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (handle == null || handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) handle.Dispose();
+            throw new Win32Exception(error, "CreateFileW pinned Git image open failed (Win32 error " + error + ")");
+        }
+        try { return new FileStream(handle, FileAccess.Read); }
+        catch { handle.Dispose(); throw; }
+    }
+}
+'@ -Language CSharp
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('LIB', $savedLib, 'Process')
+    }
+}
+
+function Open-D32PinnedGitHandle {
+    Assert-D32PinnedGitCurrent
+    Initialize-D32PinnedGitHandleType
+    $stream = [D32PinnedGitImageHandleV1]::OpenReadLocked($script:PinnedGit.path)
+    try {
+        $identity = Get-D32NativeFileIdentity $stream
+        $identityRecord = ConvertTo-D32FileIdentityRecord $identity
+        $snapshot = Get-D32BoundArtifact $script:PinnedGit.path
+        if ($snapshot.sha256 -cne $script:PinnedGit.sha256 -or
+            -not (Test-D32SameArtifactFileIdentity -Left $identityRecord -Right $script:PinnedGit.file_identity) -or
+            -not (Test-D32SameArtifactFileIdentity -Left $snapshot.file_identity -Right $identityRecord)) {
+            throw 'GIT_PIN_CHANGED: pinned Git changed before the retained executable handle was acquired'
+        }
+        return $stream
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-D32PinnedGitProcessIdentity {
+    param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process, [Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $expectedPath = Get-D32FullPath $script:PinnedGit.path
+    try {
+        $modulePath = [string]$Process.MainModule.FileName
+    }
+    catch {
+        throw "GIT_PROCESS_IDENTITY_UNAVAILABLE: cannot observe started Git process image: $($_.Exception.Message)"
+    }
+    if (-not [string]::Equals((Get-D32FullPath $modulePath), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image path does not match the caller-pinned Git executable'
+    }
+    $image = Get-D32BoundArtifact $modulePath
+    if ($image.sha256 -cne $script:PinnedGit.sha256 -or
+        -not (Test-D32SameArtifactFileIdentity -Left $image.file_identity -Right $script:PinnedGit.file_identity)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image hash or native file identity differs from pinned Git'
+    }
+    $snapshot = @(Get-D32ProcessSnapshot -ProcessId $Process.Id)
+    if ($snapshot.Count -ne 1 -or -not [bool]$snapshot[0].IdentityVerified -or
+        -not [string]::Equals([string]$snapshot[0].Name, (Split-Path -Leaf $expectedPath), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Get-D32FullPath ([string]$snapshot[0].ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started Git process name, PID, or observed image path is unverified'
+    }
+    $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+    if (-not [string]::Equals([string]$snapshot[0].CommandLine, $expectedCommand, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started Git process argv differs from the requested pinned command'
+    }
+}
+
+function Assert-D32NoNestedGitReparse {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    [void](Assert-D32NoReparsePath -Path $Path)
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "GIT_REPOSITORY_INVALID: nested Git metadata reparse point is forbidden: $($item.FullName)"
+            }
+            if (($item.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                $pending.Push($item.FullName)
+            }
+        }
+    }
+}
+
+function Assert-D32RepositoryGitInfo {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$GitDirectory)
+
+    $infoDirectory = Join-Path $GitDirectory 'info'
+    [void](Assert-D32NoReparsePath -Path $infoDirectory)
+    if (-not (Test-Path -LiteralPath $infoDirectory -PathType Container)) {
+        throw 'GIT_REPOSITORY_INVALID: direct .git/info directory is required'
+    }
+    Assert-D32NoNestedGitReparse -Path $infoDirectory
+    $items = @(Get-ChildItem -LiteralPath $infoDirectory -Force -ErrorAction Stop)
+    if ($items.Count -ne 1 -or $items[0].Name -cne 'exclude' -or
+        ($items[0].Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or
+        ($items[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'GIT_REPOSITORY_INVALID: .git/info may contain only the regular exclude file'
+    }
+    $excludePath = Join-Path $infoDirectory 'exclude'
+    [void](Assert-D32NoReparsePath -Path $excludePath)
+    $excludeLines = [IO.File]::ReadAllLines($excludePath)
+    $approvedRuleCount = 0
+    foreach ($line in $excludeLines) {
+        if ([String]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) { continue }
+        if ($line -cne 'vita-agent/target/') {
+            throw 'GIT_REPOSITORY_INVALID: .git/info/exclude contains a non-approved active pattern'
+        }
+        $approvedRuleCount++
+    }
+    if ($approvedRuleCount -ne 1) {
+        throw 'GIT_REPOSITORY_INVALID: .git/info/exclude must contain exactly one active vita-agent/target/ rule'
+    }
+
+    $repoRoot = Assert-D32NoReparsePath -Path $Root
+    $vitaAgentRoot = Assert-D32NoReparsePath -Path (Join-Path $repoRoot 'vita-agent')
+    if (-not (Test-Path -LiteralPath $vitaAgentRoot -PathType Container) -or
+        -not (Test-D32PathWithin -Path $vitaAgentRoot -Root $repoRoot)) {
+        throw 'GIT_REPOSITORY_INVALID: repo-local vita-agent directory is not canonical beneath the candidate root'
+    }
+    $targetPath = Join-Path $vitaAgentRoot 'target'
+    if (Test-Path -LiteralPath $targetPath) {
+        [void](Assert-D32NoReparsePath -Path $targetPath)
+        if (-not (Test-Path -LiteralPath $targetPath -PathType Container) -or
+            -not (Test-D32PathWithin -Path $targetPath -Root $repoRoot)) {
+            throw 'GIT_REPOSITORY_INVALID: vita-agent target is not a repo-local directory'
+        }
+    }
+    else {
+        [void](Assert-D32NoReparsePath -Path $targetPath -AllowMissingLeaf)
+    }
+}
+
+function Assert-D32RepositoryGitConfig {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $rootFull = Assert-D32NoReparsePath -Path $Root
+    $gitDirectory = Join-Path $rootFull '.git'
+    [void](Assert-D32NoReparsePath -Path $gitDirectory)
+    if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
+        throw 'GIT_REPOSITORY_INVALID: only a direct .git directory is accepted'
+    }
+    foreach ($name in @('HEAD', 'index', 'objects', 'objects/info')) {
+        [void](Assert-D32NoReparsePath -Path (Join-Path $gitDirectory $name))
+    }
+    [void](Assert-D32NoReparsePath -Path (Join-Path $gitDirectory 'refs'))
+    Assert-D32RepositoryGitInfo -Root $rootFull -GitDirectory $gitDirectory
+    Assert-D32NoNestedGitReparse -Path (Join-Path $gitDirectory 'refs')
+    Assert-D32NoNestedGitReparse -Path (Join-Path $gitDirectory 'objects')
+    foreach ($name in @('packed-refs')) {
+        $metadataPath = Join-Path $gitDirectory $name
+        if (Test-Path -LiteralPath $metadataPath) {
+            [void](Assert-D32NoReparsePath -Path $metadataPath)
+        }
+    }
+    foreach ($name in @('config.worktree', 'gitdir', 'commondir')) {
+        if (Test-Path -LiteralPath (Join-Path $gitDirectory $name)) {
+            throw "GIT_REPOSITORY_INVALID: repository metadata indirection is forbidden: $name"
+        }
+    }
+    foreach ($name in @('objects/info/alternates', 'objects/info/http-alternates', 'info/grafts')) {
+        if (Test-Path -LiteralPath (Join-Path $gitDirectory $name)) {
+            throw "GIT_REPOSITORY_INVALID: repository Git metadata indirection is forbidden: $name"
+        }
+    }
+    $configPath = Join-Path $gitDirectory 'config'
+    [void](Assert-D32NoReparsePath -Path $configPath)
+    $section = ''
+    $lines = [IO.File]::ReadAllLines($configPath)
+    for ($lineNumber = 0; $lineNumber -lt $lines.Length; $lineNumber++) {
+        if ($lineNumber -ge $lines.Length) { continue }
+        $line = $lines[$lineNumber].Trim()
+        if ([String]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#') -or $line.StartsWith(';')) { continue }
+        if ($line.StartsWith('[')) {
+            if ($line -notmatch '^\[\s*([A-Za-z0-9]+)(?:\s|\])') {
+                throw "GIT_CONFIG_INVALID: malformed repository Git config section at line $($lineNumber + 1)"
+            }
+            $section = $Matches[1].ToLowerInvariant()
+            if ($section -notin @('core', 'remote', 'branch', 'extensions')) {
+                throw "GIT_CONFIG_REJECTED: repository Git section is not allowed: $section"
+            }
+            continue
+        }
+        $key = ($line -split '[=\s]', 2)[0].ToLowerInvariant()
+        $allowed = switch ($section) {
+            'core' { $key -in @('repositoryformatversion', 'filemode', 'bare', 'logallrefupdates', 'ignorecase', 'precomposeunicode', 'symlinks', 'longpaths', 'quotepath') }
+            'remote' { $key -in @('url', 'fetch', 'pushurl', 'tagopt', 'prune', 'mirror') }
+            'branch' { $key -in @('remote', 'merge') }
+            'extensions' { $key -eq 'objectformat' -and $line -match '=\s*sha1\s*$' }
+            default { $false }
+        }
+        if (-not $allowed) {
+            throw "GIT_CONFIG_REJECTED: repository Git key is not allowed: $section.$key"
+        }
+    }
+    return $gitDirectory
+}
+
+function Get-D32GitMetadataDigest {
+    param([Parameter(Mandatory = $true)][IO.FileStream]$Stream)
+
+    $Stream.Position = 0
+    $before = Get-D32NativeFileIdentity $Stream
+    $beforeRecord = ConvertTo-D32FileIdentityRecord $before
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $hashBytes = $hasher.ComputeHash($Stream) }
+    finally { $hasher.Dispose() }
+    $after = Get-D32NativeFileIdentity $Stream
+    $length = [uint64]$Stream.Length
+    $Stream.Position = 0
+    if (-not (Test-D32SameNativeFileIdentity -Left $before -Right $after) -or $length -ne [uint64]$after.file_size) {
+        throw 'GIT_METADATA_CHANGED: metadata handle identity or bytes changed while hashing'
+    }
+    return [ordered]@{
+        file_identity = $beforeRecord
+        bytes = $length
+        sha256 = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+    }
+}
+
+function Open-D32GitMetadataFileLock {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $full = Assert-D32NoReparsePath -Path $Path
+    $snapshot = Get-D32BoundArtifact -Path $full
+    $stream = [D32PinnedGitImageHandleV1]::OpenReadLocked($full)
+    try {
+        $digest = Get-D32GitMetadataDigest -Stream $stream
+        if ($digest.sha256 -cne $snapshot.sha256 -or $digest.bytes -ne [uint64]$snapshot.bytes -or
+            -not (Test-D32SameArtifactFileIdentity -Left $digest.file_identity -Right $snapshot.file_identity)) {
+            throw 'GIT_METADATA_CHANGED: path and retained metadata handle do not bind the same bytes and identity'
+        }
+        return [pscustomobject]@{ Path = $full; Stream = $stream; Digest = $digest }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-D32GitMetadataFileLockCurrent {
+    param([Parameter(Mandatory = $true)][object]$Lock)
+
+    [void](Assert-D32NoReparsePath -Path ([string]$Lock.Path))
+    $handleDigest = Get-D32GitMetadataDigest -Stream $Lock.Stream
+    $pathDigest = Get-D32BoundArtifact -Path ([string]$Lock.Path)
+    if ($handleDigest.sha256 -cne [string]$Lock.Digest.sha256 -or
+        $handleDigest.bytes -ne [uint64]$Lock.Digest.bytes -or
+        -not (Test-D32SameArtifactFileIdentity -Left $handleDigest.file_identity -Right $Lock.Digest.file_identity) -or
+        $pathDigest.sha256 -cne [string]$Lock.Digest.sha256 -or
+        $pathDigest.bytes -ne [uint64]$Lock.Digest.bytes -or
+        -not (Test-D32SameArtifactFileIdentity -Left $pathDigest.file_identity -Right $Lock.Digest.file_identity)) {
+        throw 'GIT_METADATA_CHANGED: locked metadata path or bytes changed across Git process creation'
+    }
+}
+
+function Open-D32GitMetadataLocks {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$GitDirectory)
+
+    Initialize-D32PinnedGitHandleType
+    [void](Assert-D32RepositoryGitConfig -Root $Root)
+    $locks = [System.Collections.Generic.List[object]]::new()
+    try {
+        $locks.Add((Open-D32GitMetadataFileLock -Path (Join-Path $GitDirectory 'index')))
+        $locks.Add((Open-D32GitMetadataFileLock -Path (Join-Path $GitDirectory 'info/exclude')))
+        [void](Assert-D32RepositoryGitConfig -Root $Root)
+        foreach ($lock in $locks) { Assert-D32GitMetadataFileLockCurrent -Lock $lock }
+        return [pscustomobject]@{ Items = $locks }
+    }
+    catch {
+        foreach ($lock in $locks) { $lock.Stream.Dispose() }
+        throw
+    }
+}
+
+function Assert-D32GitMetadataLocksCurrent {
+    param([Parameter(Mandatory = $true)][object]$Locks, [Parameter(Mandatory = $true)][string]$Root)
+
+    foreach ($lock in $Locks.Items) { Assert-D32GitMetadataFileLockCurrent -Lock $lock }
+    [void](Assert-D32RepositoryGitConfig -Root $Root)
+    foreach ($lock in $Locks.Items) { Assert-D32GitMetadataFileLockCurrent -Lock $lock }
+}
+
+function Close-D32GitMetadataLocks {
+    param([Parameter(Mandatory = $true)][object]$Locks)
+
+    foreach ($lock in $Locks.Items) { $lock.Stream.Dispose() }
+}
+
 function Get-D32GitOutput {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [AllowNull()][object]$MetadataLocks,
+        [switch]$PreserveOutput
     )
 
-    $git = (Get-Command git.exe -ErrorAction Stop).Source
-    $output = @(& $git -C $Root @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "GIT_FAILED: git $($Arguments -join ' ') ($LASTEXITCODE): $($output -join ' ')"
+    Assert-D32PinnedGitCurrent
+    $rootFull = Assert-D32NoReparsePath -Path $Root
+    $gitDirectory = Assert-D32RepositoryGitConfig -Root $rootFull
+    $temporaryRoot = Assert-D32NoReparsePath -Path ([IO.Path]::GetTempPath())
+    $environmentRoot = Join-Path $temporaryRoot ('d32-fixture-git-env-' + [Guid]::NewGuid().ToString('N'))
+    [void](Ensure-D32OwnedDirectory $environmentRoot)
+    $emptyConfig = Join-Path $environmentRoot 'empty.gitconfig'
+    $emptyHooks = Join-Path $environmentRoot 'empty-hooks'
+    [IO.File]::WriteAllText($emptyConfig, '', [Text.UTF8Encoding]::new($false))
+    New-Item -ItemType Directory -Path $emptyHooks -Force:$false | Out-Null
+    $gitBin = Split-Path -Parent $script:PinnedGit.path
+    $installRoot = Split-Path -Parent $gitBin
+    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
+    if ([String]::IsNullOrWhiteSpace($systemRoot)) {
+        throw 'GIT_ENV_INVALID: Windows SystemRoot is unavailable'
     }
-    return ($output -join "`n").Trim()
+    $systemRoot = Assert-D32NoReparsePath -Path $systemRoot
+    $searchDirectories = @($gitBin, (Join-Path $installRoot 'bin'), (Join-Path $installRoot 'mingw64/bin'), (Join-Path $installRoot 'usr/bin'), (Join-Path $systemRoot 'System32'))
+    $searchDirectories = @($searchDirectories | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | ForEach-Object { Assert-D32NoReparsePath -Path $_ })
+    if ($searchDirectories.Count -eq 0) { throw 'GIT_ENV_INVALID: pinned Git has no safe executable search path' }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:PinnedGit.path
+    $startInfo.Arguments = ConvertTo-D32CommandLine (@(
+        '-c', 'core.fsmonitor=false',
+        '-c', ('core.worktree=' + $rootFull),
+        '-c', 'core.bare=false',
+        '-c', ('core.attributesFile=' + $emptyConfig),
+        '-c', ('core.hooksPath=' + $emptyHooks),
+        '-c', ('safe.directory=' + $rootFull),
+        '-C', $rootFull
+    ) + $Arguments)
+    $startInfo.WorkingDirectory = $rootFull
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    Clear-D32ChildEnvironment -StartInfo $startInfo
+    $childEnvironment = $startInfo.EnvironmentVariables
+    $childEnvironment['PATH'] = $searchDirectories -join [IO.Path]::PathSeparator
+    $childEnvironment['SystemRoot'] = $systemRoot
+    $childEnvironment['WINDIR'] = $systemRoot
+    $childEnvironment['TEMP'] = $environmentRoot
+    $childEnvironment['TMP'] = $environmentRoot
+    $childEnvironment['HOME'] = $environmentRoot
+    $childEnvironment['USERPROFILE'] = $environmentRoot
+    $childEnvironment['XDG_CONFIG_HOME'] = $environmentRoot
+    $childEnvironment['GIT_CONFIG_NOSYSTEM'] = '1'
+    $childEnvironment['GIT_CONFIG_SYSTEM'] = $emptyConfig
+    $childEnvironment['GIT_CONFIG_GLOBAL'] = $emptyConfig
+    $childEnvironment['GIT_DIR'] = $gitDirectory
+    $childEnvironment['GIT_WORK_TREE'] = $rootFull
+    $childEnvironment['GIT_INDEX_FILE'] = Join-Path $gitDirectory 'index'
+    $childEnvironment['GIT_OPTIONAL_LOCKS'] = '0'
+    $childEnvironment['GIT_TERMINAL_PROMPT'] = '0'
+    $childEnvironment['GIT_PAGER'] = 'cat'
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $pinnedGitHandle = $null
+    $ownsMetadataLocks = $false
+    $exitCode = $null
+    $stdout = ''
+    $stderr = ''
+    try {
+        if ($null -eq $MetadataLocks) {
+            $MetadataLocks = Open-D32GitMetadataLocks -Root $rootFull -GitDirectory $gitDirectory
+            $ownsMetadataLocks = $true
+        }
+        Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
+        $pinnedGitHandle = Open-D32PinnedGitHandle
+        Assert-D32PinnedGitCurrent
+        if (-not $process.Start()) { throw 'GIT_FAILED: pinned Git process did not start' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        try {
+            Assert-D32PinnedGitProcessIdentity -Process $process -Arguments (@(
+                    '-c', 'core.fsmonitor=false',
+                    '-c', ('core.worktree=' + $rootFull),
+                    '-c', 'core.bare=false',
+                    '-c', ('core.attributesFile=' + $emptyConfig),
+                    '-c', ('core.hooksPath=' + $emptyHooks),
+                    '-c', ('safe.directory=' + $rootFull),
+                    '-C', $rootFull
+                ) + $Arguments)
+        }
+        catch {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                    $process.WaitForExit()
+                }
+            }
+            catch { }
+            try { $null = $stdoutTask.GetAwaiter().GetResult() } catch { }
+            try { $null = $stderrTask.GetAwaiter().GetResult() } catch { }
+            throw
+        }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+        Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
+    }
+    finally {
+        $process.Dispose()
+        if ($null -ne $pinnedGitHandle) { $pinnedGitHandle.Dispose() }
+        if ($ownsMetadataLocks -and $null -ne $MetadataLocks) { Close-D32GitMetadataLocks -Locks $MetadataLocks }
+        Remove-D32OwnedDirectory $environmentRoot
+    }
+    Assert-D32PinnedGitCurrent
+    if ($exitCode -ne 0) {
+        throw "GIT_FAILED: pinned Git $($Arguments -join ' ') ($exitCode): $($stderr.Trim())"
+    }
+    if ($PreserveOutput) { return $stdout }
+    return $stdout.Trim()
 }
 
 function Get-D32CandidateSha {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param([Parameter(Mandatory = $true)][string]$Root, [AllowNull()][object]$MetadataLocks)
 
-    $sha = Get-D32GitOutput -Root $Root -Arguments @('rev-parse', 'HEAD')
+    $sha = Get-D32GitOutput -Root $Root -Arguments @('rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}') -MetadataLocks $MetadataLocks
     if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
         throw "GIT_FAILED: HEAD is not a full commit SHA: $sha"
     }
     return $sha.ToLowerInvariant()
+}
+
+function Assert-D32CandidateShaMatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$ActualSha,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha
+    )
+
+    if ($ExpectedSha -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'CANDIDATE_SHA_INVALID: expected candidate SHA must be 40 lowercase hexadecimal characters'
+    }
+    if ($ActualSha -cnotmatch '^[0-9a-f]{40}$' -or $ActualSha -cne $ExpectedSha) {
+        throw "CANDIDATE_SHA_MISMATCH: current HEAD does not match the caller-pinned candidate SHA $ExpectedSha"
+    }
+    return $ActualSha
+}
+
+function Assert-D32PinnedCleanCandidate {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $rootFull = Assert-D32NoReparsePath -Path $Root
+    $gitDirectory = Assert-D32RepositoryGitConfig -Root $rootFull
+    $metadataLocks = Open-D32GitMetadataLocks -Root $rootFull -GitDirectory $gitDirectory
+    try {
+        $sha = Get-D32CandidateSha -Root $rootFull -MetadataLocks $metadataLocks
+        $sha = Assert-D32CandidateShaMatch -ActualSha $sha -ExpectedSha $script:ExpectedCandidateSha
+        $status = Get-D32GitOutput -Root $rootFull -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -MetadataLocks $metadataLocks
+        Assert-D32CleanGitStatus -Status $status -Root $rootFull
+        $indexFlags = Get-D32GitOutput -Root $rootFull -Arguments @('ls-files', '-v', '-z') -MetadataLocks $metadataLocks -PreserveOutput
+        Assert-D32CleanGitIndexFlags -Output $indexFlags
+        $headAfter = Get-D32CandidateSha -Root $rootFull -MetadataLocks $metadataLocks
+        if ($headAfter -cne $sha) {
+            throw 'CANDIDATE_SHA_CHANGED: HEAD changed across Git clean-state verification'
+        }
+        Assert-D32GitMetadataLocksCurrent -Locks $metadataLocks -Root $rootFull
+        return $sha
+    }
+    finally {
+        Close-D32GitMetadataLocks -Locks $metadataLocks
+    }
+}
+
+function Assert-D32CleanGitIndexFlags {
+    param([AllowNull()][string]$Output)
+
+    if ([String]::IsNullOrEmpty($Output)) { return }
+    if (-not $Output.EndsWith([string][char]0, [StringComparison]::Ordinal)) {
+        throw 'WORKTREE_DIRTY: Git index flag inventory is not NUL-terminated'
+    }
+    $records = $Output.Split([char]0, [StringSplitOptions]::RemoveEmptyEntries)
+    foreach ($record in $records) {
+        if ($record.Length -lt 3 -or $record.Substring(0, 2) -cne 'H ' -or
+            [String]::IsNullOrEmpty($record.Substring(2))) {
+            throw 'WORKTREE_DIRTY: Git index includes assume-unchanged, skip-worktree, unmerged, or malformed flags'
+        }
+    }
+}
+
+function Write-D32FixtureGitState {
+    param([Parameter(Mandatory = $true)][ValidateRange(1, 5)][int]$Phase, [Parameter(Mandatory = $true)][ValidateSet('before', 'after')][string]$Edge, [Parameter(Mandatory = $true)][string]$Root)
+
+    $head = '0000000000000000000000000000000000000000'
+    $clean = $false
+    $failure = $null
+    try {
+        $head = Assert-D32PinnedCleanCandidate -Root $Root
+        $clean = $true
+    }
+    catch {
+        $failure = $_.Exception.Message
+        try {
+            $observedHead = Get-D32CandidateSha -Root $Root
+            if ($observedHead -match '^[0-9a-f]{40}$') { $head = $observedHead }
+        }
+        catch { }
+    }
+    $cleanLiteral = if ($clean) { 'true' } else { 'false' }
+    Write-Host "D32_FIXTURE_GIT_STATE phase=$Phase edge=$Edge head=$head clean=$cleanLiteral"
+    if (-not $clean) {
+        throw "WORKTREE_DIRTY: phase $Phase $Edge Git state is not the exact clean candidate: $failure"
+    }
 }
 
 function Get-D32EnvironmentPlan {
@@ -227,17 +1122,143 @@ function Restore-D32Environment {
     }
 }
 
+function ConvertTo-D32EnvironmentBlock {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment)
+
+    $names = @($Environment.Keys | ForEach-Object { [string]$_ })
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $ordered = [System.Collections.Generic.SortedDictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $names) {
+        if ([String]::IsNullOrWhiteSpace($name) -or $name.Contains('=') -or $name.Contains([char]0) -or -not $seen.Add($name)) {
+            throw 'CHILD_ENVIRONMENT_INVALID: environment keys must be unique ordinary Windows names'
+        }
+        $value = [string]$Environment[$name]
+        if ($value.Contains([char]0)) { throw "CHILD_ENVIRONMENT_INVALID: environment value contains NUL: $name" }
+        $ordered.Add($name, $value)
+    }
+    $entries = @($ordered.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" })
+    if ($entries.Count -eq 0) { return "`0`0" }
+    return (($entries -join "`0") + "`0`0")
+}
+
+function New-D32ProfileChildEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$TempRoot,
+        [Parameter(Mandatory = $true)][bool]$Offline
+    )
+
+    $variables = Get-D32BuildToolchainEnvironment `
+        -ValidatedProfile $ValidatedProfile `
+        -CargoHome $CargoHome `
+        -TempRoot $TempRoot `
+        -Offline $Offline
+    return ConvertTo-D32EnvironmentBlock -Environment $variables
+}
+
+function Invoke-D32LockedCargoFetches {
+    param(
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$CargoPath,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$TempRoot,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$LogRoot,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$LogPrefix,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$PhaseEvidence
+    )
+
+    $fetchEnvironment = New-D32ProfileChildEnvironment `
+        -ValidatedProfile $ValidatedProfile `
+        -CargoHome $CargoHome `
+        -TempRoot $TempRoot `
+        -Offline $false
+    $results = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+    foreach ($lock in $ValidatedProfile.LockInputs) {
+        $index++
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+        $arguments = @('fetch', '--locked', '--manifest-path', [string]$lock.ManifestFullPath, '--target', [string]$ValidatedProfile.Profile.target_triple)
+        $phaseName = '{0}-{1:D2}-fetch' -f $LogPrefix, $index
+        Write-Host "D32_FIXTURE_PHASE=fetch name=$phaseName lock=$($lock.ManifestPath)"
+        $result = Invoke-D32BoundedProcess `
+            -FilePath $CargoPath `
+            -Arguments $arguments `
+            -WorkingDirectory $RepoRoot `
+            -PhaseLog (Join-Path $LogRoot $phaseName) `
+            -TimeoutSeconds $TimeoutSeconds `
+            -ChildEnvironment $fetchEnvironment
+        if ($null -ne $result.root_identity_record) {
+            Assert-D32PinnedCargoProcessIdentity `
+                -ProcessIdentity $result.root_identity_record `
+                -CargoPath $CargoPath `
+                -Arguments $arguments `
+                -ValidatedProfile $ValidatedProfile
+        }
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+        $PhaseEvidence.Add([pscustomobject]@{
+                root_record = $result.root_identity_record
+                descendant_records = @($result.captured_descendant_records)
+            })
+        if ($result.status -ne 'succeeded' -or $result.exit_code -ne 0) {
+            throw "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); see $($result.phase_log)"
+        }
+        $results.Add([ordered]@{
+                manifest_path = [string]$lock.ManifestPath
+                lock_sha256 = [string]$lock.LockSha256
+                command = @($arguments)
+                status = [string]$result.status
+                exit_code = [int]$result.exit_code
+                process_identity = ConvertTo-D32D31ProcessIdentityDocument $result.root_identity_record
+            })
+    }
+    return @($results.ToArray())
+}
+
 function ConvertTo-D32CommandLine {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
     return (($Arguments | ForEach-Object {
-                if ($_ -match '[\s"]') {
-                    '"' + $_.Replace('"', '\"') + '"'
+                $argument = [string]$_
+                if ($argument.Length -gt 0 -and $argument -notmatch '[\s"]') {
+                    return $argument
                 }
-                else {
-                    $_
+                $builder = [Text.StringBuilder]::new()
+                [void]$builder.Append('"')
+                $slashes = 0
+                foreach ($character in $argument.ToCharArray()) {
+                    if ($character -eq '\') {
+                        $slashes++
+                        continue
+                    }
+                    if ($character -eq '"') {
+                        [void]$builder.Append([char]'\', (2 * $slashes) + 1)
+                        [void]$builder.Append('"')
+                        $slashes = 0
+                        continue
+                    }
+                    if ($slashes -gt 0) {
+                        [void]$builder.Append([char]'\', $slashes)
+                        $slashes = 0
+                    }
+                    [void]$builder.Append($character)
                 }
+                if ($slashes -gt 0) {
+                    [void]$builder.Append([char]'\', 2 * $slashes)
+                }
+                [void]$builder.Append('"')
+                return $builder.ToString()
             }) -join ' ')
+}
+
+function Clear-D32ChildEnvironment {
+    param([Parameter(Mandatory = $true)][Diagnostics.ProcessStartInfo]$StartInfo)
+
+    $StartInfo.EnvironmentVariables.Clear()
 }
 
 function Assert-D32CleanGitStatus {
@@ -632,6 +1653,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         string filePath,
         string commandLine,
         string workingDirectory,
+        string environmentBlock,
         string testFailure)
     {
         if (String.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("filePath");
@@ -645,6 +1667,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         IntPtr attributeList = IntPtr.Zero;
         IntPtr attributeListSize = IntPtr.Zero;
         IntPtr handleList = IntPtr.Zero;
+        IntPtr nativeEnvironment = IntPtr.Zero;
         ProcessInformation pi = new ProcessInformation();
         bool transferred = false;
         Exception failure = null;
@@ -724,14 +1747,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             startup.StartupInfo.StandardError = stderrWrite;
             startup.AttributeList = attributeList;
             StringBuilder mutableCommandLine = new StringBuilder(commandLine ?? String.Empty);
+            if (!String.IsNullOrEmpty(environmentBlock))
+                nativeEnvironment = Marshal.StringToHGlobalUni(environmentBlock);
+            uint creationFlags = CreateSuspended | CreateNoWindow | CreateUnicodeEnvironment | ExtendedStartupInfoPresent;
             if (!CreateProcessW(
                 filePath,
                 mutableCommandLine,
                 IntPtr.Zero,
                 IntPtr.Zero,
                 true,
-                CreateSuspended | CreateNoWindow | CreateUnicodeEnvironment | ExtendedStartupInfoPresent,
-                IntPtr.Zero,
+                creationFlags,
+                nativeEnvironment,
                 workingDirectory,
                 ref startup,
                 out pi)) {
@@ -811,6 +1837,11 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         }
         finally
         {
+            if (nativeEnvironment != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(nativeEnvironment);
+                nativeEnvironment = IntPtr.Zero;
+            }
             if (attributeList != IntPtr.Zero)
             {
                 DeleteProcThreadAttributeList(attributeList);
@@ -1005,6 +2036,7 @@ function New-D32ProcessIdentityRecord {
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [AllowNull()][Nullable[int]]$ParentProcessId,
         [AllowNull()][string]$Name,
+        [AllowNull()][string]$ImagePath,
         [AllowNull()][string]$CommandLine,
         [AllowNull()][string]$CreationDate,
         [Parameter(Mandatory = $true)][string]$ObservedAtUtc,
@@ -1015,6 +2047,7 @@ function New-D32ProcessIdentityRecord {
         ProcessId       = $ProcessId
         ParentProcessId = $ParentProcessId
         Name            = $Name
+        ImagePath       = $ImagePath
         CommandLine     = $CommandLine
         CreationDate    = $CreationDate
         ObservedAtUtc   = $ObservedAtUtc
@@ -1036,6 +2069,7 @@ function Get-D32ProcessSnapshot {
         }
         return @($items | ForEach-Object {
             $name = if ($null -eq $_.Name) { $null } else { [string]$_.Name }
+            $imagePath = if ($null -eq $_.ExecutablePath) { $null } else { [string]$_.ExecutablePath }
             $creation = if ($null -eq $_.CreationDate) { $null } else { [string]$_.CreationDate }
             $parent = if ($null -eq $_.ParentProcessId) { $null } else { [int]$_.ParentProcessId }
             $commandLine = if ($null -eq $_.CommandLine) { $null } else { [string]$_.CommandLine }
@@ -1043,10 +2077,14 @@ function Get-D32ProcessSnapshot {
                 -ProcessId ([int]$_.ProcessId) `
                 -ParentProcessId $parent `
                 -Name $name `
+                -ImagePath $imagePath `
                 -CommandLine $commandLine `
                 -CreationDate $creation `
                 -ObservedAtUtc $observedAt `
-                -IdentityVerified ($null -ne $name -and $name.Length -gt 0 -and $null -ne $creation -and $creation.Length -gt 0)
+                -IdentityVerified ($null -ne $name -and $name.Length -gt 0 -and
+                    $null -ne $imagePath -and $imagePath.Length -gt 0 -and
+                    $null -ne $commandLine -and $commandLine.Length -gt 0 -and
+                    $null -ne $creation -and $creation.Length -gt 0)
         })
     }
     catch {
@@ -1066,6 +2104,59 @@ function ConvertTo-D32IdentityDocument {
         command_line      = $Record.CommandLine
         observed_at_utc   = $Record.ObservedAtUtc
         identity_verified = [bool]$Record.IdentityVerified
+    }
+}
+
+function ConvertTo-D32D31ProcessIdentityDocument {
+    param([AllowNull()][object]$Record)
+
+    if ($null -eq $Record) { return $null }
+    return [ordered]@{
+        process_id = if ($null -eq $Record.ProcessId) { $null } else { [int]$Record.ProcessId }
+        parent_process_id = if ($null -eq $Record.ParentProcessId) { $null } else { [int]$Record.ParentProcessId }
+        name = $Record.Name
+        image_path = $Record.ImagePath
+        creation_date = $Record.CreationDate
+        command_line = $Record.CommandLine
+        observed_at_utc = $Record.ObservedAtUtc
+        identity_verified = [bool]$Record.IdentityVerified
+    }
+}
+
+function Assert-D32PinnedCargoProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object]$ProcessIdentity,
+        [Parameter(Mandatory = $true)][string]$CargoPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile
+    )
+
+    if ($null -eq $ProcessIdentity -or -not [bool]$ProcessIdentity.IdentityVerified -or [int]$ProcessIdentity.ProcessId -le 0) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: Cargo process identity was not verified'
+    }
+    $expectedPath = Get-D32FullPath $CargoPath
+    if (-not [string]::Equals((Get-D32FullPath ([string]$ProcessIdentity.ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string]$ProcessIdentity.Name, 'cargo.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: observed Cargo process name/image does not match the caller-pinned Cargo path'
+    }
+    $expectedTool = $ValidatedProfile.Profile.toolchain.cargo
+    if (-not [string]::Equals((Get-D32FullPath ([string]$expectedTool.path)), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: process path differs from the profile-pinned direct Cargo executable'
+    }
+    $observedArtifact = Get-D32BoundArtifact -Path ([string]$ProcessIdentity.ImagePath)
+    if ($observedArtifact.sha256 -cne [string]$expectedTool.sha256 -or
+        [uint64]$observedArtifact.bytes -ne [uint64]$expectedTool.bytes) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: started process image bytes/hash differ from the profile-pinned Cargo identity'
+    }
+    $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+    if (-not [string]::Equals([string]$ProcessIdentity.CommandLine, $expectedCommand, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: started Cargo process argv differs from the requested fixed command'
+    }
+    if ($null -eq $ProcessIdentity.ParentProcessId -or [int]$ProcessIdentity.ParentProcessId -ne [int]$PID -or
+        [int]$ProcessIdentity.ParentProcessId -eq [int]$ProcessIdentity.ProcessId -or
+        [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.CreationDate) -or
+        [String]::IsNullOrWhiteSpace([string]$ProcessIdentity.ObservedAtUtc)) {
+        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: Cargo parent must be this pinned PowerShell process and creation evidence must be complete'
     }
 }
 
@@ -1338,6 +2429,7 @@ function Invoke-D32BoundedProcess {
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$PhaseLog,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [AllowNull()][System.Collections.IDictionary]$ChildEnvironment,
         [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init', 'api-failure', 'attribute-failure', 'pipe-timeout')]
         [string]$FailureInjection = 'none'
     )
@@ -1379,10 +2471,12 @@ function Invoke-D32BoundedProcess {
             'attribute-failure' { 'attribute'; break }
             default { $null; break }
         }
+        $environmentBlock = if ($null -eq $ChildEnvironment) { $null } else { ConvertTo-D32EnvironmentBlock -Environment $ChildEnvironment }
         $nativeProcess = [D32FixtureNativeProcessV2]::Start(
             (Get-D32FullPath $FilePath),
             $commandLine,
             (Get-D32FullPath $WorkingDirectory),
+            $environmentBlock,
             $nativeTestFailure)
         $processId = [int]$nativeProcess.ProcessId
         $script:D32LastProcessEvidence.native_launch = [ordered]@{
@@ -1637,12 +2731,11 @@ function Get-D32Artifact {
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
         throw "FIXTURE_MISSING: expected fixture output was not produced: $full"
     }
-    $item = Get-Item -LiteralPath $full
-    $hash = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bound = Get-D32BoundArtifact -Path $full
     return [ordered]@{
-        path   = $item.FullName
-        bytes  = [uint64]$item.Length
-        sha256 = $hash
+        path   = $bound.path
+        bytes  = [uint64]$bound.bytes
+        sha256 = $bound.sha256
     }
 }
 
@@ -1658,6 +2751,237 @@ function Write-D32Manifest {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Assert-D32FixtureManifestEnvironmentShape {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment)
+
+    $required = @('original_userprofile', 'codex_home', 'userprofile', 'cargo_home', 'rustup_home', 'rustup_toolchain')
+    $actual = @($Environment.Keys | ForEach-Object { [string]$_ })
+    if ($actual.Count -ne $required.Count -or
+        @($actual | Where-Object { $_ -notin $required }).Count -ne 0 -or
+        @($required | Where-Object { $_ -notin $actual }).Count -ne 0) {
+        throw 'FIXTURE_MANIFEST_ENVIRONMENT_INVALID: schema-v3 environment must retain exactly the six consumer wire fields'
+    }
+}
+
+function Write-D32NewFixtureBuildProvenance {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document
+    )
+
+    $full = Assert-D32NoReparsePath -Path $Path -AllowMissingLeaf
+    if (Test-Path -LiteralPath $full) {
+        throw "OUTPUT_NOT_OWNED: refusing to overwrite fixture build provenance: $full"
+    }
+    $parent = Split-Path -Parent $full
+    [void](Assert-D32NoReparsePath -Path $parent)
+    $temporary = Join-Path $parent ('.fixture-build-provenance.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $json = $Document | ConvertTo-Json -Depth 12
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    try { [IO.File]::Move($temporary, $full) }
+    catch {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        throw
+    }
+    return Get-D32BoundArtifact -Path $full
+}
+
+function Assert-D32FixtureBuildProvenanceShape {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document)
+
+    $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
+        'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
+        'fixture_manifest_file_id_hex', 'environment')
+    $actual = @($Document.Keys | ForEach-Object { [string]$_ })
+    if ($actual.Count -ne $expected.Count -or
+        @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
+        @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
+        [int]$Document.schema_version -ne 1 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V1' -or
+        [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [uint64]$Document.fixture_manifest_bytes -le 0 -or
+        [string]$Document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        [string]$Document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'FIXTURE_PROVENANCE_INVALID: sidecar schema, version, manifest hash, bytes, or identity is invalid'
+    }
+    $environmentFields = @('toolchain_profile_path', 'toolchain_profile_sha256', 'target_triple', 'env_policy',
+        'cargo_policy', 'cargo_home', 'temp_root', 'run_id', 'fetch_manifests', 'offline_after_fetch')
+    $environmentKeys = @($Document.environment.Keys | ForEach-Object { [string]$_ })
+    if ($environmentKeys.Count -ne $environmentFields.Count -or
+        @($environmentKeys | Where-Object { $_ -notin $environmentFields }).Count -ne 0 -or
+        @($environmentFields | Where-Object { $_ -notin $environmentKeys }).Count -ne 0 -or
+        [string]$Document.environment.toolchain_profile_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Document.environment.run_id -cnotmatch '^[0-9a-f]{32}$' -or
+        $Document.environment.fetch_manifests -isnot [Array] -or
+        $Document.environment.fetch_manifests.Count -eq 0 -or
+        -not [bool]$Document.environment.offline_after_fetch) {
+        throw 'FIXTURE_PROVENANCE_INVALID: sidecar environment must match the exact ten-field versioned provenance shape'
+    }
+    foreach ($fetchManifest in @($Document.environment.fetch_manifests)) {
+        $fetchFields = @(Get-D32ObjectFieldNames -Object $fetchManifest)
+        $fetchRequired = @('manifest_path', 'lock_sha256', 'command', 'status', 'exit_code', 'process_identity')
+        if ($fetchFields.Count -ne $fetchRequired.Count -or
+            @($fetchFields | Where-Object { $_ -notin $fetchRequired }).Count -ne 0 -or
+            @($fetchRequired | Where-Object { $_ -notin $fetchFields }).Count -ne 0 -or
+            [string]$fetchManifest.manifest_path -cnotmatch '^[A-Za-z0-9._/-]+\.toml$' -or
+            [string]$fetchManifest.lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $fetchManifest.command -isnot [Array] -or $fetchManifest.command.Count -ne 6 -or
+            @($fetchManifest.command | Where-Object { $_ -isnot [string] }).Count -ne 0 -or
+            [string]$fetchManifest.command[0] -cne 'fetch' -or
+            [string]$fetchManifest.command[1] -cne '--locked' -or
+            [string]$fetchManifest.command[2] -cne '--manifest-path' -or
+            [string]::IsNullOrWhiteSpace([string]$fetchManifest.command[3]) -or
+            -not [IO.Path]::IsPathRooted([string]$fetchManifest.command[3]) -or
+            [string]$fetchManifest.command[4] -cne '--target' -or
+            [string]$fetchManifest.command[5] -cne [string]$Document.environment.target_triple -or
+            [string]$fetchManifest.status -cne 'succeeded' -or [int]$fetchManifest.exit_code -ne 0) {
+            throw 'FIXTURE_PROVENANCE_INVALID: sidecar fetch command/result is malformed or has missing/extra fields'
+        }
+        $identity = $fetchManifest.process_identity
+        if ($null -eq $identity) {
+            throw 'FIXTURE_PROVENANCE_INVALID: sidecar Cargo process identity is missing'
+        }
+        $identityRequired = @('process_id', 'parent_process_id', 'name', 'image_path', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified')
+        $identityFields = @(Get-D32ObjectFieldNames -Object $identity)
+        if ($identityFields.Count -ne $identityRequired.Count -or
+            @($identityFields | Where-Object { $_ -notin $identityRequired }).Count -ne 0 -or
+            @($identityRequired | Where-Object { $_ -notin $identityFields }).Count -ne 0 -or
+            [int64]$identity.process_id -le 0 -or [int64]$identity.parent_process_id -le 0 -or
+            [int64]$identity.parent_process_id -ne [int64]$PID -or
+            [string]$identity.name -cne 'cargo.exe' -or
+            [string]::IsNullOrWhiteSpace([string]$identity.image_path) -or
+            -not [IO.Path]::IsPathRooted([string]$identity.image_path) -or
+            [string]::IsNullOrWhiteSpace([string]$identity.creation_date) -or
+            [string]::IsNullOrWhiteSpace([string]$identity.command_line) -or
+            [string]::IsNullOrWhiteSpace([string]$identity.observed_at_utc) -or
+            $identity.identity_verified -isnot [bool] -or -not $identity.identity_verified) {
+            throw 'FIXTURE_PROVENANCE_INVALID: sidecar Cargo process identity is malformed or unverified'
+        }
+    }
+}
+
+function Write-D32NewRecoverySeederBuildRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document
+    )
+
+    $full = Assert-D32NoReparsePath -Path $Path -AllowMissingLeaf
+    if (Test-Path -LiteralPath $full) {
+        throw "OUTPUT_NOT_OWNED: refusing to overwrite D31 seeder record: $full"
+    }
+    $parent = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "OUTPUT_NOT_OWNED: D31 seeder record parent must already exist: $parent"
+    }
+    [void](Assert-D32NoReparsePath -Path $parent)
+    $temporary = Join-Path $parent ('.d31-recovery-seeder.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $json = $Document | ConvertTo-Json -Depth 12
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    try {
+        [IO.File]::Move($temporary, $full)
+    }
+    catch {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        throw
+    }
+    return Get-D32BoundArtifact -Path $full
+}
+
+function Get-D32ObjectFieldNames {
+    param([Parameter(Mandatory = $true)][object]$Object)
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        return @($Object.Keys | ForEach-Object { [string]$_ })
+    }
+    return @($Object.PSObject.Properties | ForEach-Object { [string]$_.Name })
+}
+
+function Assert-D32D31RecoverySeederRecordShape {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OutputRoot
+    )
+
+    $required = @('schema_version', 'purpose', 'run_id', 'candidate_sha', 'runner_process_id', 'source_repo', 'manifest_path', 'feature',
+        'command', 'target_dir', 'run_root', 'cargo_home', 'temp_root', 'toolchain_profile_path',
+        'toolchain_profile_sha256', 'target_triple', 'powershell', 'toolchain', 'fetch_manifests',
+        'fetch_phases', 'cargo_path', 'process_identity', 'status', 'exit_code', 'artifact')
+    $keys = Get-D32ObjectFieldNames -Object $Document
+    if ($keys.Count -ne $required.Count -or
+        @($keys | Where-Object { $_ -notin $required }).Count -ne 0 -or
+        @($required | Where-Object { $_ -notin $keys }).Count -ne 0 -or
+        [int]$Document.schema_version -ne 2 -or
+        [int64]$Document.runner_process_id -le 0 -or [int64]$Document.runner_process_id -ne [int64]$PID -or
+        [string]$Document.purpose -cne 'd31-recovery-seeder-test-helper' -or
+        [string]$Document.feature -cne 'd29-h9-test-helper' -or
+        [string]$Document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
+        [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Document.status -cne 'succeeded' -or [int]$Document.exit_code -ne 0) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: record must match the exact schema-v2 top-level wire shape'
+    }
+    $expectedTarget = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot 'd31-recovery-seeder-target') -AllowMissingLeaf
+    $expectedRecord = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot 'd31-recovery-seeder-build.json') -AllowMissingLeaf
+    if (-not [string]::Equals((Get-D32FullPath ([string]$Document.target_dir)), $expectedTarget, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Get-D32FullPath $Path), $expectedRecord, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Get-D32FullPath ([string]$Document.manifest_path)), (Get-D32FullPath (Join-Path ([string]$Document.source_repo) 'vita-agent/Cargo.toml')), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: manifest, fixed external target, or sibling record path differs'
+    }
+    $expectedCommand = @('build', '--quiet', '--locked', '--manifest-path', [string]$Document.manifest_path,
+        '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', [string]$Document.target_dir)
+    $command = @($Document.command | ForEach-Object { [string]$_ })
+    if ($command.Count -ne $expectedCommand.Count -or
+        (($command -join "`0") -cne ($expectedCommand -join "`0"))) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: exact fixed Cargo argv must not gain flags such as --offline'
+    }
+    $identity = $Document.process_identity
+    if ($null -eq $identity) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: Cargo process identity is missing'
+    }
+    $identityFields = @(Get-D32ObjectFieldNames -Object $identity)
+    $identityRequired = @('process_id', 'parent_process_id', 'name', 'image_path', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified')
+    if ($identityFields.Count -ne $identityRequired.Count -or
+        @($identityFields | Where-Object { $_ -notin $identityRequired }).Count -ne 0 -or
+        @($identityRequired | Where-Object { $_ -notin $identityFields }).Count -ne 0 -or
+        [int64]$identity.process_id -le 0 -or
+        [int64]$identity.parent_process_id -ne [int64]$Document.runner_process_id -or
+        [int64]$identity.process_id -eq [int64]$Document.runner_process_id -or
+        [string]$identity.name -cne 'cargo.exe' -or
+        [string]::IsNullOrWhiteSpace([string]$identity.image_path) -or
+        -not [IO.Path]::IsPathRooted([string]$identity.image_path) -or
+        [string]::IsNullOrWhiteSpace([string]$identity.creation_date) -or
+        [string]::IsNullOrWhiteSpace([string]$identity.command_line) -or
+        [string]::IsNullOrWhiteSpace([string]$identity.observed_at_utc) -or
+        $identity.identity_verified -isnot [bool] -or -not $identity.identity_verified) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: Cargo process parent must equal the recorded current runner process'
+    }
+    $artifactFields = @(Get-D32ObjectFieldNames -Object $Document.artifact)
+    if ($artifactFields.Count -ne 4 -or
+        @($artifactFields | Where-Object { $_ -notin @('path', 'bytes', 'sha256', 'file_identity') }).Count -ne 0 -or
+        @(@('path', 'bytes', 'sha256', 'file_identity') | Where-Object { $_ -notin $artifactFields }).Count -ne 0 -or
+        -not [string]::Equals([string]$Document.artifact.path, (Join-Path $expectedTarget 'debug/vita-agent.exe'), [StringComparison]::OrdinalIgnoreCase) -or
+        [uint64]$Document.artifact.bytes -le 0 -or [string]$Document.artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: artifact shape or fixed seeder image path is invalid'
+    }
+}
+
 function Invoke-D32SelfTest {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-selftest-' + [Guid]::NewGuid().ToString('N'))
     $passed = 0
@@ -1665,12 +2989,474 @@ function Invoke-D32SelfTest {
     try {
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
+        Write-Host 'D32_FIXTURE_TRUST_CONTRACT=pins:-PinnedGitPath,-PinnedGitSha256,-ExpectedCandidateSha,-ToolchainProfilePath,-ExpectedToolchainProfileSha256; d31-target:OutputRoot\d31-recovery-seeder-target; d31-record:sibling-d31-recovery-seeder-build.json; d31-env:D31_RECOVERY_SEEDER_RECORD_PATH,D31_RECOVERY_SEEDER_RECORD_SHA256,D31_RECOVERY_SEEDER_RUN_ID,D32_BUILD_TOOLCHAIN_PROFILE_PATH,D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256; profile:D32_BUILD_TOOLCHAIN_PROFILE_V1'
+
+        $fixedSeederPaths = Get-D32D31RecoverySeederPaths -OutputRoot $root
+        if ((Split-Path -Parent $fixedSeederPaths.target) -ne (Split-Path -Parent $fixedSeederPaths.record) -or
+            (Split-Path -Leaf $fixedSeederPaths.target) -ne 'd31-recovery-seeder-target' -or
+            (Split-Path -Leaf $fixedSeederPaths.record) -ne 'd31-recovery-seeder-build.json') {
+            throw 'SELFTEST_FAILED: D31 seeder target and record must be fixed canonical siblings'
+        }
+        $passed++
+
+        $quotedArguments = ConvertTo-D32CommandLine @(
+            'plain',
+            'with spaces',
+            'C:\path with space\\',
+            'embedded\"quote'
+        )
+        if ($quotedArguments -cne 'plain "with spaces" "C:\path with space\\\\" "embedded\\\"quote"') {
+            throw "SELFTEST_FAILED: Windows process argv quoting mismatch: $quotedArguments"
+        }
+        $passed++
+
+        $identityCargoPath = Join-Path $root 'cargo-identity-test.exe'
+        [IO.File]::WriteAllBytes($identityCargoPath, [byte[]](0x4D, 0x5A, 0x11, 0x22))
+        $identityCargoArtifact = Get-D32BoundArtifact -Path $identityCargoPath
+        $identityCargoArguments = @(
+            'fetch', '--locked', '--manifest-path', (Join-Path $root 'vita-agent/Cargo.toml'),
+            '--target', 'x86_64-pc-windows-msvc'
+        )
+        $identityProfile = [PSCustomObject]@{
+            Profile = [PSCustomObject]@{
+                toolchain = [PSCustomObject]@{
+                    cargo = [PSCustomObject]@{
+                        path = $identityCargoPath
+                        sha256 = $identityCargoArtifact.sha256
+                        bytes = $identityCargoArtifact.bytes
+                    }
+                }
+            }
+        }
+        $currentParentCargoIdentity = [PSCustomObject]@{
+            IdentityVerified = $true
+            ProcessId = [int]$PID + 1
+            ParentProcessId = [int]$PID
+            ImagePath = $identityCargoPath
+            Name = 'cargo.exe'
+            CommandLine = ConvertTo-D32CommandLine (@($identityCargoPath) + $identityCargoArguments)
+            CreationDate = '2026-09-23T00:00:00.0000000Z'
+            ObservedAtUtc = '2026-09-23T00:00:01.0000000Z'
+        }
+        Assert-D32PinnedCargoProcessIdentity -ProcessIdentity $currentParentCargoIdentity `
+            -CargoPath $identityCargoPath -Arguments $identityCargoArguments -ValidatedProfile $identityProfile
+        $passed++
+        $wrongParentCargoIdentity = [PSCustomObject]@{}
+        foreach ($property in $currentParentCargoIdentity.PSObject.Properties) {
+            $wrongParentCargoIdentity | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value
+        }
+        $wrongParentCargoIdentity.ParentProcessId = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 }
+        try {
+            Assert-D32PinnedCargoProcessIdentity -ProcessIdentity $wrongParentCargoIdentity `
+                -CargoPath $identityCargoPath -Arguments $identityCargoArguments -ValidatedProfile $identityProfile
+            throw 'SELFTEST_FAILED: Cargo identity with a parent other than this PowerShell process was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'CARGO_PROCESS_IDENTITY_MISMATCH:*') { throw } }
+        $passed++
+
+        $environmentBlock = ConvertTo-D32EnvironmentBlock ([ordered]@{ zLast = 'second'; AFirst = 'first' })
+        if ($environmentBlock -cne "AFirst=first`0zLast=second`0`0") {
+            throw 'SELFTEST_FAILED: explicit Unicode child environment block is not strictly sorted and double-terminated'
+        }
+        $duplicateEnvironmentNames = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+        $duplicateEnvironmentNames.Add('Path', 'one')
+        $duplicateEnvironmentNames.Add('PATH', 'two')
+        try {
+            [void](ConvertTo-D32EnvironmentBlock $duplicateEnvironmentNames)
+            throw 'SELFTEST_FAILED: case-insensitive duplicate child environment names were accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'CHILD_ENVIRONMENT_INVALID:*') { throw }
+        }
+        $passed++
+        $hostileGitEnvironment = [Diagnostics.ProcessStartInfo]::new()
+        $hostileGitEnvironment.EnvironmentVariables['GIT_CONFIG_COUNT'] = '1'
+        $hostileGitEnvironment.EnvironmentVariables['GIT_CONFIG_KEY_0'] = 'alias.status=write-marker'
+        $hostileGitEnvironment.EnvironmentVariables['GIT_CONFIG_VALUE_0'] = '!write-marker'
+        $hostileGitEnvironment.EnvironmentVariables['GIT_DIR'] = 'outside-metadata'
+        $hostileGitEnvironment.EnvironmentVariables['GIT_TRACE'] = 'write-marker'
+        Clear-D32ChildEnvironment -StartInfo $hostileGitEnvironment
+        if ($hostileGitEnvironment.EnvironmentVariables.Count -ne 0) {
+            throw 'SELFTEST_FAILED: inherited Git environment was not fully removed before spawn'
+        }
+        $passed++
+
+        $fakeGit = Join-Path $root 'fake-git.exe'
+        [IO.File]::WriteAllBytes($fakeGit, [byte[]](0x4D, 0x5A, 0x00, 0x01))
+        $fakeGitHash = (Get-FileHash -LiteralPath $fakeGit -Algorithm SHA256).Hash.ToLowerInvariant()
+        try {
+            [void](Get-D32PinnedGit -Path $fakeGit -ExpectedSha256 ('0' * 64))
+            throw 'SELFTEST_FAILED: fake Git with a mismatched SHA was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'GIT_PIN_INVALID:*') { throw }
+        }
+        $passed++
+
+        $existingPinnedGitVariable = Get-Variable -Name PinnedGit -Scope Script -ErrorAction SilentlyContinue
+        $savedPinnedGit = if ($null -eq $existingPinnedGitVariable) { $null } else { $existingPinnedGitVariable.Value }
+        $pinnedFakeGit = Get-D32PinnedGit -Path $fakeGit -ExpectedSha256 $fakeGitHash
+        $script:PinnedGit = $pinnedFakeGit
+        $gitHandle = $null
+        try {
+            $gitHandle = Open-D32PinnedGitHandle
+            $replacementDenied = $false
+            try { [IO.File]::Move($fakeGit, (Join-Path $root 'fake-git-replaced.exe')) }
+            catch { $replacementDenied = $true }
+            if (-not $replacementDenied -or -not (Test-Path -LiteralPath $fakeGit -PathType Leaf)) {
+                throw 'SELFTEST_FAILED: retained Git image handle did not deny replacement'
+            }
+        }
+        finally {
+            if ($null -ne $gitHandle) { $gitHandle.Dispose() }
+            $script:PinnedGit = $savedPinnedGit
+        }
+        $passed++
+
+        try {
+            [void](Get-D32PinnedGit -Path 'git.exe' -ExpectedSha256 $fakeGitHash)
+            throw 'SELFTEST_FAILED: relative pinned Git path was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'PATH_INVALID:*') { throw }
+        }
+        $passed++
+
+        $fakeRepo = Join-Path $root 'fake-repository'
+        $fakeGitDirectory = Join-Path $fakeRepo '.git'
+        New-Item -ItemType Directory -Path (Join-Path $fakeGitDirectory 'objects/info') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $fakeGitDirectory 'refs/heads') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $fakeGitDirectory 'info') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $fakeRepo 'vita-agent') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $fakeGitDirectory 'HEAD'), "ref: refs/heads/main`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllBytes((Join-Path $fakeGitDirectory 'index'), [byte[]]@())
+        [IO.File]::WriteAllText((Join-Path $fakeGitDirectory 'info/exclude'), "# allowed comments`n`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
+        $configPath = Join-Path $fakeGitDirectory 'config'
+        [IO.File]::WriteAllText(
+            $configPath,
+            "[core]`n`t repositoryformatversion = 0`n`t filemode = false`n`t bare = false`n`t logallrefupdates = true`n`n[remote `"origin`"]`n`t url = https://example.invalid/repo.git`n`t fetch = +refs/heads/*:refs/remotes/origin/*`n`n[branch `"main`"]`n`t remote = origin`n`t merge = refs/heads/main`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+        $hiddenUntracked = Join-Path $fakeRepo 'hidden-source.rs'
+        [IO.File]::WriteAllText($hiddenUntracked, 'untracked source', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $fakeGitDirectory 'info/exclude'), "# allowed comment`n`nvita-agent/target/`nhidden-source.rs`n", [Text.UTF8Encoding]::new($false))
+        try {
+            [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+            throw 'SELFTEST_FAILED: added .git/info/exclude rule hiding an untracked source was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'GIT_REPOSITORY_INVALID:*') { throw }
+        }
+        Remove-Item -LiteralPath $hiddenUntracked -Force
+        [IO.File]::WriteAllText((Join-Path $fakeGitDirectory 'info/exclude'), "# allowed comment`n`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
+        $passed++
+
+        $metadataLocks = Open-D32GitMetadataLocks -Root $fakeRepo -GitDirectory $fakeGitDirectory
+        try {
+            $windowsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+            $cmdPath = Assert-D32NoReparsePath -Path (Join-Path $windowsDirectory 'System32/cmd.exe')
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $cmdPath
+            $startInfo.Arguments = '/d /c exit 0'
+            $startInfo.WorkingDirectory = $root
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $process = [Diagnostics.Process]::Start($startInfo)
+            if ($null -eq $process) { throw 'SELFTEST_FAILED: metadata race probe process did not start' }
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw 'SELFTEST_FAILED: metadata race probe process did not exit successfully' }
+            $process.Dispose()
+            foreach ($metadataLock in $metadataLocks.Items) {
+                $writeOpenRejected = $false
+                try {
+                    $writeStream = [IO.File]::Open([string]$metadataLock.Path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+                    $writeStream.Dispose()
+                }
+                catch { $writeOpenRejected = $true }
+                if (-not $writeOpenRejected) {
+                    throw 'SELFTEST_FAILED: retained metadata read handle allowed a writer after process creation'
+                }
+                $renameRejected = $false
+                $movedPath = "$($metadataLock.Path).race-move"
+                try { [IO.File]::Move([string]$metadataLock.Path, $movedPath) }
+                catch { $renameRejected = $true }
+                if (-not $renameRejected) {
+                    [IO.File]::Move($movedPath, [string]$metadataLock.Path)
+                    throw 'SELFTEST_FAILED: retained metadata read handle allowed pathname replacement after process creation'
+                }
+                Assert-D32GitMetadataFileLockCurrent -Lock $metadataLock
+            }
+        }
+        finally { Close-D32GitMetadataLocks -Locks $metadataLocks }
+        $passed++
+
+        [IO.File]::WriteAllText($configPath, "[filter `"hostile`"]`n`t clean = write-marker`n", [Text.UTF8Encoding]::new($false))
+        try {
+            [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+            throw 'SELFTEST_FAILED: execution-capable Git filter config was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'GIT_CONFIG_REJECTED:*') { throw }
+        }
+        $passed++
+
+        $ordinaryConfig = @'
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = false
+	logallrefupdates = true
+'@
+        [IO.File]::WriteAllText($configPath, $ordinaryConfig, [Text.UTF8Encoding]::new($false))
+        New-Item -ItemType Directory -Path (Join-Path $fakeGitDirectory 'info') -Force | Out-Null
+        foreach ($relative in @(
+                'gitdir',
+                'commondir',
+                'config.worktree',
+                'objects/info/alternates',
+                'objects/info/http-alternates',
+                'info/grafts'
+            )) {
+            $metadataPath = Join-Path $fakeGitDirectory $relative
+            $metadataParent = Split-Path -Parent $metadataPath
+            if (-not (Test-Path -LiteralPath $metadataParent -PathType Container)) {
+                New-Item -ItemType Directory -Path $metadataParent -Force | Out-Null
+            }
+            [IO.File]::WriteAllText($metadataPath, 'outside-metadata', [Text.UTF8Encoding]::new($false))
+            try {
+                [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+                throw "SELFTEST_FAILED: Git metadata indirection was accepted: $relative"
+            }
+            catch {
+                if ($_.Exception.Message -notlike 'GIT_REPOSITORY_INVALID:*') { throw }
+            }
+            Remove-Item -LiteralPath $metadataPath -Force
+            $passed++
+        }
+        $outsideRefs = Join-Path $root 'outside-refs'
+        New-Item -ItemType Directory -Path $outsideRefs -Force | Out-Null
+        $nestedRefsJunction = Join-Path $fakeGitDirectory 'refs/heads/external'
+        try {
+            New-Item -ItemType Junction -Path $nestedRefsJunction -Target $outsideRefs -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "SELFTEST_UNAVAILABLE: could not create nested Git metadata junction: $($_.Exception.Message)"
+        }
+        try {
+            [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+            throw 'SELFTEST_FAILED: nested Git metadata reparse point was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'GIT_REPOSITORY_INVALID:*') { throw }
+        }
+        Remove-Item -LiteralPath $nestedRefsJunction -Force
+        $passed++
+
+        $outsideInfo = Join-Path $root 'outside-info'
+        New-Item -ItemType Directory -Path $outsideInfo -Force | Out-Null
+        $nestedInfoJunction = Join-Path $fakeGitDirectory 'info/external'
+        try {
+            New-Item -ItemType Junction -Path $nestedInfoJunction -Target $outsideInfo -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "SELFTEST_UNAVAILABLE: could not create nested Git info junction: $($_.Exception.Message)"
+        }
+        try {
+            [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+            throw 'SELFTEST_FAILED: nested .git/info reparse point was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'GIT_REPOSITORY_INVALID:*') { throw }
+        }
+        Remove-Item -LiteralPath $nestedInfoJunction -Force
+        $passed++
+
+        $outsideTarget = Join-Path $root 'outside-target'
+        New-Item -ItemType Directory -Path $outsideTarget -Force | Out-Null
+        $targetJunction = Join-Path $fakeRepo 'vita-agent/target'
+        try {
+            New-Item -ItemType Junction -Path $targetJunction -Target $outsideTarget -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "SELFTEST_UNAVAILABLE: could not create repo-local target junction: $($_.Exception.Message)"
+        }
+        try {
+            [void](Assert-D32RepositoryGitConfig -Root $fakeRepo)
+            throw 'SELFTEST_FAILED: approved ignore rule accepted a target path that redirects outside the repository'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'PATH_REPARSE:*') { throw }
+        }
+        Remove-Item -LiteralPath $targetJunction -Force
+        $passed++
+
+        $junction = Join-Path $root 'repo-junction'
+        try {
+            New-Item -ItemType Junction -Path $junction -Target $fakeRepo -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "SELFTEST_UNAVAILABLE: could not create a junction for the required reparse negative: $($_.Exception.Message)"
+        }
+        try {
+            [void](Assert-D32NoReparsePath -Path (Join-Path $junction '.git'))
+            throw 'SELFTEST_FAILED: reparse-point repository path was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'PATH_REPARSE:*') { throw }
+        }
+        $passed++
+
         $manifest = Assert-D32ManifestDestination -Path (Join-Path $root 'manifest.json') -OwnedRoot $root
         $sample = Join-Path $root 'sample.bin'
         [IO.File]::WriteAllBytes($sample, [byte[]](1, 2, 3, 4))
         $artifact = Get-D32Artifact $sample
         if ($artifact.bytes -ne 4 -or $artifact.sha256.Length -ne 64) {
             throw 'SELFTEST_FAILED: artifact manifest record'
+        }
+        $passed++
+        $boundArtifact = Get-D32BoundArtifact $sample
+        if ($boundArtifact.bytes -ne 4 -or
+            $boundArtifact.sha256 -ne $artifact.sha256 -or
+            $boundArtifact.file_identity.file_size -ne 4 -or
+            $boundArtifact.file_identity.directory -or
+            $boundArtifact.file_identity.reparse) {
+            throw 'SELFTEST_FAILED: native artifact identity record'
+        }
+        $passed++
+
+        $seederRecordPath = Join-Path $root 'd31-recovery-seeder-build.json'
+        $seederRunId = '0123456789abcdef0123456789abcdef'
+        $seederTarget = Join-Path $root 'd31-recovery-seeder-target'
+        $seederTargetBin = Join-Path $seederTarget 'debug'
+        New-Item -ItemType Directory -Path $seederTargetBin -Force | Out-Null
+        $seederImagePath = Join-Path $seederTargetBin 'vita-agent.exe'
+        [IO.File]::WriteAllBytes($seederImagePath, [byte[]](10, 20, 30, 40))
+        $seederArtifact = Get-D32BoundArtifact -Path $seederImagePath
+        $seederManifest = Join-Path $fakeRepo 'vita-agent/Cargo.toml'
+        $seederPowerShellIdentity = [ordered]@{
+            name = 'pwsh.exe'; path = (Join-Path $root 'pwsh.exe'); sha256 = ('a' * 64); bytes = 1
+            volume_serial_hex = '0000000000000001'; file_id_hex = ('01' * 16); reason = 'direct pinned PowerShell host executable'
+        }
+        $seederCargoIdentity = [ordered]@{
+            name = 'cargo.exe'; path = (Join-Path $root 'cargo.exe'); sha256 = ('b' * 64); bytes = 1
+            volume_serial_hex = '0000000000000001'; file_id_hex = ('02' * 16); reason = 'direct pinned cargo executable'
+        }
+        $seederRustcIdentity = [ordered]@{
+            name = 'rustc.exe'; path = (Join-Path $root 'rustc.exe'); sha256 = ('c' * 64); bytes = 1
+            volume_serial_hex = '0000000000000001'; file_id_hex = ('03' * 16); reason = 'direct pinned rustc executable'
+        }
+        $seederRustdocIdentity = [ordered]@{
+            name = 'rustdoc.exe'; path = (Join-Path $root 'rustdoc.exe'); sha256 = ('d' * 64); bytes = 1
+            volume_serial_hex = '0000000000000001'; file_id_hex = ('04' * 16); reason = 'direct pinned rustdoc executable'
+        }
+        $seederBuildCommandLine = ConvertTo-D32CommandLine (@($seederCargoIdentity.path) + @(
+            'build', '--quiet', '--locked', '--manifest-path', $seederManifest,
+            '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', $seederTarget
+        ))
+        $seederRecordDocument = [ordered]@{
+            schema_version = 2
+            purpose = 'd31-recovery-seeder-test-helper'
+            run_id = $seederRunId
+            candidate_sha = '0123456789abcdef0123456789abcdef01234567'
+            runner_process_id = [int]$PID
+            source_repo = $fakeRepo
+            manifest_path = $seederManifest
+            feature = 'd29-h9-test-helper'
+            command = @('build', '--quiet', '--locked', '--manifest-path', $seederManifest, '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', $seederTarget)
+            target_dir = $seederTarget
+            run_root = (Join-Path $root "d31-recovery-seeder-run-$seederRunId")
+            cargo_home = (Join-Path $root "d31-recovery-seeder-run-$seederRunId/cargo-home")
+            temp_root = (Join-Path $root "d31-recovery-seeder-run-$seederRunId/temp")
+            toolchain_profile_path = (Join-Path $root 'profile.json')
+            toolchain_profile_sha256 = ('e' * 64)
+            target_triple = 'x86_64-pc-windows-msvc'
+            powershell = $seederPowerShellIdentity
+            toolchain = [ordered]@{ cargo = $seederCargoIdentity; rustc = $seederRustcIdentity; rustdoc = $seederRustdocIdentity }
+            fetch_manifests = @([ordered]@{ manifest_path = 'vita-agent/Cargo.toml'; lock_sha256 = ('f' * 64) })
+            fetch_phases = @()
+            cargo_path = $seederCargoIdentity.path
+            process_identity = [ordered]@{
+                process_id = 1234; parent_process_id = [int]$PID; name = 'cargo.exe'; image_path = $seederCargoIdentity.path
+                creation_date = '2026-09-23T00:00:00.0000000Z'; command_line = $seederBuildCommandLine
+                observed_at_utc = '2026-09-23T00:00:00.0000000Z'; identity_verified = $true
+            }
+            status = 'succeeded'
+            exit_code = 0
+            artifact = $seederArtifact
+        }
+        Assert-D32D31RecoverySeederRecordShape -Document $seederRecordDocument -Path $seederRecordPath -OutputRoot $root
+        $seederRecordWrongParent = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { $seederRecordWrongParent[$field] = $seederRecordDocument[$field] }
+        $seederRecordWrongParent.process_identity = [ordered]@{}
+        foreach ($field in $seederRecordDocument.process_identity.Keys) {
+            $seederRecordWrongParent.process_identity[$field] = $seederRecordDocument.process_identity[$field]
+        }
+        $seederRecordWrongParent.process_identity.parent_process_id = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 }
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordWrongParent -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: D31 seeder v2 process identity parent other than this PowerShell process was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecordWrongRunner = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { $seederRecordWrongRunner[$field] = $seederRecordDocument[$field] }
+        $seederRecordWrongRunner.runner_process_id = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 }
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordWrongRunner -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: D31 seeder v2 runner PID other than this PowerShell process was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecordV1 = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { $seederRecordV1[$field] = $seederRecordDocument[$field] }
+        $seederRecordV1.schema_version = 1
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordV1 -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: obsolete D31 seeder record schema v1 was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecordMissingField = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { if ($field -cne 'fetch_git') { $seederRecordMissingField[$field] = $seederRecordDocument[$field] } }
+        $seederRecordMissingField.Remove('toolchain_profile_path')
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordMissingField -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: missing D31 seeder v2 field was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecordExtraField = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { $seederRecordExtraField[$field] = $seederRecordDocument[$field] }
+        $seederRecordExtraField['unexpected'] = $true
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordExtraField -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: extra D31 seeder v2 field was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecordExtraOffline = [ordered]@{}
+        foreach ($field in $seederRecordDocument.Keys) { $seederRecordExtraOffline[$field] = $seederRecordDocument[$field] }
+        $seederRecordExtraOffline.command = @($seederRecordDocument.command) + @('--offline')
+        try {
+            Assert-D32D31RecoverySeederRecordShape -Document $seederRecordExtraOffline -Path $seederRecordPath -OutputRoot $root
+            throw 'SELFTEST_FAILED: D31 seeder argv with a non-ADR --offline token was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'D31_RECOVERY_SEEDER_RECORD_INVALID:*') { throw } }
+        $seederRecord = Write-D32NewRecoverySeederBuildRecord -Path $seederRecordPath -Document $seederRecordDocument
+        $seederRecordOnDisk = Get-D32BoundArtifact -Path $seederRecordPath
+        if ($seederRecord.sha256 -ne $seederRecordOnDisk.sha256 -or
+            $seederRecord.bytes -ne $seederRecordOnDisk.bytes -or
+            $seederRecord.file_identity.file_index -ne $seederRecordOnDisk.file_identity.file_index) {
+            throw 'SELFTEST_FAILED: D31 seeder build record was not bound to its written file identity'
+        }
+        $seederRecordJson = [IO.File]::ReadAllText($seederRecordPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ([int]$seederRecordJson.schema_version -ne 2 -or
+            (Get-D32ObjectFieldNames -Object $seederRecordJson).Count -ne $seederRecordDocument.Count) {
+            throw 'SELFTEST_FAILED: written D31 seeder record JSON is not exact schema v2'
+        }
+        $passed++
+        try {
+            [void](Write-D32NewRecoverySeederBuildRecord -Path $seederRecordPath -Document $seederRecordDocument)
+            throw 'SELFTEST_FAILED: D31 seeder build record overwrite was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'OUTPUT_NOT_OWNED:*') { throw }
         }
         $passed++
 
@@ -1688,6 +3474,38 @@ function Invoke-D32SelfTest {
             throw "SELFTEST_FAILED: zero exit code was not captured exactly (status=$($zero.status), exit=$($zero.exit_code), error=$($zero.error))"
         }
         $passed++
+
+        $explicitEnvironmentScript = Join-Path $root 'explicit-environment.ps1'
+        [IO.File]::WriteAllText(
+            $explicitEnvironmentScript,
+            "if (`$env:D32_SELFTEST_ALLOWED -cne 'expected-value' -or `$null -ne `$env:D32_SELFTEST_INHERITED) { exit 13 }; exit 0`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+        $savedSelfTestInherited = [Environment]::GetEnvironmentVariable('D32_SELFTEST_INHERITED', 'Process')
+        try {
+            [Environment]::SetEnvironmentVariable('D32_SELFTEST_INHERITED', 'synthetic-ambient-secret', 'Process')
+            $explicitChildEnvironment = [ordered]@{
+                SystemRoot = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows))
+                TEMP = $root
+                TMP = $root
+                D32_SELFTEST_ALLOWED = 'expected-value'
+            }
+            $explicitEnvironment = Invoke-D32BoundedProcess `
+                -FilePath $powershell `
+                -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $explicitEnvironmentScript) `
+                -WorkingDirectory $root `
+                -PhaseLog (Join-Path $root 'explicit-environment-phase') `
+                -TimeoutSeconds 5 `
+                -ChildEnvironment $explicitChildEnvironment
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('D32_SELFTEST_INHERITED', $savedSelfTestInherited, 'Process')
+        }
+        if ($explicitEnvironment.status -ne 'succeeded' -or $explicitEnvironment.exit_code -ne 0) {
+            throw "SELFTEST_FAILED: explicit child environment was not isolated/applied (status=$($explicitEnvironment.status), exit=$($explicitEnvironment.exit_code), error=$($explicitEnvironment.error))"
+        }
+        $passed++
+
         if ($null -eq $zero.native_cleanup -or
             -not [bool]$zero.native_cleanup.cleanup_succeeded -or
             -not [bool]$zero.native_cleanup.job_close_succeeded -or
@@ -1792,11 +3610,109 @@ function Invoke-D32SelfTest {
         $passed++
 
         $envPlan = Get-D32EnvironmentPlan (Join-Path $root 'env')
+        Assert-D32FixtureManifestEnvironmentShape -Environment $envPlan
         $realCodexHome = Get-D32FullPath (Join-Path $envPlan.original_userprofile '.codex')
         if ($envPlan.codex_home -eq $envPlan.userprofile -or
             $envPlan.codex_home.Equals($realCodexHome, [StringComparison]::OrdinalIgnoreCase) -or
             $envPlan.userprofile.Equals($envPlan.original_userprofile, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'SELFTEST_FAILED: environment isolation plan'
+        }
+        $passed++
+
+        $producerFixtureManifest = [ordered]@{ schema_version = 3; environment = $envPlan }
+        $producerFixtureManifestJson = $producerFixtureManifest | ConvertTo-Json -Depth 12
+        $parsedFixtureManifest = $producerFixtureManifestJson | ConvertFrom-Json
+        $parsedEnvironmentFields = @(Get-D32ObjectFieldNames -Object $parsedFixtureManifest.environment)
+        if ([int]$parsedFixtureManifest.schema_version -ne 3 -or $parsedEnvironmentFields.Count -ne 6 -or
+            @($parsedEnvironmentFields | Where-Object { $_ -notin @('original_userprofile', 'codex_home', 'userprofile', 'cargo_home', 'rustup_home', 'rustup_toolchain') }).Count -ne 0) {
+            throw 'SELFTEST_FAILED: schema-v3 producer JSON no longer matches the strict six-field Host environment wire shape'
+        }
+        $extraManifestEnvironment = [ordered]@{}
+        foreach ($field in $envPlan.Keys) { $extraManifestEnvironment[$field] = $envPlan[$field] }
+        $extraManifestEnvironment['toolchain_profile_sha256'] = ('f' * 64)
+        try {
+            Assert-D32FixtureManifestEnvironmentShape -Environment $extraManifestEnvironment
+            throw 'SELFTEST_FAILED: toolchain provenance was accepted inside the strict schema-v3 environment'
+        }
+        catch { if ($_.Exception.Message -notlike 'FIXTURE_MANIFEST_ENVIRONMENT_INVALID:*') { throw } }
+
+        $provenanceCargoPath = Join-Path $root 'cargo.exe'
+        $provenanceManifestPath = Join-Path $fakeRepo 'vita-agent/Cargo.toml'
+        $provenanceFetchArguments = @(
+            'fetch', '--locked', '--manifest-path', $provenanceManifestPath,
+            '--target', 'x86_64-pc-windows-msvc'
+        )
+        $provenanceEnvironment = [ordered]@{
+            toolchain_profile_path = (Join-Path $root 'profile.json')
+            toolchain_profile_sha256 = ('a' * 64)
+            target_triple = 'x86_64-pc-windows-msvc'
+            env_policy = 'D32_BUILD_ENV_V1'
+            cargo_policy = 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER'
+            cargo_home = (Join-Path $root 'run/cargo-home')
+            temp_root = (Join-Path $root 'run/temp')
+            run_id = '0123456789abcdef0123456789abcdef'
+            fetch_manifests = @([ordered]@{
+                    manifest_path = 'vita-agent/Cargo.toml'
+                    lock_sha256 = ('f' * 64)
+                    command = $provenanceFetchArguments
+                    status = 'succeeded'
+                    exit_code = 0
+                    process_identity = [ordered]@{
+                        process_id = 1234
+                        parent_process_id = [int]$PID
+                        name = 'cargo.exe'
+                        image_path = $provenanceCargoPath
+                        creation_date = '2026-09-23T00:00:00.0000000Z'
+                        command_line = ConvertTo-D32CommandLine (@($provenanceCargoPath) + $provenanceFetchArguments)
+                        observed_at_utc = '2026-09-23T00:00:01.0000000Z'
+                        identity_verified = $true
+                    }
+                })
+            offline_after_fetch = $true
+        }
+        $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
+        $provenanceDocument = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V1'
+            candidate_sha = '0123456789abcdef0123456789abcdef01234567'
+            source_repo = $fakeRepo
+            fixture_manifest_path = $sample
+            fixture_manifest_sha256 = $boundManifestArtifact.sha256
+            fixture_manifest_bytes = $boundManifestArtifact.bytes
+            fixture_manifest_volume_serial_hex = $boundManifestArtifact.volume_serial_hex
+            fixture_manifest_file_id_hex = $boundManifestArtifact.file_id_hex
+            environment = $provenanceEnvironment
+        }
+        Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
+        $validFetchCommand = @($provenanceEnvironment.fetch_manifests[0].command)
+        $provenanceEnvironment.fetch_manifests[0].command = $validFetchCommand + @('--offline')
+        try {
+            Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
+            throw 'SELFTEST_FAILED: fixture sidecar fetch argv with an unapproved --offline token was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
+        $provenanceEnvironment.fetch_manifests[0].command = $validFetchCommand
+        $validFetchIdentityVerified = $provenanceEnvironment.fetch_manifests[0].process_identity.identity_verified
+        $provenanceEnvironment.fetch_manifests[0].process_identity.identity_verified = $false
+        try {
+            Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
+            throw 'SELFTEST_FAILED: fixture sidecar unverified Cargo process identity was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
+        $provenanceEnvironment.fetch_manifests[0].process_identity.identity_verified = $validFetchIdentityVerified
+        $passed++
+        $provenanceJsonPath = Join-Path $root 'fixture-build-provenance.json'
+        $provenanceFile = Write-D32NewFixtureBuildProvenance -Path $provenanceJsonPath -Document $provenanceDocument
+        $provenanceFileOnDisk = Get-D32BoundArtifact -Path $provenanceJsonPath
+        if ($provenanceFile.sha256 -cne $provenanceFileOnDisk.sha256 -or
+            $provenanceFile.bytes -ne $provenanceFileOnDisk.bytes) {
+            throw 'SELFTEST_FAILED: separate versioned fixture provenance record was not written and bound'
+        }
+        $parsedProvenance = [IO.File]::ReadAllText($provenanceJsonPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable
+        Assert-D32FixtureBuildProvenanceShape -Document $parsedProvenance
+        if ($parsedProvenance.environment.fetch_manifests[0].process_identity.command_line -cne
+            $provenanceEnvironment.fetch_manifests[0].process_identity.command_line) {
+            throw 'SELFTEST_FAILED: serialized sidecar fetch process identity did not round-trip as producer-shaped JSON'
         }
         $passed++
 
@@ -1927,11 +3843,39 @@ function Invoke-D32SelfTest {
         $passed++
 
         try {
+            [void](Assert-D32CandidateShaMatch `
+                -ActualSha '1123456789abcdef0123456789abcdef01234567' `
+                -ExpectedSha '0123456789abcdef0123456789abcdef01234567')
+            throw 'SELFTEST_FAILED: changed candidate SHA was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'CANDIDATE_SHA_MISMATCH:*') { throw }
+        }
+        if ((Assert-D32CandidateShaMatch `
+            -ActualSha '0123456789abcdef0123456789abcdef01234567' `
+            -ExpectedSha '0123456789abcdef0123456789abcdef01234567') -cne '0123456789abcdef0123456789abcdef01234567') {
+            throw 'SELFTEST_FAILED: exact candidate SHA pin was not preserved'
+        }
+        $passed++
+
+        try {
             Assert-D32CleanGitStatus -Status ' M synthetic-dirty-file' -Root $root
             throw 'SELFTEST_FAILED: dirty worktree was accepted'
         }
         catch {
             if ($_.Exception.Message -notlike 'WORKTREE_DIRTY:*') { throw }
+        }
+        $passed++
+
+        Assert-D32CleanGitIndexFlags -Output ("H tracked.rs`0H nested/source.rs`0")
+        foreach ($indexFlagOutput in @("h tracked.rs`0", "S tracked.rs`0", "H tracked.rs")) {
+            try {
+                Assert-D32CleanGitIndexFlags -Output $indexFlagOutput
+                throw 'SELFTEST_FAILED: assume-unchanged, skip-worktree, or malformed index inventory was accepted'
+            }
+            catch {
+                if ($_.Exception.Message -notlike 'WORKTREE_DIRTY:*') { throw }
+            }
         }
         $passed++
 
@@ -1970,53 +3914,199 @@ function Invoke-D32SelfTest {
     }
 }
 
+if ($D32LauncherLibraryOnly) {
+    if ($SelfTest) {
+        throw 'D32_LAUNCHER_LIBRARY_MODE_INVALID: -D32LauncherLibraryOnly and -SelfTest are mutually exclusive'
+    }
+    Ensure-D32NativeLauncher
+    return
+}
+
 if ($SelfTest) {
     Invoke-D32SelfTest
     exit 0
 }
 
+if ($PSVersionTable.PSVersion -lt [version]'7.5') {
+    throw 'TOOLCHAIN_PROFILE_BLOCKED: operational D32 builds require PowerShell 7.5 or later for the shared pinned-profile validator'
+}
+. (Join-Path $script:ScriptRoot 'd32-build-toolchain-profile.ps1')
+if ([String]::IsNullOrWhiteSpace($PinnedGitPath) -or
+    [String]::IsNullOrWhiteSpace($PinnedGitSha256) -or
+    [String]::IsNullOrWhiteSpace($ExpectedCandidateSha) -or
+    [String]::IsNullOrWhiteSpace($ToolchainProfilePath) -or
+    [String]::IsNullOrWhiteSpace($ExpectedToolchainProfileSha256)) {
+    throw 'TRUST_PINS_REQUIRED: operational runs require pinned Git, exact candidate SHA, and caller-pinned toolchain profile path/SHA; use -SelfTest only for local self-tests'
+}
+if ($ExpectedCandidateSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'CANDIDATE_SHA_INVALID: -ExpectedCandidateSha must be exactly 40 lowercase hexadecimal characters'
+}
+$script:ExpectedCandidateSha = $ExpectedCandidateSha
 if ([String]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Join-Path $script:ScriptRoot '..'
 }
-$RepoRoot = Get-D32FullPath $RepoRoot
+$RepoRoot = Assert-D32NoReparsePath -Path $RepoRoot
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
     throw "REPOSITORY_INVALID: not a Git repository root: $RepoRoot"
 }
+$earlyToolchainProfile = Test-D32BuildToolchainProfile `
+    -ProfilePath $ToolchainProfilePath `
+    -ExpectedSha256 $ExpectedToolchainProfileSha256 `
+    -Repository $RepoRoot `
+    -ExpectedTargetTriple 'x86_64-pc-windows-msvc'
+if (-not [bool]$earlyToolchainProfile.IsValid) {
+    throw "TOOLCHAIN_PROFILE_BLOCKED: $($earlyToolchainProfile.Failure)"
+}
+$script:ValidatedToolchainProfile = $earlyToolchainProfile
+$script:PinnedGit = Get-D32PinnedGit -Path $PinnedGitPath -ExpectedSha256 $PinnedGitSha256
 
-$candidateSha = Get-D32CandidateSha $RepoRoot
+$candidateSha = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+Write-Host "D32_FIXTURE_CANDIDATE_SHA=$candidateSha"
+Write-Host "D32_FIXTURE_PINNED_GIT_PATH=$($script:PinnedGit.path)"
+Write-Host "D32_FIXTURE_PINNED_GIT_SHA256=$($script:PinnedGit.sha256)"
+Write-Host "D32_PINNED_GIT_PATH=$($script:PinnedGit.path)"
+Write-Host "D32_PINNED_GIT_SHA256=$($script:PinnedGit.sha256)"
+Write-Host "D32_EXPECTED_CANDIDATE_SHA=$candidateSha"
 if ([String]::IsNullOrWhiteSpace($OutputRoot)) {
     if (-not [String]::IsNullOrWhiteSpace($ManifestPath)) {
         $OutputRoot = Split-Path -Parent (Get-D32FullPath $ManifestPath)
     }
     else {
-        $OutputRoot = Join-Path ([IO.Path]::GetTempPath()) (Join-Path 'digital-life-d32-fixtures' $candidateSha)
+        $temporaryRoot = Assert-D32NoReparsePath -Path ([IO.Path]::GetTempPath())
+        $fixtureOutputParent = Join-Path $temporaryRoot 'digital-life-d32-fixtures'
+        if (Test-Path -LiteralPath $fixtureOutputParent) {
+            [void](Assert-D32NoReparsePath -Path $fixtureOutputParent)
+        }
+        else {
+            [void](Assert-D32NoReparsePath -Path $fixtureOutputParent -AllowMissingLeaf)
+        }
+        $fixtureOutputParent = Ensure-D32OwnedDirectory $fixtureOutputParent
+        $OutputRoot = Join-Path $fixtureOutputParent $candidateSha
     }
 }
+$OutputRoot = Get-D32FullPath $OutputRoot
+if (Test-D32PathWithin -Path $OutputRoot -Root $RepoRoot) {
+    throw 'OUTPUT_NOT_OWNED: fixture output root must be outside the candidate repository'
+}
+$outputParent = Split-Path -Parent $OutputRoot
+if (-not (Test-Path -LiteralPath $outputParent -PathType Container)) {
+    throw "OUTPUT_NOT_OWNED: fixture output parent must already exist: $outputParent"
+}
+[void](Assert-D32NoReparsePath -Path $outputParent)
+if (Test-Path -LiteralPath $OutputRoot) {
+    [void](Assert-D32NoReparsePath -Path $OutputRoot)
+}
+else {
+    [void](Assert-D32NoReparsePath -Path $OutputRoot -AllowMissingLeaf)
+}
 $OutputRoot = Ensure-D32OwnedDirectory $OutputRoot
+$OutputRoot = Assert-D32NoReparsePath -Path $OutputRoot
 if ([String]::IsNullOrWhiteSpace($ManifestPath)) {
     $ManifestPath = Join-Path $OutputRoot 'fixture-manifest.json'
 }
 $ManifestPath = Assert-D32ManifestDestination -Path $ManifestPath -OwnedRoot $OutputRoot
+$ManifestPath = Assert-D32NoReparsePath -Path $ManifestPath -AllowMissingLeaf
+$fixtureProvenancePath = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot 'fixture-build-provenance.json') -AllowMissingLeaf
+if (Test-Path -LiteralPath $fixtureProvenancePath) {
+    throw "FIXTURE_PROVENANCE_NOT_NEW: refusing to reuse an existing fixture build provenance sidecar: $fixtureProvenancePath"
+}
 $logRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot 'logs')
-$environmentPlan = Get-D32EnvironmentPlan (Join-Path $OutputRoot 'isolated-env')
+$logRoot = Assert-D32NoReparsePath -Path $logRoot
+$validatedToolchainProfile = Test-D32BuildToolchainProfile `
+    -ProfilePath $ToolchainProfilePath `
+    -ExpectedSha256 $ExpectedToolchainProfileSha256 `
+    -Repository $RepoRoot `
+    -EvidenceRoot $OutputRoot `
+    -ExpectedTargetTriple 'x86_64-pc-windows-msvc'
+if (-not [bool]$validatedToolchainProfile.IsValid) {
+    throw "TOOLCHAIN_PROFILE_BLOCKED: $($validatedToolchainProfile.Failure)"
+}
+$script:ValidatedToolchainProfile = $validatedToolchainProfile
+$cargo = [string]$validatedToolchainProfile.Profile.toolchain.cargo.path
+$cargo = Assert-D32NoReparsePath -Path $cargo
+$null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
+$toolchainRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
+$toolchainRunRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot ("fixture-toolchain-run-$toolchainRunId"))
+$fixtureCargoHome = New-D32FreshCargoHome -RunRoot $toolchainRunRoot -Repository $RepoRoot
+$fixtureTempRoot = Join-Path $toolchainRunRoot 'temp'
+[void][IO.Directory]::CreateDirectory($fixtureTempRoot)
+$fixtureTempRoot = Assert-D32NoReparsePath -Path $fixtureTempRoot
+$fixtureManifestEnvironment = Get-D32EnvironmentPlan -EnvironmentRoot (Join-Path $toolchainRunRoot 'manifest-environment')
+Assert-D32FixtureManifestEnvironmentShape -Environment $fixtureManifestEnvironment
+$phaseEvidence = [System.Collections.Generic.List[object]]::new()
+$fixtureFetches = Invoke-D32LockedCargoFetches `
+    -ValidatedProfile $validatedToolchainProfile `
+    -CargoPath $cargo `
+    -CargoHome $fixtureCargoHome `
+    -TempRoot $fixtureTempRoot `
+    -RepoRoot $RepoRoot `
+    -LogRoot $logRoot `
+    -TimeoutSeconds $TimeoutSeconds `
+    -LogPrefix 'fixture' `
+    -PhaseEvidence $phaseEvidence
+$null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot
+$offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
+    -ValidatedProfile $validatedToolchainProfile `
+    -CargoHome $fixtureCargoHome `
+    -TempRoot $fixtureTempRoot `
+    -Offline $true
+$fixtureEnvironmentPlan = [ordered]@{
+    toolchain_profile_path = [string]$validatedToolchainProfile.ProfilePath
+    toolchain_profile_sha256 = [string]$validatedToolchainProfile.Digest
+    target_triple = [string]$validatedToolchainProfile.Profile.target_triple
+    env_policy = [string]$validatedToolchainProfile.Profile.env_policy
+    cargo_policy = [string]$validatedToolchainProfile.Profile.cargo_policy
+    cargo_home = [string]$fixtureCargoHome
+    temp_root = [string]$fixtureTempRoot
+    run_id = $toolchainRunId
+    fetch_manifests = @($fixtureFetches)
+    offline_after_fetch = $true
+}
+$null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+$gitStatus = ''
+Write-Host "D32_BUILD_TOOLCHAIN_PROFILE_PATH=$($validatedToolchainProfile.ProfilePath)"
+Write-Host "D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256=$($validatedToolchainProfile.Digest)"
+Write-Host "D32_BUILD_TOOLCHAIN_RUN_ID=$toolchainRunId"
 
-$gitStatus = Get-D32GitOutput -Root $RepoRoot -Arguments @('status', '--short')
-Assert-D32CleanGitStatus -Status $gitStatus -Root $RepoRoot
-$cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
-$savedEnvironment = Set-D32IsolatedEnvironment -Plan $environmentPlan -Jobs $BuildJobs
+$seederTargetDir = $null
+$seederRecordPath = $null
+$seederRunId = $null
+if ($BuildD31RecoverySeeder) {
+    $seederPaths = Get-D32D31RecoverySeederPaths -OutputRoot $OutputRoot
+    $seederTargetDir = $seederPaths.target
+    if (Test-Path -LiteralPath $seederTargetDir) {
+        throw "D31_RECOVERY_SEEDER_TARGET_NOT_NEW: refusing to reuse an existing external Cargo target directory: $seederTargetDir"
+    }
+    if (Test-D32PathWithin -Path $seederTargetDir -Root $RepoRoot) {
+        throw 'D31_RECOVERY_SEEDER_TARGET_INVALID: recovery-seeder target must be external to the repository'
+    }
+    $seederRecordPath = $seederPaths.record
+    if (Test-Path -LiteralPath $seederRecordPath) {
+        throw "D31_RECOVERY_SEEDER_RECORD_NOT_NEW: refusing to overwrite a D31 seeder record: $seederRecordPath"
+    }
+    if (Test-D32PathWithin -Path $seederRecordPath -Root $RepoRoot) {
+        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: record must be external to the repository'
+    }
+    if ((Split-Path -Parent $seederTargetDir) -ne (Split-Path -Parent $seederRecordPath)) {
+        throw 'D31_RECOVERY_SEEDER_OUTPUT_INVALID: target and build record must be siblings beneath OutputRoot'
+    }
+    $seederRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
+}
 $results = @()
-$phaseEvidence = @()
 $startedAt = [DateTimeOffset]::UtcNow
 try {
     $phase = 0
     foreach ($spec in $script:FixtureSpecs) {
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
         $phase++
+        Write-D32FixtureGitState -Phase $phase -Edge before -Root $RepoRoot
         $manifest = Get-D32FullPath (Join-Path $RepoRoot $spec.manifest)
         $artifactPath = Get-D32FullPath (Join-Path $RepoRoot $spec.artifact)
         $arguments = @('build', '--quiet', '--locked', '--manifest-path', $manifest, '--bin', $spec.binary)
         if ($spec.features.Count -gt 0) {
             $arguments += @('--features', ($spec.features -join ' '))
         }
+        $arguments += @('--jobs', [string]$BuildJobs)
         $phaseLog = Join-Path $logRoot (('{0:D2}-{1}' -f $phase, $spec.name))
         Write-Host "D32_FIXTURE_PHASE=$phase name=$($spec.name) timeout_seconds=$TimeoutSeconds"
         try {
@@ -2025,11 +4115,21 @@ try {
                 -Arguments $arguments `
                 -WorkingDirectory $RepoRoot `
                 -PhaseLog $phaseLog `
-                -TimeoutSeconds $TimeoutSeconds
-            $phaseEvidence += [pscustomobject]@{
+                -TimeoutSeconds $TimeoutSeconds `
+                -ChildEnvironment $offlineFixtureEnvironment
+            if ($null -ne $processResult.root_identity_record) {
+                Assert-D32PinnedCargoProcessIdentity `
+                    -ProcessIdentity $processResult.root_identity_record `
+                    -CargoPath $cargo `
+                    -Arguments $arguments `
+                    -ValidatedProfile $validatedToolchainProfile
+            }
+            $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
+            $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+            $phaseEvidence.Add([pscustomobject]@{
                 root_record = $processResult.root_identity_record
                 descendant_records = @($processResult.captured_descendant_records)
-            }
+            })
             $artifact = $null
             $artifactError = $null
             if ($processResult.status -eq 'succeeded') {
@@ -2069,11 +4169,14 @@ try {
             }
         }
         catch {
+            if ($_.Exception.Message -match '^(CANDIDATE_SHA_|WORKTREE_DIRTY:|GIT_PIN_|GIT_CONFIG_|GIT_REPOSITORY_|PATH_REPARSE:|TOOLCHAIN_PROFILE_|CARGO_FETCH_|CARGO_HOME_|CARGO_PROCESS_IDENTITY_)') {
+                throw
+            }
             $failureEvidence = $script:D32LastProcessEvidence
-            $phaseEvidence += [pscustomobject]@{
+            $phaseEvidence.Add([pscustomobject]@{
                 root_record = $failureEvidence.root_record
                 descendant_records = @($failureEvidence.descendant_records)
-            }
+            })
             $results += [ordered]@{
                 phase          = $phase
                 name           = $spec.name
@@ -2098,15 +4201,125 @@ try {
                 artifact       = $null
             }
         }
+        finally {
+            Write-D32FixtureGitState -Phase $phase -Edge after -Root $RepoRoot
+        }
+    }
+
+    if ($BuildD31RecoverySeeder) {
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+        if (Test-Path -LiteralPath $seederTargetDir) {
+            throw 'D31_RECOVERY_SEEDER_TARGET_NOT_NEW: external target appeared before the pinned build'
+        }
+        [void](Assert-D32NoReparsePath -Path $seederTargetDir -AllowMissingLeaf)
+        $seederManifest = Get-D32FullPath (Join-Path $RepoRoot 'vita-agent/Cargo.toml')
+        $seederRunRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot "d31-recovery-seeder-run-$seederRunId")
+        $seederCargoHome = New-D32FreshCargoHome -RunRoot $seederRunRoot -Repository $RepoRoot
+        $seederTempRoot = Join-Path $seederRunRoot 'temp'
+        [void][IO.Directory]::CreateDirectory($seederTempRoot)
+        $seederTempRoot = Assert-D32NoReparsePath -Path $seederTempRoot
+        $seederFetches = Invoke-D32LockedCargoFetches `
+            -ValidatedProfile $validatedToolchainProfile `
+            -CargoPath $cargo `
+            -CargoHome $seederCargoHome `
+            -TempRoot $seederTempRoot `
+            -RepoRoot $RepoRoot `
+            -LogRoot $logRoot `
+            -TimeoutSeconds $TimeoutSeconds `
+            -LogPrefix 'd31-seeder' `
+            -PhaseEvidence $phaseEvidence
+        $null = Test-D32CargoHome -Path $seederCargoHome -Repository $RepoRoot
+        $offlineSeederEnvironment = Get-D32BuildToolchainEnvironment `
+            -ValidatedProfile $validatedToolchainProfile `
+            -CargoHome $seederCargoHome `
+            -TempRoot $seederTempRoot `
+            -Offline $true
+        $seederArtifactPath = Join-Path $seederTargetDir 'debug/vita-agent.exe'
+        $seederArguments = @(
+            'build', '--quiet', '--locked',
+            '--manifest-path', $seederManifest,
+            '--bin', 'vita-agent',
+            '--features', 'd29-h9-test-helper',
+            '--target-dir', $seederTargetDir
+        )
+        $seederPhaseLog = Join-Path $logRoot 'd31-recovery-seeder'
+        Write-Host "D32_FIXTURE_PHASE=seeder name=d31-recovery-seeder candidate=$candidateSha run_id=$seederRunId"
+        $seederBuild = Invoke-D32BoundedProcess `
+            -FilePath $cargo `
+            -Arguments $seederArguments `
+            -WorkingDirectory $RepoRoot `
+            -PhaseLog $seederPhaseLog `
+            -TimeoutSeconds $TimeoutSeconds `
+            -ChildEnvironment $offlineSeederEnvironment
+        if ($null -ne $seederBuild.root_identity_record) {
+            Assert-D32PinnedCargoProcessIdentity `
+                -ProcessIdentity $seederBuild.root_identity_record `
+                -CargoPath $cargo `
+                -Arguments $seederArguments `
+                -ValidatedProfile $validatedToolchainProfile
+        }
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+        $phaseEvidence.Add([pscustomobject]@{
+            root_record = $seederBuild.root_identity_record
+            descendant_records = @($seederBuild.captured_descendant_records)
+        })
+        if ($seederBuild.status -ne 'succeeded' -or $seederBuild.exit_code -ne 0) {
+            throw "D31_RECOVERY_SEEDER_BUILD_FAILED: status=$($seederBuild.status) exit=$($seederBuild.exit_code); see $($seederBuild.phase_log)"
+        }
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+        [void](Assert-D32NoReparsePath -Path $seederTargetDir)
+        if (Test-D32PathWithin -Path $seederTargetDir -Root $RepoRoot) {
+            throw 'D31_RECOVERY_SEEDER_TARGET_INVALID: recovery-seeder target moved inside the repository'
+        }
+        $seederArtifact = Get-D32BoundArtifact -Path $seederArtifactPath
+        $producerIdentityRecord = $seederBuild.root_identity_record
+        $seederRecord = [ordered]@{
+            schema_version = 2
+            purpose = 'd31-recovery-seeder-test-helper'
+            run_id = $seederRunId
+            candidate_sha = $candidateSha
+            runner_process_id = [int]$PID
+            source_repo = $RepoRoot
+            manifest_path = $seederManifest
+            feature = 'd29-h9-test-helper'
+            command = @($seederArguments)
+            target_dir = $seederTargetDir
+            run_root = $seederRunRoot
+            cargo_home = $seederCargoHome
+            temp_root = $seederTempRoot
+            toolchain_profile_path = [string]$validatedToolchainProfile.ProfilePath
+            toolchain_profile_sha256 = [string]$validatedToolchainProfile.Digest
+            target_triple = [string]$validatedToolchainProfile.Profile.target_triple
+            powershell = $validatedToolchainProfile.Profile.powershell
+            toolchain = $validatedToolchainProfile.Profile.toolchain
+            fetch_manifests = @($validatedToolchainProfile.LockInputs | ForEach-Object {
+                    [ordered]@{ manifest_path = [string]$_.ManifestPath; lock_sha256 = [string]$_.LockSha256 }
+                })
+            fetch_phases = @($seederFetches)
+            cargo_path = $cargo
+            process_identity = ConvertTo-D32D31ProcessIdentityDocument $producerIdentityRecord
+            status = $seederBuild.status
+            exit_code = $seederBuild.exit_code
+            artifact = $seederArtifact
+        }
+        Assert-D32D31RecoverySeederRecordShape -Document $seederRecord -Path $seederRecordPath -OutputRoot $OutputRoot
+        $seederRecordDigest = Write-D32NewRecoverySeederBuildRecord -Path $seederRecordPath -Document $seederRecord
+        Write-Host "D31_RECOVERY_SEEDER_RECORD_PATH=$seederRecordPath"
+        Write-Host "D31_RECOVERY_SEEDER_RECORD_SHA256=$($seederRecordDigest.sha256)"
+        Write-Host "D31_RECOVERY_SEEDER_RUN_ID=$seederRunId"
+        Write-Host "D31_RECOVERY_SEEDER_PATH=$($seederArtifact.path)"
+        Write-Host "D31_RECOVERY_SEEDER_SHA256=$($seederArtifact.sha256)"
     }
 }
 finally {
-    Restore-D32Environment $savedEnvironment
+    $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
 }
 
 $globalProcessError = $null
 try {
-    [void](Test-D32NoOwnedCargoDescendants -PhaseEvidence $phaseEvidence -CheckName 'final fixture prebuild cleanup')
+    [void](Test-D32NoOwnedCargoDescendants -PhaseEvidence @($phaseEvidence.ToArray()) -CheckName 'final fixture prebuild cleanup')
 }
 catch {
     $globalProcessError = $_.Exception.Message
@@ -2116,6 +4329,11 @@ $phaseTreeErrors = @($results | Where-Object { $_.status -eq 'process_tree_error
 $allProcessErrors = @($phaseTreeErrors)
 if ($null -ne $globalProcessError) { $allProcessErrors += $globalProcessError }
 $manifestProcessError = if ($allProcessErrors.Count -eq 0) { $null } else { $allProcessErrors -join ' | ' }
+
+$candidateShaAfterBuild = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+if ($candidateShaAfterBuild -ne $candidateSha) {
+    throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed before the final manifest write'
+}
 
 $manifestDocument = [ordered]@{
     schema_version = $script:SchemaVersion
@@ -2131,16 +4349,41 @@ $manifestDocument = [ordered]@{
         nested_builds = $false
         process_tree_timeout_action = $script:D32FixtureProcessTreePolicy
     }
-    environment = $environmentPlan
+    environment = $fixtureManifestEnvironment
     process_tree_check = if ($null -eq $manifestProcessError) { 'succeeded' } else { 'failed' }
     process_tree_error = $manifestProcessError
     fixtures = @($results)
 }
 Write-D32Manifest -Path $ManifestPath -Document $manifestDocument
+$candidateShaAfterManifest = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+if ($candidateShaAfterManifest -ne $candidateSha) {
+    throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed after the final manifest write'
+}
+$manifestArtifact = Get-D32BoundArtifactWithFileId -Path $ManifestPath
+$fixtureBuildProvenance = [ordered]@{
+    schema_version = 1
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V1'
+    candidate_sha = $candidateSha
+    source_repo = $RepoRoot
+    fixture_manifest_path = $ManifestPath
+    fixture_manifest_sha256 = [string]$manifestArtifact.sha256
+    fixture_manifest_bytes = [uint64]$manifestArtifact.bytes
+    fixture_manifest_volume_serial_hex = [string]$manifestArtifact.volume_serial_hex
+    fixture_manifest_file_id_hex = [string]$manifestArtifact.file_id_hex
+    environment = $fixtureEnvironmentPlan
+}
+Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance
+$fixtureBuildProvenanceArtifact = Write-D32NewFixtureBuildProvenance -Path $fixtureProvenancePath -Document $fixtureBuildProvenance
+$candidateShaAfterProvenance = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+if ($candidateShaAfterProvenance -ne $candidateSha) {
+    throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed after the fixture provenance sidecar write'
+}
 
 $failures = @($results | Where-Object { $_.status -ne 'succeeded' })
 $failures += @([pscustomobject]@{ name = 'global-process-tree'; status = 'failed' } | Where-Object { $null -ne $globalProcessError })
 Write-Host "D32_FIXTURE_PREBUILD_MANIFEST=$ManifestPath"
+Write-Host "D32_FIXTURE_BUILD_PROVENANCE_PATH=$fixtureProvenancePath"
+Write-Host "D32_FIXTURE_BUILD_PROVENANCE_SHA256=$($fixtureBuildProvenanceArtifact.sha256)"
 if ($failures.Count -gt 0) {
     $summary = ($failures | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
     throw "FIXTURE_PREBUILD_BLOCKED: $summary; see manifest and phase logs: $ManifestPath"

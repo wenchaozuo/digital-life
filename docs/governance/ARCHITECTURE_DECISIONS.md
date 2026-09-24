@@ -12,6 +12,251 @@
 | ID | 状态 | 主题 | 决策来源 | 生效范围 |
 |---|---|---|---|---|
 | ADR-TEMPLATE | TEMPLATE | 示例占位 | - | - |
+| ADR-D32-EVIDENCE-BUNDLE-V1 | APPROVED | D32-A gate evidence bundle 与 clean-source release attestation | GPT-6 Sol | D32-A preflight/evidence only |
+| ADR-D32-FIXTURE-TRUST-D31-SEEDER | APPROVED | D32 fixture Git trust 与 D31 recovery seeder evidence | GPT-6 Sol | D32 fixture tooling 与 D31 test-helper evidence only |
+| ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP | APPROVED WITH CONDITIONS | D32-A release evidence bundle 两阶段 bootstrap | GPT-6 Sol | D32-A bundle bootstrap ordering only |
+| ADR-D32-PHASE0-TOOLCHAIN-PROFILE | APPROVED WITH CONDITIONS | D32 Phase 0 本地矩阵与 caller-pinned build toolchain | GPT-6 Sol | D32 Phase 0 与紧邻 bundle evidence build only |
+
+### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
+
+**Status:** APPROVED
+**Decision authority:** GPT-6 Sol
+**Decision date:** 2026-09-23
+**Related milestone:** D32-A final-gate evidence
+**Related baseline:** `7923794565f6742fbfd760c2f3b01e9dd18abd42` (D32 stage base); repair-lineage base: `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
+
+#### Context
+
+The existing bundle manifest can describe matching files, but it does not independently establish that the fixed release commands completed for the exact clean candidate. D32 gate evidence must also stay separate from the Tauri shipping package.
+
+#### Decision
+
+1. D32 gate evidence is a separate, external-to-clone evidence output. Its dedicated `d32-gate-bundle` directory contains exactly three flat artifacts plus `BUNDLE-MANIFEST.json`: `vita-agent.exe`, `d32a-production-canary-host.exe`, and `digital_life_lib.dll`. The build attestation is a sibling file named `D32-RELEASE-ATTESTATION.json`; the manifest binds its exact SHA-256.
+2. Artifact source paths are fixed to `vita-agent/target/release/vita-agent.exe` and `src-tauri/target/release/{d32a-production-canary-host.exe,digital_life_lib.dll}`. The attestor itself runs only the fixed locked release Cargo commands, pins their `--target-dir` outputs to `vita-agent/target` and `src-tauri/target`, records completion/exit/process identity, and records the exact candidate SHA plus clean Git status before and after each command. Before starting either command, it must fail closed if any of the three exact release artifact paths already exists; it does not move or delete prior output. The attestation records each source artifact's path, bytes, SHA-256, and file identity. On Windows, file identity includes volume serial and 128-bit file ID read from the same opened handle used to hash the bytes, alongside length, timestamps, attributes, and absolute path. The validator independently checks the attestation and current bytes.
+3. `runtime_resources` in this gate-only manifest is exactly `[]`. This does not describe or alter the installer package. The validator checks that the existing sole Tauri resource mapping remains `../vita-agent/target/release/vita-agent.exe` -> `vita-agent.exe`.
+
+#### Frozen invariants
+
+1. No frozen product behavior, protocol, persistent schema, identity continuity, authority ownership, grant/revoke semantics, or security boundary changes are authorized by this decision.
+2. Host official preflight and retained-handle checks remain the security authority. PowerShell path/hash/file-identity checks are advisory evidence and do not replace Host authority.
+3. Tauri shipping configuration and package contents are unchanged; the D32 evidence bundle is not an installer input.
+
+#### Allowed implementation space
+
+- Implement the fixed release evidence attestor and strict validator in `scripts/d32-preflight.ps1` (or an equivalent D32 evidence script).
+- Emit evidence only under a new absolute output directory outside and non-overlapping with the candidate clone; do not overwrite an existing output.
+- Require PowerShell 7.5 or later for the timestamp parsing contract; fail fast on an older runtime.
+- Add validator SelfTest positive and negative cases and update this decision index/body. A required reparse-point negative that cannot be created on the current OS/filesystem is `UNAVAILABLE` and blocks an overall SelfTest PASS.
+
+#### Forbidden implementation
+
+- Do not modify Rust/Host production code, `tauri.conf.json`, installer resources, frozen product/protocol/authority, fixture-prebuild behavior, or any user/provider/Codex secret/configuration.
+- Do not mark D32 gates PASS from generated manifest/attestation alone or infer real-canary completion from this tooling.
+
+#### Required tests
+
+- Run the preflight `-SelfTest` on the candidate validator, including exact/unique schema, duplicate JSON keys/artifacts, nested command/build-target/identity missing/extra/wrong-type cases, fixed paths, command/clean-state binding, exact hashes/bytes/identity, empty resources, flat-only contents, and Tauri map negatives.
+- For an operational evidence run, record the exact candidate SHA and clean Git checks before and after each fixed release build; validate the produced manifest and attestation together before expensive gates.
+- Same-bytes/restored-metadata file replacement must be rejected through the opened-handle volume/file identity. Reparse-point rejection is tested where the platform can create the fixture; if not, it is explicitly `UNAVAILABLE` and the overall SelfTest is `BLOCKED`, never PASS. A concurrent TOCTOU race is not claimed as SelfTest coverage; Host retained-handle gates remain required.
+
+#### Required real canary
+
+- This ADR closes no D32-A real canary. All eight ordered real Host modes and their required negative evidence remain mandatory on the same exact candidate.
+
+#### Required negative evidence
+
+- Missing/extra/duplicate schema entries, duplicated/missing artifacts, wrong-type nested command/build-target/identity values, pre-existing exact release outputs, wrong candidate or attestation SHA, missing/stale attestation, wrong release command, dirty attestation, wrong source/destination path, corrupted bytes, same-bytes replacement with restored metadata, non-empty runtime resources, extra/nested/reparse bundle contents, stale file identity, and changed Tauri resource mapping must be rejected.
+- If a reparse-point fixture cannot be created, report it as unavailable and block overall SelfTest PASS; do not convert it into PASS. No repeatable concurrent TOCTOU race injection is asserted by SelfTest.
+
+#### Compatibility constraints
+
+- Preserve the frozen product/protocol/authority surfaces and existing Tauri shipping resource mapping. The gate bundle is an evidence artifact only.
+- Exact SHA, clean tree, fixed build commands, absent-before-build proof for the three exact outputs, source paths, output schema, opened-handle volume/file identity, and manifest-to-attestation hash binding are mandatory.
+
+#### Escalation triggers
+
+- Any need to alter Host retained-handle authority, shipping package/resource mapping, product/protocol/authority semantics, or frozen architecture requires Sol arbitration before implementation.
+
+#### Supersedes / Superseded by
+
+- Supersedes none. This decision does not supersede D32-A gate requirements or grant freeze authority.
+
+---
+
+### ADR-D32-FIXTURE-TRUST-D31-SEEDER — D32 Fixture Git Trust 与 D31 Recovery Seeder Evidence
+
+**Status:** APPROVED
+**Decision authority:** GPT-6 Sol
+**Decision date:** 2026-09-23
+**Related milestone:** D32 fixture evidence and D31 recovery real-process test support
+**Related baseline:** `7923794565f6742fbfd760c2f3b01e9dd18abd42` (D32 stage base); repair-lineage base: `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
+
+#### Context
+
+D32 fixture production and validation need independent Git executable identity and clean-candidate checks. The D31 real-process recovery test also needs a purpose-built helper image without changing the existing fixture schema or shipping sidecar.
+
+#### Decision
+
+1. D32 fixture producer and consumer require a caller-pinned absolute Git executable path and its exact expected SHA-256. They validate the executable as a regular non-reparse file, sanitize inherited Git environment/configuration, and verify the exact candidate HEAD plus clean working tree before and after each fixture build or validation operation.
+2. An explicit `-BuildD31RecoverySeeder` option may build the D31 test helper using only this fixed command and feature, with the target directory beneath the caller-selected external output root:
+
+   ```text
+   cargo build --quiet --locked --manifest-path <candidate>\vita-agent\Cargo.toml --bin vita-agent --features d29-h9-test-helper --target-dir <external-output-root>\d31-recovery-seeder-target
+   ```
+
+   The expected output is `<external-output-root>\d31-recovery-seeder-target\debug\vita-agent.exe`. A sibling `d31-recovery-seeder-build.json` records schema version 2, the exact candidate SHA, fixed command/feature, canonical manifest/target/artifact paths, caller-pinned toolchain profile and exact locked-fetch provenance, PowerShell/Cargo process identities, exit status, and artifact bytes, SHA-256, and file identity. The D31 real-process test independently validates that record and reopens/rechecks the helper image before and after spawn; schema version 1 is rejected.
+3. Fixture manifest schema v3 remains unchanged. Existing fixture semantics remain unchanged except that Git trust failures now fail closed. Host retained-handle checks remain the final security authority.
+
+#### Frozen invariants
+
+1. No production authority, protocol, persistent schema, identity-continuity, grant/revoke, recovery-atomicity, or security-boundary semantics are changed.
+2. The external helper build and its record are test evidence only; they do not become an installer input or production sidecar.
+
+#### Allowed implementation space
+
+- Add the pinned-Git trust checks and sanitized Git invocation environment to the D32 fixture producer and consumer.
+- Add the opt-in D31 recovery seeder producer and its external build record/validation used by the D31 real-process test.
+- Add focused negative tests for wrong/missing Git path or hash, unsafe inherited Git configuration, dirty or changed candidate state, and changed/missing seeder artifacts or records.
+
+#### Forbidden implementation
+
+- Do not change fixture manifest schema v3, existing fixture build semantics, Host retained-handle authority, production migrations, external/frozen protocols, sidecar CLI, Tauri shipping resources, or installer/package behavior.
+- Do not allow the D31 helper image to enter the shipping release bundle or Tauri runtime resource map.
+
+#### Required tests
+
+- Verify caller-pinned Git path/hash enforcement and sanitized Git environment/configuration for both fixture production and consumption.
+- Verify exact HEAD and clean-tree checks before and after fixture builds.
+- Verify the D31 seeder is opt-in, runs only the fixed locked Cargo command/feature into an external target, and emits a record whose candidate, command, paths, exit status, bytes, hash, and identity validate independently.
+- Verify missing, stale, altered, or reparse-backed helper artifacts/records fail closed; retain the real-process D31 test as the required consumer.
+
+#### Required real canary
+
+- This decision closes no D31 real-process or D32 Host canary. The D31 helper must be consumed by its real-process test; all D32 ordered real Host modes and negative evidence remain mandatory.
+
+#### Required negative evidence
+
+- Missing or mismatched pinned Git executable, inherited Git environment/configuration, changed HEAD, dirty tree, failed fixed build, missing or modified seeder record, wrong helper path, changed helper bytes, and stale helper file identity must be rejected.
+
+#### Compatibility constraints
+
+- Fixture schema remains version 3 and existing fixture semantics remain unchanged except fail-closed trust handling.
+- No production migration, protocol, sidecar CLI, Tauri resource-map, or installer/package change is authorized.
+
+#### Escalation triggers
+
+- Any need to change Host retained-handle authority, fixture schema, production protocol, persistent schema, sidecar CLI, or shipping resource mapping requires Sol arbitration before implementation.
+
+#### Supersedes / Superseded by
+
+- Supersedes none. This decision is independent of ADR-D32-EVIDENCE-BUNDLE-V1 and does not grant D32 freeze authority.
+
+---
+
+### ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP — D32-A Release Evidence Bundle 两阶段 Bootstrap
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol
+**Decision date:** 2026-09-23
+**Related milestone:** D32-A final-gate evidence
+**Related baseline:** `7923794565f6742fbfd760c2f3b01e9dd18abd42` (D32 stage base); repair-lineage base: `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
+
+#### Context
+
+Protocol §16.1.5 requires verified bundle hashes before an expensive build or real canary. ADR-D32-EVIDENCE-BUNDLE-V1 defines two fixed release Cargo commands as the evidence-producing step that creates the exact-candidate artifacts, manifest, and attestation whose hashes must be verified. This decision resolves only that initial bootstrap ordering; it does not weaken or replace the full aggregate gate.
+
+#### Decision
+
+1. **Phase 0 — before the first evidence-producing release build:** Record that applicable governance is current; the exact candidate SHA is established and the working tree is clean; the full affected local matrix is complete, including provider/tool two-turn and mode/cleanup contracts; the fixed commands and provenance schema/canonical-path specification are validated; and the external evidence output path is fresh, absolute, outside and non-overlapping with the clone, and will not overwrite existing data. Record `bundle hashes = PENDING`, not PASS. Do not run a real canary or claim the §16.1.5 aggregate has passed.
+2. **Phase 1 — constrained bundle production and gate resumption:** Only after Phase 0 passes, the D32 preflight attestor may run exactly the two fixed locked release Cargo commands in ADR-D32-EVIDENCE-BUNDLE-V1, on the same exact clean candidate, to create its three artifacts, manifest, and sibling attestation. Do not reuse stale target outputs or substitute mocks, fixtures, or evidence for a prior candidate as proof of this run. Any command, process/tool/artifact identity, or before/after SHA/clean-state failure is `BLOCKED`. Immediately validate the generated evidence's exact schema, SHA binding, hashes, byte counts, file identities, fixed paths/commands, flat-only contents, `runtime_resources = []`, Tauri shipping resource map, and clean candidate state. Then repeat the full §16.1.5 aggregate check with `bundle hashes = VERIFIED`. No subsequent expensive gate or real canary may start until that full aggregate passes.
+
+This is a narrowly scoped bootstrap exception for those two evidence-producing commands only. It does not authorize any other build before the full aggregate, does not satisfy or waive any real-canary mode or negative evidence, and does not confer freeze authority. If any Phase 0 condition is missing, no bootstrap build is authorized.
+
+#### Frozen invariants
+
+1. The general §16.1.5 rule remains controlling except for the exact ordering above; all full-evidence requirements remain mandatory before downstream expensive gates or real canary.
+2. No product behavior, production code, protocol, persistent schema, Host authority, real-canary requirement, Tauri shipping configuration, or installer/package behavior changes are authorized.
+3. A Phase 0 `PENDING` value is an explicit staged state, never a PASS or substitute for final verified bundle hashes.
+
+#### Allowed implementation space
+
+- Clarify protocol §16.1.5 and the AGENTS.md gate mirror to state this exact two-phase sequence and authority ordering.
+- Follow the existing D32 evidence attestor/validator contract without changing its fixed commands or bundle schema.
+
+#### Forbidden implementation
+
+- No reuse of stale/pre-existing target outputs as proof of the fixed commands, prior-candidate bundle, mock, or fixture substitution.
+- No expansion to other release/build commands, candidate SHAs, evidence bundles, tasks, or real canaries.
+- No relaxation of the complete post-bundle aggregate, required real canary, negative evidence, or HIGH freeze sequence.
+
+#### Required evidence
+
+- Preserve Phase 0 records and mark bundle hashes `PENDING` until the attestor has completed successfully.
+- Record exact candidate SHA and clean state before and after each fixed command; bind completion/exit/process identity and artifact path/bytes/hash/file identity as required by ADR-D32-EVIDENCE-BUNDLE-V1.
+- Immediately validate the created manifest and attestation together and record the subsequent full §16.1.5 aggregate with bundle hashes `VERIFIED` before downstream expensive gates or real canary.
+
+#### Supersedes / Superseded by
+
+- Supersedes none. This ADR resolves only initial D32-A evidence-bundle bootstrap ordering and does not supersede ADR-D32-EVIDENCE-BUNDLE-V1, D32-A gates, or Sol final-freeze authority.
+
+---
+
+### ADR-D32-PHASE0-TOOLCHAIN-PROFILE — D32 Phase 0 本地矩阵与 Caller-Pinned Build Toolchain
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol
+**Decision date:** 2026-09-23
+**Related milestone:** D32-A final-gate evidence
+**Related decisions:** ADR-D32-EVIDENCE-BUNDLE-V1; ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP; ADR-D32-FIXTURE-TRUST-D31-SEEDER
+
+#### Context
+
+The bootstrap exception requires a trustworthy Phase 0 matrix before the two release commands, but no fixed runner or build-tool authority previously existed. Ambient PATH, rustup selection, Cargo configuration, and inherited build environment are not adequate provenance. The local matrix is necessary preparation evidence; it is not a substitute for release artifacts, D31 real-process tests, provider-backed evidence, hardware evidence, or the post-bundle aggregate.
+
+#### Decision
+
+1. **Phase 0 authority and order.** A code-owned `scripts/d32-phase0-matrix.ps1` runner performs, in order: the existing five D32 fixture build phases; the full `vita-agent-protocol` local suite; the full Vita local suite; and the full Host local suite. Phase 0 permits those locked local fixture/test compilations only; it permits no release build, D31 real-process seeder, real provider request, hardware capture, or Host real canary. Phase 0 records `bundle hashes = PENDING` and is not a §16.1.5 aggregate PASS. The ten D31 real-process test cases listed below are explicitly `NOT RUN` in Phase 0 and remain mandatory after validated bundle plus full post-bundle aggregate. The four source-ignored D29G2 real-provider tests remain `NOT RUN` pending post-bundle evaluation with the user-authorized provider. The three source-ignored interactive/physical capture tests remain `N/A — NOT RUN` with that reason. None is counted as PASS.
+2. **Fixed local package commands.** Before test execution, the runner records `--list` and `--ignored --list` output for each package and requires the fixed test inventory, exact names/counts of ignored tests, and unique presence of every deferred D31 test. Any missing/duplicate deferred name or any new/unapproved ignored/skipped test is `BLOCKED`, before Phase 1. The test commands use Cargo's default test parallelism; no global `--test-threads=1` is allowed:
+   ```text
+   cargo test --manifest-path vita-agent-protocol/Cargo.toml --all-targets --locked --offline
+   cargo test --manifest-path vita-agent/Cargo.toml --all-targets --locked --offline --features d32-a-test-helper -- <one --skip for d31_c_real_process_crash_recovery_canary>
+   cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked --offline --features d32-a-host-canary -- <one --skip for each of the nine Host D31 real-process names>
+   ```
+   Each skip is admitted only after the exact test name has been found uniquely by `--list`; test summaries must account for the exact skip count. A fixed focused local selection additionally runs these exact test suffixes, each uniquely resolved from `--list` and invoked with `--exact` (full module-qualified names are captured in the record): Vita `provider_gateway::tests::d32_native_responses_two_round_golden_and_pairing_are_exact`, `provider_gateway::tests::d32_second_turn_omits_forced_tool_choice`, `sidecar::tests::d32_forced_tool_latch_requires_exact_two_round_contract`, `d32a::tests::d32_vita_failure_preserves_primary_and_secondary_cleanup`; Host `vita_sidecar::tests::d32_each_host_mode_has_uniform_missing_provider_preflight`, `vita_sidecar::tests::d32_all_eight_modes_satisfy_the_pure_trace_contract`, `vita_sidecar::tests::d32_cancel_worker_completion_covers_return_panic_and_scope_cleanup`, `vita_sidecar::tests::d32_cancel_worker_hang_is_bounded_without_detach_and_can_cleanup`, `vita_sidecar::tests::d32_a_same_valid_host_grant_replay_is_denied`, and `vita_sidecar::tests::d32_cargo_binding_requires_the_fixed_non_git_marker`. These focused tests run in addition to, not instead of, the full package suites.
+3. **Explicit D31 real-process deferral.** The exact ten deferred names are `d31_c_real_process_crash_recovery_canary` (Vita), `d31_c_real_process_workspace_replace_canary`, `d31_c_real_process_workspace_replace_revocation_canary`, `d31_d_real_process_workspace_patch_canary`, `d31_d_real_process_workspace_patch_conflict_canary`, `d31_d_real_process_workspace_patch_revocation_canary`, `d31_c_real_process_recovery_canary`, `d31_c_real_process_recovery_revocation_canary`, `d31_b_real_process_workspace_read_canary`, and `d31_b_real_process_workspace_read_revocation_canary` (Host). Each is represented as `NOT RUN — deferred until validated bundle and full aggregate`, never silently skipped or passed. Their real-process evidence remains mandatory in the later D31 phase.
+4. **Runner-owned evidence.** The runner itself captures exact argv/cwd, complete bounded stdout/stderr logs and hashes/bytes, exit codes, test result counts, exact ignored/skipped names and counts, required named-test outcomes, tool/process identities, exact candidate HEAD and clean status before/after every command, profile/lock input hashes, and process-tree cleanup. A caller-authored PASS field is invalid. Any command failure, log/inventory parse ambiguity, unapproved ignored/skip, output mutation, unknown child image, or unverified process cleanup is `BLOCKED`. To preserve the strict fixture manifest v3 consumer contract, toolchain/fetch provenance is stored in the fixed external sibling `fixture-build-provenance.json` (`D32_FIXTURE_BUILD_PROVENANCE_V1`), which binds the manifest's bytes/SHA/opened-handle ID, profile/run fields, and each exact locked fetch command, status, and Cargo process identity; the fixture manifest's six original environment fields remain unchanged. The Phase 0 record binds the external run root, unique populated Cargo home, fetch evidence, and exact ordered fixture/fetch stdout/stderr log references with their hashes/bytes/opened-handle identities, as well as the profile SHA and exact candidate SHA. `GenerateBundle` must validate that record and its independently supplied SHA before running either fixed release command. `ValidateOnly` reports artifact-only validation unless a separately validated full-aggregate record is explicitly supplied; this decision does not authorize representing artifact validation as a gate PASS.
+5. **Toolchain profile.** Release/Phase 0 tooling requires an external caller-provided absolute profile path plus an independently supplied expected SHA-256. The duplicate-key-free exact schema is `D32_BUILD_TOOLCHAIN_PROFILE_V1` schema 1 with: fixed `x86_64-pc-windows-msvc` target; separate canonical `powershell_root`, `rust_toolchain_root`, and finite `native_roots[]`; exact current `pwsh.exe` host-process identity plus direct Cargo, rustc, and rustdoc identities; exact executable inventories for the Rust `bin` and native PATH entries; canonical native PATH/INCLUDE/LIB/LIBPATH directories under an approved native root; finite native MSVC/SDK executable identities (core `cl.exe`, `link.exe`, `lib.exe`, `rc.exe`, `mt.exe`, and any extra executable with an explicit reason); a code-owned exact allowlist of native directory/version environment variables; and exact manifest/Cargo.lock path+SHA-256 entries. Each executable identity records absolute path, SHA-256, bytes, and opened-handle volume serial/file ID. Current PowerShell `Process.MainModule` path/hash/file identity must match the profile before and after the run; the PowerShell host is recorded but excluded from child PATH. Direct Cargo/Rust tools must be beneath the Rust toolchain root, not PATH/rustup shims, and target-triple probing must match the fixed target. Every executable in constructed PATH must be pinned or observed and verified; batch launch is rejected unless a separately approved/pinned execution path is implemented. Tool identities, exact profile SHA, and effective nonsecret environment policy are checked and recorded before and after evidence phases.
+6. **Controlled environment and Cargo home.** Each Phase 0 run creates one unique, empty, external `CARGO_HOME`; user caches/config/credentials are never copied. A pinned direct Cargo performs locked fetches for the exact profile-bound manifests before local tests, without inherited credentials, proxy, wrapper, Cargo/Rust/Rustup/Git configuration, or ambient PATH. The runner rejects discovered Cargo configuration files along the working-directory ancestry and in the fresh home; `CARGO_NET_GIT_FETCH_WITH_CLI` and external Git/SSH/credential helpers are not admitted. Locked `git+` sources are allowed only when `Cargo.lock` contains a full immutable 40-hex commit object ID (and `rev=` agrees where present), and the exact lock SHA is bound in the profile/record. Cargo's in-process libgit2 may fetch those locked sources; no Git CLI, SSH helper, credential helper, proxy, or unapproved child image may execute. If fetching requires external help, auth, or a proxy, it is `BLOCKED`; do not silently enable one. After fetch, it sets `CARGO_NET_OFFLINE=true` for fixtures, tests, and the two fixed release commands. The populated Cargo home is bound by the Phase 0 record and revalidated by release generation; it is not required to be empty again. This records an allowlisted environment and toolchain profile, not a hermetic-build claim. D31 seeder creation uses the same profile schema and verifier but its own fresh home/fetch record after the bundle and full aggregate; its fixed command argv is unchanged.
+7. **Fresh-output handling.** Fixture manifest schema v3 and its fixed repository `target/debug` paths remain unchanged; the separate Phase 0 provenance sidecar does not expand or replace that consumer wire schema. To establish freshness, only the exact five fixture output files may be moved to a unique external recoverable quarantine after literal, non-reparse, opened-handle identity/hash validation and an exact move-result recheck; no broad deletion or directory move is allowed. The three fixed release outputs must be absent and freshly produced by the fixed Phase 1 commands; they are never quarantined or reused.
+
+#### Frozen invariants
+
+1. No production behavior, persisted product schema, protocol, Host authority, Tauri shipping resource map, installer/package behavior, or fixture manifest v3 semantics change.
+2. Host retained-handle checks remain the final security authority; PowerShell build provenance does not replace them.
+3. Phase 0 closes only its declared local matrix. D31 real-process, D29G2 real-provider, physical capture, all D32 ordered real Host modes, negative evidence, and final freeze requirements remain outstanding until separately evidenced.
+
+#### Allowed implementation space
+
+- Implement the fixed Phase 0 runner and strict profile/record verification in `scripts/d32-phase0-matrix.ps1` and `scripts/d32-preflight.ps1`.
+- Add only the required Phase 0/profile/provenance schema fields with explicit version bumps and reject prior/unknown versions. Fixture manifest schema v3 remains unchanged.
+- Clarify the Phase 0 ordering in protocol §16.1.5 and its AGENTS.md mirror.
+
+#### Forbidden implementation
+
+- No ambient toolchain resolution, PATH fallback, rustup shim/override selection, inherited Cargo/Rust/Git/proxy/credential/wrapper/config variables, or caller-authored test PASS.
+- No external provider request, D31 real-process execution/seeder build, screen capture, or Host real canary in Phase 0.
+- No serializing the full test suite, broad target deletion/quarantine, reuse of prior candidate evidence, or hermetic-build claim.
+- No change to fixed release command argv or fixed D31 seeder command argv.
+
+#### Required tests and evidence
+
+- PowerShell SelfTest covers exact profile/Phase 0 schemas, duplicate/extra/missing/wrong-type values, pinned tool hash/bytes/handle-ID mismatch, PATH inventory additions/missing files, stale lock hashes and immutable Git lock pins, wrong target profile, missing/extra/duplicated test/skip/ignored names, new unapproved ignores, incorrect test counts, stale Phase 0 SHA/profile/lock bindings, log hash mismatch, non-clean pre/post state, and unknown child image (including attempts to expose Git CLI/SSH/credential helpers through PATH).
+- Operational Phase 0 logs and record are tied to the exact candidate and caller-pinned profile. If actual `--list` differs from this ADR's fixed inventory, stop before any release command and return the mismatch for architecture review.
+- After bundle generation, rerun the full §16.1.5 aggregate with `bundle hashes = VERIFIED`; only then schedule D31/D29 real evidence and later real canary gates.
+
+#### Supersedes / Superseded by
+
+- Supersedes only conflicting implementation detail in ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP where necessary to permit the declared Phase 0 local fixture/test compilation. It does not expand Phase 1 beyond the two fixed release commands, alter the bundle manifest schema, or relax any downstream gate.
 
 ---
 

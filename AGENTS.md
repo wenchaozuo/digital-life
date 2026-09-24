@@ -1,200 +1,186 @@
 # AGENTS.md — 虚拟生命项目 Codex 根治理入口
 
-> **作用域：仓库根目录及其全部子目录。**
->
-> 本文件是 Codex 每次进入仓库时应优先读取的短规则入口。
-> 完整治理协议位于：`docs/governance/CODEX_DEVELOPMENT_PROTOCOL.md`
+**Protocol:** v1.1  
+**Scope:** 仓库根目录及全部子目录。  
+**Full protocol:** `docs/governance/CODEX_DEVELOPMENT_PROTOCOL.md`
 
-## 1. 强制角色分工
+## 1. 当前模型映射
 
-- **Codex**：默认工程执行者与编排器。
-- **Codex Subagents**：承担 Scout / Implementer / Tester / Evidence / Red-Team。
-- **GPT-5.6 Sol**：高风险架构权威与 HIGH milestone 最终冻结权威。
-- **GPT-5.6 Luna（最高可用推理）**：独立 HIGH Gate / Red-Team 审核权威。
+本项目当前模型信号由用户配置为 GPT-6 系列：
+
+- **Coordinator:** Sol Medium / GPT-6
+- **Architect:** Sol Max / GPT-6
+- **Codex Worker:** Luna Max / GPT-6
+- **Independent Gate:** Luna High / GPT-6
+
+角色定义优先于未来具体模型名；若模型名称变化，保持职责不变，除非用户明确更新本文件。
 
 核心原则：
 
-> **Codex 负责做；Sol 负责定；Luna 负责审。**
+> **Sol Medium 协调；Luna Max 执行；Sol Max 定架构与阶段；Luna High 独立门禁。**
 
-## 2. 每个任务开始前 MUST
+## 2. 每次开发开始 MUST
 
-1. 读取 Git 当前状态：
-   - branch
-   - HEAD
-   - working tree
-   - merge-base / base（如任务已指定）
+Coordinator MUST：
+
+1. 读取 Git branch / HEAD / working tree；
 2. 读取：
+   - `docs/governance/PROJECT_SOURCE_OF_TRUTH.md`
+   - `docs/governance/CURRENT_DEVELOPMENT_STATE.md`
    - `docs/governance/FROZEN_INVARIANTS.md`
    - `docs/governance/ARCHITECTURE_DECISIONS.md`
-   - `docs/governance/CURRENT_DEVELOPMENT_STATE.md`
-3. 将任务分类：
-   - `GREEN`
-   - `YELLOW`
-   - `RED`
-4. 判断：
-   - `SOL_REQUIRED = YES/NO`
-   - `LUNA_GATE_REQUIRED = YES/NO`
+3. 自动发现并核验当前开发总文档、阶段报告和最新 exact-SHA 证据；
+4. 确定 `CURRENT_STAGE`；
+5. 判断当前是否已有有效 Stage Contract；
+6. 将执行工作分配给 Luna Max worker；
+7. YELLOW/RED、架构争议、门禁或阶段切换时读取完整协议。
 
-无法确定风险等级时，向更高风险等级升级。
+`CURRENT_DEVELOPMENT_STATE.md` 只是缓存，不得覆盖 Git 与已验证证据。
 
-5. 对阶段级或包含多个门禁的任务，先执行批量诊断与修复流程：
-   `Blocker Census -> Common-root clustering -> Batch Repair -> Full affected matrix -> Expensive build/real canary`
-   - 先盘点当前阶段、相邻阶段、validator 与跨提交契约中的全部 blocker，再按共同根因归类；
-   - 不得按 `gate fail -> fix one -> rerun expensive gate` 逐个试错；仅当安全或数据风险要求立即停止时例外，并记录停止原因。
+## 3. 角色边界
 
-## 3. Codex MUST NOT
+### Sol Medium / Coordinator
+负责：
+- 日常任务拆分与调度；
+- 读取和同步开发状态；
+- blocker 汇总与分类；
+- batch repair 组织；
+- 构建/测试协调；
+- 生成 Gate/Architect packet；
+- 决定何时满足 Sol Max 触发条件。
 
-Codex 不得自行：
+不得自行：
+- 创造/修改 frozen architecture；
+- 弱化 invariant；
+- 改 authority / migration / schema / recovery / security / protocol 语义；
+- 代替 Luna High 做独立 gate。
 
-1. 弱化 frozen invariant；
-2. 修改 frozen architecture；
-3. 改变 authority ownership；
-4. 改变 grant/revoke semantics；
-5. 修改 persistent schema；
-6. 新增或修改 migration；
-7. 改变 crash/recovery atomicity；
-8. 改变 security / trust boundary；
-9. 改变 external/frozen protocol；
-10. 改变 identity continuity；
-11. 用 mock 替代 required real canary；
-12. 删除/弱化失败测试以获得 PASS；
-13. 把未执行的测试写成 PASS；
-14. 对 dirty working tree 宣称 final frozen；
-15. 对非 exact SHA 做最终门禁；
-16. 自行宣布 HIGH milestone FROZEN；
-17. 绕过 `SOL_REQUIRED`；
-18. 因 token/时间压力跳过 required evidence。
+### Luna Max / Worker
+负责：
+- Scout、代码调查、实现、repair、测试实现、fixture、canary、日志与证据分析。
 
-任何上述情况出现时：
+MUST report only to Coordinator。  
+MUST NOT 直接调用、请求或向 Sol Max 汇报。
 
-`STOPPED — ARCHITECTURE ESCALATION REQUIRED`
+### Sol Max / Architect
+只负责：
+- 新架构或重大架构裁决；
+- frozen invariant 决策；
+- 架构级 blocker 仲裁；
+- 当前阶段架构闭合；
+- **下一阶段目标与 Stage Contract 的确立**。
 
-并生成：
-`docs/governance/templates/ARCHITECTURE_ESCALATION_PACKET.md`
-对应格式的升级包。
+### Luna High / Independent Gate
+只负责独立 whole-candidate gate。  
+不得参与 candidate 实现。  
+输出：
+- `PASS`
+- `BLOCKED_IMPLEMENTATION`
+- `BLOCKED_ARCHITECTURE`
 
-## 4. 风险路由
+## 4. Blocker batching
 
-### GREEN
+任何 worker / tester / reviewer 发现 blocker 时：
 
-默认：
+1. 记录 blocker 与证据；
+2. 在安全且仍有价值的范围内继续完成本轮调查；
+3. 一次性向 Coordinator 返回 blocker set；
+4. 不得“发现一个 blocker 就直接升级 Sol Max”。
 
-`Codex -> Tests -> Codex Reviewer -> Done`
+Coordinator MUST 先汇总、去重、做 root-cause/dependency 分类，再：
+- implementation/evidence blockers → 批量 repair；
+- architecture blockers → 合并为一个 Architect Packet。
 
-通常不调用 Sol / Luna。
+Luna High 也 SHOULD 尽量完成 whole-candidate 审查后一次返回完整 blocker set；仅当继续检查无意义或可能产生危险副作用时可提前终止。
 
-### YELLOW
+## 5. 禁止 worktree
 
-默认：
+除非用户明确要求：
 
-`Codex -> Subagents -> Tests -> Evidence -> Codex Red Team -> Luna High Gate`
+> **MUST NOT create or use git worktrees.**
 
-### RED
+默认使用现有 repository working tree，以复用现有编译缓存。
 
-默认：
+只读 worker 可并行。  
+写 worker 默认串行；只有修改范围完全不重叠时才允许受控并行。
 
-`Scout -> Sol Architecture Decision -> Codex Implementation -> Tests -> Real Canary -> Evidence -> Codex Red Team -> Luna High Gate -> Sol Final Freeze（若为 HIGH milestone）`
+## 6. 集中构建
 
-## 5. 子代理默认预算
+Coordinator MUST 指定单一 Build Owner（通常为 Root 或 Tester）：
 
-默认最多：
+- worker 先完成一批修改；
+- 再集中 focused build/test；
+- 必要时 broader/full suite；
+- 复用现有 `target/`、incremental cache 和已编译依赖。
 
-- 1 × Scout
-- 1～2 × Implementer
-- 1 × Tester
-- 1 × Evidence / Red-Team
+除非技术上明确必要或用户要求：
 
-除非任务确实需要，不得无约束扩散子代理数量。
+> **MUST NOT run `cargo clean` or equivalent cache-clearing operations.**
 
-两个 Implementer SHOULD NOT 同时修改同一个核心生产文件。
+## 7. Sol Max 触发条件
 
-## 6. 子代理最小上下文
+只有以下类型事件才升级 Architect：
 
-不得默认让所有子代理读取完整项目历史。
+- 需要新的 Stage Contract / 下一阶段确立；
+- 当前阶段需要架构闭合；
+- 需要新建或改变 architecture / frozen invariant；
+- authority / grant/revoke / migration / schema / recovery / security / trust / identity / frozen protocol 发生语义问题；
+- 多个 blocker 汇总后确认根因是架构冲突；
+- Luna High 返回 `BLOCKED_ARCHITECTURE`；
+- 用户改变 frozen requirement；
+- 高可信证据证明现有 architecture contract 本身不成立。
 
-每个子代理只接收：
+普通 compile/test/fixture/evidence/repair 问题 MUST NOT 升级 Sol Max。
 
-- 当前 task；
-- relevant frozen invariants；
-- allowed files；
-- forbidden changes；
-- relevant symbols；
-- required tests；
-- expected output；
-- stop conditions。
+文档不限制 Sol Max 调用次数；只限制其职责和触发条件。
 
-## 7. Gate 核心纪律
+## 8. 禁止进度轮询
 
-- Gate MUST 绑定 exact Git SHA。
-- Repair 后 MUST 形成新的 candidate SHA。
-- 旧 candidate 的 PASS 不自动继承。
-- Required real canary 不得被 mock/fixture/compile PASS 替代。
+Coordinator 不应频繁轮询 worker/Luna 状态。  
+Sol Max MUST NOT 做：
+- worker progress tracking；
+- Luna progress tracking；
+- repair supervision；
+- 普通 blocker triage；
+- 常规编译/测试分析。
+
+结果完成后再汇总处理。
+
+## 9. Gate 与 Git
+
+- Gate MUST 绑定 exact candidate SHA。
+- Repair 后产生新 candidate，旧 PASS 不自动继承。
+- Required real canary 不可被 mock/compile/fixture PASS 替代。
 - Security-sensitive work MUST 有 negative evidence。
 - Evidence missing = `BLOCKED`。
-- Dirty tree = `NOT ELIGIBLE FOR FINAL FREEZE`。
-- 阶段级或多门禁任务 MUST 按 `Blocker Census -> Common-root clustering -> Batch Repair -> Full affected matrix -> Expensive build/real canary` 执行；不得逐个 blocker 触发昂贵 gate。
-- 昂贵 build/real canary 前 MUST 完成一次聚合检查：governance 状态、exact SHA/clean、provenance schema/canonical paths、bundle hashes、provider/tool two-turn contract、mode matrix、cleanup/resource lifecycle。
-- 每次 repair MUST 检查与相邻阶段及 validator 的跨提交契约；局部修复或单项测试通过不等于受影响链路已恢复。
+- Dirty tree 不可 final freeze。
+- 未经用户明确要求，MUST NOT push remote。
+- 默认允许本地 commit；不得创建 worktree。
 
-## 8. Luna BLOCKED 后
+## 10. 阶段闭合与下一阶段
 
-实现级 blocker：
+Candidate local evidence 完整后：
 
-`Luna BLOCKED -> Codex Repair -> New Candidate -> Luna Re-Gate`
+`Coordinator -> Luna High`
 
-架构级 blocker：
+结果：
 
-`Luna BLOCKED -> SOL_REQUIRED -> Sol Arbitration`
+- `BLOCKED_IMPLEMENTATION` → Coordinator 汇总并让 Luna Max 批量 repair → new candidate → re-gate
+- `BLOCKED_ARCHITECTURE` → Coordinator 汇总 → Sol Max
+- `PASS` → Coordinator 生成 Stage Closure Packet → Sol Max 做架构闭合并确立下一 Stage Contract
 
-不得把普通 compile/test/fixture/evidence 问题升级给 Sol。
+Sol Max 的阶段输出回到 Coordinator 后，进入下一阶段执行。
 
-## 9. HIGH milestone
+## 11. 完成定义
 
-HIGH milestone 只有以下流程全部完成才可冻结：
-
-`Codex Ready -> Codex Red Team PASS -> Luna High PASS -> Sol Final Whole-Candidate PASS -> FROZEN`
-
-Luna PASS ≠ 自动冻结。
-
-## 10. 必读完整版的情况
-
-出现以下任一情况 MUST 阅读：
-
-`docs/governance/CODEX_DEVELOPMENT_PROTOCOL.md`
-
-- YELLOW 或 RED；
-- SOL_REQUIRED 可能触发；
-- 准备 Luna gate；
-- 准备 HIGH milestone freeze；
-- 需要判断 real canary / negative evidence；
-- 治理规则存在歧义；
-- repair 可能触碰 frozen boundary。
-
-## 11. 报告模板
-
-使用：
-
-- `docs/governance/templates/IMPLEMENTATION_REPORT.md`
-- `docs/governance/templates/ARCHITECTURE_ESCALATION_PACKET.md`
-- `docs/governance/templates/LUNA_HIGH_GATE_PACKET.md`
-- `docs/governance/templates/SOL_ARCHITECTURE_DECISION.md`
-- `docs/governance/templates/SOL_FINAL_FREEZE_REPORT.md`
-
-## 12. 默认完成定义
-
-不得仅因“代码写完/编译成功”宣称完成。
+不得仅因代码写完或编译成功宣称阶段完成。
 
 至少要求：
-
 - implementation done；
 - required tests pass；
 - required canary pass；
 - required negative evidence established；
 - exact candidate SHA recorded；
-- working tree clean；
-- required independent gate pass；
-- unresolved architecture escalation = 0。
-
-若为 HIGH milestone，还必须：
-
-`Sol Final Freeze = PASS`
+- required Luna High gate completed；
+- unresolved architecture blocker = 0；
+- Sol Max 已完成需要的阶段架构闭合/下一阶段确立。

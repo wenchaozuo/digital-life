@@ -9,12 +9,15 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) const D32_FIXTURE_MANIFEST_ENV: &str = "D32_FIXTURE_MANIFEST_PATH";
 pub(crate) const D32_FIXTURE_SCHEMA_VERSION: u32 = 3;
+const D32_PINNED_GIT_PATH_ENV: &str = "D32_PINNED_GIT_PATH";
+const D32_PINNED_GIT_SHA256_ENV: &str = "D32_PINNED_GIT_SHA256";
+const D32_EXPECTED_CANDIDATE_SHA_ENV: &str = "D32_EXPECTED_CANDIDATE_SHA";
 const D32_FIXTURE_PROCESS_TREE_TIMEOUT_ACTION: &str =
     "native Job Object kill-on-close, then verify every captured identity and relevant descendant";
 
@@ -457,13 +460,87 @@ struct FileDigest {
     sha256: String,
 }
 
+#[derive(Debug)]
+struct PinnedGit {
+    path: PathBuf,
+    identity: FileIdentity,
+    sha256: String,
+    locked_file: File,
+}
+
+#[derive(Debug)]
+struct LockedGitMetadataFile {
+    path: PathBuf,
+    file: File,
+    digest: FileDigest,
+}
+
+#[derive(Debug)]
+struct LockedGitMetadata {
+    index: LockedGitMetadataFile,
+    info_exclude: LockedGitMetadataFile,
+}
+
 fn invalid(message: impl Into<String>) -> String {
     format!("FIXTURE_MANIFEST_INVALID: {}", message.into())
 }
 
+fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn reject_reparse_components(path: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(invalid(format!("{label} path must be absolute")));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(invalid(format!(
+            "{label} path must not contain dot or parent components"
+        )));
+    }
+    for current in path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        let metadata = std::fs::symlink_metadata(current).map_err(|error| {
+            invalid(format!(
+                "{label} path component is unavailable at {}: {error}",
+                current.display()
+            ))
+        })?;
+        if metadata_is_reparse(&metadata) {
+            return Err(invalid(format!(
+                "{label} path contains a reparse component: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn canonical(path: &Path, label: &str) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path)
-        .map_err(|error| invalid(format!("{label} cannot be canonicalized: {error}")))
+    reject_reparse_components(path, label)?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| invalid(format!("{label} cannot be canonicalized: {error}")))?;
+    reject_reparse_components(&canonical, label)?;
+    Ok(canonical)
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -471,8 +548,32 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
+fn path_is_strictly_within(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy().replace('/', "\\");
+        let root = root.to_string_lossy().replace('/', "\\");
+        let root = root.trim_end_matches('\\');
+        let has_root_prefix = path
+            .get(..root.len())
+            .map(|prefix| prefix.eq_ignore_ascii_case(root))
+            .unwrap_or(false);
+        return path.len() > root.len()
+            && has_root_prefix
+            && path.as_bytes().get(root.len()) == Some(&b'\\');
+    }
+    #[cfg(not(windows))]
+    {
+        path != root && path.starts_with(root)
+    }
+}
+
 fn validate_sha256(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 64 || value.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    {
         return Err(invalid(format!("{label} is not a 64-hex SHA-256")));
     }
     Ok(())
@@ -491,23 +592,780 @@ fn validate_candidate_sha(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn current_candidate_sha(repo_root: &Path) -> Result<String, String> {
-    let root = repo_root
+fn validate_expected_candidate_sha(actual: &str, expected: &str) -> Result<(), String> {
+    validate_candidate_sha(actual, "current candidate SHA")?;
+    validate_candidate_sha(expected, "expected candidate SHA")?;
+    if actual != expected {
+        return Err(invalid(
+            "current candidate SHA does not match the independent caller pin",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_clean_git_status(status: &[u8]) -> Result<(), String> {
+    if !status.is_empty() {
+        return Err(invalid("current working tree is not clean"));
+    }
+    Ok(())
+}
+
+fn open_pinned_git_lock(path: &Path) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            // Win32 has no FILE_SHARE_EXECUTE bit. Sharing read only permits
+            // CreateProcess to map the image while denying write/delete opens.
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| {
+                invalid(format!(
+                    "pinned executable or Git metadata cannot be locked: {error}"
+                ))
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).map_err(|error| {
+            invalid(format!(
+                "pinned executable or Git metadata cannot be opened: {error}"
+            ))
+        })
+    }
+}
+
+fn pinned_git_from_inputs(path: &Path, expected_sha256: &str) -> Result<PinnedGit, String> {
+    validate_sha256(expected_sha256, "pinned Git SHA-256")?;
+    if !path.is_absolute() {
+        return Err(invalid("pinned Git executable path must be absolute"));
+    }
+    let path = canonical(path, "pinned Git executable")?;
+    let locked_file = open_pinned_git_lock(&path)?;
+    let locked_identity = file_identity(&locked_file)?;
+    let digest = hash_artifact(&path)?;
+    if digest.identity != locked_identity || digest.sha256 != expected_sha256 {
+        return Err(invalid(
+            "pinned Git executable does not match its locked identity and independent SHA-256",
+        ));
+    }
+    Ok(PinnedGit {
+        path,
+        identity: digest.identity,
+        sha256: digest.sha256,
+        locked_file,
+    })
+}
+
+fn pinned_git_from_environment() -> Result<PinnedGit, String> {
+    let path = std::env::var_os(D32_PINNED_GIT_PATH_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid(format!("{D32_PINNED_GIT_PATH_ENV} is not set")))?;
+    let sha256 = std::env::var(D32_PINNED_GIT_SHA256_ENV)
+        .map_err(|_| invalid(format!("{D32_PINNED_GIT_SHA256_ENV} is not set")))?;
+    pinned_git_from_inputs(&path, &sha256)
+}
+
+fn verify_pinned_git(git: &PinnedGit) -> Result<(), String> {
+    reject_reparse_components(&git.path, "pinned Git executable")?;
+    let locked_identity = file_identity(&git.locked_file)?;
+    let digest = hash_artifact(&git.path)?;
+    if locked_identity != git.identity
+        || digest.identity != git.identity
+        || digest.sha256 != git.sha256
+    {
+        return Err(invalid(
+            "pinned Git executable identity or hash changed during validation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_local_git_config(git_dir: &Path) -> Result<(), String> {
+    let config_path = git_dir.join("config");
+    reject_reparse_components(&config_path, "repository Git config")?;
+    let config = std::fs::read_to_string(&config_path)
+        .map_err(|error| invalid(format!("repository Git config cannot be read: {error}")))?;
+    let mut section = String::new();
+    for (line_number, raw_line) in config.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']') {
+                return Err(invalid(format!(
+                    "repository Git config has an invalid section at line {}",
+                    line_number + 1
+                )));
+            }
+            section = line[1..line.len() - 1]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(
+                section.as_str(),
+                "core" | "remote" | "branch" | "extensions"
+            ) {
+                return Err(invalid(format!(
+                    "repository Git config section is not allowed: {section}"
+                )));
+            }
+            continue;
+        }
+
+        let key = line
+            .split(|character: char| character == '=' || character.is_whitespace())
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let allowed = match section.as_str() {
+            "core" => matches!(
+                key.as_str(),
+                "repositoryformatversion"
+                    | "filemode"
+                    | "bare"
+                    | "logallrefupdates"
+                    | "ignorecase"
+                    | "precomposeunicode"
+                    | "symlinks"
+                    | "longpaths"
+                    | "quotepath"
+            ),
+            "remote" => matches!(
+                key.as_str(),
+                "url" | "fetch" | "pushurl" | "tagopt" | "prune" | "mirror"
+            ),
+            "branch" => matches!(key.as_str(), "remote" | "merge"),
+            "extensions" => {
+                key == "objectformat"
+                    && line
+                        .split_once('=')
+                        .map(|(_, value)| value.trim().eq_ignore_ascii_case("sha1"))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(invalid(format!(
+                "repository Git config key is not allowed: {section}.{key}"
+            )));
+        }
+    }
+
+    let worktree_config = git_dir.join("config.worktree");
+    match std::fs::symlink_metadata(&worktree_config) {
+        Ok(_) => Err(invalid(
+            "repository Git config.worktree indirection is not allowed",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(invalid(format!(
+            "repository Git config.worktree could not be checked: {error}"
+        ))),
+    }
+}
+
+fn reject_optional_git_metadata_indirection(git_dir: &Path, name: &str) -> Result<(), String> {
+    let path = git_dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Err(invalid(format!(
+            "repository Git metadata indirection is not allowed: {name}"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(invalid(format!(
+            "repository Git metadata indirection could not be checked: {name}: {error}"
+        ))),
+    }
+}
+
+fn reject_reparse_metadata_tree(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| invalid(format!("{label} metadata is unavailable: {error}")))?;
+    if metadata_is_reparse(&metadata) {
+        return Err(invalid(format!(
+            "{label} contains a reparse component: {}",
+            path.display()
+        )));
+    }
+    if metadata.is_dir() {
+        let entries = std::fs::read_dir(path)
+            .map_err(|error| invalid(format!("{label} cannot be enumerated: {error}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| invalid(format!("{label} entry cannot be read: {error}")))?;
+            reject_reparse_metadata_tree(&entry.path(), label)?;
+        }
+    } else if !metadata.is_file() {
+        return Err(invalid(format!(
+            "{label} contains a non-file metadata entry: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_git_info_exclude(git_dir: &Path) -> Result<(), String> {
+    let info_dir = git_dir.join("info");
+    reject_reparse_components(&info_dir, "repository Git info metadata")?;
+    reject_reparse_metadata_tree(&info_dir, "repository Git info metadata")?;
+    let entries = std::fs::read_dir(&info_dir).map_err(|error| {
+        invalid(format!(
+            "repository Git info metadata cannot be enumerated: {error}"
+        ))
+    })?;
+    let mut saw_exclude = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            invalid(format!("repository Git info entry cannot be read: {error}"))
+        })?;
+        if entry.file_name() != "exclude" || saw_exclude {
+            return Err(invalid(
+                "repository .git/info may contain only the exact approved exclude file",
+            ));
+        }
+        saw_exclude = true;
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+            invalid(format!(
+                "repository Git info/exclude metadata is unavailable: {error}"
+            ))
+        })?;
+        if !metadata.is_file() || metadata_is_reparse(&metadata) {
+            return Err(invalid(
+                "repository .git/info/exclude must be a regular non-reparse file",
+            ));
+        }
+    }
+    if !saw_exclude {
+        return Err(invalid("repository .git/info/exclude is missing"));
+    }
+
+    let exclude = std::fs::read_to_string(info_dir.join("exclude")).map_err(|error| {
+        invalid(format!(
+            "repository .git/info/exclude cannot be read as UTF-8: {error}"
+        ))
+    })?;
+    let mut approved_count = 0_u32;
+    for raw_line in exclude.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line != "vita-agent/target/" {
+            return Err(invalid(
+                "repository .git/info/exclude contains a non-approved active pattern",
+            ));
+        }
+        approved_count += 1;
+    }
+    if approved_count != 1 {
+        return Err(invalid(
+            "repository .git/info/exclude must contain exactly one active vita-agent/target/ rule",
+        ));
+    }
+
+    let repo_root = git_dir
+        .parent()
+        .ok_or_else(|| invalid("repository Git metadata has no candidate root"))?;
+    let repo_root = canonical(repo_root, "repository root")?;
+    let vita_agent = canonical(
+        &repo_root.join("vita-agent"),
+        "repo-local vita-agent directory",
+    )?;
+    if !vita_agent.is_dir() || !path_is_strictly_within(&vita_agent, &repo_root) {
+        return Err(invalid(
+            "repo-local vita-agent directory is not a direct candidate child",
+        ));
+    }
+    let target = vita_agent.join("target");
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata_is_reparse(&metadata) {
+                return Err(invalid(
+                    "repo-local vita-agent/target must be a regular non-reparse directory",
+                ));
+            }
+            let target = canonical(&target, "repo-local vita-agent target")?;
+            if !path_is_strictly_within(&target, &repo_root) {
+                return Err(invalid("vita-agent target path escaped the candidate root"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(invalid(format!(
+                "repo-local vita-agent target cannot be inspected: {error}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_flags(output: &[u8]) -> Result<(), String> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    if output.last() != Some(&0) {
+        return Err(invalid("Git index flag inventory is not NUL-terminated"));
+    }
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 3 || record[0] != b'H' || record[1] != b' ' || record[2..].is_empty() {
+            return Err(invalid(
+                "Git index contains assume-unchanged, skip-worktree, unmerged, or malformed flags",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn digest_open_file(file: &mut File) -> Result<FileDigest, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| invalid(format!("locked Git metadata seek failed: {error}")))?;
+    let before = file_identity(file)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| invalid(format!("locked Git metadata read failed: {error}")))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        bytes = bytes
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("locked Git metadata byte count overflowed"))?;
+    }
+    let after = file_identity(file)?;
+    if before != after || after.length != bytes {
+        return Err(invalid(
+            "locked Git metadata identity or size changed while hashing",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| invalid(format!("locked Git metadata rewind failed: {error}")))?;
+    Ok(FileDigest {
+        identity: before,
+        bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn open_locked_git_metadata_file(path: &Path) -> Result<LockedGitMetadataFile, String> {
+    reject_reparse_components(path, "locked repository Git metadata")?;
+    let mut file = open_pinned_git_lock(path)?;
+    let digest = digest_open_file(&mut file)?;
+    let path_digest = hash_artifact(path)?;
+    if path_digest != digest {
+        return Err(invalid(
+            "locked Git metadata path identity or bytes changed during handle acquisition",
+        ));
+    }
+    Ok(LockedGitMetadataFile {
+        path: path.to_path_buf(),
+        file,
+        digest,
+    })
+}
+
+fn verify_locked_git_metadata_file(locked: &mut LockedGitMetadataFile) -> Result<(), String> {
+    reject_reparse_components(&locked.path, "locked repository Git metadata")?;
+    let handle_digest = digest_open_file(&mut locked.file)?;
+    let path_digest = hash_artifact(&locked.path)?;
+    if handle_digest != locked.digest || path_digest != locked.digest {
+        return Err(invalid(
+            "locked Git metadata identity or contents changed across Git process creation",
+        ));
+    }
+    Ok(())
+}
+
+fn open_locked_git_metadata(repo_root: &Path, git_dir: &Path) -> Result<LockedGitMetadata, String> {
+    validate_repository_git_metadata(git_dir)?;
+    let mut metadata = LockedGitMetadata {
+        index: open_locked_git_metadata_file(&git_dir.join("index"))?,
+        info_exclude: open_locked_git_metadata_file(&git_dir.join("info").join("exclude"))?,
+    };
+    validate_repository_git_metadata(git_dir)?;
+    verify_locked_git_metadata_file(&mut metadata.index)?;
+    verify_locked_git_metadata_file(&mut metadata.info_exclude)?;
+    if canonical(repo_root, "repository root")? != git_dir.parent().unwrap_or(git_dir) {
+        return Err(invalid(
+            "repository root changed while locking Git metadata",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn verify_locked_git_metadata(metadata: &mut LockedGitMetadata) -> Result<(), String> {
+    verify_locked_git_metadata_file(&mut metadata.index)?;
+    verify_locked_git_metadata_file(&mut metadata.info_exclude)
+}
+
+fn validate_repository_git_metadata(git_dir: &Path) -> Result<(), String> {
+    reject_reparse_components(git_dir, "repository Git metadata")?;
+    if !git_dir.is_dir() {
+        return Err(invalid(
+            "repository must use a direct non-reparse .git directory",
+        ));
+    }
+    for name in ["gitdir", "commondir", "config.worktree"] {
+        reject_optional_git_metadata_indirection(git_dir, name)?;
+    }
+    for name in ["config", "HEAD", "index"] {
+        reject_reparse_components(&git_dir.join(name), "repository Git metadata")?;
+    }
+    let packed_refs = git_dir.join("packed-refs");
+    match std::fs::symlink_metadata(&packed_refs) {
+        Ok(_) => reject_reparse_components(&packed_refs, "repository Git metadata")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(invalid(format!(
+                "repository Git packed refs could not be checked: {error}"
+            )));
+        }
+    }
+
+    // Refs and the object-store fanout are Git-controlled path components.
+    // Walk them rather than validating only their roots, so nested junctions
+    // cannot redirect Git reads outside the candidate's own metadata tree.
+    for name in ["refs", "objects"] {
+        let path = git_dir.join(name);
+        reject_reparse_components(&path, "repository Git metadata tree")?;
+        reject_reparse_metadata_tree(&path, "repository Git metadata tree")?;
+    }
+    for name in [
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+        "info/grafts",
+    ] {
+        reject_optional_git_metadata_indirection(git_dir, name)?;
+    }
+    validate_git_info_exclude(git_dir)?;
+    validate_local_git_config(git_dir)
+}
+
+fn git_search_path(git_path: &Path) -> Result<std::ffi::OsString, String> {
+    let git_bin = git_path
+        .parent()
+        .ok_or_else(|| invalid("pinned Git executable has no parent directory"))?;
+    #[cfg(windows)]
+    let search_directories = {
+        let install_root = git_bin
+            .parent()
+            .ok_or_else(|| invalid("pinned Git executable has no installation root"))?;
+        let system_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .ok_or_else(|| invalid("Windows SystemRoot is unavailable for pinned Git"))?;
+        let system_root = PathBuf::from(system_root);
+        reject_reparse_components(&system_root, "Windows system root")?;
+        if !std::fs::metadata(&system_root)
+            .map_err(|error| invalid(format!("Windows system root is unavailable: {error}")))?
+            .is_dir()
+        {
+            return Err(invalid("Windows system root is not a directory"));
+        }
+        vec![
+            git_bin.to_path_buf(),
+            install_root.join("bin"),
+            install_root.join("mingw64").join("bin"),
+            install_root.join("usr").join("bin"),
+            system_root.join("System32"),
+        ]
+    };
+    #[cfg(not(windows))]
+    let search_directories = vec![git_bin.to_path_buf(), PathBuf::from("/usr/bin")];
+    for directory in &search_directories {
+        reject_reparse_components(directory, "pinned Git search directory")?;
+        if !std::fs::metadata(directory)
+            .map_err(|error| {
+                invalid(format!(
+                    "pinned Git search directory is unavailable: {error}"
+                ))
+            })?
+            .is_dir()
+        {
+            return Err(invalid("pinned Git search directory is not a directory"));
+        }
+    }
+    std::env::join_paths(search_directories)
+        .map_err(|error| invalid(format!("pinned Git search path is invalid: {error}")))
+}
+
+#[cfg(windows)]
+fn git_system_root() -> Result<PathBuf, String> {
+    let path = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("Windows SystemRoot is unavailable for pinned Git"))?;
+    reject_reparse_components(&path, "Windows system root")?;
+    if !std::fs::metadata(&path)
+        .map_err(|error| invalid(format!("Windows system root is unavailable: {error}")))?
+        .is_dir()
+    {
+        return Err(invalid("Windows system root is not a directory"));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn verify_spawned_git_process(process_id: u32, git: &PinnedGit) -> Result<(), String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(invalid(
+            "spawned pinned Git process identity could not be opened",
+        ));
+    }
+    let result = (|| {
+        let mut image = vec![0_u16; 32_768];
+        let mut image_length = image.len() as u32;
+        let image_ok = unsafe {
+            QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut image_length)
+        };
+        if image_ok == 0 || image_length == 0 {
+            return Err(invalid(
+                "spawned pinned Git process image path could not be verified",
+            ));
+        }
+        image.truncate(image_length as usize);
+        let image_path = canonical(
+            Path::new(&std::ffi::OsString::from_wide(&image)),
+            "spawned pinned Git process image",
+        )?;
+        if !paths_equal(&image_path, &git.path) {
+            return Err(invalid(
+                "spawned Git process image path does not match the pinned executable",
+            ));
+        }
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) }
+            == 0
+        {
+            return Err(invalid(
+                "spawned pinned Git process creation identity could not be verified",
+            ));
+        }
+        let creation_ticks =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        if creation_ticks == 0 {
+            return Err(invalid(
+                "spawned pinned Git process has no stable creation identity",
+            ));
+        }
+
+        let image_digest = hash_artifact(&image_path)?;
+        if image_digest.identity != git.identity || image_digest.sha256 != git.sha256 {
+            return Err(invalid(
+                "spawned Git process image identity does not match the locked pin",
+            ));
+        }
+        Ok(())
+    })();
+    unsafe {
+        CloseHandle(process);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn verify_spawned_git_process(_process_id: u32, _git: &PinnedGit) -> Result<(), String> {
+    Err(invalid(
+        "pinned Git process image verification is supported only on Windows",
+    ))
+}
+
+fn run_pinned_git(
+    git: &PinnedGit,
+    repo_root: &Path,
+    arguments: &[&str],
+    metadata: &mut LockedGitMetadata,
+) -> Result<std::process::Output, String> {
+    verify_pinned_git(git)?;
+    let repo_root = canonical(repo_root, "repository root")?;
+    let git_dir = canonical(&repo_root.join(".git"), "repository Git metadata")?;
+    validate_repository_git_metadata(&git_dir)?;
+    verify_locked_git_metadata(metadata)?;
+
+    let isolated_config = tempfile::tempdir()
+        .map_err(|error| invalid(format!("cannot create isolated Git config root: {error}")))?;
+    let isolated_root = canonical(isolated_config.path(), "isolated Git environment")?;
+    let empty_config = isolated_root.join("empty.gitconfig");
+    File::create(&empty_config)
+        .map_err(|error| invalid(format!("cannot create isolated Git config: {error}")))?;
+    let empty_hooks = isolated_root.join("empty-hooks");
+    std::fs::create_dir(&empty_hooks)
+        .map_err(|error| invalid(format!("cannot create isolated Git hooks root: {error}")))?;
+    let search_path = git_search_path(&git.path)?;
+    let root_text = repo_root
         .to_str()
         .ok_or_else(|| invalid("repository root is not valid UTF-8"))?;
-    let output = Command::new("git")
-        .args(["-C", root, "rev-parse", "--verify", "HEAD"])
+    let git_dir_text = git_dir
+        .to_str()
+        .ok_or_else(|| invalid("repository Git metadata path is not valid UTF-8"))?;
+    let empty_config_text = empty_config
+        .to_str()
+        .ok_or_else(|| invalid("isolated Git config path is not valid UTF-8"))?;
+    let empty_hooks_text = empty_hooks
+        .to_str()
+        .ok_or_else(|| invalid("isolated Git hooks path is not valid UTF-8"))?;
+    let isolated_config_text = isolated_root
+        .to_str()
+        .ok_or_else(|| invalid("isolated Git environment path is not valid UTF-8"))?;
+
+    let mut command = Command::new(&git.path);
+    clear_inherited_git_environment(&mut command);
+    command
+        .env("PATH", search_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", empty_config_text)
+        .env("GIT_CONFIG_GLOBAL", empty_config_text)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_DIR", git_dir_text)
+        .env("GIT_WORK_TREE", root_text)
+        .env("GIT_INDEX_FILE", git_dir.join("index"))
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|error| invalid(format!("cannot resolve current candidate SHA: {error}")))?;
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("HOME", isolated_config_text)
+        .env("USERPROFILE", isolated_config_text)
+        .env("XDG_CONFIG_HOME", isolated_config_text)
+        .env("TEMP", isolated_config_text)
+        .env("TMP", isolated_config_text)
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg(format!("core.worktree={root_text}"))
+        .arg("-c")
+        .arg("core.bare=false")
+        .arg("-c")
+        .arg(format!("core.attributesFile={empty_config_text}"))
+        .arg("-c")
+        .arg(format!("core.hooksPath={empty_hooks_text}"))
+        .arg("-c")
+        .arg(format!("safe.directory={root_text}"))
+        .arg("-C")
+        .arg(&repo_root)
+        .args(arguments);
+    #[cfg(windows)]
+    {
+        let system_root = git_system_root()?;
+        command
+            .env("SystemRoot", &system_root)
+            .env("WINDIR", &system_root);
+    }
+    #[cfg(not(windows))]
+    let output = {
+        let _ = (repo_root, arguments, command);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pinned Git execution requires Windows retained-handle and process-image verification",
+        ))
+    };
+    #[cfg(windows)]
+    let output = {
+        use std::process::Stdio;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| invalid(format!("cannot spawn the pinned Git executable: {error}")))?;
+        if let Err(error) = verify_spawned_git_process(child.id(), git) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        child.wait_with_output()
+    };
+    let post_check = verify_pinned_git(git);
+    let metadata_post_check = verify_locked_git_metadata(metadata);
+    let output = output
+        .map_err(|error| invalid(format!("cannot run the pinned Git executable: {error}")))?;
+    post_check?;
+    metadata_post_check?;
+    validate_repository_git_metadata(&git_dir)?;
+    Ok(output)
+}
+
+fn clear_inherited_git_environment(command: &mut Command) {
+    command.env_clear();
+}
+
+fn current_candidate_sha_with_git(
+    repo_root: &Path,
+    git: &PinnedGit,
+    expected_candidate_sha: &str,
+) -> Result<String, String> {
+    validate_candidate_sha(expected_candidate_sha, "expected candidate SHA")?;
+    let repo_root = canonical(repo_root, "repository root")?;
+    let git_dir = canonical(&repo_root.join(".git"), "repository Git metadata")?;
+    let mut metadata = open_locked_git_metadata(&repo_root, &git_dir)?;
+    let output = run_pinned_git(
+        &git,
+        &repo_root,
+        &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        &mut metadata,
+    )?;
     if !output.status.success() {
         return Err(invalid("current candidate SHA command failed"));
     }
     let sha = String::from_utf8(output.stdout)
         .map_err(|_| invalid("current candidate SHA was not UTF-8"))?
         .trim()
-        .to_string();
+        .to_ascii_lowercase();
     validate_candidate_sha(&sha, "current candidate SHA")?;
+    validate_expected_candidate_sha(&sha, expected_candidate_sha)?;
+
+    let status = run_pinned_git(
+        &git,
+        &repo_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &mut metadata,
+    )?;
+    if !status.status.success() {
+        return Err(invalid("current working-tree status command failed"));
+    }
+    validate_clean_git_status(&status.stdout)?;
+    let index_flags = run_pinned_git(git, &repo_root, &["ls-files", "-v", "-z"], &mut metadata)?;
+    if !index_flags.status.success() {
+        return Err(invalid("current Git index flag inventory command failed"));
+    }
+    validate_index_flags(&index_flags.stdout)?;
+    let final_head = run_pinned_git(
+        git,
+        &repo_root,
+        &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        &mut metadata,
+    )?;
+    if !final_head.status.success()
+        || String::from_utf8(final_head.stdout)
+            .map_err(|_| invalid("final candidate SHA was not UTF-8"))?
+            .trim()
+            .to_ascii_lowercase()
+            != sha
+    {
+        return Err(invalid(
+            "candidate HEAD changed across Git clean-state verification",
+        ));
+    }
+    verify_locked_git_metadata(&mut metadata)?;
+    validate_repository_git_metadata(&git_dir)?;
     Ok(sha)
 }
 
@@ -519,6 +1377,12 @@ fn file_identity(file: &File) -> Result<FileIdentity, String> {
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
 
+    let metadata = file
+        .metadata()
+        .map_err(|error| invalid(format!("artifact metadata could not be read: {error}")))?;
+    if !metadata.is_file() || metadata_is_reparse(&metadata) {
+        return Err(invalid("artifact handle is not a non-reparse regular file"));
+    }
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     let ok =
         unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
@@ -535,17 +1399,45 @@ fn file_identity(file: &File) -> Result<FileIdentity, String> {
 
 #[cfg(not(windows))]
 fn file_identity(file: &File) -> Result<FileIdentity, String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     let metadata = file
         .metadata()
         .map_err(|error| invalid(format!("artifact metadata could not be read: {error}")))?;
-    Ok(FileIdentity {
-        volume_serial: 0,
-        file_index: 0,
-        length: metadata.len(),
-    })
+    if !metadata.is_file() || metadata_is_reparse(&metadata) {
+        return Err(invalid("artifact handle is not a non-reparse regular file"));
+    }
+    #[cfg(unix)]
+    {
+        Ok(FileIdentity {
+            volume_serial: metadata.dev() as u32,
+            file_index: metadata.ino(),
+            length: metadata.len(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(FileIdentity {
+            volume_serial: 0,
+            file_index: 0,
+            length: metadata.len(),
+        })
+    }
 }
 
 fn hash_artifact(path: &Path) -> Result<FileDigest, String> {
+    reject_reparse_components(path, "artifact")?;
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| invalid(format!("artifact cannot be opened: {error}")))?
+    };
+    #[cfg(not(windows))]
     let mut file =
         File::open(path).map_err(|error| invalid(format!("artifact cannot be opened: {error}")))?;
     let before = file_identity(&file)?;
@@ -572,6 +1464,18 @@ fn hash_artifact(path: &Path) -> Result<FileDigest, String> {
 
     // Reopen after hashing to bind the pathname to the same native identity
     // immediately before the caller spawns it. Timestamps are not evidence.
+    reject_reparse_components(path, "artifact")?;
+    #[cfg(windows)]
+    let rebound = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| invalid(format!("artifact disappeared after hashing: {error}")))?
+    };
+    #[cfg(not(windows))]
     let rebound = File::open(path)
         .map_err(|error| invalid(format!("artifact disappeared after hashing: {error}")))?;
     let rebound_identity = file_identity(&rebound)?;
@@ -702,6 +1606,13 @@ fn validate_record_shape(
         &expected_artifact_path(repo_root, spec),
         "expected fixture artifact",
     )?;
+    let canonical_repo = canonical(repo_root, "repository root")?;
+    if !path_is_strictly_within(&expected_artifact, &canonical_repo) {
+        return Err(invalid(format!(
+            "fixture {} artifact escapes the repository root",
+            spec.name
+        )));
+    }
     if !paths_equal(&declared_artifact, &expected_artifact) {
         return Err(invalid(format!(
             "fixture {} artifact path is not exact",
@@ -744,7 +1655,11 @@ fn parse_manifest(path: &Path) -> Result<FixtureManifest, String> {
         .map_err(|error| invalid(format!("fixture manifest schema is invalid: {error}")))
 }
 
-fn validate_manifest_common(manifest: &FixtureManifest, repo_root: &Path) -> Result<(), String> {
+fn validate_manifest_common(
+    manifest: &FixtureManifest,
+    repo_root: &Path,
+    expected_candidate_sha: &str,
+) -> Result<(), String> {
     if manifest.schema_version != D32_FIXTURE_SCHEMA_VERSION {
         return Err(invalid(format!(
             "schema_version={} expected {}",
@@ -752,10 +1667,9 @@ fn validate_manifest_common(manifest: &FixtureManifest, repo_root: &Path) -> Res
         )));
     }
     validate_candidate_sha(&manifest.candidate_sha, "candidate_sha")?;
-    let head = current_candidate_sha(repo_root)?;
-    if manifest.candidate_sha != head {
+    if manifest.candidate_sha != expected_candidate_sha {
         return Err(invalid(format!(
-            "candidate_sha does not match current HEAD {head}"
+            "candidate_sha does not match independently pinned candidate {expected_candidate_sha}"
         )));
     }
     let source_repo = canonical(Path::new(&manifest.source_repo), "source_repo")?;
@@ -806,6 +1720,11 @@ fn validate_manifest_common(manifest: &FixtureManifest, repo_root: &Path) -> Res
 /// spawned. All five manifest records are schema-checked; only the selected
 /// image is reopened, rehashed, and identity-checked on this call.
 pub(crate) fn existing_fixture(repo_root: &Path, name: &str) -> Result<PathBuf, String> {
+    let git = pinned_git_from_environment()?;
+    let expected_candidate_sha = std::env::var(D32_EXPECTED_CANDIDATE_SHA_ENV)
+        .map_err(|_| invalid(format!("{D32_EXPECTED_CANDIDATE_SHA_ENV} is not set")))?;
+    validate_candidate_sha(&expected_candidate_sha, "expected candidate SHA")?;
+    let initial_head = current_candidate_sha_with_git(repo_root, &git, &expected_candidate_sha)?;
     let manifest_path = std::env::var_os(D32_FIXTURE_MANIFEST_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| invalid(format!("{D32_FIXTURE_MANIFEST_ENV} is not set")))?;
@@ -814,7 +1733,12 @@ pub(crate) fn existing_fixture(repo_root: &Path, name: &str) -> Result<PathBuf, 
     }
     let manifest_path = canonical(&manifest_path, "fixture manifest")?;
     let manifest = parse_manifest(&manifest_path)?;
-    validate_manifest_common(&manifest, repo_root)?;
+    validate_manifest_common(&manifest, repo_root, &expected_candidate_sha)?;
+    if manifest.candidate_sha != initial_head {
+        return Err(invalid(
+            "manifest candidate_sha does not match the clean initial candidate HEAD",
+        ));
+    }
     let spec = find_spec(name).ok_or_else(|| invalid(format!("unknown fixture name {name}")))?;
     let record = manifest
         .fixtures
@@ -830,6 +1754,12 @@ pub(crate) fn existing_fixture(repo_root: &Path, name: &str) -> Result<PathBuf, 
     let digest = hash_artifact(&path)?;
     if digest.bytes != artifact.bytes || digest.sha256 != artifact.sha256.to_ascii_lowercase() {
         return Err(invalid(format!("fixture {name} changed before spawn")));
+    }
+    let final_head = current_candidate_sha_with_git(repo_root, &git, &expected_candidate_sha)?;
+    if final_head != manifest.candidate_sha {
+        return Err(invalid(
+            "candidate HEAD changed while the fixture was being validated",
+        ));
     }
     Ok(path)
 }
@@ -1047,8 +1977,450 @@ mod tests {
     }
 
     #[test]
+    fn repository_git_config_rejects_execution_and_indirection() {
+        let root = tempfile::tempdir().expect("temporary Git metadata root");
+        let git_dir = root.path().join(".git");
+        std::fs::create_dir(&git_dir).expect("temporary Git metadata directory");
+        let config = git_dir.join("config");
+        std::fs::write(
+            &config,
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n\tignorecase = true\n[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+        )
+        .expect("write ordinary clone config");
+        assert!(validate_local_git_config(&git_dir).is_ok());
+
+        for hostile in [
+            "[filter \"evil\"]\n\tclean = write-owned-marker\n",
+            "[include]\n\tpath = outside.gitconfig\n",
+            "[includeIf \"gitdir:/\"]\n\tpath = outside.gitconfig\n",
+            "[core]\n\tfsmonitor = write-owned-marker\n",
+            "[extensions]\n\tworktreeConfig = true\n",
+        ] {
+            std::fs::write(&config, hostile).expect("write hostile clone config");
+            assert!(
+                validate_local_git_config(&git_dir).is_err(),
+                "hostile Git config must be rejected: {hostile}"
+            );
+        }
+    }
+
+    fn create_minimal_direct_git_metadata(git_dir: &Path) {
+        std::fs::create_dir_all(git_dir.join("objects/info")).expect("Git objects info");
+        std::fs::create_dir_all(git_dir.join("objects/pack")).expect("Git pack directory");
+        std::fs::create_dir_all(git_dir.join("refs/heads")).expect("Git refs directory");
+        std::fs::create_dir_all(git_dir.join("info")).expect("Git info directory");
+        let repo_root = git_dir.parent().expect("fake Git repository root");
+        std::fs::create_dir_all(repo_root.join("vita-agent/target"))
+            .expect("approved ignored target");
+        std::fs::write(
+            git_dir.join("info/exclude"),
+            "# test metadata\n\nvita-agent/target/\n",
+        )
+        .expect("Git info exclude");
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n",
+        )
+        .expect("Git config");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("Git HEAD");
+        std::fs::write(git_dir.join("index"), b"").expect("Git index");
+    }
+
+    #[test]
+    fn git_metadata_indirections_and_nested_reparse_paths_are_rejected() {
+        let root = tempfile::tempdir().expect("temporary Git metadata root");
+        let git_dir = root.path().join(".git");
+        create_minimal_direct_git_metadata(&git_dir);
+        assert!(validate_repository_git_metadata(&git_dir).is_ok());
+
+        for relative in [
+            "gitdir",
+            "commondir",
+            "config.worktree",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+        ] {
+            let path = git_dir.join(relative);
+            std::fs::write(&path, "outside-metadata\n").expect("write forbidden Git metadata");
+            assert!(
+                validate_repository_git_metadata(&git_dir).is_err(),
+                "Git metadata indirection must be rejected: {relative}"
+            );
+            std::fs::remove_file(path).expect("remove forbidden Git metadata");
+        }
+
+        let hidden_untracked = git_dir
+            .parent()
+            .expect("fake Git repository root")
+            .join("hidden-source.rs");
+        std::fs::write(&hidden_untracked, "untracked source\n").expect("hidden untracked source");
+        std::fs::write(
+            git_dir.join("info/exclude"),
+            "# comments and blanks are allowed\n\nvita-agent/target/\nhidden-source.rs\n",
+        )
+        .expect("inject forbidden hidden-untracked rule");
+        assert!(
+            validate_repository_git_metadata(&git_dir).is_err(),
+            "an info/exclude rule that hides an untracked source must be rejected"
+        );
+        std::fs::remove_file(hidden_untracked).expect("remove hidden untracked source");
+        std::fs::write(
+            git_dir.join("info/exclude"),
+            "# comments and blanks are allowed\n\nvita-agent/target/\n",
+        )
+        .expect("restore exact approved ignore policy");
+
+        std::fs::write(
+            git_dir.join("info/exclude"),
+            "# comments\nvita-agent/target/\n!hidden-source.rs\n",
+        )
+        .expect("inject forbidden negated rule");
+        assert!(validate_repository_git_metadata(&git_dir).is_err());
+        std::fs::write(git_dir.join("info/exclude"), "vita-agent/target/\n")
+            .expect("restore exact approved ignore policy");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = root.path().join("outside-refs");
+            std::fs::create_dir(&outside).expect("outside refs target");
+            let heads = git_dir.join("refs/heads");
+            std::fs::remove_dir(&heads).expect("remove direct refs directory");
+            symlink(&outside, &heads).expect("create nested refs symlink");
+            assert!(
+                validate_repository_git_metadata(&git_dir).is_err(),
+                "nested refs symlink must be rejected"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_git_metadata_junction_is_rejected() {
+        let root = tempfile::tempdir().expect("temporary Git metadata root");
+        let git_dir = root.path().join(".git");
+        create_minimal_direct_git_metadata(&git_dir);
+        let outside = root.path().join("outside-refs");
+        std::fs::create_dir(&outside).expect("outside refs target");
+        let heads = git_dir.join("refs/heads");
+        std::fs::remove_dir(&heads).expect("remove direct refs directory");
+
+        let system_root = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot for junction test"),
+        );
+        let output = Command::new(system_root.join("System32").join("cmd.exe"))
+            .env_clear()
+            .env("SystemRoot", &system_root)
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                heads.to_str().expect("junction path UTF-8"),
+                outside.to_str().expect("junction target UTF-8"),
+            ])
+            .output()
+            .expect("create nested Git metadata junction");
+        assert!(
+            output.status.success(),
+            "required nested-junction negative could not be established: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            validate_repository_git_metadata(&git_dir).is_err(),
+            "nested Git metadata junction must be rejected"
+        );
+    }
+
+    #[test]
+    fn repo_local_vita_agent_target_indirection_is_rejected() {
+        let root = tempfile::tempdir().expect("temporary candidate root");
+        let git_dir = root.path().join(".git");
+        create_minimal_direct_git_metadata(&git_dir);
+        let target = root.path().join("vita-agent/target");
+        std::fs::remove_dir_all(&target).expect("remove direct repo-local target");
+        let outside = root.path().join("outside-target");
+        std::fs::create_dir(&outside).expect("outside target");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&outside, &target).expect("create target symlink");
+        }
+        #[cfg(windows)]
+        {
+            let system_root = PathBuf::from(
+                std::env::var_os("SystemRoot").expect("Windows SystemRoot for target junction"),
+            );
+            let output = Command::new(system_root.join("System32").join("cmd.exe"))
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .args([
+                    "/d",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    target.to_str().expect("target junction path UTF-8"),
+                    outside.to_str().expect("outside target path UTF-8"),
+                ])
+                .output()
+                .expect("create repo-local target junction");
+            assert!(
+                output.status.success(),
+                "required target-junction negative could not be established: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        assert!(
+            validate_repository_git_metadata(&git_dir).is_err(),
+            "the only allowlisted exclude target cannot redirect outside the candidate root"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_git_info_junction_is_rejected() {
+        let root = tempfile::tempdir().expect("temporary Git metadata root");
+        let git_dir = root.path().join(".git");
+        create_minimal_direct_git_metadata(&git_dir);
+        let outside = root.path().join("outside-info");
+        std::fs::create_dir(&outside).expect("outside info target");
+        let nested = git_dir.join("info/external");
+        let system_root = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot for junction test"),
+        );
+        let output = Command::new(system_root.join("System32").join("cmd.exe"))
+            .env_clear()
+            .env("SystemRoot", &system_root)
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                nested.to_str().expect("junction path UTF-8"),
+                outside.to_str().expect("junction target UTF-8"),
+            ])
+            .output()
+            .expect("create nested Git info junction");
+        assert!(
+            output.status.success(),
+            "required info-junction negative could not be established: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            validate_repository_git_metadata(&git_dir).is_err(),
+            "nested Git info junction must be rejected"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_metadata_handles_remain_locked_across_process_creation() {
+        let root = tempfile::tempdir().expect("temporary retained Git metadata root");
+        let git_dir = root.path().join(".git");
+        create_minimal_direct_git_metadata(&git_dir);
+        let repo_root = root.path().to_path_buf();
+        let mut metadata = open_locked_git_metadata(&repo_root, &git_dir)
+            .expect("index and info/exclude should be retained under read-only locks");
+
+        let system_root = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot for process-creation test"),
+        );
+        let child = Command::new(system_root.join("System32").join("cmd.exe"))
+            .env_clear()
+            .env("SystemRoot", &system_root)
+            .args(["/d", "/c", "exit", "0"])
+            .spawn()
+            .expect("create bounded process while metadata handles are retained");
+        let output = child
+            .wait_with_output()
+            .expect("wait for process-creation probe");
+        assert!(
+            output.status.success(),
+            "process-creation probe must exit successfully"
+        );
+
+        for path in [git_dir.join("index"), git_dir.join("info/exclude")] {
+            let write_open = std::fs::OpenOptions::new().write(true).open(&path);
+            assert!(
+                write_open.is_err(),
+                "retained Git metadata handle must deny write opens after process creation: {}",
+                path.display()
+            );
+            let remove = std::fs::remove_file(&path);
+            assert!(
+                remove.is_err(),
+                "retained Git metadata handle must deny pathname replacement after process creation: {}",
+                path.display()
+            );
+        }
+        verify_locked_git_metadata(&mut metadata)
+            .expect("metadata identity and bytes remain bound across process creation");
+    }
+
+    #[test]
+    fn candidate_sha_pin_and_dirty_status_reject_negative_evidence() {
+        let expected = "0123456789abcdef0123456789abcdef01234567";
+        let changed = "1123456789abcdef0123456789abcdef01234567";
+        assert!(validate_expected_candidate_sha(expected, expected).is_ok());
+        assert!(validate_expected_candidate_sha(changed, expected).is_err());
+        assert!(validate_clean_git_status(b"").is_ok());
+        assert!(validate_clean_git_status(b"?? untracked-file\n").is_err());
+        assert!(
+            validate_clean_git_status(b" M tracked-file\n").is_err(),
+            "tracked edits must be rejected"
+        );
+        assert!(validate_index_flags(b"H tracked-file\0H nested/source.rs\0").is_ok());
+        assert!(
+            validate_index_flags(b"h tracked-file\0").is_err(),
+            "assume-unchanged flags must be rejected"
+        );
+        assert!(
+            validate_index_flags(b"S tracked-file\0").is_err(),
+            "skip-worktree flags must be rejected"
+        );
+        assert!(
+            validate_index_flags(b"H tracked-file").is_err(),
+            "unterminated index inventory must be rejected"
+        );
+    }
+
+    #[test]
+    fn hostile_inherited_git_environment_is_cleared_before_spawn() {
+        let mut command = Command::new("synthetic-git.exe");
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "alias.status=write-marker")
+            .env("GIT_CONFIG_VALUE_0", "!write-marker")
+            .env("GIT_CONFIG_PARAMETERS", "core.fsmonitor=write-marker")
+            .env("GIT_DIR", "outside-metadata")
+            .env("GIT_TRACE", "write-marker");
+        clear_inherited_git_environment(&mut command);
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "no inherited variables, including GIT_*, may reach pinned Git"
+        );
+    }
+
+    #[test]
+    fn pinned_git_rejects_relative_paths_and_fake_sha_before_spawn() {
+        let root = tempfile::tempdir().expect("temporary fake Git root");
+        let fake_git = root.path().join("git.exe");
+        std::fs::write(&fake_git, b"not a Git executable").expect("write fake Git image");
+        let actual_sha = hash_artifact(&fake_git)
+            .expect("hash fake Git image")
+            .sha256;
+
+        assert!(pinned_git_from_inputs(Path::new("git.exe"), &actual_sha).is_err());
+        assert!(pinned_git_from_inputs(&fake_git, &"0".repeat(64)).is_err());
+        pinned_git_from_inputs(&fake_git, &actual_sha)
+            .unwrap_or_else(|error| panic!("exact fake Git pin should validate: {error}"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_git_lock_denies_replacement_and_spawned_process_image_is_verified() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().expect("temporary locked Git root");
+        let fake_git = root.path().join("fake-git.exe");
+        std::fs::write(&fake_git, b"not a Git image").expect("write fake Git image");
+        let fake_sha = hash_artifact(&fake_git)
+            .expect("hash fake Git image")
+            .sha256;
+        let fake_pin = pinned_git_from_inputs(&fake_git, &fake_sha).expect("lock fake Git path");
+
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fake_git)
+                .is_err(),
+            "locked Git handle must deny write access"
+        );
+        let moved_fake = root.path().join("moved-fake-git.exe");
+        assert!(
+            std::fs::rename(&fake_git, &moved_fake).is_err(),
+            "locked Git handle must deny path replacement"
+        );
+        drop(fake_pin);
+        std::fs::rename(&fake_git, &moved_fake)
+            .expect("replacement becomes possible only after lock release");
+
+        let system_root = PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot for process test"),
+        );
+        let command_processor = system_root.join("System32").join("cmd.exe");
+        let locked_command = root.path().join("pinned-git.exe");
+        std::fs::copy(&command_processor, &locked_command)
+            .expect("copy Windows command processor into the test root");
+        let command_sha = hash_artifact(&locked_command)
+            .expect("hash copied Windows command processor")
+            .sha256;
+        let command_pin = pinned_git_from_inputs(&locked_command, &command_sha)
+            .expect("lock copied Windows command processor");
+        let mut child = Command::new(&command_pin.path)
+            .args(["/d", "/c", "timeout /t 5 /nobreak >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pinned-image identity test process");
+        assert!(verify_spawned_git_process(child.id(), &command_pin).is_ok());
+        let raced_replacement = root.path().join("pinned-git-replacement.exe");
+        assert!(
+            std::fs::rename(&locked_command, &raced_replacement).is_err(),
+            "pinned Git path replacement must fail while the verified process is running"
+        );
+        let wrong_pin = pinned_git_from_inputs(
+            &moved_fake,
+            &hash_artifact(&moved_fake)
+                .expect("hash moved fake Git image")
+                .sha256,
+        )
+        .expect("lock wrong expected image");
+        assert!(verify_spawned_git_process(child.id(), &wrong_pin).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(command_pin);
+        std::fs::rename(&locked_command, &raced_replacement)
+            .expect("path replacement becomes possible only after process and lock release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_git_rejects_symlinked_executable_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary Git symlink root");
+        let real_dir = root.path().join("real");
+        std::fs::create_dir(&real_dir).expect("real Git directory");
+        let real_git = real_dir.join("git");
+        std::fs::write(&real_git, b"pinned bytes").expect("write fake Git image");
+        let linked_dir = root.path().join("linked");
+        symlink(&real_dir, &linked_dir).expect("create Git path symlink");
+        let linked_git = linked_dir.join("git");
+        let expected_sha = hash_artifact(&real_git)
+            .expect("hash fake Git image")
+            .sha256;
+
+        assert!(pinned_git_from_inputs(&linked_git, &expected_sha).is_err());
+    }
+
+    #[test]
     fn producer_consumer_round_trip_covers_all_five_fixture_records() {
         let produced = producer_manifest_value();
+        assert_eq!(
+            produced["environment"]
+                .as_object()
+                .expect("producer environment object")
+                .len(),
+            6,
+            "producer schema-v3 environment retains the strict six-field consumer wire shape"
+        );
         let parsed: FixtureManifest = serde_json::from_value(produced.clone())
             .expect("the producer-shaped manifest must satisfy the strict consumer");
         assert_eq!(parsed.fixtures.len(), 5);
@@ -1070,6 +2442,14 @@ mod tests {
         let reparsed: FixtureManifest = serde_json::from_value(serialized)
             .expect("the serialized manifest must remain consumable");
         assert_eq!(reparsed.fixtures.len(), 5);
+
+        let mut provenance_must_stay_separate = produced;
+        provenance_must_stay_separate["environment"]["toolchain_profile_sha256"] =
+            json!("a".repeat(64));
+        assert!(
+            serde_json::from_value::<FixtureManifest>(provenance_must_stay_separate).is_err(),
+            "toolchain provenance must not be added to the v3 BuildEnvironmentWire"
+        );
     }
 
     #[test]

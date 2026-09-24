@@ -2099,7 +2099,7 @@ mod windows {
         CODEX_UPSTREAM_COMMIT, PROTOCOL_VERSION, RUNTIME_ID,
     };
     use sha2::{Digest, Sha256};
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File};
     use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -21588,50 +21588,28 @@ mod windows {
 
         #[test]
         fn d31_c_real_process_recovery_canary() {
-            run_d31_c_real_process_recovery_canary(false, d31_c_require_real_canary());
+            run_d31_c_real_process_recovery_canary(false);
         }
 
         #[test]
         fn d31_c_real_process_recovery_revocation_canary() {
-            if !d31_c_require_real_canary() {
-                eprintln!(
-                    "skipping D31-C recovery revocation canary; set D31_C_REQUIRE_REAL_CANARY=1 for the freeze gate"
-                );
-                return;
-            }
-            run_d31_c_real_process_recovery_canary(true, true);
+            run_d31_c_real_process_recovery_canary(true);
         }
 
-        fn run_d31_c_real_process_recovery_canary(
-            revoke_before_revalidation: bool,
-            require_real_canary: bool,
-        ) {
+        fn run_d31_c_real_process_recovery_canary(revoke_before_revalidation: bool) {
             const RECOVERY_ORIGINAL: &[u8] = b"D31-C recovery original content\n";
             const RECOVERY_REPLACEMENT: &[u8] = b"D31-C recovery replacement content\n";
             let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../vita-agent/target/release/vita-agent.exe");
-            if !executable.is_file() {
-                if require_real_canary {
-                    panic!(
-                        "D31-C recovery process freeze canary requires the release image: {}",
-                        executable.display()
-                    );
-                }
-                eprintln!(
-                    "skipping D31-C recovery process canary; release image is absent: {}",
-                    executable.display()
-                );
-                return;
-            }
+            assert!(
+                executable.is_file(),
+                "D31-C recovery process canary requires the production release image: {}",
+                executable.display()
+            );
+            let seeder = d31_c_recovery_seeder_image(&executable);
             let git_path = match resolve_git_path() {
                 Ok(path) => path,
-                Err(error) => {
-                    if require_real_canary {
-                        panic!("D31-C recovery canary requires trusted Git: {error}");
-                    }
-                    eprintln!("skipping D31-C recovery canary: {error}");
-                    return;
-                }
+                Err(error) => panic!("D31-C recovery canary requires trusted Git: {error}"),
             };
             let workspace = tempfile::tempdir().expect("D31-C recovery canary workspace");
             let git_metadata = workspace.path().join(".git");
@@ -21647,7 +21625,8 @@ mod windows {
             let session_id = "d31-c-recovery-process-session".to_string();
             let life_id = "d31-c-recovery-process-life".to_string();
             let task_id = "d31-c-recovery-process-task".to_string();
-            let seed = Command::new(&executable)
+            verify_d31_c_recovery_seeder_image(&seeder);
+            let seed = Command::new(&seeder.path)
                 .args([
                     "--seed-recovery-fixture",
                     app_data.path().to_str().expect("recovery app-data path"),
@@ -21657,6 +21636,7 @@ mod windows {
                 ])
                 .output()
                 .expect("spawn recovery fixture seeder");
+            verify_d31_c_recovery_seeder_image(&seeder);
             if !seed.status.success() {
                 panic!(
                     "D31-C recovery fixture seeder failed: status={:?}, stderr={}",
@@ -21664,6 +21644,7 @@ mod windows {
                     String::from_utf8_lossy(&seed.stderr)
                 );
             }
+
             let transaction_id = String::from_utf8(seed.stdout)
                 .expect("recovery fixture transaction id utf8")
                 .trim()
@@ -21984,6 +21965,2326 @@ mod windows {
             ));
             session.retire();
             process.shutdown().expect("D31-C recovery process shutdown");
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D31RecoverySeederBuildRecord {
+            schema_version: u32,
+            purpose: String,
+            run_id: String,
+            candidate_sha: String,
+            runner_process_id: u32,
+            source_repo: String,
+            manifest_path: String,
+            feature: String,
+            command: Vec<String>,
+            target_dir: String,
+            run_root: String,
+            cargo_home: String,
+            temp_root: String,
+            toolchain_profile_path: String,
+            toolchain_profile_sha256: String,
+            target_triple: String,
+            powershell: D32BuildProfileIdentity,
+            toolchain: D32BuildProfileToolchain,
+            fetch_manifests: Vec<D32BuildProfileFetchManifest>,
+            fetch_phases: Vec<D31RecoverySeederFetchPhase>,
+            cargo_path: String,
+            process_identity: D31RecoverySeederProcessIdentity,
+            status: String,
+            exit_code: i32,
+            artifact: D31RecoverySeederArtifact,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D31RecoverySeederProcessIdentity {
+            process_id: u32,
+            parent_process_id: Option<u32>,
+            name: Option<String>,
+            image_path: Option<String>,
+            creation_date: Option<String>,
+            command_line: Option<String>,
+            observed_at_utc: String,
+            identity_verified: bool,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D31RecoverySeederArtifact {
+            path: String,
+            bytes: u64,
+            sha256: String,
+            file_identity: D31RecoverySeederFileIdentity,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D31RecoverySeederFileIdentity {
+            volume_serial: u32,
+            file_index: u64,
+            file_size: u64,
+            directory: bool,
+            reparse: bool,
+        }
+
+        #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildProfileIdentity {
+            name: String,
+            path: String,
+            sha256: String,
+            bytes: u64,
+            volume_serial_hex: String,
+            file_id_hex: String,
+            reason: String,
+        }
+
+        #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildProfileToolchain {
+            cargo: D32BuildProfileIdentity,
+            rustc: D32BuildProfileIdentity,
+            rustdoc: D32BuildProfileIdentity,
+        }
+
+        #[derive(Debug, serde::Deserialize, Eq, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildProfileNativeRoot {
+            name: String,
+            path: String,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildProfileNative {
+            path_entries: Vec<String>,
+            include_dirs: Vec<String>,
+            lib_dirs: Vec<String>,
+            libpath_dirs: Vec<String>,
+            environment: D31UniqueStringMap,
+            path_images: Vec<D32BuildProfileIdentity>,
+        }
+
+        #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildProfileFetchManifest {
+            manifest_path: String,
+            lock_sha256: String,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D32BuildToolchainProfileV1 {
+            schema_version: u32,
+            profile_type: String,
+            target_triple: String,
+            system_root: String,
+            powershell_root: String,
+            powershell: D32BuildProfileIdentity,
+            rust_toolchain_root: String,
+            toolchain: D32BuildProfileToolchain,
+            rust_toolchain_bin_images: Vec<D32BuildProfileIdentity>,
+            native_roots: Vec<D32BuildProfileNativeRoot>,
+            native: D32BuildProfileNative,
+            fetch_manifests: Vec<D32BuildProfileFetchManifest>,
+            fetch_git: D31RequiredNullable<D32BuildProfileIdentity>,
+            env_policy: String,
+            cargo_policy: String,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(transparent)]
+        struct D31RequiredNullable<T>(Option<T>);
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct D31RecoverySeederFetchPhase {
+            manifest_path: String,
+            lock_sha256: String,
+            command: Vec<String>,
+            status: String,
+            exit_code: i32,
+            process_identity: D31RecoverySeederProcessIdentity,
+        }
+
+        struct D31ProfileFileEvidence {
+            volume_serial_hex: String,
+            file_id_hex: String,
+            bytes: u64,
+            sha256: String,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(C)]
+        struct D31FileIdInfo {
+            volume_serial_number: u64,
+            file_id: [u8; 16],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileInformationByHandleEx(
+                file: HANDLE,
+                file_information_class: i32,
+                information: *mut std::ffi::c_void,
+                buffer_size: u32,
+            ) -> i32;
+        }
+
+        const D31_FILE_INFO_BY_HANDLE_CLASS_FILE_ID_INFO: i32 = 18;
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct D31UniqueStringMap(BTreeMap<String, String>);
+
+        impl<'de> serde::Deserialize<'de> for D31UniqueStringMap {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct UniqueStringMapVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for UniqueStringMapVisitor {
+                    type Value = D31UniqueStringMap;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("an object with unique string keys and string values")
+                    }
+
+                    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+                    where
+                        M: serde::de::MapAccess<'de>,
+                    {
+                        let mut entries = BTreeMap::new();
+                        while let Some((key, value)) = map.next_entry::<String, String>()? {
+                            if entries.insert(key, value).is_some() {
+                                return Err(serde::de::Error::custom(
+                                    "duplicate native environment key",
+                                ));
+                            }
+                        }
+                        Ok(D31UniqueStringMap(entries))
+                    }
+                }
+
+                deserializer.deserialize_map(UniqueStringMapVisitor)
+            }
+        }
+
+        struct D31RecoverySeederImage {
+            path: PathBuf,
+            identity: HostFileIdentity,
+            bytes: u64,
+            sha256: String,
+            record_path: PathBuf,
+            record_identity: HostFileIdentity,
+            record_bytes: u64,
+            record_sha256: String,
+        }
+
+        fn d31_c_volume_root(path: &Path) -> PathBuf {
+            let mut root = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+                    Component::RootDir => {
+                        root.push(component.as_os_str());
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            assert!(
+                root.is_absolute(),
+                "D31 recovery path must have a volume root"
+            );
+            root
+        }
+
+        fn d31_c_normalize_path_string(path: &Path) -> String {
+            let value = path.to_string_lossy().replace('/', "\\");
+            let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+            value.to_ascii_lowercase()
+        }
+
+        fn d31_c_path_display(path: &Path) -> String {
+            let value = path.to_string_lossy().replace('/', "\\");
+            value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+        }
+
+        fn d31_c_path_is_within(path: &Path, root: &Path) -> bool {
+            let path = d31_c_normalize_path_string(path);
+            let root = d31_c_normalize_path_string(root);
+            let root = root.trim_end_matches('\\');
+            path.get(..root.len())
+                .map(|prefix| prefix.eq_ignore_ascii_case(root))
+                .unwrap_or(false)
+                && (path.len() == root.len() || path.as_bytes().get(root.len()) == Some(&b'\\'))
+        }
+
+        fn d31_c_recovery_file_evidence(path: &Path) -> (HostFileIdentity, u64, String) {
+            assert!(
+                path.is_absolute(),
+                "D31 recovery evidence path must be absolute"
+            );
+            let volume_root = d31_c_volume_root(path);
+            host_verify_no_reparse_path(&volume_root, path)
+                .expect("D31 recovery evidence path must be non-reparse");
+            let before = host_file_identity(path, false)
+                .expect("D31 recovery evidence path must be a regular non-reparse file");
+            let mut file = File::open(path).expect("open D31 recovery evidence file");
+            let length = file
+                .metadata()
+                .expect("D31 recovery evidence file metadata")
+                .len();
+            let mut digest = Sha256::new();
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .expect("read D31 recovery evidence file");
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            drop(file);
+            let after = host_file_identity(path, false)
+                .expect("D31 recovery evidence path identity recheck");
+            host_verify_no_reparse_path(&volume_root, path)
+                .expect("D31 recovery evidence path remained non-reparse");
+            assert_eq!(
+                before, after,
+                "D31 recovery file identity changed while hashing"
+            );
+            assert_eq!(
+                length, before.file_size,
+                "D31 recovery file size changed while hashing"
+            );
+            (before, length, format!("{:x}", digest.finalize()))
+        }
+
+        fn d31_c_profile_file_evidence(path: &Path) -> D31ProfileFileEvidence {
+            let path = d31_c_canonical_no_reparse(path, "D32 build profile executable");
+            let path_identity_before = host_file_identity(&path, false)
+                .expect("D32 profile executable must be a regular non-reparse file");
+            let mut file =
+                File::open(&path).expect("open D32 profile executable through one handle");
+            let raw_handle = file.as_raw_handle() as HANDLE;
+            let mut basic = BY_HANDLE_FILE_INFORMATION::default();
+            assert_ne!(
+                unsafe { GetFileInformationByHandle(raw_handle, &mut basic) },
+                0,
+                "read D32 profile executable native identity"
+            );
+            assert_eq!(
+                basic.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY),
+                0,
+                "D32 profile executable handle must be a regular non-reparse file"
+            );
+            let handle_identity = HostFileIdentity {
+                volume_serial: basic.dwVolumeSerialNumber,
+                file_index: (u64::from(basic.nFileIndexHigh) << 32)
+                    | u64::from(basic.nFileIndexLow),
+                file_size: (u64::from(basic.nFileSizeHigh) << 32) | u64::from(basic.nFileSizeLow),
+                directory: false,
+                reparse: false,
+            };
+            assert_eq!(
+                path_identity_before, handle_identity,
+                "D32 profile executable path and retained handle identity must agree"
+            );
+            let mut file_id = D31FileIdInfo {
+                volume_serial_number: 0,
+                file_id: [0; 16],
+            };
+            assert_ne!(
+                unsafe {
+                    GetFileInformationByHandleEx(
+                        raw_handle,
+                        D31_FILE_INFO_BY_HANDLE_CLASS_FILE_ID_INFO,
+                        (&mut file_id as *mut D31FileIdInfo).cast(),
+                        std::mem::size_of::<D31FileIdInfo>() as u32,
+                    )
+                },
+                0,
+                "read D32 profile executable 128-bit file ID"
+            );
+            let length_before = file
+                .metadata()
+                .expect("D32 profile executable metadata")
+                .len();
+            assert_eq!(length_before, handle_identity.file_size);
+            let mut digest = Sha256::new();
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .expect("hash D32 profile executable through its identity handle");
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            let length_after = file
+                .metadata()
+                .expect("D32 profile executable final metadata")
+                .len();
+            let mut final_basic = BY_HANDLE_FILE_INFORMATION::default();
+            assert_ne!(
+                unsafe { GetFileInformationByHandle(raw_handle, &mut final_basic) },
+                0,
+                "recheck D32 profile executable native identity"
+            );
+            let mut final_file_id = D31FileIdInfo {
+                volume_serial_number: 0,
+                file_id: [0; 16],
+            };
+            assert_ne!(
+                unsafe {
+                    GetFileInformationByHandleEx(
+                        raw_handle,
+                        D31_FILE_INFO_BY_HANDLE_CLASS_FILE_ID_INFO,
+                        (&mut final_file_id as *mut D31FileIdInfo).cast(),
+                        std::mem::size_of::<D31FileIdInfo>() as u32,
+                    )
+                },
+                0,
+                "recheck D32 profile executable 128-bit file ID"
+            );
+            assert_eq!(
+                length_before, length_after,
+                "D32 profile executable size changed while hashing"
+            );
+            assert_eq!(basic.dwFileAttributes, final_basic.dwFileAttributes);
+            assert_eq!(basic.dwVolumeSerialNumber, final_basic.dwVolumeSerialNumber);
+            assert_eq!(basic.nFileIndexHigh, final_basic.nFileIndexHigh);
+            assert_eq!(basic.nFileIndexLow, final_basic.nFileIndexLow);
+            assert_eq!(
+                file_id, final_file_id,
+                "D32 profile executable handle identity changed while hashing"
+            );
+            assert_eq!(
+                file_id.volume_serial_number as u32, basic.dwVolumeSerialNumber,
+                "D32 profile extended/basic volume serials must agree"
+            );
+            let path_identity_after = host_file_identity(&path, false)
+                .expect("D32 profile executable path identity recheck");
+            assert_eq!(
+                path_identity_before, path_identity_after,
+                "D32 profile executable path rebound while hashing"
+            );
+            let file_id_hex = file_id
+                .file_id
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            D31ProfileFileEvidence {
+                volume_serial_hex: format!("{:016x}", file_id.volume_serial_number),
+                file_id_hex,
+                bytes: length_after,
+                sha256: format!("{:x}", digest.finalize()),
+            }
+        }
+
+        fn d31_c_canonical_no_reparse(path: &Path, label: &str) -> PathBuf {
+            assert!(path.is_absolute(), "{label} path must be absolute");
+            let raw_root = d31_c_volume_root(path);
+            host_verify_no_reparse_path(&raw_root, path)
+                .unwrap_or_else(|error| panic!("{label} path failed raw reparse checks: {error}"));
+            let canonical = fs::canonicalize(path)
+                .unwrap_or_else(|error| panic!("{label} path could not canonicalize: {error}"));
+            assert!(
+                d31_c_paths_equal(path, &canonical),
+                "{label} path must already be canonical"
+            );
+            let canonical_root = d31_c_volume_root(&canonical);
+            host_verify_no_reparse_path(&canonical_root, &canonical).unwrap_or_else(|error| {
+                panic!("{label} canonical path failed reparse checks: {error}")
+            });
+            canonical
+        }
+
+        fn d31_c_validate_record_provenance(
+            record_candidate_sha: &str,
+            expected_candidate_sha: &str,
+            record_run_id: &str,
+            expected_run_id: &str,
+        ) -> Result<(), String> {
+            let valid_candidate = |value: &str| {
+                value.len() == 40
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            };
+            if !valid_candidate(expected_candidate_sha)
+                || !valid_candidate(record_candidate_sha)
+                || record_candidate_sha != expected_candidate_sha
+            {
+                return Err("D31 seeder record candidate SHA is stale or mismatched".to_string());
+            }
+            let valid_run_id = |value: &str| {
+                value.len() == 32
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            };
+            if !valid_run_id(expected_run_id)
+                || !valid_run_id(record_run_id)
+                || record_run_id != expected_run_id
+            {
+                return Err("D31 seeder record run ID is stale or mismatched".to_string());
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_record_schema_version(version: u32) -> Result<(), String> {
+            if version != 2 {
+                return Err("D31 recovery seeder record must use schema version 2".to_string());
+            }
+            Ok(())
+        }
+
+        fn d31_c_paths_equal(left: &Path, right: &Path) -> bool {
+            d31_c_normalize_path_string(left) == d31_c_normalize_path_string(right)
+        }
+
+        fn d31_c_validate_fixed_seeder_paths(
+            record_path: &Path,
+            target_dir: &Path,
+        ) -> Result<(), String> {
+            if record_path.file_name() != Some(OsStr::new("d31-recovery-seeder-build.json")) {
+                return Err(
+                    "D31 seeder build record name is not the fixed sibling name".to_string()
+                );
+            }
+            if target_dir.file_name() != Some(OsStr::new("d31-recovery-seeder-target")) {
+                return Err("D31 seeder target name is not the fixed output-root child".to_string());
+            }
+            match (record_path.parent(), target_dir.parent()) {
+                (Some(record_parent), Some(target_parent))
+                    if d31_c_paths_equal(record_parent, target_parent) =>
+                {
+                    Ok(())
+                }
+                _ => Err("D31 seeder record and target are not canonical siblings".to_string()),
+            }
+        }
+
+        fn d31_c_validate_fixed_seeder_run_paths(
+            record_path: &Path,
+            target_dir: &Path,
+            run_root: &Path,
+            cargo_home: &Path,
+            temp_root: &Path,
+            run_id: &str,
+        ) -> Result<(), String> {
+            d31_c_validate_fixed_seeder_paths(record_path, target_dir)?;
+            let valid_run_id = run_id.len() == 32
+                && run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+            if !valid_run_id {
+                return Err("D31 seeder run ID is malformed".to_string());
+            }
+            let output_root = record_path
+                .parent()
+                .ok_or_else(|| "D31 seeder record has no output-root parent".to_string())?;
+            let expected_run_root = output_root.join(format!("d31-recovery-seeder-run-{run_id}"));
+            let expected_cargo_home = expected_run_root.join("cargo-home");
+            let expected_temp_root = expected_run_root.join("temp");
+            if !d31_c_paths_equal(run_root, &expected_run_root)
+                || !d31_c_paths_equal(cargo_home, &expected_cargo_home)
+                || !d31_c_paths_equal(temp_root, &expected_temp_root)
+            {
+                return Err(
+                    "D31 seeder fresh-run directory layout does not match its unique run ID"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_profile_identity(
+            identity: &D32BuildProfileIdentity,
+            expected_name: &str,
+            expected_reason: Option<&str>,
+            allowed_root: &Path,
+        ) -> Result<(), String> {
+            if identity.name != expected_name || identity.reason.trim().is_empty() {
+                return Err(format!(
+                    "D32 toolchain profile identity {expected_name} name/reason mismatch"
+                ));
+            }
+            if expected_reason.is_some_and(|reason| identity.reason != reason) {
+                return Err(format!(
+                    "D32 toolchain profile identity {expected_name} reason mismatch"
+                ));
+            }
+            if identity.sha256.len() != 64
+                || !identity
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                || identity.volume_serial_hex.len() != 16
+                || !identity
+                    .volume_serial_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                || identity.file_id_hex.len() != 32
+                || !identity
+                    .file_id_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                || identity.bytes == 0
+            {
+                return Err(format!(
+                    "D32 toolchain profile identity {expected_name} has malformed hash/ID/size"
+                ));
+            }
+            let path = d31_c_canonical_no_reparse(
+                Path::new(&identity.path),
+                "D32 toolchain profile identity",
+            )
+            .to_string_lossy()
+            .into_owned();
+            let basename = Path::new(&path)
+                .file_name()
+                .ok_or_else(|| {
+                    format!("D32 toolchain profile identity {expected_name} has no basename")
+                })?
+                .to_string_lossy();
+            if !d31_c_paths_equal(Path::new(&identity.path), Path::new(&path))
+                || !d31_c_path_is_within(Path::new(&path), allowed_root)
+                || !identity.name.eq_ignore_ascii_case(basename.as_ref())
+            {
+                return Err(format!("D32 toolchain profile identity {expected_name} path is outside its approved root"));
+            }
+            let actual = d31_c_profile_file_evidence(Path::new(&path));
+            if actual.sha256 != identity.sha256
+                || actual.bytes != identity.bytes
+                || actual.volume_serial_hex != identity.volume_serial_hex
+                || actual.file_id_hex != identity.file_id_hex
+            {
+                return Err(format!("D32 toolchain profile identity {expected_name} differs from current opened-handle evidence"));
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_profile_image_inventory(
+            records: &[D32BuildProfileIdentity],
+            directories: &[String],
+            allowed_roots: &[PathBuf],
+            label: &str,
+        ) -> Result<HashSet<String>, String> {
+            if records.is_empty() || directories.is_empty() {
+                return Err(format!(
+                    "D32 toolchain profile {label} inventory/directories must be nonempty"
+                ));
+            }
+            let mut declared = HashSet::new();
+            for record in records {
+                let lower_name = record.name.to_ascii_lowercase();
+                if lower_name == "git.exe"
+                    || lower_name == "ssh.exe"
+                    || lower_name == "ssh-agent.exe"
+                    || lower_name.starts_with("git-credential")
+                {
+                    return Err(format!(
+                        "D32 toolchain profile {label} exposes a Git/SSH helper"
+                    ));
+                }
+                let path = PathBuf::from(&record.path);
+                let canonical = d31_c_canonical_no_reparse(&path, "D32 PATH executable identity");
+                let path_string = canonical.to_string_lossy().into_owned();
+                let basename = canonical
+                    .file_name()
+                    .ok_or_else(|| format!("D32 toolchain profile {label} image lacks basename"))?
+                    .to_string_lossy();
+                if !basename.eq_ignore_ascii_case(&record.name) {
+                    return Err(format!(
+                        "D32 toolchain profile {label} image name/path mismatch"
+                    ));
+                }
+                let extension = canonical
+                    .extension()
+                    .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if extension == "bat" || extension == "cmd" {
+                    return Err(format!(
+                        "D32 toolchain profile {label} contains an unpinned batch executable"
+                    ));
+                }
+                if extension != "exe" && extension != "com" {
+                    return Err(format!(
+                        "D32 toolchain profile {label} contains a non-executable PATH image"
+                    ));
+                }
+                let owner = allowed_roots
+                    .iter()
+                    .filter(|root| d31_c_path_is_within(&canonical, root))
+                    .collect::<Vec<_>>();
+                if owner.len() != 1 {
+                    return Err(format!(
+                        "D32 toolchain profile {label} image is outside exactly one approved root"
+                    ));
+                }
+                if !directories
+                    .iter()
+                    .any(|directory| d31_c_path_is_within(&canonical, Path::new(directory)))
+                {
+                    return Err(format!("D32 toolchain profile {label} image is outside constructed PATH directories"));
+                }
+                d31_c_validate_profile_identity(record, &record.name, None, owner[0])?;
+                if !declared.insert(path_string.to_ascii_lowercase()) {
+                    return Err(format!(
+                        "D32 toolchain profile {label} contains a duplicate image path"
+                    ));
+                }
+            }
+
+            let mut actual = HashSet::new();
+            let mut normalized_dirs = HashSet::new();
+            for directory in directories {
+                let canonical = d31_c_canonical_no_reparse(
+                    Path::new(directory),
+                    "D32 constructed PATH directory",
+                );
+                if !fs::metadata(&canonical)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "D32 toolchain profile {label} PATH entry is not a directory"
+                    ));
+                }
+                if !normalized_dirs.insert(canonical.to_string_lossy().to_ascii_lowercase()) {
+                    return Err(format!(
+                        "D32 toolchain profile {label} PATH contains duplicate directories"
+                    ));
+                }
+                let entries = fs::read_dir(&canonical).map_err(|error| {
+                    format!("D32 toolchain profile {label} PATH enumeration failed: {error}")
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        format!("D32 toolchain profile {label} PATH entry read failed: {error}")
+                    })?;
+                    let path = entry.path();
+                    let extension = path
+                        .extension()
+                        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if extension == "bat" || extension == "cmd" {
+                        return Err(format!(
+                            "D32 toolchain profile {label} PATH exposes a batch file"
+                        ));
+                    }
+                    if extension != "exe" && extension != "com" {
+                        continue;
+                    }
+                    host_verify_no_reparse_path(&canonical, &path)
+                        .map_err(|error| format!("D32 toolchain profile {label} PATH image has reparse indirection: {error}"))?;
+                    let canonical_image = fs::canonicalize(&path).map_err(|error| {
+                        format!(
+                            "D32 toolchain profile {label} PATH image cannot canonicalize: {error}"
+                        )
+                    })?;
+                    if !d31_c_paths_equal(&path, &canonical_image) {
+                        return Err(format!(
+                            "D32 toolchain profile {label} PATH image is not canonical"
+                        ));
+                    }
+                    actual.insert(canonical_image.to_string_lossy().to_ascii_lowercase());
+                }
+            }
+            if actual != declared {
+                return Err(format!("D32 toolchain profile {label} inventory does not exactly cover current PATH images"));
+            }
+            Ok(actual)
+        }
+
+        fn d31_c_validate_build_toolchain_profile(
+            profile: &D32BuildToolchainProfileV1,
+            source_repo: &Path,
+        ) -> Result<(), String> {
+            if profile.schema_version != 1
+                || profile.profile_type != "D32_BUILD_TOOLCHAIN_PROFILE_V1"
+                || profile.target_triple != "x86_64-pc-windows-msvc"
+                || profile.env_policy != "D32_BUILD_ENV_V1"
+                || profile.cargo_policy != "FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER"
+                || profile.fetch_git.0.is_some()
+            {
+                return Err(
+                    "D31 seeder build toolchain profile has unsupported schema or policies"
+                        .to_string(),
+                );
+            }
+            let source_repo = d31_c_canonical_no_reparse(source_repo, "D31 source repository");
+            let system_root = d31_c_canonical_no_reparse(
+                Path::new(&profile.system_root),
+                "D32 Windows system root",
+            );
+            let inherited_system_root = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "D31 seeder test requires the explicitly supplied SystemRoot".to_string()
+                })?;
+            if !d31_c_paths_equal(&system_root, &inherited_system_root) {
+                return Err(
+                    "D32 toolchain profile system_root differs from the current Windows root"
+                        .to_string(),
+                );
+            }
+            let powershell_root = d31_c_canonical_no_reparse(
+                Path::new(&profile.powershell_root),
+                "D32 PowerShell root",
+            );
+            let rust_root = d31_c_canonical_no_reparse(
+                Path::new(&profile.rust_toolchain_root),
+                "D32 Rust toolchain root",
+            );
+            for (label, root) in [
+                ("PowerShell", &powershell_root),
+                ("Rust toolchain", &rust_root),
+            ] {
+                if d31_c_path_is_within(root, &source_repo)
+                    || d31_c_path_is_within(&source_repo, root)
+                    || d31_c_path_is_within(root, &system_root)
+                    || d31_c_path_is_within(&system_root, root)
+                {
+                    return Err(format!(
+                        "D32 {label} root overlaps repository or Windows system root"
+                    ));
+                }
+            }
+            if d31_c_path_is_within(&powershell_root, &rust_root)
+                || d31_c_path_is_within(&rust_root, &powershell_root)
+            {
+                return Err("D32 PowerShell and Rust toolchain roots overlap".to_string());
+            }
+            d31_c_validate_profile_identity(
+                &profile.powershell,
+                "pwsh.exe",
+                Some("direct pinned PowerShell host executable"),
+                &powershell_root,
+            )?;
+
+            if profile.native_roots.len() != 2 {
+                return Err(
+                    "D32 toolchain profile must contain exactly the MSVC and Windows SDK roots"
+                        .to_string(),
+                );
+            }
+            let mut native_roots = BTreeMap::new();
+            for root in &profile.native_roots {
+                if root.name != "msvc" && root.name != "windows-sdk" {
+                    return Err(
+                        "D32 toolchain profile contains an unapproved native root name".to_string(),
+                    );
+                }
+                let path =
+                    d31_c_canonical_no_reparse(Path::new(&root.path), "D32 native tool root");
+                if !fs::metadata(&path)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+                    || d31_c_path_is_within(&path, &source_repo)
+                    || d31_c_path_is_within(&source_repo, &path)
+                    || d31_c_path_is_within(&path, &rust_root)
+                    || d31_c_path_is_within(&rust_root, &path)
+                    || d31_c_path_is_within(&path, &powershell_root)
+                    || d31_c_path_is_within(&powershell_root, &path)
+                    || d31_c_path_is_within(&path, &system_root)
+                    || d31_c_path_is_within(&system_root, &path)
+                {
+                    return Err(format!(
+                        "D32 native root {} is invalid or overlaps an authority root",
+                        root.name
+                    ));
+                }
+                if native_roots.insert(root.name.as_str(), path).is_some() {
+                    return Err(
+                        "D32 toolchain profile native root names are duplicated".to_string()
+                    );
+                }
+            }
+            let msvc_root = native_roots
+                .get("msvc")
+                .ok_or_else(|| "D32 toolchain profile is missing the MSVC root".to_string())?
+                .clone();
+            let sdk_root = native_roots
+                .get("windows-sdk")
+                .ok_or_else(|| "D32 toolchain profile is missing the Windows SDK root".to_string())?
+                .clone();
+            if d31_c_path_is_within(&msvc_root, &sdk_root)
+                || d31_c_path_is_within(&sdk_root, &msvc_root)
+            {
+                return Err("D32 native MSVC and Windows SDK roots overlap".to_string());
+            }
+
+            let rust_bin =
+                d31_c_canonical_no_reparse(&rust_root.join("bin"), "D32 Rust toolchain bin");
+            for (identity, tool, reason) in [
+                (
+                    &profile.toolchain.cargo,
+                    "cargo.exe",
+                    "direct pinned cargo executable",
+                ),
+                (
+                    &profile.toolchain.rustc,
+                    "rustc.exe",
+                    "direct pinned rustc executable",
+                ),
+                (
+                    &profile.toolchain.rustdoc,
+                    "rustdoc.exe",
+                    "direct pinned rustdoc executable",
+                ),
+            ] {
+                d31_c_validate_profile_identity(identity, tool, Some(reason), &rust_bin)?;
+            }
+            let rust_path_dirs = vec![rust_bin.to_string_lossy().into_owned()];
+            let rust_roots = vec![rust_root.clone()];
+            let rust_images = d31_c_validate_profile_image_inventory(
+                &profile.rust_toolchain_bin_images,
+                &rust_path_dirs,
+                &rust_roots,
+                "rust_toolchain_bin_images",
+            )?;
+            for direct in [
+                &profile.toolchain.cargo,
+                &profile.toolchain.rustc,
+                &profile.toolchain.rustdoc,
+            ] {
+                if !rust_images.contains(&d31_c_normalize_path_string(Path::new(&direct.path))) {
+                    return Err(
+                        "D32 direct Rust tool is missing from the exact PATH image inventory"
+                            .to_string(),
+                    );
+                }
+            }
+
+            let native = &profile.native;
+            for (label, directories) in [
+                ("path_entries", &native.path_entries),
+                ("include_dirs", &native.include_dirs),
+                ("lib_dirs", &native.lib_dirs),
+                ("libpath_dirs", &native.libpath_dirs),
+            ] {
+                if directories.is_empty() {
+                    return Err(format!("D32 native.{label} must be a nonempty array"));
+                }
+                let mut seen = HashSet::new();
+                for directory in directories {
+                    let path = d31_c_canonical_no_reparse(
+                        Path::new(directory),
+                        "D32 native tool directory",
+                    );
+                    let owners = [&msvc_root, &sdk_root]
+                        .iter()
+                        .filter(|root| d31_c_path_is_within(&path, root))
+                        .count();
+                    if owners != 1 || !seen.insert(path.to_string_lossy().to_ascii_lowercase()) {
+                        return Err(format!(
+                            "D32 native.{label} contains an invalid or duplicate directory"
+                        ));
+                    }
+                }
+            }
+            let path_environment = [
+                "VCINSTALLDIR",
+                "VCToolsInstallDir",
+                "VCToolsRedistDir",
+                "VSINSTALLDIR",
+                "WindowsSdkDir",
+                "UniversalCRTSdkDir",
+            ];
+            let version_environment = [
+                "VCToolsVersion",
+                "WindowsSDKVersion",
+                "WindowsSDKLibVersion",
+                "UCRTVersion",
+                "VisualStudioVersion",
+                "VSCMD_VER",
+                "VSCMD_ARG_TGT_ARCH",
+            ];
+            for (name, value) in &native.environment.0 {
+                if path_environment.contains(&name.as_str()) {
+                    let path =
+                        d31_c_canonical_no_reparse(Path::new(value), "D32 native environment path");
+                    let owners = [&msvc_root, &sdk_root]
+                        .iter()
+                        .filter(|root| d31_c_path_is_within(&path, root))
+                        .count();
+                    if owners != 1 {
+                        return Err(format!(
+                            "D32 native environment path {name} is outside approved roots"
+                        ));
+                    }
+                } else if version_environment.contains(&name.as_str()) {
+                    let version_value = value.strip_suffix('\\').unwrap_or(value);
+                    if value.is_empty()
+                        || version_value.is_empty()
+                        || version_value.bytes().any(|byte| {
+                            !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                        })
+                        || (name == "VSCMD_ARG_TGT_ARCH" && value != "x64")
+                    {
+                        return Err(format!("D32 native environment value {name} is invalid"));
+                    }
+                } else {
+                    return Err(format!(
+                        "D32 native environment variable {name} is not allowed"
+                    ));
+                }
+            }
+            let native_root_values = vec![msvc_root.clone(), sdk_root.clone()];
+            let native_images = d31_c_validate_profile_image_inventory(
+                &native.path_images,
+                &native.path_entries,
+                &native_root_values,
+                "native.path_images",
+            )?;
+            for core_name in ["cl.exe", "link.exe", "lib.exe", "rc.exe", "mt.exe"] {
+                if native
+                    .path_images
+                    .iter()
+                    .filter(|identity| identity.name.eq_ignore_ascii_case(core_name))
+                    .count()
+                    != 1
+                {
+                    return Err(format!(
+                        "D32 native PATH image inventory must pin exactly one {core_name}"
+                    ));
+                }
+            }
+            if native_images.len() != native.path_images.len() {
+                return Err("D32 native executable identity inventory is inconsistent".to_string());
+            }
+
+            let allowed_environment = [
+                "VCINSTALLDIR",
+                "VCToolsInstallDir",
+                "VCToolsRedistDir",
+                "VSINSTALLDIR",
+                "WindowsSdkDir",
+                "UniversalCRTSdkDir",
+                "VCToolsVersion",
+                "WindowsSDKVersion",
+                "WindowsSDKLibVersion",
+                "UCRTVersion",
+                "VisualStudioVersion",
+                "VSCMD_VER",
+                "VSCMD_ARG_TGT_ARCH",
+            ];
+            if native
+                .environment
+                .0
+                .keys()
+                .any(|key| !allowed_environment.contains(&key.as_str()))
+            {
+                return Err(
+                    "D32 native environment contains a forbidden wrapper/flag variable".to_string(),
+                );
+            }
+
+            let expected_locks = [
+                (
+                    "vita-agent-protocol/Cargo.toml",
+                    "vita-agent-protocol/Cargo.lock",
+                ),
+                ("vita-agent/Cargo.toml", "vita-agent/Cargo.lock"),
+                ("src-tauri/Cargo.toml", "src-tauri/Cargo.lock"),
+            ];
+            if profile.fetch_manifests.len() != expected_locks.len() {
+                return Err(
+                    "D32 toolchain profile must bind the exact three Cargo manifests".to_string(),
+                );
+            }
+            for (index, (manifest_relative, lock_relative)) in expected_locks.iter().enumerate() {
+                let binding = &profile.fetch_manifests[index];
+                if binding.manifest_path != *manifest_relative
+                    || binding.lock_sha256.len() != 64
+                    || !binding
+                        .lock_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                {
+                    return Err(format!(
+                        "D32 toolchain profile lock binding {index} is malformed or out of order"
+                    ));
+                }
+                let manifest = d31_c_canonical_no_reparse(
+                    &source_repo.join(manifest_relative),
+                    "D32 lock-bound Cargo manifest",
+                );
+                if !manifest.is_file() {
+                    return Err(format!(
+                        "D32 toolchain profile manifest {manifest_relative} is not a file"
+                    ));
+                }
+                let lock = d31_c_canonical_no_reparse(
+                    &source_repo.join(lock_relative),
+                    "D32 lock-bound Cargo.lock",
+                );
+                let lock_evidence = d31_c_profile_file_evidence(&lock);
+                if lock_evidence.sha256 != binding.lock_sha256 {
+                    return Err(format!(
+                        "D32 toolchain profile lock SHA differs for {lock_relative}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn d31_c_read_pinned_build_toolchain_profile(
+            configured_path: &Path,
+            expected_sha256: &str,
+            source_repo: &Path,
+        ) -> Result<(PathBuf, D32BuildToolchainProfileV1), String> {
+            if expected_sha256.len() != 64
+                || !expected_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err("D32 toolchain profile SHA pin is malformed".to_string());
+            }
+            let path = d31_c_canonical_no_reparse(configured_path, "D32 toolchain profile");
+            if d31_c_path_is_within(&path, source_repo) || d31_c_path_is_within(source_repo, &path)
+            {
+                return Err(
+                    "D32 toolchain profile must be outside and non-overlapping with the repository"
+                        .to_string(),
+                );
+            }
+            let before = d31_c_profile_file_evidence(&path);
+            if before.sha256 != expected_sha256 {
+                return Err(
+                    "D32 toolchain profile bytes differ from the independent SHA pin".to_string(),
+                );
+            }
+            if before.bytes > 4 * 1024 * 1024 {
+                return Err("D32 toolchain profile exceeds the bounded JSON size".to_string());
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("D32 toolchain profile could not be read: {error}"))?;
+            if bytes.len() as u64 != before.bytes
+                || format!("{:x}", Sha256::digest(&bytes)) != before.sha256
+            {
+                return Err(
+                    "D32 toolchain profile bytes changed between identity snapshot and parse"
+                        .to_string(),
+                );
+            }
+            let after = d31_c_profile_file_evidence(&path);
+            if before.bytes != after.bytes
+                || before.sha256 != after.sha256
+                || before.volume_serial_hex != after.volume_serial_hex
+                || before.file_id_hex != after.file_id_hex
+            {
+                return Err("D32 toolchain profile identity changed while reading".to_string());
+            }
+            let profile: D32BuildToolchainProfileV1 = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("D32 toolchain profile has an invalid/duplicate/unknown schema field: {error}"))?;
+            d31_c_validate_build_toolchain_profile(&profile, source_repo)?;
+            Ok((path, profile))
+        }
+
+        fn d31_c_validate_cargo_configuration_absent(
+            source_repo: &Path,
+            cargo_home: &Path,
+        ) -> Result<(), String> {
+            for name in [
+                "config",
+                "config.toml",
+                "credentials",
+                "credentials.toml",
+                "credentials.json",
+            ] {
+                if cargo_home.join(name).exists() {
+                    return Err(format!("D31 seeder Cargo home contains forbidden configuration/credential file {name}"));
+                }
+            }
+            let mut cursor = Some(source_repo.to_path_buf());
+            while let Some(directory) = cursor {
+                for name in ["config", "config.toml"] {
+                    if directory.join(".cargo").join(name).exists() {
+                        return Err(format!("D31 source repository ancestry contains forbidden Cargo configuration {name}"));
+                    }
+                }
+                cursor = directory.parent().map(Path::to_path_buf);
+            }
+            for package in ["vita-agent-protocol", "vita-agent", "src-tauri"] {
+                for name in ["config", "config.toml"] {
+                    if source_repo.join(package).join(".cargo").join(name).exists() {
+                        return Err(format!(
+                            "D31 package {package} contains forbidden Cargo configuration {name}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_seeder_profile_binding(
+            record_profile_path: &str,
+            record_profile_sha256: &str,
+            record_target_triple: &str,
+            record_powershell: &D32BuildProfileIdentity,
+            record_toolchain: &D32BuildProfileToolchain,
+            record_fetch_manifests: &[D32BuildProfileFetchManifest],
+            expected_profile_path: &Path,
+            expected_profile_sha256: &str,
+            profile: &D32BuildToolchainProfileV1,
+        ) -> Result<(), String> {
+            let canonical_record_path = d31_c_canonical_no_reparse(
+                Path::new(record_profile_path),
+                "D31 record toolchain profile path",
+            );
+            if !d31_c_paths_equal(&canonical_record_path, expected_profile_path)
+                || record_profile_sha256 != expected_profile_sha256
+                || profile.target_triple != record_target_triple
+                || &profile.powershell != record_powershell
+                || &profile.toolchain != record_toolchain
+                || profile.fetch_manifests.as_slice() != record_fetch_manifests
+            {
+                return Err("D31 seeder record does not bind the independently pinned current toolchain profile".to_string());
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_fetch_phases(
+            phases: &[D31RecoverySeederFetchPhase],
+            profile: &D32BuildToolchainProfileV1,
+            cargo_path: &Path,
+            source_repo: &Path,
+            runner_process_id: u32,
+        ) -> Result<(), String> {
+            if runner_process_id == 0 {
+                return Err("D31 runner process ID is missing".to_string());
+            }
+            if phases.len() != profile.fetch_manifests.len() || phases.is_empty() {
+                return Err(
+                    "D31 seeder must record exactly one locked fetch for every profile manifest"
+                        .to_string(),
+                );
+            }
+            for (index, (phase, manifest)) in
+                phases.iter().zip(&profile.fetch_manifests).enumerate()
+            {
+                let manifest_path = d31_c_canonical_no_reparse(
+                    &source_repo.join(&manifest.manifest_path),
+                    "D31 locked fetch manifest",
+                );
+                let expected_command = vec![
+                    "fetch".to_string(),
+                    "--locked".to_string(),
+                    "--manifest-path".to_string(),
+                    d31_c_path_display(&manifest_path),
+                    "--target".to_string(),
+                    profile.target_triple.clone(),
+                ];
+                if phase.manifest_path != manifest.manifest_path
+                    || phase.lock_sha256 != manifest.lock_sha256
+                    || phase.command != expected_command
+                    || phase.status != "succeeded"
+                    || phase.exit_code != 0
+                {
+                    return Err(format!("D31 locked fetch phase {index} does not match the profile-bound manifest and fixed command"));
+                }
+                d31_c_validate_process_identity(
+                    &phase.process_identity,
+                    cargo_path,
+                    &expected_command,
+                    runner_process_id,
+                )
+                .map_err(|error| {
+                    format!("D31 locked fetch phase {index} process provenance: {error}")
+                })?;
+            }
+            Ok(())
+        }
+
+        fn d31_c_windows_quote_argument(argument: &str) -> String {
+            if !argument.is_empty()
+                && !argument
+                    .chars()
+                    .any(|character| character.is_whitespace() || character == '"')
+            {
+                return argument.to_string();
+            }
+            let mut quoted = String::from("\"");
+            let mut backslashes = 0usize;
+            for character in argument.chars() {
+                if character == '\\' {
+                    backslashes += 1;
+                    continue;
+                }
+                if character == '"' {
+                    quoted.push_str(&"\\".repeat((2 * backslashes) + 1));
+                    quoted.push('"');
+                    backslashes = 0;
+                    continue;
+                }
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(character);
+            }
+            if backslashes > 0 {
+                quoted.push_str(&"\\".repeat(2 * backslashes));
+            }
+            quoted.push('"');
+            quoted
+        }
+
+        fn d31_c_expected_cargo_process_command_line(
+            cargo_path: &Path,
+            arguments: &[String],
+        ) -> String {
+            std::iter::once(cargo_path.to_string_lossy().into_owned())
+                .chain(arguments.iter().cloned())
+                .map(|argument| d31_c_windows_quote_argument(&argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn d31_c_expected_recovery_seeder_build_argv(
+            manifest_path: &Path,
+            target_dir: &Path,
+        ) -> Vec<String> {
+            vec![
+                "build".to_string(),
+                "--quiet".to_string(),
+                "--locked".to_string(),
+                "--manifest-path".to_string(),
+                d31_c_path_display(manifest_path),
+                "--bin".to_string(),
+                "vita-agent".to_string(),
+                "--features".to_string(),
+                "d29-h9-test-helper".to_string(),
+                "--target-dir".to_string(),
+                d31_c_path_display(target_dir),
+            ]
+        }
+
+        fn d31_c_validate_recovery_seeder_build_argv(
+            actual: &[String],
+            manifest_path: &Path,
+            target_dir: &Path,
+        ) -> Result<(), String> {
+            let expected = d31_c_expected_recovery_seeder_build_argv(manifest_path, target_dir);
+            if actual != expected {
+                return Err(
+                    "D31 seeder build argv differs from the fixed schema-v2 command".to_string(),
+                );
+            }
+            Ok(())
+        }
+
+        fn d31_c_validate_process_identity(
+            identity: &D31RecoverySeederProcessIdentity,
+            cargo_path: &Path,
+            expected_command: &[String],
+            expected_runner_process_id: u32,
+        ) -> Result<(), String> {
+            if !identity.identity_verified
+                || identity.process_id == 0
+                || expected_runner_process_id == 0
+            {
+                return Err("D31 Cargo process identity is not verified".to_string());
+            }
+            if identity.parent_process_id != Some(expected_runner_process_id)
+                || identity.parent_process_id == Some(identity.process_id)
+            {
+                return Err(
+                    "D31 Cargo parent process ID does not match the recorded runner".to_string(),
+                );
+            }
+            if identity.observed_at_utc.trim().is_empty()
+                || identity
+                    .creation_date
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                return Err("D31 Cargo process identity lacks creation evidence".to_string());
+            }
+            let expected_name = cargo_path
+                .file_name()
+                .ok_or_else(|| "D31 Cargo executable path has no file name".to_string())?
+                .to_string_lossy();
+            let observed_name = identity
+                .name
+                .as_deref()
+                .ok_or_else(|| "D31 Cargo process image name is missing".to_string())?;
+            if !observed_name.eq_ignore_ascii_case(&expected_name) {
+                return Err(
+                    "D31 Cargo process image name does not match the pinned command".to_string(),
+                );
+            }
+            let observed_image_path = identity
+                .image_path
+                .as_deref()
+                .ok_or_else(|| "D31 Cargo process image path is missing".to_string())?;
+            if !Path::new(observed_image_path).is_absolute()
+                || !d31_c_paths_equal(Path::new(observed_image_path), cargo_path)
+            {
+                return Err(
+                    "D31 Cargo process image path does not match the pinned executable".to_string(),
+                );
+            }
+            let expected_line =
+                d31_c_expected_cargo_process_command_line(cargo_path, expected_command);
+            if identity.command_line.as_deref() != Some(expected_line.as_str()) {
+                return Err("D31 Cargo process argv does not match the fixed command".to_string());
+            }
+            Ok(())
+        }
+
+        fn d31_c_recovery_seeder_image(production_executable: &Path) -> D31RecoverySeederImage {
+            let configured_record_path = std::env::var_os("D31_RECOVERY_SEEDER_RECORD_PATH")
+                .map(PathBuf::from)
+                .expect("D31_RECOVERY_SEEDER_RECORD_PATH must identify the separate build record");
+            let expected_record_sha = std::env::var("D31_RECOVERY_SEEDER_RECORD_SHA256").expect(
+                "D31_RECOVERY_SEEDER_RECORD_SHA256 must independently pin the build record",
+            );
+            let expected_run_id = std::env::var("D31_RECOVERY_SEEDER_RUN_ID")
+                .expect("D31_RECOVERY_SEEDER_RUN_ID must independently pin this producer run");
+            let configured_profile_path = std::env::var_os("D32_BUILD_TOOLCHAIN_PROFILE_PATH")
+                .map(PathBuf::from)
+                .expect(
+                    "D32_BUILD_TOOLCHAIN_PROFILE_PATH must independently pin the build profile",
+                );
+            let expected_profile_sha = std::env::var("D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256")
+                .expect("D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256 must independently pin the build profile bytes");
+            assert!(
+                expected_record_sha.len() == 64
+                    && expected_record_sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "D31_RECOVERY_SEEDER_RECORD_SHA256 must be 64 lowercase hex characters"
+            );
+            assert!(
+                expected_profile_sha.len() == 64
+                    && expected_profile_sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256 must be 64 lowercase hex characters"
+            );
+            let source_repo_raw = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let source_repo_raw_root = d31_c_volume_root(&source_repo_raw);
+            host_verify_no_reparse_path(&source_repo_raw_root, &source_repo_raw)
+                .expect("D31 recovery source repository must have no reparse components");
+            let source_repo = fs::canonicalize(&source_repo_raw)
+                .expect("D31 recovery source repository must canonicalize");
+            let source_repo =
+                d31_c_canonical_no_reparse(&source_repo, "D31 recovery source repository");
+            let (expected_profile_path, profile) = d31_c_read_pinned_build_toolchain_profile(
+                &configured_profile_path,
+                &expected_profile_sha,
+                &source_repo,
+            )
+            .unwrap_or_else(|error| {
+                panic!("D31 build toolchain profile validation failed: {error}")
+            });
+            let record_path =
+                d31_c_canonical_no_reparse(&configured_record_path, "D31 recovery build record");
+            let (record_identity, record_bytes, record_sha256) =
+                d31_c_recovery_file_evidence(&record_path);
+            assert_eq!(
+                record_sha256, expected_record_sha,
+                "D31 recovery build record must match its independent SHA-256 pin"
+            );
+            let record_bytes_value =
+                fs::read(&record_path).expect("read D31 recovery build record");
+            assert_eq!(
+                record_bytes_value.len() as u64,
+                record_bytes,
+                "D31 recovery build record byte count changed between snapshot and parse"
+            );
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&record_bytes_value)),
+                record_sha256,
+                "D31 recovery build record contents changed between snapshot and parse"
+            );
+            let (record_identity_after_read, record_bytes_after_read, record_sha_after_read) =
+                d31_c_recovery_file_evidence(&record_path);
+            assert_eq!(
+                record_identity_after_read, record_identity,
+                "D31 recovery build record identity changed while parsing"
+            );
+            assert_eq!(
+                record_bytes_after_read, record_bytes,
+                "D31 recovery build record size changed while parsing"
+            );
+            assert_eq!(
+                record_sha_after_read, record_sha256,
+                "D31 recovery build record hash changed while parsing"
+            );
+            let record: D31RecoverySeederBuildRecord = serde_json::from_slice(&record_bytes_value)
+                .expect("D31 recovery build record must satisfy its strict schema");
+            let expected_candidate_sha = std::env::var("D32_EXPECTED_CANDIDATE_SHA")
+                .expect("D32_EXPECTED_CANDIDATE_SHA must independently pin the candidate");
+            assert!(
+                expected_candidate_sha.len() == 40
+                    && expected_candidate_sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "D32_EXPECTED_CANDIDATE_SHA must be 40 lowercase hex characters"
+            );
+            d31_c_validate_record_provenance(
+                &record.candidate_sha,
+                &expected_candidate_sha,
+                &record.run_id,
+                &expected_run_id,
+            )
+            .unwrap_or_else(|error| panic!("D31 recovery record provenance: {error}"));
+            let expected_manifest = source_repo.join("vita-agent/Cargo.toml");
+            let manifest = d31_c_canonical_no_reparse(
+                Path::new(&record.manifest_path),
+                "D31 recovery manifest",
+            );
+            let target_dir = d31_c_canonical_no_reparse(
+                Path::new(&record.target_dir),
+                "D31 recovery target directory",
+            );
+            let run_root =
+                d31_c_canonical_no_reparse(Path::new(&record.run_root), "D31 seeder run root");
+            let cargo_home =
+                d31_c_canonical_no_reparse(Path::new(&record.cargo_home), "D31 seeder Cargo home");
+            let temp_root =
+                d31_c_canonical_no_reparse(Path::new(&record.temp_root), "D31 seeder temp root");
+            d31_c_validate_fixed_seeder_run_paths(
+                &record_path,
+                &target_dir,
+                &run_root,
+                &cargo_home,
+                &temp_root,
+                &record.run_id,
+            )
+            .unwrap_or_else(|error| panic!("D31 recovery fixed output paths: {error}"));
+            for (label, path) in [
+                (
+                    "output root",
+                    record_path.parent().expect("D31 record parent"),
+                ),
+                ("seeder run root", run_root.as_path()),
+                ("seeder Cargo home", cargo_home.as_path()),
+                ("seeder temp root", temp_root.as_path()),
+                ("seeder target", target_dir.as_path()),
+            ] {
+                if d31_c_path_is_within(path, &source_repo)
+                    || d31_c_path_is_within(&source_repo, path)
+                {
+                    panic!("D31 {label} must be external and non-overlapping with the source repository");
+                }
+            }
+            for path in [&run_root, &cargo_home, &temp_root, &target_dir] {
+                host_file_identity(path, true)
+                    .expect("D31 seeder run directories must be non-reparse directories");
+            }
+            d31_c_validate_cargo_configuration_absent(&source_repo, &cargo_home)
+                .unwrap_or_else(|error| panic!("D31 Cargo configuration boundary: {error}"));
+            d31_c_validate_seeder_profile_binding(
+                &record.toolchain_profile_path,
+                &record.toolchain_profile_sha256,
+                &record.target_triple,
+                &record.powershell,
+                &record.toolchain,
+                &record.fetch_manifests,
+                &expected_profile_path,
+                &expected_profile_sha,
+                &profile,
+            )
+            .unwrap_or_else(|error| panic!("D31 toolchain profile provenance: {error}"));
+            host_file_identity(&target_dir, true)
+                .expect("D31 recovery target must be a non-reparse directory");
+            let expected_artifact = target_dir.join("debug/vita-agent.exe");
+            let artifact_path = d31_c_canonical_no_reparse(
+                Path::new(&record.artifact.path),
+                "D31 recovery test-helper image",
+            );
+            let expected_command = d31_c_expected_recovery_seeder_build_argv(
+                Path::new(&record.manifest_path),
+                Path::new(&record.target_dir),
+            );
+            let repo_is_external = !d31_c_path_is_within(&record_path, &source_repo);
+            assert!(
+                repo_is_external,
+                "D31 recovery build record must be external to the source repository"
+            );
+            assert!(
+                !d31_c_path_is_within(&target_dir, &source_repo),
+                "D31 recovery target directory must be external to the source repository"
+            );
+            d31_c_validate_record_schema_version(record.schema_version)
+                .unwrap_or_else(|error| panic!("D31 recovery build record schema: {error}"));
+            assert_eq!(record.purpose, "d31-recovery-seeder-test-helper");
+            assert!(d31_c_paths_equal(
+                Path::new(&record.source_repo),
+                &source_repo
+            ));
+            assert_eq!(
+                manifest, expected_manifest,
+                "D31 recovery Cargo manifest path"
+            );
+            assert_eq!(record.feature, "d29-h9-test-helper");
+            assert_eq!(record.command, expected_command, "D31 recovery Cargo argv");
+            assert_eq!(record.status, "succeeded");
+            assert_eq!(record.exit_code, 0);
+            assert!(record.process_identity.identity_verified);
+            assert_ne!(record.process_identity.process_id, 0);
+            assert_ne!(
+                record.process_identity.parent_process_id,
+                Some(record.process_identity.process_id),
+                "D31 Cargo parent identity cannot be the Cargo process itself"
+            );
+            assert!(!record.process_identity.observed_at_utc.trim().is_empty());
+            assert!(record.process_identity.name.is_some());
+            assert!(record.process_identity.image_path.is_some());
+            assert!(record.process_identity.creation_date.is_some());
+            assert!(record.process_identity.command_line.is_some());
+            assert!(
+                Path::new(&record.cargo_path).is_absolute(),
+                "D31 Cargo executable path must be absolute"
+            );
+            let cargo_path =
+                d31_c_canonical_no_reparse(Path::new(&record.cargo_path), "D31 Cargo executable");
+            assert!(
+                d31_c_paths_equal(
+                    Path::new(&record.cargo_path),
+                    Path::new(&profile.toolchain.cargo.path)
+                ),
+                "D31 Cargo executable must be the exact profile-pinned direct cargo.exe"
+            );
+            d31_c_validate_profile_identity(
+                &profile.toolchain.cargo,
+                "cargo.exe",
+                Some("direct pinned cargo executable"),
+                &d31_c_canonical_no_reparse(
+                    &Path::new(&profile.rust_toolchain_root).join("bin"),
+                    "D32 Rust toolchain bin",
+                ),
+            )
+            .unwrap_or_else(|error| panic!("D31 Cargo executable identity: {error}"));
+            assert_ne!(
+                record.runner_process_id, 0,
+                "D31 runner process ID must be recorded"
+            );
+            d31_c_validate_recovery_seeder_build_argv(
+                &record.command,
+                Path::new(&record.manifest_path),
+                Path::new(&record.target_dir),
+            )
+            .unwrap_or_else(|error| panic!("D31 recovery Cargo argv: {error}"));
+            d31_c_validate_fetch_phases(
+                &record.fetch_phases,
+                &profile,
+                &cargo_path,
+                &source_repo,
+                record.runner_process_id,
+            )
+            .unwrap_or_else(|error| panic!("D31 locked fetch provenance: {error}"));
+            d31_c_validate_process_identity(
+                &record.process_identity,
+                Path::new(&record.cargo_path),
+                &expected_command,
+                record.runner_process_id,
+            )
+            .unwrap_or_else(|error| panic!("D31 Cargo process provenance: {error}"));
+            assert_eq!(
+                record.artifact.bytes, record.artifact.file_identity.file_size,
+                "D31 recovery artifact size must match its native identity record"
+            );
+            assert!(!record.artifact.file_identity.directory);
+            assert!(!record.artifact.file_identity.reparse);
+            assert_eq!(
+                artifact_path, expected_artifact,
+                "D31 recovery artifact path"
+            );
+            assert!(
+                record.artifact.sha256.len() == 64
+                    && record
+                        .artifact
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "D31 recovery artifact SHA-256 must be lowercase hex"
+            );
+            let expected_identity = HostFileIdentity {
+                volume_serial: record.artifact.file_identity.volume_serial,
+                file_index: record.artifact.file_identity.file_index,
+                file_size: record.artifact.file_identity.file_size,
+                directory: record.artifact.file_identity.directory,
+                reparse: record.artifact.file_identity.reparse,
+            };
+            let (artifact_identity, artifact_bytes, artifact_sha256) =
+                d31_c_recovery_file_evidence(&artifact_path);
+            assert_eq!(
+                artifact_identity, expected_identity,
+                "D31 recovery artifact identity"
+            );
+            assert_eq!(
+                artifact_bytes, record.artifact.bytes,
+                "D31 recovery artifact byte count"
+            );
+            assert_eq!(
+                artifact_sha256, record.artifact.sha256,
+                "D31 recovery artifact SHA-256"
+            );
+            let production =
+                d31_c_canonical_no_reparse(production_executable, "D31 production sidecar image");
+            let production_identity = host_file_identity(&production, false)
+                .expect("D31 production sidecar must be a non-reparse regular file");
+            assert_ne!(
+                artifact_identity, production_identity,
+                "D31 recovery seeder must not reuse the production sidecar image"
+            );
+            let image = D31RecoverySeederImage {
+                path: artifact_path,
+                identity: artifact_identity,
+                bytes: artifact_bytes,
+                sha256: artifact_sha256,
+                record_path,
+                record_identity,
+                record_bytes,
+                record_sha256,
+            };
+            verify_d31_c_recovery_seeder_image(&image);
+            image
+        }
+
+        fn verify_d31_c_recovery_seeder_image(image: &D31RecoverySeederImage) {
+            let (record_identity, record_bytes, record_sha256) =
+                d31_c_recovery_file_evidence(&image.record_path);
+            assert_eq!(
+                record_identity, image.record_identity,
+                "D31 recovery record identity changed"
+            );
+            assert_eq!(
+                record_bytes, image.record_bytes,
+                "D31 recovery record size changed"
+            );
+            assert_eq!(
+                record_sha256, image.record_sha256,
+                "D31 recovery record SHA-256 changed"
+            );
+            let (artifact_identity, artifact_bytes, artifact_sha256) =
+                d31_c_recovery_file_evidence(&image.path);
+            assert_eq!(
+                artifact_identity, image.identity,
+                "D31 recovery seeder file identity changed"
+            );
+            assert_eq!(
+                artifact_bytes, image.bytes,
+                "D31 recovery seeder byte count changed"
+            );
+            assert_eq!(
+                artifact_sha256, image.sha256,
+                "D31 recovery seeder image hash changed"
+            );
+        }
+
+        #[test]
+        fn d31_c_seeder_rejects_stale_candidate_and_same_candidate_stale_run() {
+            let candidate = "0123456789abcdef0123456789abcdef01234567";
+            let changed_candidate = "1123456789abcdef0123456789abcdef01234567";
+            let current_run = "0123456789abcdef0123456789abcdef";
+            let stale_run = "1123456789abcdef0123456789abcdef";
+
+            assert!(d31_c_validate_record_provenance(
+                candidate,
+                candidate,
+                current_run,
+                current_run
+            )
+            .is_ok());
+            assert!(d31_c_validate_record_provenance(
+                changed_candidate,
+                candidate,
+                current_run,
+                current_run
+            )
+            .is_err());
+            assert!(
+                d31_c_validate_record_provenance(candidate, candidate, stale_run, current_run)
+                    .is_err(),
+                "a prior record for the same candidate must not satisfy the current run pin"
+            );
+            assert!(d31_c_validate_record_provenance(
+                candidate,
+                candidate,
+                current_run,
+                "not-a-run-id"
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn d31_c_seeder_paths_and_process_argv_are_exact() {
+            let output_root = PathBuf::from(r"C:\D32 evidence\run-1");
+            let record_path = output_root.join("d31-recovery-seeder-build.json");
+            let target_dir = output_root.join("d31-recovery-seeder-target");
+            assert!(d31_c_validate_fixed_seeder_paths(&record_path, &target_dir).is_ok());
+            assert!(d31_c_paths_equal(
+                Path::new(r"C:\D32 evidence\run-1\d31-recovery-seeder-build.json"),
+                Path::new(r"\\?\C:\D32 evidence\run-1\d31-recovery-seeder-build.json")
+            ));
+            assert!(d31_c_path_is_within(
+                Path::new(r"\\?\C:\D32 evidence\run-1\d31-recovery-seeder-build.json"),
+                &output_root
+            ));
+
+            let run_id = "0123456789abcdef0123456789abcdef";
+            let run_root = output_root.join(format!("d31-recovery-seeder-run-{run_id}"));
+            assert!(d31_c_validate_fixed_seeder_run_paths(
+                &record_path,
+                &target_dir,
+                &run_root,
+                &run_root.join("cargo-home"),
+                &run_root.join("temp"),
+                run_id,
+            )
+            .is_ok());
+            assert!(d31_c_validate_fixed_seeder_run_paths(
+                &record_path,
+                &target_dir,
+                &run_root,
+                &run_root.join("old-cargo-home"),
+                &run_root.join("temp"),
+                run_id,
+            )
+            .is_err());
+            assert!(d31_c_validate_fixed_seeder_run_paths(
+                &record_path,
+                &target_dir,
+                &run_root,
+                &run_root.join("cargo-home"),
+                &run_root.join("temp"),
+                "1123456789abcdef0123456789abcdef",
+            )
+            .is_err());
+
+            let wrong_record = output_root.join("older-build.json");
+            assert!(d31_c_validate_fixed_seeder_paths(&wrong_record, &target_dir).is_err());
+            let wrong_parent =
+                PathBuf::from(r"C:\D32 evidence\other-run").join("d31-recovery-seeder-target");
+            assert!(d31_c_validate_fixed_seeder_paths(&record_path, &wrong_parent).is_err());
+
+            let cargo_path = PathBuf::from(r"C:\Rust toolchain\bin\cargo.exe");
+            let command = vec![
+                "build".to_string(),
+                "--quiet".to_string(),
+                "--locked".to_string(),
+                "--manifest-path".to_string(),
+                r"C:\candidate tree\vita-agent\Cargo.toml".to_string(),
+                "--bin".to_string(),
+                "vita-agent".to_string(),
+                "--features".to_string(),
+                "d29-h9-test-helper".to_string(),
+                "--target-dir".to_string(),
+                target_dir.to_string_lossy().into_owned(),
+            ];
+            assert!(!command.iter().any(|argument| argument == "--offline"));
+
+            let mut identity = D31RecoverySeederProcessIdentity {
+                process_id: 42,
+                parent_process_id: Some(7),
+                name: Some("cargo.exe".to_string()),
+                image_path: Some(cargo_path.to_string_lossy().into_owned()),
+                creation_date: Some("20260923123456.000000+000".to_string()),
+                command_line: Some(d31_c_expected_cargo_process_command_line(
+                    &cargo_path,
+                    &command,
+                )),
+                observed_at_utc: "2026-09-23T12:34:56Z".to_string(),
+                identity_verified: true,
+            };
+            assert!(d31_c_validate_process_identity(&identity, &cargo_path, &command, 7).is_ok());
+            assert!(d31_c_validate_process_identity(&identity, &cargo_path, &command, 8).is_err());
+            identity.name = Some("rustc.exe".to_string());
+            assert!(d31_c_validate_process_identity(&identity, &cargo_path, &command, 7).is_err());
+            identity.name = Some("cargo.exe".to_string());
+            identity.image_path = Some(r"C:\other\cargo.exe".to_string());
+            assert!(d31_c_validate_process_identity(&identity, &cargo_path, &command, 7).is_err());
+            identity.image_path = Some(cargo_path.to_string_lossy().into_owned());
+            identity.command_line = Some("cargo.exe build --offline".to_string());
+            assert!(d31_c_validate_process_identity(&identity, &cargo_path, &command, 7).is_err());
+
+            assert_eq!(
+                d31_c_windows_quote_argument(r"C:\path with space\\"),
+                r#""C:\path with space\\\\"#
+            );
+            assert_eq!(
+                d31_c_windows_quote_argument(r#"embedded\"quote"#),
+                r#""embedded\\\"quote""#
+            );
+        }
+
+        #[test]
+        fn d31_c_seeder_record_v2_binds_current_profile_and_rejects_stale_pins() {
+            let profile_root = tempfile::tempdir().expect("D31 profile binding root");
+            let profile_path = profile_root.path().join("caller-pinned-profile.json");
+            fs::write(&profile_path, b"profile bytes are independently pinned")
+                .expect("D31 profile binding file");
+            let profile_path = fs::canonicalize(&profile_path).expect("canonical D31 profile path");
+            let profile_sha = "a".repeat(64);
+            let powershell = D32BuildProfileIdentity {
+                name: "pwsh.exe".to_string(),
+                path: r"C:\Pinned PowerShell\pwsh.exe".to_string(),
+                sha256: "b".repeat(64),
+                bytes: 10,
+                volume_serial_hex: "0000000000000001".to_string(),
+                file_id_hex: "01".repeat(16),
+                reason: "direct pinned PowerShell host executable".to_string(),
+            };
+            let toolchain = D32BuildProfileToolchain {
+                cargo: D32BuildProfileIdentity {
+                    name: "cargo.exe".to_string(),
+                    path: r"C:\Pinned Rust\bin\cargo.exe".to_string(),
+                    sha256: "c".repeat(64),
+                    bytes: 11,
+                    volume_serial_hex: "0000000000000001".to_string(),
+                    file_id_hex: "02".repeat(16),
+                    reason: "direct pinned cargo executable".to_string(),
+                },
+                rustc: D32BuildProfileIdentity {
+                    name: "rustc.exe".to_string(),
+                    path: r"C:\Pinned Rust\bin\rustc.exe".to_string(),
+                    sha256: "d".repeat(64),
+                    bytes: 12,
+                    volume_serial_hex: "0000000000000001".to_string(),
+                    file_id_hex: "03".repeat(16),
+                    reason: "direct pinned rustc executable".to_string(),
+                },
+                rustdoc: D32BuildProfileIdentity {
+                    name: "rustdoc.exe".to_string(),
+                    path: r"C:\Pinned Rust\bin\rustdoc.exe".to_string(),
+                    sha256: "e".repeat(64),
+                    bytes: 13,
+                    volume_serial_hex: "0000000000000001".to_string(),
+                    file_id_hex: "04".repeat(16),
+                    reason: "direct pinned rustdoc executable".to_string(),
+                },
+            };
+            let fetch_manifests = vec![D32BuildProfileFetchManifest {
+                manifest_path: "vita-agent/Cargo.toml".to_string(),
+                lock_sha256: "f".repeat(64),
+            }];
+            let profile = D32BuildToolchainProfileV1 {
+                schema_version: 1,
+                profile_type: "D32_BUILD_TOOLCHAIN_PROFILE_V1".to_string(),
+                target_triple: "x86_64-pc-windows-msvc".to_string(),
+                system_root: r"C:\Windows".to_string(),
+                powershell_root: r"C:\Pinned PowerShell".to_string(),
+                powershell: powershell.clone(),
+                rust_toolchain_root: r"C:\Pinned Rust".to_string(),
+                toolchain: toolchain.clone(),
+                rust_toolchain_bin_images: Vec::new(),
+                native_roots: Vec::new(),
+                native: D32BuildProfileNative {
+                    path_entries: Vec::new(),
+                    include_dirs: Vec::new(),
+                    lib_dirs: Vec::new(),
+                    libpath_dirs: Vec::new(),
+                    environment: D31UniqueStringMap(BTreeMap::new()),
+                    path_images: Vec::new(),
+                },
+                fetch_manifests: fetch_manifests.clone(),
+                fetch_git: D31RequiredNullable(None),
+                env_policy: "D32_BUILD_ENV_V1".to_string(),
+                cargo_policy: "FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER".to_string(),
+            };
+
+            let validate = |path: &str,
+                            sha: &str,
+                            target: &str,
+                            record_toolchain: &D32BuildProfileToolchain,
+                            manifests: &[D32BuildProfileFetchManifest]| {
+                d31_c_validate_seeder_profile_binding(
+                    path,
+                    sha,
+                    target,
+                    &powershell,
+                    record_toolchain,
+                    manifests,
+                    &profile_path,
+                    &profile_sha,
+                    &profile,
+                )
+            };
+            let profile_path_text = profile_path.to_string_lossy().into_owned();
+            assert!(validate(
+                &profile_path_text,
+                &profile_sha,
+                "x86_64-pc-windows-msvc",
+                &toolchain,
+                &fetch_manifests,
+            )
+            .is_ok());
+            assert!(validate(
+                &profile_path_text,
+                &"9".repeat(64),
+                "x86_64-pc-windows-msvc",
+                &toolchain,
+                &fetch_manifests,
+            )
+            .is_err());
+            assert!(validate(
+                &profile_path_text,
+                &profile_sha,
+                "x86_64-pc-windows-gnu",
+                &toolchain,
+                &fetch_manifests,
+            )
+            .is_err());
+            let stale_fetch = vec![D32BuildProfileFetchManifest {
+                manifest_path: "vita-agent/Cargo.toml".to_string(),
+                lock_sha256: "0".repeat(64),
+            }];
+            assert!(validate(
+                &profile_path_text,
+                &profile_sha,
+                "x86_64-pc-windows-msvc",
+                &toolchain,
+                &stale_fetch,
+            )
+            .is_err());
+            assert!(d31_c_validate_record_schema_version(2).is_ok());
+            assert!(d31_c_validate_record_schema_version(1).is_err());
+            assert!(
+                serde_json::from_str::<D31UniqueStringMap>(r#"{"PATH":"one","PATH":"two"}"#)
+                    .is_err()
+            );
+
+            let identity_wire = |name: &str, path: &str| {
+                serde_json::json!({
+                    "name": name,
+                    "path": path,
+                    "sha256": "a".repeat(64),
+                    "bytes": 1,
+                    "volume_serial_hex": "0000000000000001",
+                    "file_id_hex": "01".repeat(16),
+                    "reason": "test-only pinned image"
+                })
+            };
+            let profile_wire = serde_json::json!({
+                "schema_version": 1,
+                "profile_type": "D32_BUILD_TOOLCHAIN_PROFILE_V1",
+                "target_triple": "x86_64-pc-windows-msvc",
+                "system_root": r"C:\Windows",
+                "powershell_root": r"C:\Pinned PowerShell",
+                "powershell": identity_wire("pwsh.exe", r"C:\Pinned PowerShell\pwsh.exe"),
+                "rust_toolchain_root": r"C:\Pinned Rust",
+                "toolchain": {
+                    "cargo": identity_wire("cargo.exe", r"C:\Pinned Rust\bin\cargo.exe"),
+                    "rustc": identity_wire("rustc.exe", r"C:\Pinned Rust\bin\rustc.exe"),
+                    "rustdoc": identity_wire("rustdoc.exe", r"C:\Pinned Rust\bin\rustdoc.exe")
+                },
+                "rust_toolchain_bin_images": [],
+                "native_roots": [],
+                "native": {
+                    "path_entries": [], "include_dirs": [], "lib_dirs": [], "libpath_dirs": [],
+                    "environment": {}, "path_images": []
+                },
+                "fetch_manifests": [{
+                    "manifest_path": "vita-agent/Cargo.toml",
+                    "lock_sha256": "f".repeat(64)
+                }],
+                "fetch_git": null,
+                "env_policy": "D32_BUILD_ENV_V1",
+                "cargo_policy": "FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER"
+            });
+            let parsed_profile = serde_json::from_value::<D32BuildToolchainProfileV1>(profile_wire.clone())
+                .expect("D32 profile must explicitly encode fetch_git as null when no external Git is permitted");
+            assert!(parsed_profile.fetch_git.0.is_none());
+
+            let source_root = tempfile::tempdir().expect("D31 producer-shaped source repository");
+            let source_repo = source_root.path().join("source");
+            let manifest_parent = source_repo.join("vita-agent");
+            fs::create_dir_all(&manifest_parent).expect("D31 source manifest directory");
+            fs::write(
+                manifest_parent.join("Cargo.toml"),
+                b"[package]\nname='vita-agent'\n",
+            )
+            .expect("D31 source manifest");
+            let source_repo =
+                fs::canonicalize(source_repo).expect("canonical D31 source repository");
+            let manifest_path = fs::canonicalize(source_repo.join("vita-agent/Cargo.toml"))
+                .expect("canonical D31 Cargo manifest");
+            let output_root = tempfile::tempdir().expect("D31 producer-shaped output root");
+            let output_root =
+                fs::canonicalize(output_root.path()).expect("canonical D31 output root");
+            let target_dir = output_root.join("d31-recovery-seeder-target");
+            let run_id = "0123456789abcdef0123456789abcdef";
+            let run_root = output_root.join(format!("d31-recovery-seeder-run-{run_id}"));
+            let record_path = output_root.join("d31-recovery-seeder-build.json");
+            let cargo_path = PathBuf::from(r"C:\Pinned Rust\bin\cargo.exe");
+            let fetch_command = vec![
+                "fetch".to_string(),
+                "--locked".to_string(),
+                "--manifest-path".to_string(),
+                d31_c_path_display(&manifest_path),
+                "--target".to_string(),
+                parsed_profile.target_triple.clone(),
+            ];
+            let build_command =
+                d31_c_expected_recovery_seeder_build_argv(&manifest_path, &target_dir);
+            let mut missing_fetch_git = profile_wire.clone();
+            missing_fetch_git
+                .as_object_mut()
+                .expect("profile wire object")
+                .remove("fetch_git");
+            assert!(
+                serde_json::from_value::<D32BuildToolchainProfileV1>(missing_fetch_git).is_err(),
+                "missing fetch_git must be rejected rather than defaulted to null"
+            );
+            let mut non_null_fetch_git = profile_wire.clone();
+            non_null_fetch_git["fetch_git"] = identity_wire("git.exe", r"C:\Pinned Git\git.exe");
+            let non_null_profile = serde_json::from_value::<D32BuildToolchainProfileV1>(non_null_fetch_git)
+                .expect("non-null fetch_git is structurally parseable for rejection at the profile policy boundary");
+            assert!(d31_c_validate_build_toolchain_profile(
+                &non_null_profile,
+                Path::new(r"C:\repo")
+            )
+            .is_err());
+
+            let pinned_image = |name: &str, path: &str, reason: &str| {
+                serde_json::json!({
+                    "name": name, "path": path, "sha256": "a".repeat(64), "bytes": 1,
+                    "volume_serial_hex": "0000000000000001", "file_id_hex": "01".repeat(16),
+                    "reason": reason
+                })
+            };
+            let fetch_process_identity_wire = serde_json::json!({
+                "process_id": 1235,
+                "parent_process_id": 456,
+                "name": "cargo.exe",
+                "image_path": cargo_path.to_string_lossy(),
+                "creation_date": "2026-09-23T00:00:00.0000000Z",
+                "command_line": d31_c_expected_cargo_process_command_line(&cargo_path, &fetch_command),
+                "observed_at_utc": "2026-09-23T00:00:00.0000000Z",
+                "identity_verified": true
+            });
+            let build_process_identity_wire = serde_json::json!({
+                "process_id": 1234,
+                "parent_process_id": 456,
+                "name": "cargo.exe",
+                "image_path": cargo_path.to_string_lossy(),
+                "creation_date": "2026-09-23T00:00:00.0000000Z",
+                "command_line": d31_c_expected_cargo_process_command_line(&cargo_path, &build_command),
+                "observed_at_utc": "2026-09-23T00:00:00.0000000Z",
+                "identity_verified": true
+            });
+            let v2_record_wire = serde_json::json!({
+                "schema_version": 2,
+                "purpose": "d31-recovery-seeder-test-helper",
+                "run_id": run_id,
+                "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+                "source_repo": d31_c_path_display(&source_repo),
+                "manifest_path": d31_c_path_display(&manifest_path),
+                "feature": "d29-h9-test-helper",
+                "command": build_command,
+                "runner_process_id": 456,
+                "target_dir": d31_c_path_display(&target_dir),
+                "run_root": d31_c_path_display(&run_root),
+                "cargo_home": d31_c_path_display(&run_root.join("cargo-home")),
+                "temp_root": d31_c_path_display(&run_root.join("temp")),
+                "toolchain_profile_path": d31_c_path_display(&profile_path),
+                "toolchain_profile_sha256": profile_sha,
+                "target_triple": "x86_64-pc-windows-msvc",
+                "powershell": pinned_image("pwsh.exe", r"C:\Pinned PowerShell\pwsh.exe", "direct pinned PowerShell host executable"),
+                "toolchain": {
+                    "cargo": pinned_image("cargo.exe", r"C:\Pinned Rust\bin\cargo.exe", "direct pinned cargo executable"),
+                    "rustc": pinned_image("rustc.exe", r"C:\Pinned Rust\bin\rustc.exe", "direct pinned rustc executable"),
+                    "rustdoc": pinned_image("rustdoc.exe", r"C:\Pinned Rust\bin\rustdoc.exe", "direct pinned rustdoc executable")
+                },
+                "fetch_manifests": [{ "manifest_path": "vita-agent/Cargo.toml", "lock_sha256": "f".repeat(64) }],
+                "fetch_phases": [{
+                    "manifest_path": "vita-agent/Cargo.toml", "lock_sha256": "f".repeat(64),
+                    "command": fetch_command,
+                    "status": "succeeded", "exit_code": 0, "process_identity": fetch_process_identity_wire
+                }],
+                "cargo_path": cargo_path.to_string_lossy(),
+                "process_identity": build_process_identity_wire,
+                "status": "succeeded",
+                "exit_code": 0,
+                "artifact": {
+                    "path": d31_c_path_display(&target_dir.join("debug/vita-agent.exe")),
+                    "bytes": 1, "sha256": "d".repeat(64),
+                    "file_identity": { "volume_serial": 1, "file_index": 2, "file_size": 1, "directory": false, "reparse": false }
+                }
+            });
+            let parsed_v2 = serde_json::from_value::<D31RecoverySeederBuildRecord>(
+                v2_record_wire.clone(),
+            )
+            .expect(
+                "complete producer-shaped v2 D31 record must satisfy the exact Host wire schema",
+            );
+            assert!(d31_c_validate_record_schema_version(parsed_v2.schema_version).is_ok());
+            assert_eq!(parsed_v2.runner_process_id, 456);
+            assert_eq!(
+                parsed_v2.command, build_command,
+                "D31 producer build argv must be exact"
+            );
+            assert!(d31_c_validate_recovery_seeder_build_argv(
+                &parsed_v2.command,
+                &manifest_path,
+                &target_dir,
+            )
+            .is_ok());
+            assert!(d31_c_validate_seeder_profile_binding(
+                &parsed_v2.toolchain_profile_path,
+                &parsed_v2.toolchain_profile_sha256,
+                &parsed_v2.target_triple,
+                &parsed_v2.powershell,
+                &parsed_v2.toolchain,
+                &parsed_v2.fetch_manifests,
+                &profile_path,
+                &profile_sha,
+                &parsed_profile,
+            )
+            .is_ok());
+            assert!(d31_c_validate_fixed_seeder_run_paths(
+                &record_path,
+                &target_dir,
+                &run_root,
+                &run_root.join("cargo-home"),
+                &run_root.join("temp"),
+                run_id,
+            )
+            .is_ok());
+            assert!(d31_c_validate_fetch_phases(
+                &parsed_v2.fetch_phases,
+                &parsed_profile,
+                &cargo_path,
+                &source_repo,
+                parsed_v2.runner_process_id,
+            )
+            .is_ok());
+            assert!(d31_c_validate_process_identity(
+                &parsed_v2.process_identity,
+                &cargo_path,
+                &build_command,
+                parsed_v2.runner_process_id,
+            )
+            .is_ok());
+            let mut wrong_build_argv = build_command.clone();
+            wrong_build_argv.push("--offline".to_string());
+            assert!(d31_c_validate_recovery_seeder_build_argv(
+                &wrong_build_argv,
+                &manifest_path,
+                &target_dir,
+            )
+            .is_err());
+            let mut wrong_fetch_argv = v2_record_wire.clone();
+            wrong_fetch_argv["fetch_phases"][0]["command"] = serde_json::json!([
+                "fetch",
+                "--locked",
+                "--manifest-path",
+                d31_c_path_display(&manifest_path),
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--offline"
+            ]);
+            let wrong_fetch_record =
+                serde_json::from_value::<D31RecoverySeederBuildRecord>(wrong_fetch_argv)
+                    .expect("wrong argv remains structurally parseable for semantic rejection");
+            assert!(d31_c_validate_fetch_phases(
+                &wrong_fetch_record.fetch_phases,
+                &parsed_profile,
+                &cargo_path,
+                &source_repo,
+                parsed_v2.runner_process_id,
+            )
+            .is_err());
+            let mut wrong_build_process = v2_record_wire.clone();
+            wrong_build_process["process_identity"]["command_line"] =
+                serde_json::json!("cargo.exe build --offline");
+            let wrong_build_record = serde_json::from_value::<D31RecoverySeederBuildRecord>(
+                wrong_build_process,
+            )
+            .expect("wrong process command remains structurally parseable for semantic rejection");
+            assert!(d31_c_validate_process_identity(
+                &wrong_build_record.process_identity,
+                &cargo_path,
+                &build_command,
+                parsed_v2.runner_process_id,
+            )
+            .is_err());
+            let mut wrong_runner = v2_record_wire.clone();
+            wrong_runner["runner_process_id"] = serde_json::json!(457);
+            let wrong_runner_record = serde_json::from_value::<D31RecoverySeederBuildRecord>(
+                wrong_runner,
+            )
+            .expect("mismatched runner remains structurally parseable for semantic rejection");
+            assert!(d31_c_validate_fetch_phases(
+                &wrong_runner_record.fetch_phases,
+                &parsed_profile,
+                &cargo_path,
+                &source_repo,
+                wrong_runner_record.runner_process_id,
+            )
+            .is_err());
+            assert!(d31_c_validate_process_identity(
+                &wrong_runner_record.process_identity,
+                &cargo_path,
+                &build_command,
+                wrong_runner_record.runner_process_id,
+            )
+            .is_err());
+            let mut wrong_build_parent = v2_record_wire.clone();
+            wrong_build_parent["process_identity"]["parent_process_id"] = serde_json::json!(457);
+            let wrong_build_parent_record =
+                serde_json::from_value::<D31RecoverySeederBuildRecord>(wrong_build_parent)
+                    .expect("wrong parent remains structurally parseable for semantic rejection");
+            assert!(d31_c_validate_process_identity(
+                &wrong_build_parent_record.process_identity,
+                &cargo_path,
+                &build_command,
+                wrong_build_parent_record.runner_process_id,
+            )
+            .is_err());
+            let mut wrong_fetch_parent = v2_record_wire.clone();
+            wrong_fetch_parent["fetch_phases"][0]["process_identity"]["parent_process_id"] =
+                serde_json::json!(457);
+            let wrong_fetch_parent_record = serde_json::from_value::<D31RecoverySeederBuildRecord>(
+                wrong_fetch_parent,
+            )
+            .expect("wrong fetch parent remains structurally parseable for semantic rejection");
+            assert!(d31_c_validate_fetch_phases(
+                &wrong_fetch_parent_record.fetch_phases,
+                &parsed_profile,
+                &cargo_path,
+                &source_repo,
+                wrong_fetch_parent_record.runner_process_id,
+            )
+            .is_err());
+            let mut v1_record = v2_record_wire.clone();
+            v1_record["schema_version"] = serde_json::json!(1);
+            let parsed_v1 = serde_json::from_value::<D31RecoverySeederBuildRecord>(v1_record)
+                .expect("v1 remains structurally readable so its obsolete version can be explicitly rejected");
+            assert!(d31_c_validate_record_schema_version(parsed_v1.schema_version).is_err());
+            let mut missing_v2_field = v2_record_wire.clone();
+            missing_v2_field
+                .as_object_mut()
+                .expect("record wire object")
+                .remove("process_identity");
+            assert!(
+                serde_json::from_value::<D31RecoverySeederBuildRecord>(missing_v2_field).is_err()
+            );
+            let mut extra_v2_field = v2_record_wire;
+            extra_v2_field["unexpected"] = serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<D31RecoverySeederBuildRecord>(extra_v2_field).is_err()
+            );
         }
 
         #[test]

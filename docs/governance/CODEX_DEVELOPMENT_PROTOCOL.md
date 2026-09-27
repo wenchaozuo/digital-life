@@ -1,25 +1,33 @@
 # CODEX_DEVELOPMENT_PROTOCOL.md
 
-**Version:** 1.1  
+**Version:** 1.2
+
 **Status:** Project Governance Baseline  
 **Scope:** 虚拟生命项目后续全部开发阶段。
 
 ## 0. 目的
 
-让 Codex 长期自主执行工程工作，同时把不同推理强度用在最合适的位置：
+让多 Agent 真正并行进行调查和代码产出，同时避免大型 Rust/Tauri 项目因多 worktree 重复编译造成磁盘与时间浪费。
+
+当前模型职责：
 
 - Sol Medium / GPT-6：Coordinator
 - Luna Max / GPT-6：Worker
 - Sol Max / GPT-6：Architect
 - Luna High / GPT-6：Independent Gate
 
+核心执行方式：
+
+> **并行调查 / 并行 Patch Worktree → 单一 Integration Tree → 集中构建与门禁**
+
 本协议重点避免：
 - 子代理发现一个 blocker 就直接升级架构模型；
 - blocker 一个一个 repair 导致重复编译；
-- worktree 导致构建缓存分裂；
-- Sol Max 被用于进度跟踪；
-- Gate 只发现第一个 blocker 就退出；
-- 状态文档过时导致回退开发阶段。
+- 每个 Agent 各自维护完整构建环境；
+- worktree 无限增长导致目录和状态混乱；
+- Coordinator 把 Worker 的实现方法规定过死；
+- Sol Max 被用于执行期跟踪；
+- Gate 只发现第一个 blocker 就退出。
 
 除非用户明确覆盖，本协议为强制规则。
 
@@ -29,11 +37,13 @@
 
 - **MUST / MUST NOT**：强制 / 禁止。
 - **SHOULD / SHOULD NOT**：默认要求；偏离需有明确工程理由。
-- **PASS**：当前 exact candidate 满足指定 gate。
+- **PASS**：当前 exact Integration Candidate 满足指定 gate。
 - **BLOCKED_IMPLEMENTATION**：架构不变即可 repair 的问题。
 - **BLOCKED_ARCHITECTURE**：需要 Architect 决策的问题。
 - **Stage Contract**：由 Sol Max 确立的阶段目标、范围、禁止项和 exit criteria。
-- **Exact Candidate**：当前门禁对应的精确 Git SHA。
+- **Patch Worktree**：仅用于隔离并行代码修改的临时工作树，默认不构建。
+- **Integration Tree**：唯一正常集成、编译、测试、canary、candidate commit 工作树。
+- **Exact Candidate**：Integration Tree 上当前门禁对应的精确 Git SHA。
 - **Real Canary**：真实目标路径验证，不等价于 mock/compile/unit fixture。
 - **Negative Evidence**：证明禁止行为没有发生的证据。
 
@@ -61,11 +71,15 @@ MUST：
 - 同步 Source of Truth；
 - 识别 CURRENT_STAGE；
 - 按 Stage Contract 拆任务；
-- 调度 Luna Max worker；
-- 控制并行写入；
+- 为每个 Worker 给出明确 Task Packet；
+- 选择 READ_ONLY / PATCH_WORKTREE / INTEGRATION 模式；
+- 管理最多 3 个 active Patch Worktree；
+- 避免多个写 Worker 修改重叠核心代码；
 - 汇总全部 blocker；
 - 组织 batch repair；
-- 组织集中 build/test；
+- 汇聚 patch 到 Integration Tree；
+- 指定 Integration / Build Owner；
+- 组织集中 build/test/canary；
 - 生成 Luna Gate Packet；
 - 在 Architect 触发条件满足时生成压缩 packet；
 - 阶段 gate 通过后准备 closure/next-stage packet。
@@ -74,47 +88,87 @@ MUST NOT：
 - 自行创造/改变 frozen architecture；
 - 自行弱化 invariant；
 - 自行修改 authority/schema/migration/recovery/security/protocol 的冻结语义；
-- 频繁轮询 worker 或 Gate 进度；
-- 用 Sol Max 做普通 blocker 分类。
+- 频繁轮询 Worker 或 Gate 进度；
+- 用 Sol Max 做普通 blocker 分类；
+- 把 Worker 当作逐步照抄指令的低自主执行器。
 
-Coordinator 可以在已冻结架构内做普通工程决策。
+Coordinator 可以在已冻结架构内做普通工程与调度决策。
 
 ---
 
 # 4. Worker — Luna Max
 
-默认所有 Codex 工程 worker 使用 Luna Max。
+默认所有 Codex 工程 Worker 使用 Luna Max。
 
 Worker MAY 承担：
 - Scout；
 - implementation；
 - repair；
 - tests/fixtures；
-- canary；
+- canary implementation；
 - evidence/root-cause analysis；
-- read-only red-team。
+- read-only red-team；
+- Integration / Build Owner（被明确指定时）。
 
 Worker MUST：
 - 只处理被分配范围；
 - 遵守相关 invariant；
+- 根据 Task Packet 在约束内自主决定具体做法；
 - 将 findings/blockers 汇总返回 Coordinator；
-- 在安全范围内尽量完成本轮调查再返回。
+- 在安全范围内尽量完成本轮调查再返回；
+- 输出 changed files、patch/local commit、tests、风险、假设和 blocker set。
 
 Worker MUST NOT：
 - 直接调用/汇报 Sol Max；
 - 自行修改 Stage Contract；
 - 自行修改 frozen invariant；
 - 删除/弱化失败测试获得 PASS；
-- 创建 git worktree；
-- 无授权 push remote。
+- 无授权 push remote；
+- 在普通 Patch Worktree 中执行正常 build/test/canary。
 
 ---
 
-# 5. Blocker batching
+# 5. Worker Task Packet — 高约束目标，低约束实现
+
+Coordinator MUST 给每个 Worker 提供足够明确但不过度规定实现方法的任务包。
+
+Task Packet 至少包括：
+
+- Role；
+- Execution mode；
+- Goal；
+- Current stage；
+- Relevant context；
+- Frozen constraints；
+- Allowed modification scope；
+- Required outputs/evidence；
+- Blocker policy；
+- Build policy；
+- Stop conditions。
+
+默认原则：
+
+> **Sol Max 决定 WHAT MUST BE TRUE。**
+>
+> **Sol Medium 决定 WHAT WORK NEEDS TO BE DONE。**
+>
+> **Luna Max 决定 HOW TO DO IT。**
+
+只有以下情况 SHOULD 指明具体实现做法：
+- Sol Max 已冻结该实现路径；
+- 已知历史坑必须明确禁止；
+- repair 针对一个已定义 closure proof 的 blocker。
+
+标准模板：
+`templates/WORKER_TASK_PACKET.md`
+
+---
+
+# 6. Blocker batching
 
 发现 blocker 不等于立即 repair。
 
-每轮 worker/reviewer：
+每轮 Worker/Reviewer：
 
 1. 记录 blocker；
 2. 标注 evidence；
@@ -137,7 +191,113 @@ MUST NOT 以“一个 blocker → 一次 Sol Max → 一次 compile”的方式�
 
 ---
 
-# 6. Architect — Sol Max
+# 7. Parallel Workspace Policy
+
+多 Agent 优势主要来自**并行调查和并行代码产出**，不是并行完整构建。
+
+## 7.1 READ_ONLY
+
+适用：
+- Scout；
+- root-cause investigation；
+- evidence analysis；
+- red-team；
+- architecture impact discovery。
+
+直接共享仓库只读视图，不创建 worktree。
+
+## 7.2 PATCH_WORKTREE
+
+当多个 Luna Max 需要并行修改互不冲突的代码时使用。
+
+规则：
+
+1. 最多 **3 个 active Patch Worktree**；
+2. 达到上限不得创建第 4 个，必须先完成/回收已有 slot；
+3. Coordinator 管理 active registry；
+4. 推荐命名：
+   `<stage>-w<n>-<short-task>`
+5. SHOULD 使用仓库外固定根目录，例如：
+   `<repo-parent>/.<repo-name>-worktrees/`
+6. Patch Worktree 只用于：
+   - edit；
+   - git diff/status；
+   - 必要的低成本静态检查；
+   - patch/local commit 产出。
+7. 默认禁止：
+   - 正常 `cargo build/test`；
+   - Tauri full build；
+   - real canary；
+   - final candidate validation。
+8. 不得长期积累：
+   - `target/`；
+   - release artifacts；
+   - 大型临时构建目录。
+9. patch 被集成或任务放弃后 MUST remove；
+10. SHOULD 执行安全的 `git worktree prune` 清理 stale metadata。
+
+Patch Worktree 是临时资源，不是长期开发环境。
+
+## 7.3 INTEGRATION
+
+必须存在唯一正常 Integration Tree。
+
+只有 Integration Tree 负责：
+
+- 批量应用/合并 Worker patch；
+- mechanical conflict resolution；
+- candidate commit；
+- `cargo check/build/test`；
+- broader/full suite；
+- real canary；
+- exact SHA evidence；
+- Luna High gate。
+
+Luna High 只审 Integration Candidate，不审各 Patch Worktree branch。
+
+## 7.4 ISOLATED_BUILD_WORKTREE
+
+只在两个互斥方案必须通过真实隔离构建/运行才能判断时使用。
+
+必须：
+- Coordinator 明确批准；
+- 临时创建；
+- 使用独立 `target`；
+- 不与 Integration Tree 并发共享同一 `CARGO_TARGET_DIR`；
+- MAY 复用安全的 compiler cache（如项目环境已配置）；
+- 验证结束后清理。
+
+这是例外模式，不是普通 Worker 默认模式。
+
+---
+
+# 8. Integration / Build Owner
+
+Coordinator MUST 指定一个 Luna Max 作为当前 Build Owner，或由 Root 承担等价职责。
+
+推荐 Build Wave：
+
+`parallel analysis/edit -> blocker batch -> patch batch -> integration -> focused check/test -> broader suite -> real canary`
+
+Build Owner MUST：
+- 确认应用 patch 的基线；
+- 优先发现 patch overlap/冲突；
+- 机械冲突自行解决；
+- 如果两个 patch 隐含互斥架构假设，返回 Coordinator 分类；
+- 保持 Integration Tree 与 candidate evidence 可审计。
+
+MUST NOT：
+- 为每个小 blocker 重复完整构建；
+- 默认执行 `cargo clean`；
+- 把 Patch Worktree 的局部成功当成最终 candidate evidence。
+
+除非技术必要或用户明确要求：
+
+> **MUST NOT run `cargo clean` or equivalent cache reset.**
+
+---
+
+# 9. Architect — Sol Max
 
 Sol Max 使用当前可用最高 Sol 推理等级，负责高信息密度架构任务。
 
@@ -160,7 +320,7 @@ Sol Max 使用当前可用最高 Sol 推理等级，负责高信息密度架构�
 - frozen external/IPC protocol。
 
 ## C. Architecture blocker
-- blocker 批次的共同根因是冻结架构冲突；
+- blocker 批次共同根因是冻结架构冲突；
 - Luna High 返回 `BLOCKED_ARCHITECTURE`；
 - 高可信证据证明现有 contract 本身不成立。
 
@@ -172,21 +332,22 @@ Sol Max 使用当前可用最高 Sol 推理等级，负责高信息密度架构�
 - 确立下一 Stage Contract。
 
 Sol Max MUST NOT：
-- 跟踪 worker/Luna 进度；
+- 跟踪 Worker/Luna 进度；
+- 管理 worktree slot；
 - 逐个查看普通 blocker；
 - 指挥常规 repair；
 - 做普通 compile/test 分析；
 - 重复 Luna High 的实现级 whole-candidate gate。
 
-本协议**不规定 Sol Max 固定调用次数**。是否调用由职责和触发条件决定。
+本协议不规定 Sol Max 固定调用次数。是否调用由职责和触发条件决定。
 
 ---
 
-# 7. Independent Gate — Luna High
+# 10. Independent Gate — Luna High
 
 Luna High 与 Luna Max implementation context 必须逻辑隔离。
 
-输入以 Gate Packet 为准，重点包括：
+输入只针对最终 Integration Candidate，重点包括：
 - Stage Contract / requirement；
 - frozen invariants；
 - base/parent/candidate；
@@ -218,13 +379,15 @@ Luna High MUST return to Coordinator，不直接联系 Sol Max。
 
 ---
 
-# 8. Gate 后路由
+# 11. Gate 后路由
 
 ## BLOCKED_IMPLEMENTATION
 Coordinator：
 - 汇总 blocker set；
 - 由 Luna Max 批量 repair；
-- 产生新 exact candidate；
+- 必要时重新分配 Patch Worktree；
+- 集成 patch；
+- 产生新 exact Integration Candidate；
 - 重跑受影响 evidence；
 - re-gate。
 
@@ -238,47 +401,13 @@ Coordinator：
 
 ## PASS
 Coordinator：
+- 确认所有临时 Patch Worktree 已集成或清理；
 - 生成 Stage Closure & Next Stage Packet；
 - 交 Sol Max 做阶段架构闭合/下一阶段确立。
 
 ---
 
-# 9. Workspace policy — no worktree
-
-除非用户明确要求：
-
-> MUST NOT create or use git worktrees.
-
-原因：
-- 保持单一真实 working tree；
-- 复用 Cargo/incremental build cache；
-- 避免重复依赖编译；
-- 减少 merge 后重复 gate。
-
-只读任务可以并行。  
-写任务默认串行；若明确不重叠，可受控并行。
-
----
-
-# 10. Build policy
-
-Coordinator 指定 Build Owner。
-
-推荐顺序：
-
-`analysis -> repair batch -> write complete -> focused build/test -> broader suite -> real canary`
-
-MUST NOT 让每个 worker 为每个小 blocker 独立清缓存/完整编译。
-
-除非技术必要或用户明确要求：
-
-> MUST NOT run `cargo clean` or equivalent cache reset.
-
-失败测试可以先进行有针对性的低成本诊断，但最终 candidate 必须使用规定的统一验证。
-
----
-
-# 11. Source of Truth
+# 12. Source of Truth
 
 按 `PROJECT_SOURCE_OF_TRUTH.md` 自动发现和同步。
 
@@ -288,46 +417,49 @@ MUST NOT 让每个 worker 为每个小 blocker 独立清缓存/完整编译。
 - Frozen decisions/invariants 决定规范边界；
 - Sol Max Stage Contract 决定正式阶段目标；
 - latest verified development document 辅助恢复开发上下文；
-- `CURRENT_DEVELOPMENT_STATE.md` 只是缓存。
+- `CURRENT_DEVELOPMENT_STATE.md` 只是缓存；
+- Patch Worktree branch/commit 只是候选 patch 来源，不是最终项目状态。
 
 不得只按文件名/修改时间猜“最新”。
 
 ---
 
-# 12. Git discipline
+# 13. Git discipline
 
 Gate 前 MUST 记录：
 - branch；
 - base；
 - parent；
-- candidate；
+- Integration candidate；
 - merge-base（适用时）；
-- working tree。
+- Integration working tree。
 
 规则：
-- Gate 绑定 exact SHA；
+- Gate 只绑定 Integration exact SHA；
 - repair 后新 SHA 重新 gate；
-- dirty tree 不可 final freeze；
+- dirty Integration Tree 不可 final freeze；
 - 默认本地 commit；
 - 未经用户明确要求不 push remote；
-- 禁止 worktree。
+- Patch Worktree branch/commit 不自动具有 gate/freeze 权威；
+- 阶段闭合前临时 worktree 必须被集成、明确保留理由或清理。
 
 ---
 
-# 13. Real Canary
+# 14. Real Canary
 
 明确要求真实 Host/OS/filesystem/SQLite/process/toolchain/crash 行为时：
 
 - mock PASS ≠ real canary；
 - fixture PASS ≠ real canary；
-- compile PASS ≠ real canary。
+- compile PASS ≠ real canary；
+- Patch Worktree 的局部运行结果 ≠ 最终 Integration Candidate canary。
 
 无法建立 required real canary：
 `BLOCKED_IMPLEMENTATION`，除非根因是 architecture contract 本身不可实现，此时升级为 `BLOCKED_ARCHITECTURE`。
 
 ---
 
-# 14. Negative Evidence
+# 15. Negative Evidence
 
 安全/权限/恢复阶段不能只证明 happy path。
 
@@ -348,7 +480,7 @@ stale evidence accepted = 0
 
 ---
 
-# 15. Fail-closed
+# 16. Fail-closed
 
 不得使用：
 - probably pass
@@ -361,21 +493,21 @@ Evidence missing = BLOCKED。
 
 ---
 
-# 16. Context / token discipline
+# 17. Context / token discipline
 
 - Coordinator 读取完整治理和开发上下文；
-- Luna Max worker 只拿任务所需最小上下文；
+- Luna Max Worker 只拿 `WORKER_TASK_PACKET` 所需最小上下文；
 - Sol Max 只拿压缩后的 Architect/Stage packet；
 - Luna High 只拿独立 Gate packet；
 - 不让所有代理重复扫描完整历史；
 - 不把大量原始日志直接塞给 Sol Max；
-- 可以引用仓库文档位置，避免重复复制全文。
-
-节省 token 不能作为跳过 required evidence 的理由。
+- READ_ONLY Worker 优先引用代码/文档位置；
+- Patch Worker 只接收相关 scope 与 frozen constraints；
+- 节省 token 不能作为跳过 required evidence 的理由。
 
 ---
 
-# 17. 阶段循环
+# 18. 阶段循环
 
 ```text
 Sol Medium Coordinator
@@ -384,18 +516,24 @@ Stage Contract exists?
     ├─ no → Sol Max establishes Stage Contract
     └─ yes
         ↓
-Luna Max workers
+parallel task decomposition
         ↓
-blocker batching
+READ_ONLY workers + up to 3 PATCH_WORKTREE workers
         ↓
-batch repair
+blocker batching / patch batching
         ↓
-centralized build/test/canary/evidence
+single Integration Tree
+        ↓
+Integration / Build Owner
+        ↓
+focused build/test → broader suite → real canary/evidence
         ↓
 Luna High gate
-    ├─ BLOCKED_IMPLEMENTATION → batch repair → re-gate
+    ├─ BLOCKED_IMPLEMENTATION → batch repair → integrate → re-gate
     ├─ BLOCKED_ARCHITECTURE → consolidated packet → Sol Max
     └─ PASS
+        ↓
+cleanup/resolve temporary worktrees
         ↓
 Stage Closure Packet
         ↓
@@ -406,24 +544,25 @@ Coordinator executes next stage
 
 ---
 
-# 18. 默认完成标准
+# 19. 默认完成标准
 
 一个阶段只有在以下条件满足时才算治理意义上的闭合：
 
 - Stage Contract obligations 已满足；
 - implementation 完成；
 - required tests/canary/negative evidence 完成；
-- Luna High 对 exact candidate 给出 PASS；
+- Luna High 对 exact Integration Candidate 给出 PASS；
 - required architecture blockers = 0；
+- 临时 Patch Worktree 已集成或清理；
 - Sol Max 完成阶段架构闭合，并在需要继续开发时给出下一 Stage Contract。
 
 代码编译成功本身不等于阶段闭合。
 
 ---
 
-# 19. D32 阶段专用补充协议（保留的 §16.1）
+# 20. D32 阶段专用补充协议（保留的 §16.1）
 
-以下内容只补充 D32 已批准 ADR 明确引用的聚合门槛与 release-evidence bootstrap 顺序。其余项目治理以本文件 0–18 节及 `AGENTS.md` v1.1 为准，角色映射见 `MODEL_ROUTING.md`；如有冲突，遵循用户当前指令、已批准 ADR/Frozen Invariants 和新协议的控制层级。
+以下内容只补充 D32 已批准 ADR 明确引用的聚合门槛与 release-evidence bootstrap 顺序。其余项目治理以本文件 0–19 节及 `AGENTS.md` v1.2 为准；模型信号映射见 `MODEL_ROUTING.md`，通用角色边界以当前 AGENTS.md 与本协议为准；如有冲突，遵循用户当前指令、已批准 ADR/Frozen Invariants/Stage Contract 和本协议的控制层级。
 
 ## 16.1 阶段级与多门禁任务的批量修复纪律
 

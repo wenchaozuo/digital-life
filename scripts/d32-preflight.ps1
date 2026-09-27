@@ -1651,10 +1651,10 @@ function Test-D32Governance {
             )
             $missingLinks = @($requiredLinks | Where-Object { $agentsText -notmatch [regex]::Escape($_) })
             if ($missingLinks.Count -gt 0) {
-                Add-D32Finding -Findings $Findings -Severity ERROR -Check 'governance.index' -Message ("AGENTS.md does not index required v1.1 governance files: " + ($missingLinks -join ', '))
+                Add-D32Finding -Findings $Findings -Severity ERROR -Check 'governance.index' -Message ("AGENTS.md does not index the required governance inputs: " + ($missingLinks -join ', '))
             }
             else {
-                Add-D32Finding -Findings $Findings -Severity PASS -Check 'governance.index' -Message 'AGENTS.md indexes the v1.1 source-of-truth, state, invariant, architecture, and protocol inputs'
+                Add-D32Finding -Findings $Findings -Severity PASS -Check 'governance.index' -Message 'AGENTS.md indexes the required source-of-truth, state, invariant, architecture, and protocol inputs'
             }
         }
         catch {
@@ -1669,7 +1669,7 @@ function Test-D32Governance {
                 Add-D32Finding -Findings $Findings -Severity ERROR -Check 'governance.model-routing' -Message 'CODEX_DEVELOPMENT_PROTOCOL.md does not identify the current MODEL_ROUTING.md authority'
             }
             else {
-                Add-D32Finding -Findings $Findings -Severity PASS -Check 'governance.model-routing' -Message 'the v1.1 protocol identifies the current role/model routing table'
+                Add-D32Finding -Findings $Findings -Severity PASS -Check 'governance.model-routing' -Message 'the current protocol identifies the role/model routing table'
             }
         }
         catch {
@@ -2803,7 +2803,7 @@ function Test-D32PostBundleAggregateReadiness {
         }
     }
     if (@($Validation.Findings | Where-Object { $_.Check -ceq 'governance.files' -and $_.Severity -ceq 'PASS' }).Count -ne 7) {
-        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'aggregate.required-evidence' -Message 'exact seven-file v1.1 governance inventory was not validated'
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'aggregate.required-evidence' -Message 'the exact seven required governance inputs were not validated'
     }
     if (@($Validation.Findings | Where-Object { $_.Check -ceq 'bundle.build_targets' -and $_.Severity -ceq 'PASS' }).Count -ne 2) {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'aggregate.required-evidence' -Message 'both fixed Cargo release target directories were not validated'

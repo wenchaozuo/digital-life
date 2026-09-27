@@ -1,55 +1,58 @@
 # CURRENT_DEVELOPMENT_STATE.md
 
-> 本文件是 Codex 每轮进入项目时读取的“短状态页”。
->
-> 它描述当前开发位置与尚未关闭的门禁；不得把未完成 candidate 写成 FROZEN。
+> 本文件是 Codex 每轮进入项目时读取的短状态页。它是缓存，不覆盖 Git、已批准决定或 exact-SHA evidence。
 
 ## 1. 当前阶段
 
-**Milestone / Task:** D32 final-gate readiness（D32-A-R2 implementation line）
+- **Milestone / Task:** D32 final-gate readiness（D32-A-R2）
+- **Status:** NOT FROZEN
+- **Current Stage Contract:** docs/governance/SC-D32-V1.md
+- **Stage decision:** ADR-D32-GOVERNANCE-V12-RECONCILIATION，Sol Max 批准并自 2026-09-27 前瞻生效。
 
-**Status:** `NOT FROZEN`
+SC-D32-V1 的建立日期不声称存在先前 ratification；它以列明的 e902 baseline 开始约束后续 D32 gate work。
 
 ## 2. Git 参考
 
-**Base / merge-base:** `4c727ec5ba42e0288400d5847b43b08a1c96bc54`
+**Base / merge-base:** 4c727ec5ba42e0288400d5847b43b08a1c96bc54
 
-**Implementation parent before this governance sync:** `83c597f32f60c56d5ee81d4b652874479c0a06bf`
+**Integration parent / D32 baseline before this repair batch:** e902a05bf3193212c131c78ec7dfe6b72e2c292f
 
-本治理同步提交之后的门禁 candidate 必须从执行门禁时的 checkout 读取：
-`git rev-parse HEAD`。该 SHA 应写入对应的 gate evidence；本文件不预填本次提交 SHA。
+本治理与 raw-stream repair batch 之后的 gate candidate SHA 必须在执行门禁时从 Git 读取。Gate 前记录当前 branch、HEAD、parent、merge-base（适用时）和 clean Integration Tree；本状态页不预填它自己的 commit SHA。
 
-## 3. 当前阶段状态
+## 3. 本批次范围和状态
 
-- D32 实现父提交已记录；本次变更只同步治理入口和本状态页。
-- 旧 candidate 的结果不自动适用于治理同步后的 exact candidate。
-- 当前没有据此页关闭任何 D32 final gate。
+- 本批次只同步通用治理入口至 v1.2、保留候选 D32 §§16.1.1–16.1.5 supplement 并建立 SC-D32-V1，同时修复 fixture child stdout/stderr raw capture。
+- 本批次不改变 F-01 至 F-17、既有 D32 ADR 的实质语义、fixture manifest v3、证据 schema/trace/trust、fixed Cargo argv、provider/tool two-turn contract、Host authority 或 gate 要求。
+- Raw stdout/stderr 字节变化后，须对新的 exact candidate 重建受影响的 fixture、Phase 0 及下游 evidence；旧 candidate gate 不继承。
+- 当前没有因此关闭任何 D32 final gate，候选状态仍为 NOT FROZEN。
 
 ## 4. 尚未关闭的门禁
 
-- [ ] 新鲜 fixture 证据
-- [ ] 完整 local affected matrix
-- [ ] release、bundle 与 provenance 检查
-- [ ] 按规定顺序完成 8 个 real Host canary modes
-- [ ] Codex Red Team review
-- [ ] Luna High Gate
-- [ ] Sol Final Whole-Candidate review / freeze
-
-昂贵 build 或 real canary 启动前，必须先完成治理状态、exact SHA 与 clean tree、provenance schema / canonical paths、bundle hashes、provider/tool two-turn contract、mode matrix 和 cleanup/resource lifecycle 的聚合 preflight。
+- [ ] Phase 0：五个 fixture phases、完整 protocol/Vita/Host 本地 suites、ADR 指定的 named checks 与 process/cleanup evidence
+- [ ] Phase 1：两条固定 locked release Cargo commands、fresh 三件 flat artifacts、bundle manifest 和 sibling attestation
+- [ ] 完整 post-bundle aggregate，bundle hashes = VERIFIED
+- [ ] 十个 D31 real-process cases（Phase 0 期间明确 NOT RUN）
+- [ ] 适用且用户已授权 provider 时运行四个 D29G2 real-provider cases；未授权时不得把 NOT RUN 记为 PASS
+- [ ] 八个按 SC-D32-V1 固定顺序运行的 real Host modes 与全部适用 negative evidence
+- [ ] 对同一 exact candidate 完成 Codex Red Team review 和 Luna High whole-candidate gate
+- [ ] Luna High PASS 后提交 exact-SHA packet，由 Sol Max 完成 D32 closure
+- [x] 三个 interactive/physical capture cases：N/A — NOT RUN；依现有 D32 决定记录理由，不计为 PASS
 
 ## 5. 冻结状态
 
-**D32 candidate status:** `NOT FROZEN`
+**D32 candidate status:** NOT FROZEN
 
-原因：fresh fixture、完整 local matrix、release/bundle/provenance、8 个有序 real Host canary modes，以及独立 Codex Red Team、Luna High Gate 和 Sol final review 均未在本状态页建立关闭证据。证据缺失不代表 PASS。
+Phase 0、Phase 1、full aggregate、D31 real-process、适用 D29G2 provider、八个有序 Host modes、Red Team、Luna High 和 Sol Max D32 closure 均未在本状态页建立当前 exact-candidate evidence。证据缺失不代表 PASS。
 
 ## 6. 后续 gate 顺序
 
-1. 记录当前 exact candidate SHA 与 clean working tree。
-2. 建立 fresh fixture 证据并完成完整 local affected matrix。
-3. 核验 release、bundle、provenance 与昂贵 gate 前聚合 preflight。
-4. 按已定义顺序运行全部 8 个 real Host canary modes，并分别记录正向与负向证据。
-5. 对同一 exact candidate 完成 Codex Red Team 与 Luna High Gate。
-6. Luna PASS 后提交 Sol Final Whole-Candidate review；只有 Sol 明确 PASS 才能标为 FROZEN。
+1. 读取实际 Git 状态，记录当前 clean Integration Candidate exact SHA 和适用 profile/toolchain inputs。
+2. 按 ADR-D32-PHASE0-TOOLCHAIN-PROFILE 完成 Phase 0 五个 fixture phases、full local suites 和 named checks。Phase 0 不运行 release build、D31 real-process/seeder、provider request、physical capture 或 Host real canary。
+3. Phase 0 通过后，只运行 ADR-D32-EVIDENCE-BUNDLE-V1 指定的两条 fixed locked release Cargo argv，生成 fresh 三件 flat artifacts、manifest 和 sibling attestation。
+4. 立即验证 schema、SHA、commands、hashes/bytes/file identities、flat layout、runtime_resources = []、Tauri resource map 与 clean state；随后完成 full §16.1.5 aggregate，bundle hashes = VERIFIED。
+5. Aggregate 通过后完成十个 D31 real-process cases，以及适用且用户已授权的四个 D29G2 provider cases。三个 interactive/physical capture cases 继续标为 N/A — NOT RUN。
+6. 在同一 exact candidate 上按 SC-D32-V1 的精确顺序运行八个 Host real-canary modes，并建立 required negative evidence。
+7. 对同一个 clean exact candidate 完成 Codex Red Team 和 Luna High gate。Repair 后新 SHA 必须重建受影响 evidence 并重新 gate。
+8. Luna High PASS 后交 Sol Max 做 D32 closure。任务在 D32 结束；不做 D33 规划或 Stage Contract。
 
-任何 repair 都会产生新 candidate SHA；受影响证据和后续 gate 必须针对新 SHA 重建。
+任何 repair 都会产生新 candidate SHA；受影响 evidence 和后续 gate 必须针对新 SHA 重建。

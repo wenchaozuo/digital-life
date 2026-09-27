@@ -18,6 +18,7 @@
 | ADR-D32-PHASE0-TOOLCHAIN-PROFILE | APPROVED WITH CONDITIONS | D32 Phase 0 本地矩阵与 caller-pinned build toolchain | GPT-6 Sol | D32 Phase 0 与紧邻 bundle evidence build only |
 | ADR-D32-PROCESS-EVENT-TRACE-V1 | SUPERSEDED | D32 Phase 0/release evidence command-processor denial and complete process trace (historical trace-source conditions) | GPT-6 Sol Max | Historical; superseded for implementation by V2 |
 | ADR-D32-PROCESS-EVENT-TRACE-V2 | APPROVED | Synchronous Win32 debug events plus independent Job accounting | GPT-6 Sol Max | D32 Phase 0、release evidence build 与相应 provenance only |
+| ADR-D32-GOVERNANCE-V12-RECONCILIATION | APPROVED WITH CONDITIONS | D32 candidate governance v1.2 reconciliation and prospective SC-D32-V1 | GPT-6 Sol Max | D32 final-gate candidate only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -396,6 +397,72 @@ This clarification is approved under ADR-D32-PROCESS-EVENT-TRACE-V2 and retains 
 5. Same-user runtime negative evidence covers root PID mismatch, null image handle, unknown image/parent/helper, forbidden command processor and PATH/absolute script launches, debug-chain interruption, Wait/Continue error or timeout, missing EXIT, and rapid spawn/exit/PID-reuse races. Normal pinned toolchain/build/test descendants must remain accepted. Any missing cleanup or identity proof is BLOCKED; no polling or policy fallback is allowed.
 
 ---
+
+### ADR-D32-GOVERNANCE-V12-RECONCILIATION — D32 Governance v1.2 与前瞻 Stage Contract
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-27
+**Related milestone:** D32 final-gate readiness（D32-A-R2）
+**Related baseline:** e902a05bf3193212c131c78ec7dfe6b72e2c292f
+
+#### Context
+
+候选树的治理入口与通用 protocol 仍为 v1.1，用户当前治理已更新为 v1.2。候选树还保留 D32 已批准的 §16.1.1–§16.1.5 聚合门槛和 release-evidence bootstrap 顺序；它们继续约束 D32，且 §16.1.5 的 Phase 0 → Phase 1 次序是唯一窄例外。候选的既有 ADR、F-01 至 F-17 与历史 exact-SHA 证据属于已批准历史，不能用空白索引或新文档覆盖。
+
+#### Decision
+
+1. 当前 AGENTS.md v1.2 与 CODEX_DEVELOPMENT_PROTOCOL.md v1.2 现在控制 Coordinator、Worker、workspace、Integration/Build Owner、gate 和 Git 的通用治理。角色职责优先于模型名称；本决定不改变已配置角色或职责边界。
+2. 候选原有完整 D32 §16.1.1–§16.1.5 补充协议继续有效。保留每条门槛、证据要求、禁止项和稳定的 §16.1.5 引用；Phase 0 → Phase 1 例外严格限于该补充协议及已批准 D32 ADR 所列的五个 fixture phases、完整本地测试矩阵和两条固定 locked release Cargo argv。该例外不扩展到其他候选、命令、build、real canary、D31 seeder、provider 请求或 gate。
+3. 保留候选 ARCHITECTURE_DECISIONS.md 的所有既有决定、状态、历史证据和 FROZEN_INVARIANTS.md 的 F-01 至 F-17。只追加本决定，不替换或改写既有 ADR。ADR-D32-PROCESS-EVENT-TRACE-V2 对通用 protocol v1.1 的治理引用由当前 v1.2 取代；其中 no-worktree 的通用工作区规则依当前 v1.2 更新为受控 Patch Worktree + 唯一 Integration Tree。该历史 ADR 中 Phase 0 包含两条 release build 的概述，依后续批准的 ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP、ADR-D32-EVIDENCE-BUNDLE-V1、ADR-D32-PHASE0-TOOLCHAIN-PROFILE 及本候选 §16.1.5 的精确定义，由 Phase 0 local fixture/test matrix → Phase 1 两条固定 release command 取代。以上仅澄清已批准的通用治理和 D32 Phase 0/Phase 1 次序；Win32 debug event、Job accounting、trace、schema、trust、negative-evidence 和 downstream gate 条件保持不变。
+4. 建立独立记录 SC-D32-V1，自 2026-09-27 起前瞻生效，以 e902a05bf3193212c131c78ec7dfe6b72e2c292f 为 D32 Integration 起始基线。该建立日期不声称存在先前 ratification；基线也不代表任何 gate 已满足。Contract scope、required sequence 与 exit criteria 记录于 docs/governance/SC-D32-V1.md。
+5. scripts/d32-fixture-prebuild.ps1 的 stdout/stderr log 必须只含被启动 child process 实际写入的原始字节。phase、exit code、captured PID、cleanup 和错误等 wrapper 状态保留在现有结构化 result、process trace 与 reap/cleanup 字段中，不得追加进 raw stream。该修复不更改任何证据 schema、trace source、信任边界、fixed Cargo argv、fixture manifest v3、production authority 或 negative/gate 要求。
+6. raw stdout/stderr 字节及其 hashes/bytes 属于 Phase 0 provenance；新候选必须重新建立受影响的 fixture、Phase 0 和后续 exact-SHA 证据。既有候选的 gate 或 evidence 不继承。
+7. D32 工作在 SC-D32-V1 定义的 Sol Max D32 closure 后停止；本决定不规划或建立 D33。
+
+#### Frozen invariants
+
+1. 用户当前指令和 AGENTS.md / protocol v1.2 控制通用角色、workspace 和 Integration 治理；既有 frozen product、authority、identity、security、schema、protocol 与 recovery invariant 不变。
+2. D32 §16.1.1–§16.1.5 supplement 及其唯一 Phase 0 → Phase 1 窄例外保持原语义和下游要求。
+3. raw child stdout/stderr 与结构化进程/cleanup evidence 分离；raw logs 不包含 Codex wrapper 追加的文本。
+4. Gate 绑定同一 clean Integration Candidate exact SHA；evidence missing remains BLOCKED。
+
+#### Allowed implementation space
+
+- 在 D32 候选中同步当前 AGENTS.md / protocol v1.2，保留 D32 supplement 和 §16.1.5 引用，并记录 SC-D32-V1。
+- 更新仍标注 protocol v1.1 的 D32 governance diagnostic 文案，不改变 validator inventory、字段、schema 或 gate 判定。
+- 修复 fixture raw-stream capture，并加入 success、non-zero、timeout/descendant-cleanup 的 focused SelfTest。
+
+#### Forbidden implementation
+
+- 不得弱化或扩展 §16.1.5 Phase 0 → Phase 1 例外、固定 Cargo argv、fixture/test inventory、schema、trace、trust、authority、negative evidence、real canary 或 Luna High/Sol gate。
+- 不得覆盖或重建既有 ADR/Frozen Invariants、修改 F-ID，或把旧 evidence 移植为新 SHA 的 PASS。
+- 不得建立 D33 计划或 Stage Contract。
+
+#### Required tests
+
+- SelfTest 必须以无末尾换行的 child payload 验证成功与非零退出时 stdout/stderr 与实际字节完全一致；payload 要含看似 wrapper trailer 的文本，以证明 child 内容保留且 wrapper trailer 不追加。
+- timeout + descendant cleanup SelfTest 必须验证 raw streams 完全一致，并验证 timeout status、root/descendant identity、reap 记录、Job cleanup 与零 residual descendant。
+- v1.2 governance diagnostics 应保留当前模型路由引用；其余 D32 SelfTest 和现有 negative coverage 不得减少。
+
+#### Required real canary
+
+- 本决定不关闭任何 D31 real-process 或 D32 Host real canary。SC-D32-V1 要求的十个 D31 real-process cases、适用且用户已授权 provider 的 D29G2 tests、八个有序 Host modes 与 negative evidence 仍须分别建立。
+
+#### Required negative evidence
+
+- SelfTest 拒绝 raw stream 中出现任何 wrapper 添加的 exit、descendant、timeout、PID 或 kill-output 文本，同时保留 child 主动写出的相同样式文本。
+- 所有既有 D32 unauthorized mutation、revoke/cancel/Life/migration、identity、environment、cleanup、trace 与 process-tree negative evidence 保持强制。
+
+#### Compatibility constraints
+
+- 当前通用治理以 v1.2 为准；D32 supplement、D32 process trace V2、fixed commands、bundle/schema、fixture manifest v3、Tauri resource map、Host retained-handle authority 和所有既有 frozen invariants 保持不变。
+- 此决定本身既不建立 Phase 0/Phase 1 evidence，也不代表 aggregate、real-canary、Luna High、Sol closure 或 FROZEN。
+
+#### Supersedes / Superseded by
+
+- 取代 ADR-D32-PROCESS-EVENT-TRACE-V2 中过时的通用 root governance v1.1/no-worktree 规则，以及其被后续 D32 bootstrap/toolchain ADR 与 §16.1.5 supersede 的 Phase 0 release-build 排期概述；不取代该 ADR 的任何 trace-source、process launch、identity、cleanup、schema、trust、negative evidence 或 downstream gate requirement。
+- 无 D33 Stage Contract。
 
 ## ADR 模板
 

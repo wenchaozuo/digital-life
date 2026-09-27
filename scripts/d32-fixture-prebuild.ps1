@@ -4073,7 +4073,6 @@ function Invoke-D32BoundedProcess {
     $timedOut = $false
     $exitCode = $null
     $reap = $null
-    $killOutput = [System.Collections.Generic.List[string]]::new()
     $script:D32LastProcessEvidence = [ordered]@{
         root_record = $null
         descendant_records = @()
@@ -4277,7 +4276,6 @@ function Invoke-D32BoundedProcess {
                         -CapturedDescendantRecords $capturedDescendantRecords `
                         -NativeProcess $nativeProcess
                     $nativeCleanup = $reap.NativeCleanup
-                    $killOutput.AddRange([string[]]@($reap.KillOutput))
                     $residualDescendantRecords = @($reap.ResidualRecords | Where-Object { [int]$_.ProcessId -ne [int]$rootIdentity.ProcessId })
                 }
                 catch {
@@ -4352,19 +4350,8 @@ function Invoke-D32BoundedProcess {
     }
 
     $script:D32LastProcessEvidence.native_cleanup = ConvertTo-D32NativeCleanupDocument $nativeCleanup
-    $capturedDescendantPids = @($capturedDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
     $residualDescendantPids = @($residualDescendantRecords | ForEach-Object { [int]$_.ProcessId } | Select-Object -Unique)
-    if ($timedOut) {
-        [IO.File]::AppendAllText(
-            $stderrPath,
-            "`nD32_FIXTURE_PHASE=timeout`nCAPTURED_DESCENDANT_PIDS=$($capturedDescendantPids -join ',')`n$($killOutput -join "`n")`n",
-            [Text.UTF8Encoding]::new($false))
-    }
     $finished = [DateTimeOffset]::UtcNow
-    [IO.File]::AppendAllText(
-        $stdoutPath,
-        "`nD32_FIXTURE_EXIT_CODE=$exitCode`nD32_FIXTURE_DESCENDANTS=$($capturedDescendantPids -join ',')`n",
-        [Text.UTF8Encoding]::new($false))
     return [ordered]@{
         status = if ($null -ne $treeError) { 'process_tree_error' } elseif ($null -ne $initError) { 'spawn_failed' } elseif ($timedOut) { 'timeout' } elseif ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
         exit_code = $exitCode
@@ -5926,6 +5913,62 @@ public static class D32DebugSelfTestLauncher
         }
         $passed++
 
+        $writeRawProcessScript = {
+            param(
+                [Parameter(Mandatory = $true)][string]$Path,
+                [Parameter(Mandatory = $true)][string]$StdoutText,
+                [Parameter(Mandatory = $true)][string]$StderrText,
+                [Parameter(Mandatory = $true)][string[]]$Body
+            )
+            $stdoutBytes = [Text.Encoding]::UTF8.GetBytes($StdoutText)
+            $stderrBytes = [Text.Encoding]::UTF8.GetBytes($StderrText)
+            if (($stdoutBytes.Length -gt 0 -and $stdoutBytes[-1] -in @(10, 13)) -or
+                ($stderrBytes.Length -gt 0 -and $stderrBytes[-1] -in @(10, 13))) {
+                throw 'SELFTEST_FAILED: raw stream payload must not end with a newline'
+            }
+            $stdoutBase64 = [Convert]::ToBase64String($stdoutBytes)
+            $stderrBase64 = [Convert]::ToBase64String($stderrBytes)
+            $content = @(
+                ('$raw = [Convert]::FromBase64String(''{0}'')' -f $stdoutBase64)
+                '[Console]::OpenStandardOutput().Write($raw, 0, $raw.Length)'
+                ('$raw = [Convert]::FromBase64String(''{0}'')' -f $stderrBase64)
+                '[Console]::OpenStandardError().Write($raw, 0, $raw.Length)'
+            ) + @($Body)
+            [IO.File]::WriteAllText($Path, ($content -join [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+            return [PSCustomObject]@{ stdout = $stdoutBytes; stderr = $stderrBytes }
+        }
+        $assertRawProcessStreams = {
+            param(
+                [Parameter(Mandatory = $true)][object]$Result,
+                [Parameter(Mandatory = $true)][object]$Payload,
+                [Parameter(Mandatory = $true)][string]$CaseName
+            )
+            $actualStdout = [IO.File]::ReadAllBytes([string]$Result.stdout_log)
+            $actualStderr = [IO.File]::ReadAllBytes([string]$Result.stderr_log)
+            if ([Convert]::ToBase64String($actualStdout) -cne [Convert]::ToBase64String([byte[]]$Payload.stdout) -or
+                [Convert]::ToBase64String($actualStderr) -cne [Convert]::ToBase64String([byte[]]$Payload.stderr)) {
+                throw "SELFTEST_FAILED: $CaseName stdout/stderr logs were not byte-exact child streams"
+            }
+        }
+
+        $rawSuccessScript = Join-Path $root 'raw-success.ps1'
+        $rawSuccessPayload = & $writeRawProcessScript -Path $rawSuccessScript -StdoutText 'child-success-no-newline|D32_FIXTURE_EXIT_CODE=child|D32_FIXTURE_DESCENDANTS=child' -StderrText 'child-success-stderr-no-newline|D32_FIXTURE_PHASE=timeout|CAPTURED_DESCENDANT_PIDS=child|taskkill' -Body @('exit 0')
+        $rawSuccess = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $rawSuccessScript) -WorkingDirectory $root -PhaseLog (Join-Path $root 'raw-success-phase') -TimeoutSeconds 5
+        if ($rawSuccess.status -ne 'succeeded' -or $rawSuccess.exit_code -ne 0) {
+            throw 'SELFTEST_FAILED: raw-stream success child status/exit code was not preserved'
+        }
+        & $assertRawProcessStreams -Result $rawSuccess -Payload $rawSuccessPayload -CaseName 'success'
+        $passed++
+
+        $rawNonZeroScript = Join-Path $root 'raw-nonzero.ps1'
+        $rawNonZeroPayload = & $writeRawProcessScript -Path $rawNonZeroScript -StdoutText 'child-nonzero-no-newline|D32_FIXTURE_EXIT_CODE=child|D32_FIXTURE_DESCENDANTS=child' -StderrText 'child-nonzero-stderr-no-newline|D32_FIXTURE_PHASE=timeout|CAPTURED_DESCENDANT_PIDS=child|taskkill' -Body @('exit 7')
+        $rawNonZero = Invoke-D32BoundedProcess -FilePath $powershell -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $rawNonZeroScript) -WorkingDirectory $root -PhaseLog (Join-Path $root 'raw-nonzero-phase') -TimeoutSeconds 5
+        if ($rawNonZero.status -ne 'failed' -or $rawNonZero.exit_code -ne 7) {
+            throw 'SELFTEST_FAILED: raw-stream non-zero child status/exit code was not preserved'
+        }
+        & $assertRawProcessStreams -Result $rawNonZero -Payload $rawNonZeroPayload -CaseName 'non-zero'
+        $passed++
+
         $normalChildScript = Join-Path $root 'descendant-normal.ps1'
         $normalChildWorkerScript = Join-Path $root 'descendant-normal-worker.ps1'
         $normalChildReadyPath = Join-Path $root 'descendant-normal-ready.marker'
@@ -6440,20 +6483,36 @@ public static class D32DebugSelfTestLauncher
         $passed++
 
         $childScript = Join-Path $root 'descendant-timeout.ps1'
-        [IO.File]::WriteAllText(
-            $childScript,
-            "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null`nStart-Sleep -Seconds 5`n",
-            [Text.UTF8Encoding]::new($false)
-        )
+        $timeoutLaunch = "Start-Process -FilePath '$powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden | Out-Null"
+        $timeoutPayload = & $writeRawProcessScript -Path $childScript -StdoutText 'child-timeout-no-newline|D32_FIXTURE_EXIT_CODE=child|D32_FIXTURE_DESCENDANTS=child' -StderrText 'child-timeout-stderr-no-newline|D32_FIXTURE_PHASE=timeout|CAPTURED_DESCENDANT_PIDS=child|taskkill' -Body @($timeoutLaunch, 'Start-Sleep -Seconds 5')
         $bounded = Invoke-D32BoundedProcess `
             -FilePath $powershell `
             -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $childScript) `
             -WorkingDirectory $root `
             -PhaseLog (Join-Path $root 'timeout-phase') `
             -TimeoutSeconds 1
-        if ($bounded.status -ne 'timeout' -or $bounded.error -notlike '*captured identity*reaped*' -or @($bounded.descendant_identities).Count -lt 1 -or @($bounded.descendant_pids).Count -ne 0) {
-            throw 'SELFTEST_FAILED: bounded timeout/tree reap'
+        if ($bounded.status -ne 'timeout' -or
+            $null -ne $bounded.exit_code -or
+            $bounded.error -notlike '*captured identity*reaped*' -or
+            $null -eq $bounded.root_identity_record -or
+            [int]$bounded.root_identity_record.ProcessId -ne [int]$bounded.pid -or
+            -not [bool]$bounded.root_identity_record.IdentityVerified -or
+            @($bounded.descendant_identities).Count -lt 1 -or
+            @($bounded.descendant_pids).Count -ne 0 -or
+            $null -eq $bounded.native_launch -or
+            [int]$bounded.native_launch.process_id -ne [int]$bounded.pid -or
+            -not $bounded.Contains('process_trace') -or
+            $null -eq $bounded.reap -or
+            -not $bounded.reap.Contains('kill_output') -or
+            @($bounded.reap.process_ids).Count -lt 2 -or
+            @($bounded.reap.process_ids | Where-Object { [int]$_ -eq [int]$bounded.pid }).Count -ne 1 -or
+            $null -eq $bounded.native_cleanup -or
+            -not [bool]$bounded.native_cleanup.cleanup_succeeded -or
+            -not [bool]$bounded.native_cleanup.job_active_process_count_verified -or
+            [uint32]$bounded.native_cleanup.job_active_process_count -ne 0) {
+            throw 'SELFTEST_FAILED: bounded timeout/tree reap structured status and cleanup evidence'
         }
+        & $assertRawProcessStreams -Result $bounded -Payload $timeoutPayload -CaseName 'timeout with descendant cleanup'
         $passed++
 
         Write-Host "D32_FIXTURE_PREBUILD_SELFTEST PASS ($passed checks)"

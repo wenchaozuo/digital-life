@@ -1679,15 +1679,6 @@ function Invoke-D32LockedCargoFetches {
             -TimeoutSeconds $TimeoutSeconds `
             -ChildEnvironment $fetchEnvironment `
             -RequireDebugEvents
-        if ($null -ne $result.root_identity_record) {
-            Assert-D32PinnedCargoProcessIdentity `
-                -ProcessIdentity $result.root_identity_record `
-                -CargoPath $CargoPath `
-                -Arguments $arguments `
-                -ValidatedProfile $ValidatedProfile
-        }
-        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
-        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
         $PhaseEvidence.Add([pscustomobject]@{
                 name = $phaseName
                 executable = [IO.Path]::GetFullPath($CargoPath)
@@ -1699,13 +1690,31 @@ function Invoke-D32LockedCargoFetches {
                 process_trace = $result.process_trace
             })
         if ($result.status -ne 'succeeded' -or $result.exit_code -ne 0) {
-            $failure = "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); see $($result.phase_log)"
+            $failure = "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); process_error=$($result.error); see $($result.phase_log)"
             try {
                 Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
             }
             catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
             throw $failure
         }
+        try {
+            Assert-D32PinnedCargoProcessIdentity `
+                -ProcessIdentity $result.root_identity_record `
+                -CargoPath $CargoPath `
+                -Arguments $arguments `
+                -ValidatedProfile $ValidatedProfile `
+                -ProcessResult $result
+        }
+        catch {
+            $failure = $_.Exception.Message
+            try {
+                Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+            }
+            catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
+            throw $failure
+        }
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
         $results.Add([ordered]@{
                 manifest_path = [string]$lock.ManifestPath
                 lock_sha256 = [string]$lock.LockSha256
@@ -4074,14 +4083,32 @@ function ConvertTo-D32D31ProcessIdentityDocument {
 
 function Assert-D32PinnedCargoProcessIdentity {
     param(
-        [Parameter(Mandatory = $true)][object]$ProcessIdentity,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$ProcessIdentity,
         [Parameter(Mandatory = $true)][string]$CargoPath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][object]$ValidatedProfile
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [AllowNull()][object]$ProcessResult
     )
 
     if ($null -eq $ProcessIdentity -or -not [bool]$ProcessIdentity.IdentityVerified -or [int]$ProcessIdentity.ProcessId -le 0) {
-        throw 'CARGO_PROCESS_IDENTITY_MISMATCH: Cargo process identity was not verified'
+        $identityState = if ($null -eq $ProcessIdentity) {
+            'root_identity=UNAVAILABLE'
+        }
+        else {
+            'root_identity_verified={0}; process_id={1}; parent_process_id={2}; image_path={3}; name={4}' -f `
+                [bool]$ProcessIdentity.IdentityVerified, $ProcessIdentity.ProcessId, $ProcessIdentity.ParentProcessId, $ProcessIdentity.ImagePath, $ProcessIdentity.Name
+        }
+        $processContext = ''
+        if ($null -ne $ProcessResult) {
+            $trace = $ProcessResult.process_trace
+            $traceContext = if ($null -eq $trace) { 'trace=UNAVAILABLE' } else {
+                'trace_state={0}; trace_block_reason={1}; event_chain_complete={2}; accounting_consistent={3}' -f `
+                    [string]$trace.state, [string]$trace.block_reason, [bool]$trace.event_chain_complete, [bool]$trace.accounting_consistent
+            }
+            $processContext = '; process_status={0}; exit_code={1}; process_error={2}; {3}' -f `
+                [string]$ProcessResult.status, $ProcessResult.exit_code, [string]$ProcessResult.error, $traceContext
+        }
+        throw "CARGO_PROCESS_IDENTITY_MISMATCH: Cargo process identity was not verified; $identityState$processContext"
     }
     $expectedPath = Get-D32FullPath $CargoPath
     if (-not [string]::Equals((Get-D32FullPath ([string]$ProcessIdentity.ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -5782,6 +5809,27 @@ function Invoke-D32SelfTest {
             throw 'SELFTEST_FAILED: Cargo identity with a parent other than this PowerShell process was accepted'
         }
         catch { if ($_.Exception.Message -notlike 'CARGO_PROCESS_IDENTITY_MISMATCH:*') { throw } }
+        $passed++
+        $unverifiedCargoIdentity = [PSCustomObject]@{ IdentityVerified = $false; ProcessId = 0; ParentProcessId = 0; ImagePath = $null; Name = $null }
+        $unverifiedCargoResult = [PSCustomObject]@{
+            status = 'process_tree_error'
+            exit_code = $null
+            error = 'DEBUG_PROCESS_TRACE_BLOCKED: root EXIT event missing'
+            process_trace = [PSCustomObject]@{ state = 'BLOCKED'; block_reason = 'root EXIT event missing'; event_chain_complete = $false; accounting_consistent = $false }
+        }
+        $identityFailureContextPreserved = $false
+        try {
+            Assert-D32PinnedCargoProcessIdentity -ProcessIdentity $unverifiedCargoIdentity `
+                -CargoPath $identityCargoPath -Arguments $identityCargoArguments -ValidatedProfile $identityProfile `
+                -ProcessResult $unverifiedCargoResult
+        }
+        catch {
+            $identityFailureContextPreserved = $_.Exception.Message.StartsWith('CARGO_PROCESS_IDENTITY_MISMATCH:', [StringComparison]::Ordinal) -and
+                $_.Exception.Message.Contains('process_status=process_tree_error') -and
+                $_.Exception.Message.Contains('process_error=DEBUG_PROCESS_TRACE_BLOCKED: root EXIT event missing') -and
+                $_.Exception.Message.Contains('trace_block_reason=root EXIT event missing')
+        }
+        if (-not $identityFailureContextPreserved) { throw 'SELFTEST_FAILED: Cargo identity failure discarded the bounded process and V2 trace failure context' }
         $passed++
 
         if (-not [D32FixtureNativeProcessV2]::DebugCreateProcessIdentityMatches(713, 713, 713, $true)) {
@@ -7702,6 +7750,7 @@ try {
         $arguments += @('--jobs', [string]$BuildJobs)
         $phaseLog = Join-Path $logRoot (('{0:D2}-{1}' -f $phase, $spec.name))
         Write-Host "D32_FIXTURE_PHASE=$phase name=$($spec.name) timeout_seconds=$TimeoutSeconds"
+        $processResult = $null
         try {
             $processResult = Invoke-D32BoundedProcess `
                 -FilePath $cargo `
@@ -7711,13 +7760,12 @@ try {
                 -TimeoutSeconds $TimeoutSeconds `
                 -ChildEnvironment $offlineFixtureEnvironment `
                 -RequireDebugEvents
-            if ($null -ne $processResult.root_identity_record) {
-                Assert-D32PinnedCargoProcessIdentity `
-                    -ProcessIdentity $processResult.root_identity_record `
-                    -CargoPath $cargo `
-                    -Arguments $arguments `
-                    -ValidatedProfile $validatedToolchainProfile
-            }
+            Assert-D32PinnedCargoProcessIdentity `
+                -ProcessIdentity $processResult.root_identity_record `
+                -CargoPath $cargo `
+                -Arguments $arguments `
+                -ValidatedProfile $validatedToolchainProfile `
+                -ProcessResult $processResult
             $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
             $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
             $phaseEvidence.Add([pscustomobject]@{
@@ -7778,7 +7826,7 @@ try {
         catch {
             $primaryFailure = $_.Exception.Message
             try {
-                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $null -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
+                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
             }
             catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
             if ($_.Exception.Message -match '^(CANDIDATE_SHA_|WORKTREE_DIRTY:|GIT_PIN_|GIT_CONFIG_|GIT_REPOSITORY_|PATH_REPARSE:|TOOLCHAIN_PROFILE_|CARGO_FETCH_|CARGO_HOME_|CARGO_PROCESS_IDENTITY_)') {
@@ -7871,7 +7919,8 @@ try {
                 -ProcessIdentity $seederBuild.root_identity_record `
                 -CargoPath $cargo `
                 -Arguments $seederArguments `
-                -ValidatedProfile $validatedToolchainProfile
+                -ValidatedProfile $validatedToolchainProfile `
+                -ProcessResult $seederBuild
         }
         $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
         $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot

@@ -512,11 +512,18 @@ function Test-D32Phase0SuiteCounts {
 }
 
 function Get-D32Phase0FixtureGitStates {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines, [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [switch]$AllowPartial
+    )
     if ($ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$') { throw 'Phase0 fixture Git-state expected SHA is malformed' }
     $states = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Lines) {
-        if ($line -notmatch '^D32_FIXTURE_GIT_STATE phase=([1-5]) edge=(before|after) head=([0-9a-f]{40}) clean=(true|false)$') { continue }
+        if ($line -notmatch '^D32_FIXTURE_GIT_STATE(?:\s|$)') { continue }
+        if ($line -notmatch '^D32_FIXTURE_GIT_STATE phase=([1-5]) edge=(before|after) head=([0-9a-f]{40}) clean=(true|false)$') {
+            throw 'PHASE0_FIXTURE_STATE_BLOCKED: malformed per-phase Git-state marker'
+        }
         $phase = [int]$Matches[1]
         $edge = [string]$Matches[2]
         $head = [string]$Matches[3]
@@ -524,11 +531,19 @@ function Get-D32Phase0FixtureGitStates {
         if ($head -cne $ExpectedCandidateSha -or -not $clean) { throw "PHASE0_FIXTURE_STATE_BLOCKED: phase $phase $edge candidate/clean check failed" }
         $states.Add([ordered]@{ phase = $phase; edge = $edge; head = $head; clean = $clean })
     }
-    if ($states.Count -ne 10) { throw "PHASE0_FIXTURE_STATE_BLOCKED: expected 10 per-phase Git-state lines, observed $($states.Count)" }
     $expectedKeys = @()
     for ($phase = 1; $phase -le 5; $phase++) { $expectedKeys += @("$phase|before", "$phase|after") }
     $actualKeys = @($states | ForEach-Object { "$($_.phase)|$($_.edge)" })
-    if (($actualKeys -join '|') -cne ($expectedKeys -join '|')) { throw 'PHASE0_FIXTURE_STATE_BLOCKED: per-phase Git-state lines are missing, duplicated, reordered, or extra' }
+    if ($AllowPartial) {
+        if ($states.Count -gt $expectedKeys.Count) { throw 'PHASE0_FIXTURE_STATE_BLOCKED: per-phase Git-state prefix contains extra markers' }
+        if ($states.Count -gt 0 -and ($actualKeys -join '|') -cne (($expectedKeys | Select-Object -First $states.Count) -join '|')) {
+            throw 'PHASE0_FIXTURE_STATE_BLOCKED: partial per-phase Git-state markers are not an ordered prefix'
+        }
+    }
+    else {
+        if ($states.Count -ne 10) { throw "PHASE0_FIXTURE_STATE_BLOCKED: expected 10 per-phase Git-state lines, observed $($states.Count)" }
+        if (($actualKeys -join '|') -cne ($expectedKeys -join '|')) { throw 'PHASE0_FIXTURE_STATE_BLOCKED: per-phase Git-state lines are missing, duplicated, reordered, or extra' }
+    }
     return @($states.ToArray())
 }
 
@@ -1857,6 +1872,18 @@ function Get-D32Phase0FixtureFailureSummary {
     return $null
 }
 
+function Invoke-D32Phase0FixtureProducerCapture {
+    param([Parameter(Mandatory = $true)][scriptblock]$Producer)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $failure = $null
+    try {
+        & $Producer *>&1 | ForEach-Object { $null = $lines.Add([string]$_) }
+    }
+    catch { $failure = $_.Exception.Message }
+    return [PSCustomObject]@{ Lines = @($lines.ToArray()); Failure = $failure }
+}
+
 function Test-D32Phase0FixedInventory {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Inventories)
     foreach ($package in @('protocol', 'vita', 'host')) {
@@ -1935,13 +1962,10 @@ function Invoke-D32Phase0Matrix {
         Phase0OwnerBinding = $outputBinding
         TimeoutSeconds = [Math]::Min($TimeoutSeconds, 1800)
     }
-    $fixtureOutput = @()
-    $fixtureFailure = $null
-    try { $fixtureOutput = @(& $fixtureScript @fixtureArguments *>&1) }
-    catch {
-        $fixtureFailure = $_.Exception.Message
-        $fixtureOutput += [string]$_
-    }
+    $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
+    $fixtureCapture = Invoke-D32Phase0FixtureProducerCapture -Producer $fixtureProducer
+    $fixtureOutput = @($fixtureCapture.Lines)
+    $fixtureFailure = $fixtureCapture.Failure
     $fixtureText = ($fixtureOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
     $fixtureOutputTooLarge = $fixtureText.Length -gt 16000000
     if ($fixtureOutputTooLarge) {
@@ -1957,7 +1981,15 @@ function Invoke-D32Phase0Matrix {
     $fixtureGitStates = @()
     $fixtureGitStateFailure = $null
     try {
-        $fixtureGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($fixtureText -split "`r?`n") -ExpectedCandidateSha $ExpectedSha)
+        if ([String]::IsNullOrWhiteSpace($fixtureFailure)) {
+            $fixtureGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($fixtureText -split "`r?`n") -ExpectedCandidateSha $ExpectedSha)
+        }
+        else {
+            $fixtureGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($fixtureText -split "`r?`n") -ExpectedCandidateSha $ExpectedSha -AllowPartial)
+            if ($fixtureGitStates.Count -lt 10) {
+                $fixtureGitStateFailure = "PHASE0_FIXTURE_STATE_INCOMPLETE: producer failed after $($fixtureGitStates.Count) of 10 ordered clean-candidate Git-state markers; $((10 - $fixtureGitStates.Count)) remaining markers are unavailable after the primary failure"
+            }
+        }
     }
     catch { $fixtureGitStateFailure = $_.Exception.Message }
     if (-not [String]::IsNullOrWhiteSpace($fixtureGitStateFailure) -and [String]::IsNullOrWhiteSpace($transcriptFailure)) {
@@ -2442,6 +2474,34 @@ function Test-D32Phase0MatrixRecordSelfTest {
     }
     try { $validGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($gitStateLines.ToArray()) -ExpectedCandidateSha $candidate); & $add 'five fixture phases require exact pre/post candidate and clean evidence' ($validGitStates.Count -eq 10) }
     catch { & $add 'five fixture phases require exact pre/post candidate and clean evidence' $false }
+    try {
+        $partialGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($gitStateLines.ToArray() | Select-Object -First 2) -ExpectedCandidateSha $candidate -AllowPartial)
+        & $add 'failed fixture Git-state capture accepts only a valid ordered clean-candidate prefix' ($partialGitStates.Count -eq 2 -and $partialGitStates[0].phase -eq 1 -and $partialGitStates[0].edge -ceq 'before' -and $partialGitStates[1].edge -ceq 'after')
+    }
+    catch { & $add 'failed fixture Git-state capture accepts only a valid ordered clean-candidate prefix' $false $_.Exception.Message }
+    $reorderedPartialGitState = @($gitStateLines.ToArray() | Select-Object -First 2)
+    $reorderedPartialGitState[0], $reorderedPartialGitState[1] = $reorderedPartialGitState[1], $reorderedPartialGitState[0]
+    $reorderedPartialRejected = $false
+    try { $null = Get-D32Phase0FixtureGitStates -Lines $reorderedPartialGitState -ExpectedCandidateSha $candidate -AllowPartial }
+    catch { $reorderedPartialRejected = $_.Exception.Message -like '*partial per-phase Git-state markers are not an ordered prefix*' }
+    & $add 'failed fixture Git-state capture rejects reordered partial markers' $reorderedPartialRejected
+    $malformedPartialRejected = $false
+    try { $null = Get-D32Phase0FixtureGitStates -Lines @('D32_FIXTURE_GIT_STATE phase=1 edge=before malformed') -ExpectedCandidateSha $candidate -AllowPartial }
+    catch { $malformedPartialRejected = $_.Exception.Message -like '*malformed per-phase Git-state marker*' }
+    & $add 'fixture Git-state parser rejects malformed marker-shaped lines' $malformedPartialRejected
+
+    $capturedDiagnosticPayloadLine = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_PAYLOAD_V1:structured-selftest-payload'
+    $fixtureProducerProbe = {
+        Write-Host "D32_FIXTURE_GIT_STATE phase=1 edge=before head=$candidate clean=true"
+        Write-Output $capturedDiagnosticPayloadLine
+        throw 'SELFTEST_TERMINATING_FIXTURE_PRODUCER'
+    }.GetNewClosure()
+    $fixtureCaptureProbe = Invoke-D32Phase0FixtureProducerCapture -Producer $fixtureProducerProbe
+    & $add 'producer capture preserves Git marker and structured diagnostic emitted before a terminating failure' `
+        ($fixtureCaptureProbe.Failure -ceq 'SELFTEST_TERMINATING_FIXTURE_PRODUCER' -and
+            @($fixtureCaptureProbe.Lines | Where-Object { $_ -ceq "D32_FIXTURE_GIT_STATE phase=1 edge=before head=$candidate clean=true" }).Count -eq 1 -and
+            @($fixtureCaptureProbe.Lines | Where-Object { $_ -ceq $capturedDiagnosticPayloadLine }).Count -eq 1)
+
     $fakeOutputRoot = Join-Path ([IO.Path]::GetTempPath()) ('d32-phase0-logs-selftest-' + [Guid]::NewGuid().ToString('N'))
     $fakeFixtureNames = @('d29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
     $fakeFixtureRecords = @(
@@ -2841,6 +2901,58 @@ function Test-D32Phase0MatrixRecordSelfTest {
             RootIdentity = $ownerBinding.RootIdentity
             OwnerMarker = $ownerBinding.OwnerMarker
         }
+        $payloadArguments = @('build', '--quiet', '--locked', '--manifest-path', (Join-Path $testRepository 'vita-agent/Cargo.toml'), '--bin', 'd32a-sandbox-fixture', '--jobs', '1')
+        $payloadCargo = $fakeProfile.Profile.toolchain.cargo
+        $capturedFailurePayload = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_PAYLOAD_V1'
+            candidate_sha = $candidate
+            toolchain_profile_path = [string]$fakeProfile.ProfilePath
+            toolchain_profile_sha256 = [string]$fakeProfile.Digest
+            run_id = $runId
+            failing_fixed_command = [ordered]@{
+                name = 'd32a-sandbox-fixture'
+                executable = [string]$payloadCargo.path
+                executable_sha256 = [string]$payloadCargo.sha256
+                executable_bytes = [Int64]$payloadCargo.bytes
+                executable_volume_serial_hex = [string]$payloadCargo.volume_serial_hex
+                executable_file_id_hex = [string]$payloadCargo.file_id_hex
+                arguments = @($payloadArguments)
+                command_line = ConvertTo-D32Phase0CommandLine -Arguments (@([string]$payloadCargo.path) + @($payloadArguments))
+                working_directory = [IO.Path]::GetFullPath($testRepository)
+            }
+            process_identity = $null
+            raw_v2_trace = [ordered]@{ record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'; state = 'BLOCKED'; block_reason = 'selftest trace evidence' }
+            raw_job_debug_cleanup = [ordered]@{
+                raw_native_cleanup = [ordered]@{ CleanupSucceeded = $false; JobActiveProcessCount = 1 }
+                raw_process_evidence = [ordered]@{ raw_trace_retained = $true }
+                trace_state = 'BLOCKED'
+                cleanup_status = 'UNVERIFIED'
+            }
+            ordered_stream_paths = @(
+                [ordered]@{ ordinal = 1; stream = 'stdout'; path = (Join-Path $selfTestRoot 'payload.stdout.log') },
+                [ordered]@{ ordinal = 2; stream = 'stderr'; path = (Join-Path $selfTestRoot 'payload.stderr.log') }
+            )
+            primary_error = 'CARGO_PROCESS_IDENTITY_MISMATCH: selftest preserved primary'
+            secondary_errors = @('selftest cleanup failure remains secondary')
+        }
+        $payloadLine = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_PAYLOAD_V1:' + (ConvertTo-Json -InputObject $capturedFailurePayload -Depth 20 -Compress)
+        $payloadProducer = { Write-Output $payloadLine; throw 'SELFTEST_FIXTURE_FAILURE_AFTER_PAYLOAD' }.GetNewClosure()
+        $capturedPayloadOutput = Invoke-D32Phase0FixtureProducerCapture -Producer $payloadProducer
+        $validatedCapturedPayload = Get-D32Phase0FixtureFailurePayload `
+            -Lines $capturedPayloadOutput.Lines `
+            -Repository $testRepository `
+            -ExpectedCandidateSha $candidate `
+            -ValidatedProfile $fakeProfile `
+            -ExpectedRunId $runId
+        & $add 'streaming fixture failure capture validates and retains primary, raw V2/cleanup, and ordered stream payload before throw' `
+            ($capturedPayloadOutput.Failure -ceq 'SELFTEST_FIXTURE_FAILURE_AFTER_PAYLOAD' -and
+                $validatedCapturedPayload.primary_error -ceq 'CARGO_PROCESS_IDENTITY_MISMATCH: selftest preserved primary' -and
+                $validatedCapturedPayload.raw_v2_trace.block_reason -ceq 'selftest trace evidence' -and
+                $validatedCapturedPayload.raw_job_debug_cleanup.raw_native_cleanup.JobActiveProcessCount -eq 1 -and
+                $validatedCapturedPayload.raw_job_debug_cleanup.raw_process_evidence.raw_trace_retained -eq $true -and
+                $validatedCapturedPayload.ordered_stream_paths.Count -eq 2 -and
+                $validatedCapturedPayload.secondary_errors[0] -ceq 'selftest cleanup failure remains secondary')
         $diagnosticPathExpected = Join-Path $selfTestRoot $script:D32Phase0BlockedDiagnosticName
         $diagnosticInitiallyAbsent = -not (Test-D32Phase0DirectoryEntryExists -Path $diagnosticPathExpected)
         $diagnosticEntryDetected = $false
@@ -2893,6 +3005,38 @@ function Test-D32Phase0MatrixRecordSelfTest {
             catch { $diagnosticCollisionRejected = $_.Exception.Message -like '*refusing to overwrite an existing blocked-diagnostic sidecar*' }
             $diagnosticSnapshotAfterCollision = Get-D32Phase0FileReference -Path $diagnosticPath
             if (-not $diagnosticCollisionRejected -or $diagnosticSnapshotBeforeCollision.sha256 -cne $diagnosticSnapshotAfterCollision.sha256) { throw 'blocked diagnostic create-new collision overwrote or accepted an existing sidecar' }
+
+            $ownedDiagnosticReference = Get-D32Phase0FileReference -Path $diagnosticPath
+            if (-not (Test-D32ProfilePathWithin -Child $diagnosticPath -Parent $selfTestRoot) -or -not (Test-D32ProfileNoReparsePath -Path $diagnosticPath) -or
+                (Get-D32Phase0FileReference -Path $diagnosticPath).sha256 -cne $ownedDiagnosticReference.sha256) { throw 'blocked diagnostic no-process self-test target is not the exact test-owned file' }
+            [IO.File]::Delete($diagnosticPath)
+            $noProcessDiagnosticPath = Write-D32Phase0BlockedDiagnostic `
+                -PrimaryError 'selftest failure before process creation' `
+                -Command $null `
+                -ProcessIdentity $null `
+                -RawV2Trace $null `
+                -NativeCleanup $null `
+                -StdoutPath $null `
+                -StderrPath $null
+            $noProcessDiagnostic = [IO.File]::ReadAllText($noProcessDiagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-D32Phase0Json
+            $expectedUnverifiedNoProcess = @(
+                'trace.dedicated_debugger_thread', 'trace.debugger_kill_on_exit_enabled', 'trace.debugger_thread_exited',
+                'trace.debugger_thread_joined', 'trace.retained_process_handles_signaled', 'trace.debugger_association_query_verified',
+                'trace.debugger_association_absent', 'trace.job_accounting_verified', 'trace.accounting_consistent',
+                'trace.event_chain_complete', 'trace.job_active_processes', 'cleanup.CleanupSucceeded', 'cleanup.JobCloseSucceeded',
+                'cleanup.JobActiveProcessCountVerified', 'cleanup.DebuggerThreadJoined', 'cleanup.RetainedProcessHandlesSignaled',
+                'cleanup.DebuggerAssociationQueryVerified', 'cleanup.DebuggerAssociationAbsent'
+            )
+            $expectedContextUnverified = @('failing_fixed_command', 'process_identity', 'stream.stdout', 'stream.stderr')
+            $missingNoProcessTraceFields = @($expectedUnverifiedNoProcess | Where-Object { $_ -notin @($noProcessDiagnostic.job_debug_cleanup.unverified_fields) })
+            $missingNoProcessContextFields = @($expectedContextUnverified | Where-Object { $_ -notin @($noProcessDiagnostic.unverified_fields) })
+            $noProcessUnverifiedValid = $null -eq $noProcessDiagnostic.raw_v2_trace -and $null -eq $noProcessDiagnostic.process_identity -and
+                $null -eq $noProcessDiagnostic.failing_fixed_command -and $noProcessDiagnostic.job_debug_cleanup.verification -ceq 'UNVERIFIED' -and
+                $null -eq $noProcessDiagnostic.job_debug_cleanup.raw_native_cleanup -and
+                $noProcessDiagnostic.job_debug_cleanup.unverified_fields.Count -eq 18 -and $missingNoProcessTraceFields.Count -eq 0 -and
+                $missingNoProcessContextFields.Count -eq 0 -and $noProcessDiagnostic.ordered_stream_captures.Count -eq 2 -and
+                @($noProcessDiagnostic.ordered_stream_captures | Where-Object { $_.status -cne 'UNAVAILABLE' -or $null -ne $_.reference }).Count -eq 0
+            & $add 'blocked diagnostic with no process creation leaves all 18 trace/cleanup fields explicitly UNVERIFIED' $noProcessUnverifiedValid
         }
         catch { $diagnosticWriteFailure = $_.Exception.Message }
         finally { $script:D32Phase0FailureContext = $previousFailureContext }

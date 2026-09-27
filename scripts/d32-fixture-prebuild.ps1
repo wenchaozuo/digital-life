@@ -6875,8 +6875,8 @@ function Invoke-D32PinnedGitProcessIdentitySelfTest {
             throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git rev-parse returned no exact commit identity'
         }
         $statusOutput = Get-D32GitOutput -Root $repo -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -PreserveOutput
-        if ($statusOutput -isnot [string] -or -not $statusOutput.Contains('scripts/d32-fixture-prebuild.ps1')) {
-            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git status output was not captured as raw text'
+        if ($statusOutput -isnot [string]) {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git status output was not captured as raw text, including an empty clean result'
         }
         $indexOutput = Get-D32GitOutput -Root $repo -Arguments @('ls-files', '-v', '-z') -PreserveOutput
         if ($indexOutput -isnot [string] -or -not $indexOutput.Contains([char]0)) {

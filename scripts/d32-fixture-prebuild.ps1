@@ -1141,28 +1141,28 @@ function Assert-D32PreflightSelfTestGitSetup {
     $gitDirectory = Join-Path $rootFull '.git'
     if ($signature -ceq "init`0-q") {
         if (-not $AfterExecution -and (Test-Path -LiteralPath $gitDirectory)) { throw 'SELFTEST_GIT_SETUP_BLOCKED: init target already contains Git metadata' }
-        if ($AfterExecution -and (-not (Test-Path -LiteralPath $gitDirectory -PathType Container) -or
-            -not (Test-D32NoReparsePath -Path $gitDirectory))) {
-            throw 'SELFTEST_GIT_SETUP_BLOCKED: init did not create direct non-reparse Git metadata beneath the exact owned marker root'
+        if ($AfterExecution) {
+            if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
+                throw 'SELFTEST_GIT_SETUP_BLOCKED: init did not create direct Git metadata beneath the exact owned marker root'
+            }
+            [void](Assert-D32NoReparsePath -Path $gitDirectory)
         }
         if ($AfterExecution) {
             $infoDirectory = Join-Path $gitDirectory 'info'
-            if (-not (Test-Path -LiteralPath $infoDirectory -PathType Container) -or
-                -not (Test-D32NoReparsePath -Path $infoDirectory)) {
+            if (-not (Test-Path -LiteralPath $infoDirectory -PathType Container)) {
                 throw 'SELFTEST_GIT_SETUP_BLOCKED: init did not create direct non-reparse Git info metadata'
             }
+            [void](Assert-D32NoReparsePath -Path $infoDirectory)
             $excludePath = Join-Path $infoDirectory 'exclude'
-            if ((Test-Path -LiteralPath $excludePath) -and -not (Test-D32NoReparsePath -Path $excludePath)) {
-                throw 'SELFTEST_GIT_SETUP_BLOCKED: init created a reparse-backed Git exclude file'
-            }
+            if (Test-Path -LiteralPath $excludePath) { [void](Assert-D32NoReparsePath -Path $excludePath) }
             [IO.File]::WriteAllText($excludePath, "# allowed comments`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
         }
     }
     else {
-        if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container) -or
-            -not (Test-D32NoReparsePath -Path $gitDirectory)) {
+        if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
             throw 'SELFTEST_GIT_SETUP_BLOCKED: Git fixture metadata is absent or reparse-backed before add/commit'
         }
+        [void](Assert-D32NoReparsePath -Path $gitDirectory)
         [void](Assert-D32RepositoryGitConfig -Root $rootFull)
     }
     return [PSCustomObject]@{ Root = $rootFull; GitDirectory = $gitDirectory }

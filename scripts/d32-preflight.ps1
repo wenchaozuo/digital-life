@@ -78,6 +78,7 @@ $ErrorActionPreference = 'Stop'
 $script:D32PreflightGitCaptureModule = $null
 $script:D32GitCaptureContext = $null
 $script:D32LastPreflightGitCapture = $null
+$script:D32LastPreflightGitCaptureFailure = $null
 . (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
 if ($Phase0DependencyLibraryOnly -and -not $LibraryOnly) {
     throw 'PHASE0_DEPENDENCY_IMPORT_INVALID: dependency-only import requires -LibraryOnly'
@@ -1385,6 +1386,7 @@ function Invoke-D32Git {
         TrustedGitAfter  = $null
     }
     $script:D32LastPreflightGitCapture = $null
+    $script:D32LastPreflightGitCaptureFailure = $null
     $before = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
     $result.TrustedGitBefore = $before
     if (-not $before.IsValid) {
@@ -1425,6 +1427,7 @@ function Invoke-D32Git {
         }
         $capture = & $module { param($parameters) Invoke-D32PreflightPinnedGitCapture @parameters } $call
         $script:D32LastPreflightGitCapture = $capture.Attempt
+        $script:D32LastPreflightGitCaptureFailure = if ([bool]$capture.ProcessValidated) { $null } else { [string]$capture.Failure }
         if (-not [bool]$capture.ProcessValidated) {
             $result.Failure = 'trusted Git V2 process capture, metadata fence, or cleanup failed'
             return [PSCustomObject]$result
@@ -1514,6 +1517,7 @@ function Get-D32PreflightGitCaptureModule {
                     StdOut = ''
                     StdErr = ''
                     Attempt = $script:D32LastPinnedGitAttempt
+                    Failure = $_.Exception.Message
                 }
             }
         }
@@ -1634,7 +1638,7 @@ function Invoke-D32PreflightGitProcessSelfTest {
         )) {
             $setupResult = Invoke-D32Git -Repository $fixtureRepository -Arguments $setup.Arguments -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
             if ($setupResult.ExitCode -ne 0 -or $null -ne $setupResult.Failure -or $null -eq $script:D32LastPreflightGitCapture) {
-                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture $($setup.Name) did not complete through V2: $($setupResult.Failure)"
+                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture $($setup.Name) did not complete through V2: $($script:D32LastPreflightGitCaptureFailure)"
             }
             Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name "fixture-$($setup.Name)"
         }

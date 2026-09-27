@@ -503,6 +503,44 @@ function Test-D32ProfileImageInventory {
     return $actual
 }
 
+function Test-D32ProfileExactVctipImageRecord {
+    param([AllowNull()][object]$Record)
+
+    if ($null -eq $Record) { return $false }
+    $path = Get-D32ProfileProperty -Object $Record -Name 'Path'
+    $sha256 = Get-D32ProfileProperty -Object $Record -Name 'Sha256'
+    $bytes = Get-D32ProfileProperty -Object $Record -Name 'Bytes'
+    $volume = Get-D32ProfileProperty -Object $Record -Name 'VolumeSerialHex'
+    $fileId = Get-D32ProfileProperty -Object $Record -Name 'FileIdHex'
+    return $path -is [string] -and
+        [String]::Equals([string]$path, 'E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe', [StringComparison]::OrdinalIgnoreCase) -and
+        $sha256 -is [string] -and [String]::Equals([string]$sha256, 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', [StringComparison]::Ordinal) -and
+        $bytes -is [ValueType] -and [Int64]$bytes -eq 335328 -and
+        $volume -is [string] -and [String]::Equals([string]$volume, '749614a1961465c0', [StringComparison]::Ordinal) -and
+        $fileId -is [string] -and [String]::Equals([string]$fileId, '0b5d2000000001000000000000000000', [StringComparison]::Ordinal)
+}
+
+function Test-D32ProfilePinnedVctipContentIdentity {
+    param([AllowNull()][object]$Bytes, [AllowNull()][object]$Sha256)
+
+    return $Bytes -is [ValueType] -and [Int64]$Bytes -eq 335328 -and
+        $Sha256 -is [string] -and [String]::Equals([string]$Sha256, 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', [StringComparison]::Ordinal)
+}
+
+function Get-D32ProfileExactVctipImageRecord {
+    param([Parameter(Mandatory = $true)][object]$ValidatedProfile)
+
+    $records = @($ValidatedProfile.ExecutableInventory) + @($ValidatedProfile.WindowsImageInventory)
+    $vctip = @($records | Where-Object {
+        [IO.Path]::GetFileName([string]$_.Path) -ieq 'vctip.exe' -or
+        (Test-D32ProfilePinnedVctipContentIdentity -Bytes $_.Bytes -Sha256 $_.Sha256)
+    })
+    if ($vctip.Count -ne 1 -or -not (Test-D32ProfileExactVctipImageRecord -Record $vctip[0])) {
+        throw 'D32_VCTIP_PROFILE_PIN_BLOCKED: the caller-pinned Profile V2 must contain exactly the approved MSVC VCTIP path/bytes/SHA/opened-handle identity'
+    }
+    return $vctip[0]
+}
+
 function Test-D32ProfileScriptInventory {
     param(
         [Parameter(Mandatory = $true)][object[]]$DeclaredRecords,

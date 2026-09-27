@@ -1654,7 +1654,8 @@ function Invoke-D32LockedCargoFetches {
         [Parameter(Mandatory = $true)][string]$LogRoot,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][string]$LogPrefix,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$PhaseEvidence
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$PhaseEvidence,
+        [switch]$AllowPinnedCargoVctip
     )
 
     $fetchEnvironment = New-D32ProfileChildEnvironment `
@@ -1678,7 +1679,8 @@ function Invoke-D32LockedCargoFetches {
             -PhaseLog (Join-Path $LogRoot $phaseName) `
             -TimeoutSeconds $TimeoutSeconds `
             -ChildEnvironment $fetchEnvironment `
-            -RequireDebugEvents
+            -RequireDebugEvents `
+            -AllowPinnedCargoVctip:$AllowPinnedCargoVctip
         $PhaseEvidence.Add([pscustomobject]@{
                 name = $phaseName
                 executable = [IO.Path]::GetFullPath($CargoPath)
@@ -1793,6 +1795,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -1917,6 +1920,7 @@ internal sealed class D32DebugLaunchCoordinator
     public bool InjectFirstCreateInterruption;
     public bool InjectFirstCreateIdentityMismatch;
     public bool AllowPinnedGitRoot;
+    public bool AllowPinnedCargoVctip;
     public string FailureInjection;
 }
 
@@ -1933,6 +1937,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private const uint JobObjectExtendedLimitInformationClass = 9;
     private const uint JobObjectBasicAccountingInformationClass = 1;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+    private const uint JobObjectLimitBreakawayOk = 0x00000800;
+    private const uint JobObjectLimitSilentBreakawayOk = 0x00001000;
+    private const string PinnedVctipPath = @"E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe";
+    private const string PinnedVctipSha256 = "e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996";
+    private const string PinnedVctipBytes = "335328";
+    private const string PinnedVctipVolumeSerial = "749614a1961465c0";
+    private const string PinnedVctipFileId = "0b5d2000000001000000000000000000";
     private const uint WaitObject0 = 0x00000000;
     private const int ErrorInsufficientBuffer = 122;
     private const uint DebugEventException = 1;
@@ -2224,6 +2235,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         uint jobObjectInformationLength,
         out uint returnLength);
 
+    [DllImport("kernel32.dll", EntryPoint = "QueryInformationJobObject", SetLastError = true)]
+    private static extern bool QueryExtendedInformationJobObject(
+        IntPtr job,
+        uint jobObjectInformationClass,
+        ref JobObjectExtendedLimitInformation jobObjectInformation,
+        uint jobObjectInformationLength,
+        out uint returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WaitForDebugEvent(out DebugEvent debugEvent, uint milliseconds);
 
@@ -2313,6 +2335,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private uint _closedJobActiveProcessCount;
     private int _closedJobActiveProcessCountError;
     private bool _debugEnabled;
+    private bool _jobNonBreakawayVerified;
     private bool _debugKillOnExitEnabled;
     private bool _debugRootResumedAfterKillOnExit;
     private bool _debugCleanupVerified;
@@ -2444,6 +2467,33 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         }
     }
 
+    private static void RequireNonBreakawayJob(IntPtr job)
+    {
+        if (job == IntPtr.Zero || job == new IntPtr(-1)) throw new InvalidOperationException("JOB_CONTAINMENT_BLOCKED: owned Job handle is invalid");
+        JobObjectExtendedLimitInformation limits = new JobObjectExtendedLimitInformation();
+        uint returned;
+        uint expectedLength = (uint)Marshal.SizeOf(typeof(JobObjectExtendedLimitInformation));
+        if (!QueryExtendedInformationJobObject(job, JobObjectExtendedLimitInformationClass, ref limits, expectedLength, out returned) || returned < expectedLength)
+            ThrowLastError("QueryInformationJobObject(ExtendedLimitInformation) failed");
+        uint flags = limits.BasicLimitInformation.LimitFlags;
+        if (!HasRequiredNonBreakawayJobFlags(flags))
+            throw new InvalidOperationException("JOB_CONTAINMENT_BLOCKED: owned Job is not exactly KILL_ON_JOB_CLOSE with breakaway disabled (flags=0x" + flags.ToString("x8", CultureInfo.InvariantCulture) + ")");
+    }
+
+    public static bool HasRequiredNonBreakawayJobFlags(uint flags)
+    {
+        return flags == JobObjectLimitKillOnJobClose &&
+            (flags & (JobObjectLimitBreakawayOk | JobObjectLimitSilentBreakawayOk)) == 0;
+    }
+
+    private static bool ProcessIsInOwnedJob(IntPtr process, IntPtr job)
+    {
+        bool inJob;
+        if (process == IntPtr.Zero || process == new IntPtr(-1) || job == IntPtr.Zero || job == new IntPtr(-1)) return false;
+        if (!IsProcessInJob(process, job, out inJob)) return false;
+        return inJob;
+    }
+
     private bool TryGetActiveProcessCount(out uint count, out int error)
     {
         count = 0;
@@ -2571,7 +2621,82 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection)
     {
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false);
+            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false, false);
+    }
+
+    public static bool IsApprovedPinnedCargoVctipConfiguration(string expectedRootPin, string[] approvedImagePins)
+    {
+        try
+        {
+            string[] root = ParseDebugPin(expectedRootPin);
+            if (!String.Equals(Path.GetFileName(root[0]), "cargo.exe", StringComparison.OrdinalIgnoreCase) || approvedImagePins == null) return false;
+            List<string[]> vctipPins = new List<string[]>();
+            for (int i = 0; i < approvedImagePins.Length; i++)
+            {
+                string[] pin = ParseDebugPin(approvedImagePins[i]);
+                if (String.Equals(Path.GetFileName(pin[0]), "vctip.exe", StringComparison.OrdinalIgnoreCase) || IsPinnedVctipContentIdentity(pin[1], pin[2])) vctipPins.Add(pin);
+            }
+            return vctipPins.Count == 1 && IsExactPinnedVctipPin(vctipPins[0]);
+        }
+        catch { return false; }
+    }
+
+    public static bool IsPinnedCargoVctipChildAllowed(
+        string expectedRootPath,
+        bool allowPinnedCargoVctip,
+        string imagePath,
+        long imageBytes,
+        string imageSha256,
+        string imageVolumeSerialHex,
+        string imageFileIdHex,
+        string[] approvedImagePins)
+    {
+        if (!allowPinnedCargoVctip || String.IsNullOrWhiteSpace(expectedRootPath) ||
+            !String.Equals(Path.GetFileName(expectedRootPath), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(imagePath), "vctip.exe", StringComparison.OrdinalIgnoreCase) ||
+            approvedImagePins == null) return false;
+        try
+        {
+            string[][] matches = approvedImagePins.Select(ParseDebugPin)
+                .Where(pin => String.Equals(Path.GetFileName(pin[0]), "vctip.exe", StringComparison.OrdinalIgnoreCase) || IsPinnedVctipContentIdentity(pin[1], pin[2]))
+                .ToArray();
+            if (matches.Length != 1 || !IsExactPinnedVctipPin(matches[0])) return false;
+            DebugImageSnapshot image = new DebugImageSnapshot {
+                Path = NormalizeDebugPath(imagePath), Bytes = imageBytes, Sha256 = imageSha256,
+                VolumeSerialHex = imageVolumeSerialHex, FileIdHex = imageFileIdHex
+            };
+            return DebugImageMatches(image, matches[0]);
+        }
+        catch { return false; }
+    }
+
+    private static bool IsExactPinnedVctipPin(string[] pin)
+    {
+        return pin != null && pin.Length == 5 &&
+            String.Equals(NormalizeDebugPath(pin[0]), NormalizeDebugPath(PinnedVctipPath), StringComparison.OrdinalIgnoreCase) &&
+            String.Equals(pin[1], PinnedVctipBytes, StringComparison.Ordinal) &&
+            String.Equals(pin[2], PinnedVctipSha256, StringComparison.Ordinal) &&
+            String.Equals(pin[3], PinnedVctipVolumeSerial, StringComparison.Ordinal) &&
+            String.Equals(pin[4], PinnedVctipFileId, StringComparison.Ordinal);
+    }
+
+    private static bool IsPinnedVctipContentIdentity(string bytes, string sha256)
+    {
+        return String.Equals(bytes, PinnedVctipBytes, StringComparison.Ordinal) &&
+            String.Equals(sha256, PinnedVctipSha256, StringComparison.Ordinal);
+    }
+
+    private static bool IsPinnedVctipContentIdentity(long bytes, string sha256)
+    {
+        return bytes == 335328 && String.Equals(sha256, PinnedVctipSha256, StringComparison.Ordinal);
+    }
+
+    public void ConfigurePinnedCargoDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds)
+    {
+        if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
+            throw new InvalidOperationException("D32_VCTIP_PROFILE_PIN_BLOCKED: only the exact approved caller-pinned Profile V2 VCTIP entry may be configured beneath a fixed Cargo root");
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+            false, false, null, false, true);
     }
 
     public void ConfigurePinnedGitDebugCapture(string expectedRootPin, string approvedWindowsImagePin, int timeoutMilliseconds)
@@ -2583,10 +2708,10 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!String.Equals(Path.GetFileName(childPin[0]), "conhost.exe", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("standalone pinned-Git capture requires the caller-pinned conhost.exe child image");
         ConfigureDebugCapture(expectedRootPin, new string[] { approvedWindowsImagePin }, new string[0], timeoutMilliseconds,
-            false, false, null, true);
+            false, false, null, true, false);
     }
 
-    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot)
+    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot, bool allowPinnedCargoVctip)
     {
         if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
@@ -2602,6 +2727,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             _debugCoordinator.InjectFirstCreateIdentityMismatch = injectFirstCreateIdentityMismatch;
             _debugCoordinator.FailureInjection = failureInjection;
             _debugCoordinator.AllowPinnedGitRoot = allowPinnedGitRoot;
+            _debugCoordinator.AllowPinnedCargoVctip = allowPinnedCargoVctip;
             _debugCoordinator.CapturePlanReady.Set();
         }
     }
@@ -2767,6 +2893,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         IntPtr nativeEnvironment = IntPtr.Zero;
         ProcessInformation pi = new ProcessInformation();
         bool transferred = false;
+        bool jobNonBreakawayVerified = false;
         bool debugKillOnExitEnabled = false;
         Exception failure = null;
         string cleanupErrors = null;
@@ -2777,6 +2904,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             job = CreateJobObjectW(IntPtr.Zero, null);
             if (job == IntPtr.Zero) ThrowLastError("CreateJobObjectW failed");
             ConfigureKillOnClose(job);
+            RequireNonBreakawayJob(job);
+            jobNonBreakawayVerified = true;
 
             SecurityAttributes pipeAttributes = new SecurityAttributes();
             pipeAttributes.Length = Marshal.SizeOf(typeof(SecurityAttributes));
@@ -2871,6 +3000,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
             if (!AssignProcessToJobObject(job, pi.Process))
                 ThrowLastError("AssignProcessToJobObject failed");
+            RequireNonBreakawayJob(job);
+            if (!ProcessIsInOwnedJob(pi.Process, job))
+                throw new InvalidOperationException("JOB_CONTAINMENT_BLOCKED: suspended root process is not a member of the exact owned non-breakaway Job");
             if (String.Equals(testFailure, "assign", StringComparison.Ordinal)) {
                 bool assignedWithInvalidJob = AssignProcessToJobObject(IntPtr.Zero, pi.Process);
                 int assignError = assignedWithInvalidJob ? 0 : Marshal.GetLastWin32Error();
@@ -2901,6 +3033,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 pi.ProcessId,
                 debugEnabled);
             result._debugKillOnExitEnabled = debugKillOnExitEnabled;
+            result._jobNonBreakawayVerified = jobNonBreakawayVerified;
             job = IntPtr.Zero;
             pi.Process = IntPtr.Zero;
             pi.Thread = IntPtr.Zero;
@@ -3162,7 +3295,6 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             name.StartsWith("git-credential", StringComparison.Ordinal) || name.Contains("credential") || name.StartsWith("ssh", StringComparison.Ordinal) ||
             name.StartsWith("plink", StringComparison.Ordinal) || name.StartsWith("putty", StringComparison.Ordinal) || name == "pageant.exe" ||
             name.StartsWith("tortoiseplink", StringComparison.Ordinal)) return "Git/SSH/credential helper image is never launchable";
-        if (name == "vctip.exe") return "MSVC VCTIP telemetry helper is explicitly denied";
         return null;
     }
 
@@ -3288,6 +3420,21 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!_debugKillOnExitEnabled)
         {
             TraceBlock(trace, "DebugSetProcessKillOnExit(TRUE) was not established before root resume");
+            trace.DebugApiErrorCount++;
+            if (!TerminateJobObject(_job, 0xD3201000)) trace.DebugApiErrorCount++;
+            trace.EventChainComplete = false;
+            trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            return trace;
+        }
+        try
+        {
+            if (!_jobNonBreakawayVerified) throw new InvalidOperationException("owned Job non-breakaway configuration was not verified before root resume");
+            RequireNonBreakawayJob(_job);
+            if (!ProcessIsInOwnedJob(_process, _job)) throw new InvalidOperationException("suspended root is not a member of the exact owned non-breakaway Job");
+        }
+        catch (Exception error)
+        {
+            TraceBlock(trace, "JOB_CONTAINMENT_BLOCKED: " + error.Message);
             trace.DebugApiErrorCount++;
             if (!TerminateJobObject(_job, 0xD3201000)) trace.DebugApiErrorCount++;
             trace.EventChainComplete = false;
@@ -3428,10 +3575,16 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                             string identity = ev.ProcessId.ToString(CultureInfo.InvariantCulture) + "@" + creation.ToString(CultureInfo.InvariantCulture);
                             if (creation <= 0 || !identities.Add(identity)) throw new InvalidOperationException("process PID/creation identity is absent or duplicated");
                             if (active.ContainsKey(ev.ProcessId)) throw new InvalidOperationException("PID reused before the prior process identity exited");
+                            if (!_jobNonBreakawayVerified) throw new InvalidOperationException("owned Job non-breakaway configuration was not verified before CREATE continuation");
+                            RequireNonBreakawayJob(_job);
+                            if (!ProcessIsInOwnedJob(created.Process, _job)) throw new InvalidOperationException("CREATE process handle is not a member of the exact owned non-breakaway Job");
                             if (trace.ProcessCreateEventCount == 1)
                             {
                                 if (parentPid != (uint)trace.DebuggerProcessId) throw new InvalidOperationException("fixed root parent PID differs from the current runner");
                                 parentCreation = debuggerCreation;
+                                if (String.Equals(Path.GetFileName(image.Path), "vctip.exe", StringComparison.OrdinalIgnoreCase) ||
+                                    IsPinnedVctipContentIdentity(image.Bytes, image.Sha256))
+                                    throw new InvalidOperationException("MSVC VCTIP is authorized only as an exact pinned descendant of the fixed Cargo root");
                                 string rootDeny = GetHardDeniedImageReason(image.Path);
                                 bool pinnedGitRootAllowed = _debugCoordinator.AllowPinnedGitRoot &&
                                     String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase);
@@ -3445,12 +3598,24 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 if (!active.TryGetValue(parentPid, out parent) || parent.Record.CreationFileTime <= 0)
                                     throw new InvalidOperationException("child parent PID lacks a unique active retained identity");
                                 parentCreation = parent.Record.CreationFileTime;
+                                // Each retained parent was itself admitted from this root's verified CREATE chain.
                                 string denied = GetHardDeniedImageReason(image.Path);
                                 if (denied != null) throw new InvalidOperationException(denied + ": " + image.Path);
                                 if (_debugCoordinator.AllowPinnedGitRoot &&
                                     (trace.ProcessCreateEventCount != 2 || trace.Processes.Count != 1 || parentPid != trace.Processes[0].ProcessId))
                                     throw new InvalidOperationException("standalone pinned Git permits only one direct caller-pinned Windows console-host child; observed " + image.Path + " parent=" + parent.Record.ImagePath);
-                                foreach (string[] pin in pins)
+                                bool vctipName = String.Equals(Path.GetFileName(image.Path), "vctip.exe", StringComparison.OrdinalIgnoreCase);
+                                bool vctipContent = IsPinnedVctipContentIdentity(image.Bytes, image.Sha256);
+                                if (vctipName || vctipContent)
+                                {
+                                    if (!vctipName)
+                                        throw new InvalidOperationException("copied or renamed MSVC VCTIP image content is not authorized under another path/name");
+                                    reason = IsPinnedCargoVctipChildAllowed(expectedRoot[0], _debugCoordinator.AllowPinnedCargoVctip,
+                                        image.Path, image.Bytes, image.Sha256, image.VolumeSerialHex, image.FileIdHex, approvedImagePins)
+                                        ? "caller-pinned-msvc-vctip-descendant-of-fixed-cargo-root" : null;
+                                    if (reason == null) throw new InvalidOperationException("MSVC VCTIP descendant does not match the exact caller-pinned Profile V2 entry, Cargo-root permission, or opened hFile identity");
+                                }
+                                else foreach (string[] pin in pins)
                                 {
                                     if (DebugImageMatches(image, pin)) { reason = "caller-pinned-toolchain-native-or-Windows-image"; break; }
                                 }
@@ -3602,6 +3767,26 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 }
                 if (!TerminateJobObject(_job, 0xD320100A)) trace.DebugApiErrorCount++;
                 break;
+            }
+            if (ev.Code == DebugEventCreateProcess)
+            {
+                try
+                {
+                    RequireNonBreakawayJob(_job);
+                    DebugCreateProcessInfo created = ev.Data.CreateProcess;
+                    if (!_jobNonBreakawayVerified || !ProcessIsInOwnedJob(created.Process, _job))
+                        throw new InvalidOperationException("CREATE process is not in the verified owned non-breakaway Job immediately before continuation");
+                }
+                catch (Exception error)
+                {
+                    trace.DebugApiErrorCount++;
+                    trace.EventChainComplete = false;
+                    TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT Job containment failed before ContinueDebugEvent: " + error.Message);
+                    trace.UncontinuedCreateProcessId = ev.ProcessId;
+                    trace.UncontinuedCreateContinueCallCount = 0;
+                    if (!TerminateJobObject(_job, 0xD320100C)) trace.DebugApiErrorCount++;
+                    break;
+                }
             }
             DebugContinueCallCount++;
             if (!ContinueDebugEvent(ev.ProcessId, ev.ThreadId, continueStatus))
@@ -4483,6 +4668,7 @@ function Invoke-D32BoundedProcess {
         [ValidateSet('none', 'spawn-init', 'cim-init', 'pipe-init', 'api-failure', 'attribute-failure', 'pipe-timeout')]
         [string]$FailureInjection = 'none',
         [switch]$RequireDebugEvents,
+        [switch]$AllowPinnedCargoVctip,
         [string[]]$CandidateImageRoots
     )
 
@@ -4637,9 +4823,18 @@ function Invoke-D32BoundedProcess {
                 $approvedImages = @($profileCurrent.ExecutableInventory) + @($profileCurrent.WindowsImageInventory)
                 $approvedPinText = @($approvedImages | ForEach-Object { ConvertTo-D32DebugImagePinText -Image $_ })
                 $targetRoots = if ($CandidateImageRoots) { @($CandidateImageRoots | ForEach-Object { [IO.Path]::GetFullPath($_) }) } else { @(Get-D32DebugCandidateTargetRoots -Repository $profileCurrent.Repository) }
-                $nativeProcess.ConfigureDebugCapture(
-                    (ConvertTo-D32DebugImagePinText -Image $rootImage), [string[]]$approvedPinText, [string[]]$targetRoots,
-                    [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false, $false)
+                $rootPinText = ConvertTo-D32DebugImagePinText -Image $rootImage
+                $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
+                if ($AllowPinnedCargoVctip) {
+                    if (-not (Test-D32ProfilePathEqual -Left $rootImage.Path -Right ([string]$profileCurrent.Profile.toolchain.cargo.path))) {
+                        throw 'D32_VCTIP_PROFILE_PIN_BLOCKED: VCTIP descendant authority is restricted to the exact caller-pinned Cargo root'
+                    }
+                    $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $profileCurrent
+                    $nativeProcess.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout)
+                }
+                else {
+                    $nativeProcess.ConfigureDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout, $false, $false)
+                }
                 $debugJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
                 $traceNative = $nativeProcess.WaitForDebugTrace($debugJoinTimeout)
                 $traceDocument = ConvertTo-D32DebugProcessTraceDocument -Trace $traceNative
@@ -5979,6 +6174,12 @@ public static class D32DebugSelfTestLauncher
             using (Process child = Start(Path.Combine(system, "whoami.exe"), new string[0]))
                 return child.WaitForExit(10000) ? 0 : 43;
         }
+        if (mode == "spawn-vctip")
+        {
+            if (args.Length < 4) return 46;
+            using (Process child = Start(args[2], new string[] { "exit", args[3] }))
+                return child.WaitForExit(10000) ? 0 : 47;
+        }
         if (mode == "spawn-cmd")
         {
             if (args.Length < 3) return 44;
@@ -6025,6 +6226,78 @@ public static class D32DebugSelfTestLauncher
             VolumeSerialHex = $consoleHostArtifact.volume_serial_hex; FileIdHex = $consoleHostArtifact.file_id_hex
         }
         $consoleHostPin = ConvertTo-D32DebugImagePinText -Image $consoleHostImage
+        $cargoPolicyRoot = 'C:\selftest-profile\bin\cargo.exe'
+        $cargoPolicyPin = @($cargoPolicyRoot, '1', ('a' * 64), ('0' * 16), ('0' * 32)) -join "`t"
+        $vctipPolicyPath = 'E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe'
+        $vctipPolicyPin = @(
+            $vctipPolicyPath,
+            '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+            '749614a1961465c0', '0b5d2000000001000000000000000000'
+        ) -join "`t"
+        $exactVctipConfigAccepted = [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVctipConfiguration($cargoPolicyPin, @($vctipPolicyPin))
+        $exactVctipChildAccepted = [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed(
+            $cargoPolicyRoot, $true,
+            $vctipPolicyPath, 335328,
+            'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+            '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin))
+        $invalidVctipPins = @(
+            @('E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', '335329', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c0', '0b5d2000000001000000000000000000') -join "`t",
+            @('E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', '335328', ('0' * 64), '749614a1961465c0', '0b5d2000000001000000000000000000') -join "`t",
+            @('E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c1', '0b5d2000000001000000000000000000') -join "`t",
+            @('E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c0', '0b5d2000000001000000000000000001') -join "`t",
+            @('E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip-copy.exe', '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c0', '0b5d2000000001000000000000000001') -join "`t"
+        )
+        $vctipInvalidPinsRejected = @($invalidVctipPins | Where-Object {
+            [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVctipConfiguration($cargoPolicyPin, @($_)) -or
+            [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed($cargoPolicyRoot, $true,
+                'E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', 335328,
+                'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+                '749614a1961465c0', '0b5d2000000001000000000000000000', @($_))
+        }).Count -eq 0
+        $vctipNegativePolicyValid = -not [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed(
+            $cargoPolicyRoot, $false, 'E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', 335328,
+            'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+            '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin)) -and
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed(
+                'C:\\selftest-profile\\bin\\other.exe', $true, 'E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip.exe', 335328,
+                'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+                '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin)) -and
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed(
+                $cargoPolicyRoot, $true, 'E:\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vctip-copy.exe', 335328,
+                'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+                '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin))
+        $duplicateVctipPinRejected = -not [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVctipConfiguration($cargoPolicyPin, @($vctipPolicyPin, $invalidVctipPins[-1]))
+        $tab = [string][char]9
+        $canonicalInvalidVctipPins = @(
+            @($vctipPolicyPath, '335329', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c0', '0b5d2000000001000000000000000000') -join $tab,
+            @($vctipPolicyPath, '335328', ('0' * 64), '749614a1961465c0', '0b5d2000000001000000000000000000') -join $tab,
+            @($vctipPolicyPath, '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c1', '0b5d2000000001000000000000000000') -join $tab,
+            @($vctipPolicyPath, '335328', 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996', '749614a1961465c0', '0b5d2000000001000000000000000001') -join $tab
+        )
+        $canonicalVctipDriftRejected = @($canonicalInvalidVctipPins | Where-Object {
+            [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVctipConfiguration($cargoPolicyPin, @($_)) -or
+            [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed($cargoPolicyRoot, $true,
+                $vctipPolicyPath, 335328, 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+                '749614a1961465c0', '0b5d2000000001000000000000000000', @($_))
+        }).Count -eq 0
+        $canonicalCopiedVctipPathRejected = -not [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed(
+            $cargoPolicyRoot, $true, $vctipPolicyPath.Replace('vctip.exe', 'vctip-copy.exe'), 335328,
+            'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+            '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin))
+        if (-not $exactVctipConfigAccepted -or -not $exactVctipChildAccepted -or -not $vctipInvalidPinsRejected -or
+            -not $vctipNegativePolicyValid -or -not $duplicateVctipPinRejected -or
+            -not $canonicalVctipDriftRejected -or -not $canonicalCopiedVctipPathRejected) {
+            throw "SELFTEST_FAILED: exact caller-pinned Cargo/VCTIP policy admitted drift/copy or rejected the approved identity (config=$exactVctipConfigAccepted child=$exactVctipChildAccepted invalid=$vctipInvalidPinsRejected negative=$vctipNegativePolicyValid duplicate=$duplicateVctipPinRejected canonicalDrift=$canonicalVctipDriftRejected copiedPath=$canonicalCopiedVctipPathRejected)"
+        }
+        Write-Host 'D32_VCTIP_POLICY=PASS exact_profile_record_and_opened_identity_only; drift_copy_wrong_root_and_unpermitted_denied'
+        $passed++
+        $jobFlagsPolicyValid = [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002000) -and
+            -not [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002800) -and
+            -not [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00003000) -and
+            -not [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002004)
+        if (-not $jobFlagsPolicyValid) { throw 'SELFTEST_FAILED: owned Job admitted breakaway or non-contract extended flags' }
+        Write-Host 'D32_JOB_NONBREAKAWAY_FLAGS=PASS exact_kill_on_close_only'
+        $passed++
         $debugScriptDirectory = Join-Path $root 'script-bin'
         [void](New-Item -ItemType Directory -Path $debugScriptDirectory)
         $cmdScriptPath = Join-Path $debugScriptDirectory 'd32-debug-no-launch.cmd'
@@ -6079,6 +6352,29 @@ public static class D32DebugSelfTestLauncher
             [uint32]$unknownChild.Cleanup.JobActiveProcessCount -ne 0) {
             throw "SELFTEST_FAILED: unknown child/helper was not blocked at its unvalidated CREATE with full cleanup: $($unknownChild.Trace.BlockReason); $($unknownChild.Cleanup.Detail)"
         }
+        $passed++
+
+        $copiedVctipPath = Join-Path $root 'vctip.exe'
+        [IO.File]::Copy($debugLauncherPath, $copiedVctipPath)
+        $copiedVctipRootMarker = Join-Path $root 'd32-copied-vctip-root.marker'
+        $copiedVctipChildMarker = Join-Path $root 'd32-copied-vctip-child.marker'
+        $copiedVctipAttempt = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath `
+            -Arguments @('spawn-vctip', $copiedVctipRootMarker, $copiedVctipPath, $copiedVctipChildMarker) `
+            -WorkingDirectory $root -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
+        if ($copiedVctipAttempt.Trace.State -cne 'BLOCKED' -or
+            $copiedVctipAttempt.Trace.BlockReason -notmatch 'MSVC VCTIP descendant does not match the exact caller-pinned Profile V2 entry' -or
+            [uint32]$copiedVctipAttempt.Trace.UncontinuedCreateProcessId -le 0 -or
+            [int]$copiedVctipAttempt.Trace.UncontinuedCreateContinueCallCount -ne 0 -or
+            $copiedVctipAttempt.ContinueCalls -le 0 -or -not (Test-Path -LiteralPath $copiedVctipRootMarker) -or
+            (Test-Path -LiteralPath $copiedVctipChildMarker) -or
+            -not $copiedVctipAttempt.Cleanup.CleanupSucceeded -or -not $copiedVctipAttempt.Cleanup.ProcessWaitSignaled -or
+            -not $copiedVctipAttempt.Cleanup.DebuggerThreadExited -or -not $copiedVctipAttempt.Cleanup.DebuggerThreadJoined -or
+            -not $copiedVctipAttempt.Cleanup.DebuggerKillOnExitEnabled -or -not $copiedVctipAttempt.Cleanup.RetainedProcessHandlesSignaled -or
+            -not $copiedVctipAttempt.Cleanup.DebuggerAssociationQueryVerified -or -not $copiedVctipAttempt.Cleanup.DebuggerAssociationAbsent -or
+            -not $copiedVctipAttempt.Cleanup.JobActiveProcessCountVerified -or [uint32]$copiedVctipAttempt.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: copied/unprofiled VCTIP did not remain uncontinued with no child marker and complete V2 cleanup: $($copiedVctipAttempt.Trace.BlockReason); $($copiedVctipAttempt.Cleanup.Detail)"
+        }
+        Write-Host 'D32_VCTIP_NEGATIVE=copied_unprofiled_child:PASS uncontinued_create_calls=0 child_marker=false job_active=0'
         $passed++
 
         foreach ($commandTarget in @([PSCustomObject]@{ Name = 'absolute-cmd'; Command = $cmdScriptPath }, [PSCustomObject]@{ Name = 'PATH-cmd'; Command = 'd32-debug-no-launch.cmd' })) {
@@ -7679,7 +7975,8 @@ $fixtureFetches = Invoke-D32FixturePreCargoBoundary `
             -LogRoot $logRoot `
             -TimeoutSeconds $TimeoutSeconds `
             -LogPrefix 'fixture' `
-            -PhaseEvidence $phaseEvidence
+            -PhaseEvidence $phaseEvidence `
+            -AllowPinnedCargoVctip
     }
 $null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot
 $offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
@@ -7759,7 +8056,8 @@ try {
                 -PhaseLog $phaseLog `
                 -TimeoutSeconds $TimeoutSeconds `
                 -ChildEnvironment $offlineFixtureEnvironment `
-                -RequireDebugEvents
+                -RequireDebugEvents `
+                -AllowPinnedCargoVctip
             Assert-D32PinnedCargoProcessIdentity `
                 -ProcessIdentity $processResult.root_identity_record `
                 -CargoPath $cargo `

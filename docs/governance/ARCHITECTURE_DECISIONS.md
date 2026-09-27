@@ -22,6 +22,7 @@
 | ADR-D32-PINNED-GIT-ROOT-IDENTITY | APPROVED WITH CONDITIONS | D32 fixture tooling caller-pinned direct Git root identity under V2 trace | GPT-6 Sol Max | D32 fixture Git metadata queries only |
 | ADR-D32-RELEASE-OUTPUT-FRESHNESS-QUARANTINE | APPROVED WITH CONDITIONS | Exact D32 release-output freshness quarantine exception | GPT-6 Sol Max | Three named Phase 1 release leaves only |
 | ADR-D32-PHASE0-COMPACT-EVIDENCE-V1 | APPROVED WITH CONDITIONS | D32 Phase 0 compact external storage and failure-only diagnostic | GPT-6 Sol Max | Prospective D32 Phase 0 schema/storage migration only |
+| ADR-D32-CARGO-PINNED-VCTIP-DESCENDANT-V1 | APPROVED WITH CONDITIONS | Exact Profile V2 VCTIP child under fixed Cargo roots | GPT-6 Sol Max | D32 Phase 0/Phase 1 Cargo process traces only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -582,6 +583,39 @@ The current Phase 0 output basename combined with the pinned source/output paths
 #### Supersedes / Superseded by
 
 - Supersedes only the prospective Phase 0 storage basenames and the affected schema-version numbers in earlier D32 tooling decisions. It does not supersede or alter the profile, trace, fixture-manifest, D31 seeder, fixed argv, real-canary, negative-evidence, independent-gate, or final-freeze requirements.
+
+---
+
+### ADR-D32-CARGO-PINNED-VCTIP-DESCENDANT-V1 — Exact VCTIP Child Under Fixed Cargo Roots
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-28
+**Related milestone:** D32-A final-gate readiness
+**Related baseline:** `7ecab45f343eb48636b61a046f224d61368e01a1`
+**Related decisions:** ADR-D32-PHASE0-TOOLCHAIN-PROFILE; ADR-D32-PROCESS-EVENT-TRACE-V2; ADR-D32-PINNED-GIT-ROOT-IDENTITY; ADR-D32-PHASE0-COMPACT-EVIDENCE-V1
+
+#### Context
+
+The approved caller-pinned MSVC toolchain launches `vctip.exe` as a Cargo build descendant. A blanket basename denial blocks the fixed D32 Cargo commands, while a basename or broad-path exemption would grant unbounded helper authority. This decision permits only the single exact toolchain image under the already pinned Cargo process tree.
+
+#### Decision
+
+1. For D32 Phase 0 and Phase 1 only, a `vctip.exe` descendant may be continued only when the current caller-pinned Profile V2 contains exactly one matching image record at `E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe` with 335328 bytes, SHA-256 `e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996`, volume serial `749614a1961465c0`, and file ID `0b5d2000000001000000000000000000`.
+2. Immediately before `ContinueDebugEvent`, require the observed image's opened `hFile` identity to match that exact record; the root to be the fixed Cargo image selected from the same validated profile; the process to have an active retained parent identity in the accepted CREATE chain; and the process to be in the exact owned Job whose verified extended flags are only `KILL_ON_JOB_CLOSE` (breakaway and silent breakaway disabled). Any missing, stale, conflicting, or unverifiable check blocks that CREATE with zero Continue calls and no child user-code marker.
+3. The narrow exception is not a basename allowlist. An unpinned, renamed, copied, drifted, duplicate, wrong-profile, or otherwise mismatched VCTIP image is blocked. VCTIP content at another path/name is not admitted as an ordinary pinned toolchain or candidate-target image. All other command-processor, shell, Git, SSH, credential-helper, script, and helper denials remain unchanged.
+4. Preserve Profile V2, process/Job trace V2, unique CREATE/EXIT identity accounting, independent Job accounting, full cleanup verification, fixed command arguments, and production Host authority. This decision adds no user-code authority and changes no Stage Contract, invariant, schema, or downstream gate.
+
+#### Required tests and evidence
+
+- Exercise the exact profile record and exact opened-handle identity as the only positive VCTIP admission; reject each changed path, byte count, SHA, volume serial, file ID, Cargo root, profile, duplicate/copy, and parent-chain case.
+- Verify a renamed/unpinned VCTIP CREATE is left uncontinued with zero CREATE Continue calls, no child marker, and complete V2 debugger/Job cleanup.
+- Verify the owned Job flags remain exact kill-on-close with both breakaway flags absent; preserve all existing command and helper denial tests.
+- A focused positive policy/self-test is not a formal Phase 0/Phase 1 result and does not authorize release, canary, aggregate PASS, Gate, or stage closure.
+
+#### Supersedes / Superseded by
+
+- Supersedes only the blanket name-only denial of the exact caller-pinned VCTIP descendant described above. No other launch denial, process-trace requirement, cleanup requirement, toolchain trust rule, or gate is superseded.
 
 ---
 

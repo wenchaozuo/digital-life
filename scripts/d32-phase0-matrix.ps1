@@ -187,7 +187,8 @@ function ConvertTo-D32Phase0ProcessRecord {
     param(
         [Parameter(Mandatory = $true)][object]$Process,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
-        [Parameter(Mandatory = $true)][string]$Repository
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPath
     )
     if ($Process.process_id -le 0 -or $null -eq $Process.parent_process_id -or
         [String]::IsNullOrWhiteSpace([string]$Process.name) -or
@@ -198,7 +199,7 @@ function ConvertTo-D32Phase0ProcessRecord {
     }
     $imagePath = [IO.Path]::GetFullPath([string]$Process.image_path)
     $snapshot = Get-D32ProfileFileSnapshot -Path $imagePath
-    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository
+    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $snapshot
     if ([String]::IsNullOrWhiteSpace($allowReason)) { throw 'PHASE0_PROCESS_TREE_BLOCKED: unknown child image is outside the pinned toolchain/native inventory and candidate debug targets' }
     $matching = @($ValidatedProfile.ExecutableInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $imagePath })
     if ($matching.Count -gt 1) { throw "PHASE0_PROCESS_TREE_BLOCKED: duplicate pinned process image identity: $imagePath" }
@@ -226,10 +227,40 @@ function ConvertTo-D32Phase0ProcessRecord {
 }
 
 function Get-D32Phase0AllowedChildImageReason {
-    param([Parameter(Mandatory = $true)][string]$ImagePath, [Parameter(Mandatory = $true)][object]$ValidatedProfile, [Parameter(Mandatory = $true)][string]$Repository)
+    param(
+        [Parameter(Mandatory = $true)][string]$ImagePath,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
+        [AllowNull()][object]$ImageIdentity
+    )
     $imageName = [IO.Path]::GetFileName($ImagePath).ToLowerInvariant()
+    $imageBytes = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('bytes', 'Bytes')
+    $imageSha256 = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
+    $knownVctipContent = Test-D32ProfilePinnedVctipContentIdentity -Bytes $imageBytes -Sha256 $imageSha256
+    if ($imageName -ceq 'vctip.exe' -or $knownVctipContent) {
+        if ($imageName -cne 'vctip.exe') { return $null }
+        $profileCargoPath = $null
+        try { $profileCargoPath = [string]$ValidatedProfile.Profile.toolchain.cargo.path } catch { return $null }
+        if ([String]::IsNullOrWhiteSpace($profileCargoPath) -or -not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right $profileCargoPath)) { return $null }
+        $vctip = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $ValidatedProfile
+        if (-not (Test-D32ProfilePathEqual -Left $vctip.Path -Right $ImagePath)) { return $null }
+        if ($null -ne $ImageIdentity) {
+            $openedPath = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('path', 'Path', 'image_path', 'ImagePath')
+            $openedBytes = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('bytes', 'Bytes')
+            $openedSha = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
+            $openedVolume = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('volume_serial_hex', 'VolumeSerialHex')
+            $openedFileId = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('file_id_hex', 'FileIdHex')
+            if (-not (Test-D32ProfilePathEqual -Left ([string]$openedPath) -Right ([string]$vctip.Path)) -or
+                -not (Test-D32Phase0Integer -Value $openedBytes -Positive) -or [Int64]$openedBytes -ne [Int64]$vctip.Bytes -or
+                $openedSha -isnot [string] -or [string]$openedSha -cne [string]$vctip.Sha256 -or
+                $openedVolume -isnot [string] -or [string]$openedVolume -cne [string]$vctip.VolumeSerialHex -or
+                $openedFileId -isnot [string] -or [string]$openedFileId -cne [string]$vctip.FileIdHex) { return $null }
+        }
+        return 'caller-pinned-msvc-vctip-descendant-of-fixed-cargo-root'
+    }
     if ([IO.Path]::GetExtension($ImagePath).ToLowerInvariant() -in @('.bat', '.cmd') -or
-        $imageName -in @('cmd.exe', 'command.com', 'cscript.exe', 'wscript.exe', 'mshta.exe', 'bash.exe', 'sh.exe', 'dash.exe', 'zsh.exe', 'fish.exe', 'nu.exe', 'pageant.exe', 'vctip.exe') -or
+        $imageName -in @('cmd.exe', 'command.com', 'cscript.exe', 'wscript.exe', 'mshta.exe', 'bash.exe', 'sh.exe', 'dash.exe', 'zsh.exe', 'fish.exe', 'nu.exe', 'pageant.exe') -or
         $imageName.StartsWith('powershell', [StringComparison]::Ordinal) -or $imageName.StartsWith('pwsh', [StringComparison]::Ordinal) -or $imageName.StartsWith('wsl', [StringComparison]::Ordinal) -or
         $imageName -ceq 'git.exe' -or $imageName.StartsWith('git-bash', [StringComparison]::Ordinal) -or $imageName.StartsWith('git-cmd', [StringComparison]::Ordinal) -or
         $imageName.StartsWith('git-lfs', [StringComparison]::Ordinal) -or $imageName.StartsWith('git-remote-', [StringComparison]::Ordinal) -or
@@ -494,7 +525,7 @@ function Test-D32Phase0DebugProcessTrace {
     foreach ($record in $Trace.processes) {
         $identity = "$($record.process_id)|$($record.creation_filetime)"
         if ($identity -eq $rootKey) { continue }
-        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository
+        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $record
         if ([String]::IsNullOrWhiteSpace($actualReason) -or $record.allowed_image_reason -cne $actualReason) { throw "PROCESS_TRACE_BLOCKED: child/helper image is outside exact pinned inventory and candidate target roots: $($record.image_path)" }
         $pinned = @($ValidatedProfile.ExecutableInventory + $ValidatedProfile.WindowsImageInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $record.image_path })
         if ($pinned.Count -gt 1) { throw 'PROCESS_TRACE_BLOCKED: pinned process image identity is ambiguous' }
@@ -730,9 +761,15 @@ function Invoke-D32Phase0PinnedProcess {
             (Join-Path $Repository 'vita-agent-protocol\target\debug'),
             (Join-Path $Repository 'vita-agent-protocol\target\release')
         ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
-        $native.ConfigureDebugCapture(
-            (@([string]$image.Path, [string]$image.Bytes, [string]$image.Sha256, [string]$image.VolumeSerialHex, [string]$image.FileIdHex) -join "`t"),
-            [string[]]$approvedPinText, [string[]]$candidateRoots, [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000)), $false, $false)
+        $rootPinText = @([string]$image.Path, [string]$image.Bytes, [string]$image.Sha256, [string]$image.VolumeSerialHex, [string]$image.FileIdHex) -join "`t"
+        $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
+        if (Test-D32ProfilePathEqual -Left $image.Path -Right ([string]$currentProfile.Profile.toolchain.cargo.path)) {
+            $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $currentProfile
+            $native.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout)
+        }
+        else {
+            $native.ConfigureDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout, $false, $false)
+        }
         $traceJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
         $traceNative = $native.WaitForDebugTrace($traceJoinTimeout)
         $processTrace = ConvertTo-D32Phase0DebugProcessTraceDocument -Trace $traceNative
@@ -741,7 +778,7 @@ function Invoke-D32Phase0PinnedProcess {
         if ($traceNative.Processes.Count -eq 0) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: root CREATE_PROCESS_DEBUG_EVENT is absent' }
         $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -CommandLine $commandLine
         if ($rootSnapshot.parent_process_id -ne $PID) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: fixed command parent is not the exact runner identity' }
-        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository
+        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable
         if (-not (Test-D32ProfilePathEqual -Left $rootRecord.image_path -Right $image.Path) -or $rootRecord.sha256 -cne $image.Sha256 -or
             $rootRecord.volume_serial_hex -cne $image.VolumeSerialHex -or $rootRecord.file_id_hex -cne $image.FileIdHex -or $rootRecord.command_line -cne $commandLine) {
             throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: root executable path/hash/file ID/argv mismatch'
@@ -750,7 +787,7 @@ function Invoke-D32Phase0PinnedProcess {
             $childSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $child
             $key = "$($childSnapshot.process_id)|$($childSnapshot.creation_date)"
             if ($descendants.Contains($key)) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: duplicate child PID/creation identity' }
-            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository
+            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable
         }
         $exitCode = [int]$native.ExitCode
         $cleanup = $native.CloseJobAndWait(15000)
@@ -957,6 +994,33 @@ function Test-D32Phase0DirectoryEntryExists {
     return $false
 }
 
+function Get-D32Phase0DiagnosticPropertyValue {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+    foreach ($name in $Names) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            foreach ($key in $Object.Keys) {
+                if ([String]::Equals([string]$key, $name, [StringComparison]::Ordinal)) { return $Object[$key] }
+            }
+        }
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -ne $property) { return $property.Value }
+    }
+    return $null
+}
+
+function New-D32Phase0FixtureGitStatePrefixEvidence {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$States)
+
+    if ($States.Count -eq 0) { return $null }
+    $json = ConvertTo-Json -InputObject @($States) -Depth 8 -Compress
+    return 'PHASE0_FIXTURE_GIT_STATE_PREFIX_V1:' + $json
+}
+
 function Write-D32Phase0BlockedDiagnostic {
     param(
         [Parameter(Mandatory = $true)][string]$PrimaryError,
@@ -1010,12 +1074,29 @@ function Write-D32Phase0BlockedDiagnostic {
         [PSCustomObject]@{ Name = 'job_active_processes'; Expected = 0 }
     )
     foreach ($requirement in $traceRequirements) {
-        $property = if ($null -eq $RawV2Trace) { $null } else { $RawV2Trace.PSObject.Properties[$requirement.Name] }
-        if ($null -eq $property -or $property.Value -ne $requirement.Expected) { $unverified.Add("trace.$($requirement.Name)") }
+        $value = Get-D32Phase0DiagnosticPropertyValue -Object $RawV2Trace -Names @($requirement.Name)
+        if ($null -eq $RawV2Trace -or $null -eq $value -or $value -ne $requirement.Expected) { $unverified.Add("trace.$($requirement.Name)") }
     }
-    foreach ($fieldName in @('CleanupSucceeded', 'JobCloseSucceeded', 'JobActiveProcessCountVerified', 'DebuggerThreadJoined', 'RetainedProcessHandlesSignaled', 'DebuggerAssociationQueryVerified', 'DebuggerAssociationAbsent')) {
-        $property = if ($null -eq $NativeCleanup) { $null } else { $NativeCleanup.PSObject.Properties[$fieldName] }
-        if ($null -eq $property -or $property.Value -isnot [bool] -or -not $property.Value) { $unverified.Add("cleanup.$fieldName") }
+    $cleanupRequirements = @(
+        [PSCustomObject]@{ Name = 'CleanupSucceeded'; NativeNames = @('CleanupSucceeded', 'cleanup_succeeded'); TraceNames = @() },
+        [PSCustomObject]@{ Name = 'JobCloseSucceeded'; NativeNames = @('JobCloseSucceeded', 'job_close_succeeded'); TraceNames = @() },
+        [PSCustomObject]@{ Name = 'JobActiveProcessCountVerified'; NativeNames = @('JobActiveProcessCountVerified', 'job_active_process_count_verified'); TraceNames = @() },
+        [PSCustomObject]@{ Name = 'DebuggerThreadJoined'; NativeNames = @('DebuggerThreadJoined', 'debugger_thread_joined'); TraceNames = @('debugger_thread_joined') },
+        [PSCustomObject]@{ Name = 'RetainedProcessHandlesSignaled'; NativeNames = @('RetainedProcessHandlesSignaled', 'retained_process_handles_signaled'); TraceNames = @('retained_process_handles_signaled') },
+        [PSCustomObject]@{ Name = 'DebuggerAssociationQueryVerified'; NativeNames = @('DebuggerAssociationQueryVerified', 'debugger_association_query_verified'); TraceNames = @('debugger_association_query_verified') },
+        [PSCustomObject]@{ Name = 'DebuggerAssociationAbsent'; NativeNames = @('DebuggerAssociationAbsent', 'debugger_association_absent'); TraceNames = @('debugger_association_absent') }
+    )
+    foreach ($requirement in $cleanupRequirements) {
+        $value = Get-D32Phase0DiagnosticPropertyValue -Object $NativeCleanup -Names $requirement.NativeNames
+        if ($null -eq $value -and $requirement.TraceNames.Count -gt 0) {
+            $value = Get-D32Phase0DiagnosticPropertyValue -Object $RawV2Trace -Names $requirement.TraceNames
+        }
+        $verified = $value -is [bool] -and $value
+        if ($requirement.Name -ceq 'JobActiveProcessCountVerified') {
+            $activeCount = Get-D32Phase0DiagnosticPropertyValue -Object $NativeCleanup -Names @('JobActiveProcessCount', 'job_active_process_count')
+            $verified = $verified -and (Test-D32Phase0Integer -Value $activeCount) -and [Int64]$activeCount -eq 0
+        }
+        if (-not $verified) { $unverified.Add("cleanup.$($requirement.Name)") }
     }
     $profileIdentity = [ordered]@{
         bytes = [Int64]$context.Profile.Identity.Bytes
@@ -1029,6 +1110,10 @@ function Write-D32Phase0BlockedDiagnostic {
     $contextUnverified = [System.Collections.Generic.List[string]]::new()
     if ($null -eq $commandRecord) { $contextUnverified.Add('failing_fixed_command') }
     if ($null -eq $ProcessIdentity) { $contextUnverified.Add('process_identity') }
+    else {
+        $identityVerified = Get-D32Phase0DiagnosticPropertyValue -Object $ProcessIdentity -Names @('identity_verified', 'IdentityVerified')
+        if ($identityVerified -isnot [bool] -or -not $identityVerified) { $contextUnverified.Add('process_identity.identity_verified') }
+    }
     foreach ($capture in $captures) { if ($capture.status -cne 'CAPTURED') { $contextUnverified.Add("stream.$($capture.stream)") } }
     $document = [ordered]@{
         schema_version = 1
@@ -1527,7 +1612,7 @@ function Test-D32Phase0MatrixRecord {
                     $traceChild[0].sha256 -cne $child.sha256 -or $traceChild[0].bytes -ne $child.bytes -or
                     $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex -or
                     $traceChild[0].parent_process_id -ne $child.parent_process_id) { throw "Phase0 command[$i] child record differs from synchronized debug CREATE evidence" }
-                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo
+                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo -ExpectedRootPath ([string]$plan.executable) -ImageIdentity $child
                 if ([String]::IsNullOrWhiteSpace($actualReason) -or $child.allowed_image_reason -cne $actualReason) { throw "Phase0 command[$i] contains unknown child image" }
             }
         }
@@ -2006,6 +2091,10 @@ function Invoke-D32Phase0Matrix {
         foreach ($secondary in @($fixtureGitStateFailure, $transcriptFailure)) {
             if (-not [String]::IsNullOrWhiteSpace([string]$secondary)) { $diagnosticSecondary.Add([string]$secondary) }
         }
+        if ($null -ne $fixtureFailure -and $fixtureGitStates.Count -gt 0) {
+            $prefixEvidence = New-D32Phase0FixtureGitStatePrefixEvidence -States @($fixtureGitStates)
+            if (-not [String]::IsNullOrWhiteSpace($prefixEvidence)) { $diagnosticSecondary.Add($prefixEvidence) }
+        }
         foreach ($captureFailure in @($fixtureText -split "`r?`n" | Where-Object { $_.StartsWith('D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:', [StringComparison]::Ordinal) })) {
             $diagnosticSecondary.Add([string]$captureFailure.Substring('D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:'.Length))
         }
@@ -2477,8 +2566,18 @@ function Test-D32Phase0MatrixRecordSelfTest {
     try {
         $partialGitStates = @(Get-D32Phase0FixtureGitStates -Lines @($gitStateLines.ToArray() | Select-Object -First 2) -ExpectedCandidateSha $candidate -AllowPartial)
         & $add 'failed fixture Git-state capture accepts only a valid ordered clean-candidate prefix' ($partialGitStates.Count -eq 2 -and $partialGitStates[0].phase -eq 1 -and $partialGitStates[0].edge -ceq 'before' -and $partialGitStates[1].edge -ceq 'after')
+        $prefixEvidence = New-D32Phase0FixtureGitStatePrefixEvidence -States $partialGitStates
+        $prefixPayload = ConvertFrom-D32Phase0Json ($prefixEvidence.Substring('PHASE0_FIXTURE_GIT_STATE_PREFIX_V1:'.Length))
+        & $add 'blocked diagnostic can preserve the exact validated Git-state prefix without claiming later markers' `
+            ($prefixEvidence.StartsWith('PHASE0_FIXTURE_GIT_STATE_PREFIX_V1:', [StringComparison]::Ordinal) -and
+                $prefixPayload.Count -eq 2 -and $prefixPayload[0].phase -eq 1 -and $prefixPayload[0].edge -ceq 'before' -and
+                $prefixPayload[1].phase -eq 1 -and $prefixPayload[1].edge -ceq 'after' -and
+                @($prefixPayload | Where-Object { $_.clean -ne $true -or $_.head -cne $candidate }).Count -eq 0)
     }
-    catch { & $add 'failed fixture Git-state capture accepts only a valid ordered clean-candidate prefix' $false $_.Exception.Message }
+    catch {
+        & $add 'failed fixture Git-state capture accepts only a valid ordered clean-candidate prefix' $false $_.Exception.Message
+        & $add 'blocked diagnostic can preserve the exact validated Git-state prefix without claiming later markers' $false $_.Exception.Message
+    }
     $reorderedPartialGitState = @($gitStateLines.ToArray() | Select-Object -First 2)
     $reorderedPartialGitState[0], $reorderedPartialGitState[1] = $reorderedPartialGitState[1], $reorderedPartialGitState[0]
     $reorderedPartialRejected = $false
@@ -2612,10 +2711,66 @@ function Test-D32Phase0MatrixRecordSelfTest {
         'C:\\unapproved\\ssh-add.exe', 'C:\\unapproved\\plink.exe', 'C:\\unapproved\\bash.exe', 'C:\\unapproved\\pwsh-preview.exe',
         'C:\\unapproved\\command.com', 'C:\\unapproved\\nested-script.cmd'
     )
-    $deniedProcessImagesBlocked = @($deniedProcessImages | Where-Object { -not [String]::IsNullOrWhiteSpace((Get-D32Phase0AllowedChildImageReason -ImagePath $_ -ValidatedProfile $minimalProfile -Repository 'C:\\candidate')) }).Count -eq 0
+    $deniedProcessImagesBlocked = @($deniedProcessImages | Where-Object { -not [String]::IsNullOrWhiteSpace((Get-D32Phase0AllowedChildImageReason -ImagePath $_ -ValidatedProfile $minimalProfile -Repository 'C:\\candidate' -ExpectedRootPath 'C:\\pinned\\cargo.exe')) }).Count -eq 0
     & $add 'command processors, shells, Git remotes, SSH clients, and credential helpers are blocked' $deniedProcessImagesBlocked
-    & $add 'candidate debug target process images require explicit candidate-owned classification' ((Get-D32Phase0AllowedChildImageReason -ImagePath 'C:\\candidate\\vita-agent\\target\\debug\\build-script.exe' -ValidatedProfile $minimalProfile -Repository 'C:\\candidate') -ceq 'candidate-owned-target-image-observed-by-opened-handle')
-    & $add 'candidate release build-script images are covered by captured opened-handle identity' ((Get-D32Phase0AllowedChildImageReason -ImagePath 'C:\\candidate\\src-tauri\\target\\release\\build\\script.exe' -ValidatedProfile $minimalProfile -Repository 'C:\\candidate') -ceq 'candidate-owned-target-image-observed-by-opened-handle')
+    & $add 'candidate debug target process images require explicit candidate-owned classification' ((Get-D32Phase0AllowedChildImageReason -ImagePath 'C:\\candidate\\vita-agent\\target\\debug\\build-script.exe' -ValidatedProfile $minimalProfile -Repository 'C:\\candidate' -ExpectedRootPath 'C:\\pinned\\cargo.exe') -ceq 'candidate-owned-target-image-observed-by-opened-handle')
+    & $add 'candidate release build-script images are covered by captured opened-handle identity' ((Get-D32Phase0AllowedChildImageReason -ImagePath 'C:\\candidate\\src-tauri\\target\\release\\build\\script.exe' -ValidatedProfile $minimalProfile -Repository 'C:\\candidate' -ExpectedRootPath 'C:\\pinned\\cargo.exe') -ceq 'candidate-owned-target-image-observed-by-opened-handle')
+
+    $approvedVctipRecord = [PSCustomObject]@{
+        Path = 'E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe'
+        Bytes = [Int64]335328
+        Sha256 = 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996'
+        VolumeSerialHex = '749614a1961465c0'
+        FileIdHex = '0b5d2000000001000000000000000000'
+    }
+    $cargoRootPath = 'C:\\pinned\\cargo.exe'
+    $vctipProfile = [PSCustomObject]@{
+        Profile = [PSCustomObject]@{ toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]@{ path = $cargoRootPath } } }
+        ExecutableInventory = @($approvedVctipRecord)
+        WindowsImageInventory = @()
+    }
+    $vctipOpenedIdentity = [PSCustomObject]@{
+        Path = $approvedVctipRecord.Path; Bytes = $approvedVctipRecord.Bytes; Sha256 = $approvedVctipRecord.Sha256
+        VolumeSerialHex = $approvedVctipRecord.VolumeSerialHex; FileIdHex = $approvedVctipRecord.FileIdHex
+    }
+    $exactVctipAdmission = Get-D32Phase0AllowedChildImageReason -ImagePath $approvedVctipRecord.Path -ValidatedProfile $vctipProfile -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $vctipOpenedIdentity
+    & $add 'exact Profile V2 VCTIP path and opened-handle identity are allowed only below the caller-pinned Cargo root' `
+        ($exactVctipAdmission -ceq 'caller-pinned-msvc-vctip-descendant-of-fixed-cargo-root')
+    & $add 'VCTIP is blocked below a non-Cargo root or a different profile Cargo path' `
+        ((Get-D32Phase0AllowedChildImageReason -ImagePath $approvedVctipRecord.Path -ValidatedProfile $vctipProfile -Repository 'C:\\candidate' -ExpectedRootPath 'C:\\other\\cargo.exe' -ImageIdentity $vctipOpenedIdentity) -eq $null -and
+            (Get-D32Phase0AllowedChildImageReason -ImagePath $approvedVctipRecord.Path -ValidatedProfile ([PSCustomObject]@{ Profile = [PSCustomObject]@{ toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]@{ path = 'C:\\other\\cargo.exe' } } }; ExecutableInventory = @($approvedVctipRecord); WindowsImageInventory = @() }) -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $vctipOpenedIdentity) -eq $null)
+    $vctipHandleDriftRejected = $false
+    foreach ($mutation in @(
+        [PSCustomObject]@{ Field = 'Bytes'; Value = [Int64]335329 },
+        [PSCustomObject]@{ Field = 'Sha256'; Value = ('0' * 64) },
+        [PSCustomObject]@{ Field = 'VolumeSerialHex'; Value = '749614a1961465c1' },
+        [PSCustomObject]@{ Field = 'FileIdHex'; Value = '0b5d2000000001000000000000000001' }
+    )) {
+        $driftedIdentity = [PSCustomObject]@{
+            Path = $approvedVctipRecord.Path; Bytes = $approvedVctipRecord.Bytes; Sha256 = $approvedVctipRecord.Sha256
+            VolumeSerialHex = $approvedVctipRecord.VolumeSerialHex; FileIdHex = $approvedVctipRecord.FileIdHex
+        }
+        $driftedIdentity.($mutation.Field) = $mutation.Value
+        if ($null -ne (Get-D32Phase0AllowedChildImageReason -ImagePath $approvedVctipRecord.Path -ValidatedProfile $vctipProfile -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $driftedIdentity)) { $vctipHandleDriftRejected = $false; break }
+        $vctipHandleDriftRejected = $true
+    }
+    & $add 'VCTIP opened-handle bytes, hash, volume, and file-ID drift fail closed' $vctipHandleDriftRejected
+    $renamedVctipIdentity = [PSCustomObject]@{
+        Path = 'E:\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip-copy.exe'
+        Bytes = $approvedVctipRecord.Bytes; Sha256 = $approvedVctipRecord.Sha256
+        VolumeSerialHex = $approvedVctipRecord.VolumeSerialHex; FileIdHex = '0b5d2000000001000000000000000001'
+    }
+    & $add 'copied or renamed VCTIP content cannot inherit ordinary pinned-image or candidate-target admission' `
+        ((Get-D32Phase0AllowedChildImageReason -ImagePath $renamedVctipIdentity.Path -ValidatedProfile $vctipProfile -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $renamedVctipIdentity) -eq $null)
+    $duplicateVctipProfile = [PSCustomObject]@{
+        Profile = $vctipProfile.Profile
+        ExecutableInventory = @($approvedVctipRecord, $renamedVctipIdentity)
+        WindowsImageInventory = @()
+    }
+    $duplicateVctipProfileRejected = $false
+    try { $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $duplicateVctipProfile }
+    catch { $duplicateVctipProfileRejected = $_.Exception.Message -like '*D32_VCTIP_PROFILE_PIN_BLOCKED*' }
+    & $add 'Profile V2 rejects duplicate/copied VCTIP content under a renamed inventory path' $duplicateVctipProfileRejected
 
     $validCounts = [PSCustomObject][ordered]@{ passed = [Int64]3; failed = [Int64]0; ignored = [Int64]1; measured = [Int64]0; filtered_out = [Int64]1 }
     & $add 'suite counts reconcile with exact list, ignore and skip totals' (Test-D32Phase0SuiteCounts -Counts $validCounts -TestCount 5 -ExpectedIgnored 1 -ExpectedFiltered 1)
@@ -2890,8 +3045,10 @@ function Test-D32Phase0MatrixRecordSelfTest {
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
         $sidecarPath = Join-Path $fixtureOutputRoot 'fixture-build-provenance.json'
         $emptyLogPath = Join-Path $fixtureOutputRoot 'empty-stderr.log'
+        $emptyStdoutPath = Join-Path $fixtureOutputRoot 'empty-stdout.log'
         [IO.File]::WriteAllText($manifestPath, '{}', [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllBytes($emptyLogPath, [byte[]]@())
+        [IO.File]::WriteAllBytes($emptyStdoutPath, [byte[]]@())
         $previousFailureContext = $script:D32Phase0FailureContext
         $script:D32Phase0FailureContext = [PSCustomObject]@{
             EvidenceRoot = $selfTestRoot
@@ -2960,7 +3117,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         try {
             $diagnosticPath = Write-D32Phase0BlockedDiagnostic `
                 -PrimaryError 'selftest primary failure' `
-                -SecondaryErrors @('selftest secondary cleanup failure') `
+                -SecondaryErrors @('selftest secondary cleanup failure', (New-D32Phase0FixtureGitStatePrefixEvidence -States @($partialGitStates))) `
                 -Command ([ordered]@{ name = 'selftest-fixed-command'; arguments = @('fetch', '--locked') }) `
                 -ProcessIdentity $null `
                 -RawV2Trace ([PSCustomObject]@{ record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'; schema_version = 2; state = 'BLOCKED'; event_chain_complete = $false; job_active_processes = 2 }) `
@@ -2992,6 +3149,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 $diagnostic.phase1_allowed -ne $false -or $diagnostic.aggregate_allowed -ne $false -or $diagnostic.run_id -cne $runId -or
                 -not $diagnosticBindingValid -or
                 $diagnostic.primary_error -cne 'selftest primary failure' -or @($diagnostic.secondary_errors | Where-Object { $_ -ceq 'selftest secondary cleanup failure' }).Count -ne 1 -or
+                @($diagnostic.secondary_errors | Where-Object { $_ -ceq (New-D32Phase0FixtureGitStatePrefixEvidence -States @($partialGitStates)) }).Count -ne 1 -or
                 $diagnostic.raw_v2_trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or
                 $diagnostic.job_debug_cleanup.verification -cne 'UNVERIFIED' -or @($diagnostic.job_debug_cleanup.unverified_fields).Count -eq 0 -or
                 $diagnostic.job_debug_cleanup.raw_native_cleanup.CleanupSucceeded -ne $false -or $diagnostic.job_debug_cleanup.raw_native_cleanup.JobActiveProcessCount -ne 2 -or
@@ -3037,6 +3195,42 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 $missingNoProcessContextFields.Count -eq 0 -and $noProcessDiagnostic.ordered_stream_captures.Count -eq 2 -and
                 @($noProcessDiagnostic.ordered_stream_captures | Where-Object { $_.status -cne 'UNAVAILABLE' -or $null -ne $_.reference }).Count -eq 0
             & $add 'blocked diagnostic with no process creation leaves all 18 trace/cleanup fields explicitly UNVERIFIED' $noProcessUnverifiedValid
+
+            $noProcessReference = Get-D32Phase0FileReference -Path $noProcessDiagnosticPath
+            if (-not (Test-D32ProfilePathWithin -Child $noProcessDiagnosticPath -Parent $selfTestRoot) -or
+                -not (Test-D32ProfileNoReparsePath -Path $noProcessDiagnosticPath) -or
+                (Get-D32Phase0FileReference -Path $noProcessDiagnosticPath).sha256 -cne $noProcessReference.sha256) {
+                throw 'blocked diagnostic snake-case cleanup self-test target is not the exact test-owned file'
+            }
+            [IO.File]::Delete($noProcessDiagnosticPath)
+            $snakeCaseTrace = [ordered]@{
+                record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
+                dedicated_debugger_thread = $true; debugger_kill_on_exit_enabled = $true; debugger_thread_exited = $true
+                debugger_thread_joined = $true; retained_process_handles_signaled = $true
+                debugger_association_query_verified = $true; debugger_association_absent = $true
+                job_accounting_verified = $true; accounting_consistent = $false; event_chain_complete = $false; job_active_processes = 0
+            }
+            $snakeCaseCleanup = [ordered]@{
+                cleanup_succeeded = $true; job_close_succeeded = $true; job_active_process_count_verified = $true
+                job_active_process_count = 0
+            }
+            $snakeCaseDiagnosticPath = Write-D32Phase0BlockedDiagnostic `
+                -PrimaryError 'selftest blocked after verified native cleanup' `
+                -Command ([ordered]@{ name = 'selftest-fixed-cargo-command'; arguments = @('build', '--locked') }) `
+                -ProcessIdentity ([ordered]@{ process_id = 30292; identity_verified = $false }) `
+                -RawV2Trace $snakeCaseTrace `
+                -NativeCleanup $snakeCaseCleanup `
+                -StdoutPath $emptyStdoutPath `
+                -StderrPath $emptyLogPath
+            $snakeCaseDiagnostic = [IO.File]::ReadAllText($snakeCaseDiagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-D32Phase0Json
+            $snakeCleanupFields = @($snakeCaseDiagnostic.job_debug_cleanup.unverified_fields | Where-Object { $_ -like 'cleanup.*' })
+            $snakeTraceFields = @($snakeCaseDiagnostic.job_debug_cleanup.unverified_fields)
+            $identityUnverified = @($snakeCaseDiagnostic.unverified_fields | Where-Object { $_ -ceq 'process_identity.identity_verified' }).Count -eq 1
+            $snakeCaseCleanupValidated = $snakeCaseDiagnostic.job_debug_cleanup.verification -ceq 'UNVERIFIED' -and
+                $snakeCleanupFields.Count -eq 0 -and $snakeTraceFields.Count -eq 2 -and
+                $snakeTraceFields -contains 'trace.accounting_consistent' -and $snakeTraceFields -contains 'trace.event_chain_complete' -and
+                $identityUnverified -and $snakeCaseDiagnostic.process_identity.identity_verified -eq $false
+            & $add 'blocked diagnostic reads raw V2 snake-case cleanup precisely and marks incomplete process identity explicitly' $snakeCaseCleanupValidated
         }
         catch { $diagnosticWriteFailure = $_.Exception.Message }
         finally { $script:D32Phase0FailureContext = $previousFailureContext }
@@ -3148,6 +3342,83 @@ function Test-D32Phase0MatrixRecordSelfTest {
             & $add 'fixture build provenance v3 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V3')
         }
         catch { & $add 'fixture build provenance v3 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
+
+        $vctipTraceProfile = [PSCustomObject]@{
+            Profile = $fakeProfile.Profile
+            ExecutableInventory = @($fakeProfile.ExecutableInventory) + @($approvedVctipRecord)
+            WindowsImageInventory = @($fakeProfile.WindowsImageInventory)
+        }
+        $vctipTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $traceRecords[0].process_trace -Depth 12 -Compress)
+        $vctipRootRecord = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace.processes[0] -Depth 8 -Compress)
+        $vctipRootPid = [uint32]$vctipRootRecord.process_id
+        $vctipRootCreation = [Int64]$vctipRootRecord.creation_filetime
+        $vctipChildPid = $vctipRootPid + 300
+        $vctipChildCreation = $vctipRootCreation + 10
+        $vctipChildCreatedAt = [DateTime]::FromFileTimeUtc($vctipChildCreation).ToString('o')
+        $vctipChildExitCreation = $vctipRootCreation + 20
+        $vctipChildExitAt = [DateTime]::FromFileTimeUtc($vctipChildExitCreation).ToString('o')
+        $vctipRootExitCreation = $vctipRootCreation + 30
+        $vctipRootExitAt = [DateTime]::FromFileTimeUtc($vctipRootExitCreation).ToString('o')
+        $vctipRootRecord.exit_sequence = 4
+        $vctipRootRecord.exited_at_utc = $vctipRootExitAt
+        $vctipChildRecord = [PSCustomObject][ordered]@{
+            process_id = $vctipChildPid; parent_process_id = $vctipRootPid
+            creation_filetime = $vctipChildCreation; parent_creation_filetime = $vctipRootCreation
+            image_path = $approvedVctipRecord.Path; bytes = [Int64]$approvedVctipRecord.Bytes
+            sha256 = $approvedVctipRecord.Sha256; volume_serial_hex = $approvedVctipRecord.VolumeSerialHex
+            file_id_hex = $approvedVctipRecord.FileIdHex
+            allowed_image_reason = 'caller-pinned-msvc-vctip-descendant-of-fixed-cargo-root'
+            image_verified = $true; exited = $true; exit_code = 0; create_sequence = 2; exit_sequence = 3
+            created_at_utc = $vctipChildCreatedAt; exited_at_utc = $vctipChildExitAt
+        }
+        $vctipTrace.process_events = @(
+            [PSCustomObject][ordered]@{ sequence = 1; kind = 'CREATE'; process_id = $vctipRootPid; parent_process_id = [uint32]$vctipRootRecord.parent_process_id; creation_filetime = $vctipRootCreation; parent_creation_filetime = [Int64]$vctipRootRecord.parent_creation_filetime; exit_code = 0 },
+            [PSCustomObject][ordered]@{ sequence = 2; kind = 'CREATE'; process_id = $vctipChildPid; parent_process_id = $vctipRootPid; creation_filetime = $vctipChildCreation; parent_creation_filetime = $vctipRootCreation; exit_code = 0 },
+            [PSCustomObject][ordered]@{ sequence = 3; kind = 'EXIT'; process_id = $vctipChildPid; parent_process_id = $vctipRootPid; creation_filetime = $vctipChildCreation; parent_creation_filetime = $vctipRootCreation; exit_code = 0 },
+            [PSCustomObject][ordered]@{ sequence = 4; kind = 'EXIT'; process_id = $vctipRootPid; parent_process_id = [uint32]$vctipRootRecord.parent_process_id; creation_filetime = $vctipRootCreation; parent_creation_filetime = [Int64]$vctipRootRecord.parent_creation_filetime; exit_code = 0 }
+        )
+        $vctipTrace.processes = @($vctipRootRecord, $vctipChildRecord)
+        $vctipTrace.process_create_event_count = 2; $vctipTrace.process_exit_event_count = 2; $vctipTrace.process_event_count = 4
+        $vctipTrace.debug_event_count = [Int64]$vctipTrace.process_event_count + [Int64]$vctipTrace.thread_create_event_count +
+            [Int64]$vctipTrace.thread_exit_event_count + [Int64]$vctipTrace.image_load_event_count +
+            [Int64]$vctipTrace.image_unload_event_count + [Int64]$vctipTrace.exception_event_count +
+            [Int64]$vctipTrace.debug_string_event_count
+        $vctipTrace.job_total_processes = 2; $vctipTrace.retained_process_handle_count = 3
+        $vctipTraceAccepted = $false
+        $vctipTraceFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $vctipTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+            $vctipTraceAccepted = $true
+        }
+        catch { $vctipTraceFailure = $_.Exception.Message }
+        & $add 'V2 process-trace validator accepts only an exact VCTIP image with the fixed Cargo root and retained parent chain' $vctipTraceAccepted ([string]$vctipTraceFailure)
+        $unknownVctipParent = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
+        $unknownVctipParent.process_events[1].parent_process_id = $vctipChildPid + 1
+        $unknownVctipParentRejected = $false
+        $unknownVctipParentFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $unknownVctipParent -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+        }
+        catch { $unknownVctipParentFailure = $_.Exception.Message; $unknownVctipParentRejected = $unknownVctipParentFailure -like '*parent identity is unknown, exited, or ambiguous*' }
+        & $add 'VCTIP CREATE with an unknown or non-retained parent is rejected by V2 event-chain validation' $unknownVctipParentRejected ([string]$unknownVctipParentFailure)
+        $driftedVctipTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
+        $driftedVctipTrace.processes[1].file_id_hex = '0b5d2000000001000000000000000001'
+        $driftedVctipTraceRejected = $false
+        $driftedVctipTraceFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $driftedVctipTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+        }
+        catch {
+            $driftedVctipTraceFailure = $_.Exception.Message
+            $driftedVctipTraceRejected = $driftedVctipTraceFailure -like '*outside exact pinned inventory*' -or $driftedVctipTraceFailure -like '*caller-pinned child image changed*'
+        }
+        & $add 'V2 trace rejects a VCTIP opened file-ID mismatch before evidence acceptance' $driftedVctipTraceRejected ([string]$driftedVctipTraceFailure)
 
         $unclassifiedEventTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
         $unclassifiedEventTrace.process_traces[0].process_trace.debug_event_count++

@@ -1156,6 +1156,17 @@ function Assert-D32PreflightSelfTestGitSetup {
             $excludePath = Join-Path $infoDirectory 'exclude'
             if (Test-Path -LiteralPath $excludePath) { [void](Assert-D32NoReparsePath -Path $excludePath) }
             [IO.File]::WriteAllText($excludePath, "# allowed comments`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
+            $indexPath = Join-Path $gitDirectory 'index'
+            if (Test-Path -LiteralPath $indexPath) {
+                [void](Assert-D32NoReparsePath -Path $indexPath)
+            }
+            else {
+                $emptyIndexHeader = [byte[]]@(0x44, 0x49, 0x52, 0x43, 0, 0, 0, 2, 0, 0, 0, 0)
+                $emptyIndexHasher = [Security.Cryptography.SHA1]::Create()
+                try { $emptyIndexChecksum = $emptyIndexHasher.ComputeHash($emptyIndexHeader) }
+                finally { $emptyIndexHasher.Dispose() }
+                [IO.File]::WriteAllBytes($indexPath, [byte[]]($emptyIndexHeader + $emptyIndexChecksum))
+            }
         }
     }
     else {

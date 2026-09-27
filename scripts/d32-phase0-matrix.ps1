@@ -2590,6 +2590,10 @@ function Test-D32Phase0MatrixRecordSelfTest {
     if (Test-Path -LiteralPath $selfTestRoot) { throw 'Phase0 sidecar self-test root unexpectedly already exists' }
     $profileSelfTestRoot = Join-Path $tempBase ('d32-phase0-profile-selftest-' + [Guid]::NewGuid().ToString('N'))
     if (Test-Path -LiteralPath $profileSelfTestRoot) { throw 'Phase0 profile self-test root unexpectedly already exists' }
+    $startupSelfTestRoot = Join-Path $tempBase ('d32-phase0-startup-selftest-' + [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $startupSelfTestRoot) { throw 'Phase0 startup self-test root unexpectedly already exists' }
+    $startupSelfTestModuleName = 'D32Phase0StartupSelfTest_' + [Guid]::NewGuid().ToString('N')
+    $startupSelfTestModule = $null
     [void][IO.Directory]::CreateDirectory($profileSelfTestRoot)
     try {
         if (-not (Test-D32ProfileNoReparsePath -Path $profileSelfTestRoot) -or -not (Test-D32ProfilePathEqual -Left ([IO.Path]::GetDirectoryName($profileSelfTestRoot)) -Right $tempBase)) { throw 'Phase0 profile self-test temp root is not a direct regular temp child' }
@@ -2616,6 +2620,178 @@ function Test-D32Phase0MatrixRecordSelfTest {
         $null = Test-D32ProfileDirectoryIdentity -Path $runRoot -VolumeSerialHex $runRootIdentity.VolumeSerialHex -FileIdHex $runRootIdentity.FileIdHex
         $null = Test-D32ProfileDirectoryIdentity -Path $cargoHome -VolumeSerialHex $cargoHomeIdentity.VolumeSerialHex -FileIdHex $cargoHomeIdentity.FileIdHex
         $null = Test-D32ProfileDirectoryIdentity -Path $tempRoot -VolumeSerialHex $tempRootIdentity.VolumeSerialHex -FileIdHex $tempRootIdentity.FileIdHex
+
+        $fixtureStartupScriptPath = Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'
+        $startupTestModuleBody = {
+            param([string]$Phase0ScriptPath, [string]$FixtureScriptPath)
+            . $Phase0ScriptPath -Phase0LibraryOnly
+            $preflightLibraryPath = Join-Path (Split-Path -Parent $Phase0ScriptPath) 'd32-preflight.ps1'
+            . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+            . $FixtureScriptPath -D32LauncherLibraryOnly
+
+            function Invoke-D32Phase0StartupSelfTest {
+                param(
+                    [Parameter(Mandatory = $true)][string]$OutputRoot,
+                    [Parameter(Mandatory = $true)][string]$Repository,
+                    [Parameter(Mandatory = $true)][string]$CandidateSha,
+                    [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+                    [Parameter(Mandatory = $true)][string]$RunId
+                )
+
+                $binding = New-D32Phase0FixtureOutputRoot `
+                    -Path $OutputRoot `
+                    -Repository $Repository `
+                    -ExpectedCandidateSha $CandidateSha `
+                    -ValidatedProfile $ValidatedProfile `
+                    -RunId $RunId
+                $fixtureOwner = Test-D32FixturePhase0OwnerBinding `
+                    -OutputRoot $OutputRoot `
+                    -ExpectedCandidateSha $CandidateSha `
+                    -ValidatedProfile $ValidatedProfile `
+                    -OwnerBinding $binding
+                $storage = Initialize-D32FixturePhase0Storage `
+                    -OutputRoot $OutputRoot `
+                    -Repository $Repository `
+                    -ExpectedCandidateSha $CandidateSha `
+                    -ValidatedProfile $ValidatedProfile `
+                    -OwnerBinding $binding
+                $script:D32Phase0StorageContext = $storage.StorageContext
+
+                $fakeBoundaryState = [PSCustomObject]@{ Called = $false }
+                $fakeFetchAction = {
+                    $fakeBoundaryState.Called = $true
+                    throw 'PHASE0_SELFTEST_FAKE_PRE_CARGO_STOP'
+                }.GetNewClosure()
+                $previousFailureContext = $script:D32Phase0FailureContext
+                $script:D32Phase0FailureContext = [PSCustomObject]@{
+                    EvidenceRoot = $OutputRoot
+                    CandidateSha = $CandidateSha
+                    Profile = $ValidatedProfile
+                    RunId = $binding.RunId
+                    RootIdentity = $binding.RootIdentity
+                    OwnerMarker = $binding.OwnerMarker
+                }
+                try {
+                    $boundaryFailure = $null
+                    try {
+                        $null = Invoke-D32FixturePreCargoBoundary `
+                            -OutputRoot $OutputRoot `
+                            -Repository $Repository `
+                            -ExpectedCandidateSha $CandidateSha `
+                            -ValidatedProfile $ValidatedProfile `
+                            -OwnerBinding $binding `
+                            -StorageContext $storage.StorageContext `
+                            -FetchAction $fakeFetchAction
+                    }
+                    catch { $boundaryFailure = $_.Exception.Message }
+
+                    $tamperedStorage = [ordered]@{
+                        evidence_root = $storage.StorageContext.evidence_root
+                        owner_marker = $storage.StorageContext.owner_marker
+                        run_root = $storage.StorageContext.run_root
+                        cargo_home = $storage.StorageContext.cargo_home
+                        temp_root = [ordered]@{
+                            path = $storage.StorageContext.temp_root.path
+                            volume_serial_hex = $storage.StorageContext.temp_root.volume_serial_hex
+                            file_id_hex = 'f' * 32
+                        }
+                        run_id = $storage.StorageContext.run_id
+                    }
+                    $tamperedBoundaryState = [PSCustomObject]@{ Called = $false }
+                    $neverFetchAction = { $tamperedBoundaryState.Called = $true }.GetNewClosure()
+                    $tamperedBoundaryFailure = $null
+                    try {
+                        $null = Invoke-D32FixturePreCargoBoundary `
+                            -OutputRoot $OutputRoot `
+                            -Repository $Repository `
+                            -ExpectedCandidateSha $CandidateSha `
+                            -ValidatedProfile $ValidatedProfile `
+                            -OwnerBinding $binding `
+                            -StorageContext $tamperedStorage `
+                            -FetchAction $neverFetchAction
+                    }
+                    catch { $tamperedBoundaryFailure = $_.Exception.Message }
+
+                    $null = Write-D32Phase0BlockedDiagnostic `
+                        -PrimaryError ([string]$boundaryFailure) `
+                        -SecondaryErrors @('self-test fake boundary launched no child process') `
+                        -Command $null `
+                        -ProcessIdentity $null `
+                        -RawV2Trace $null `
+                        -NativeCleanup $null `
+                        -StdoutPath $null `
+                        -StderrPath $null
+                    $diagnosticPath = Join-Path $OutputRoot $script:D32Phase0BlockedDiagnosticName
+                    $diagnostic = [IO.File]::ReadAllText($diagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-D32Phase0Json
+
+                    $rootAndOwnerPassed = $fixtureOwner.RunId -ceq $RunId -and
+                        (Test-D32ProfilePathEqual -Left $fixtureOwner.EvidenceRoot -Right $OutputRoot) -and
+                        $fixtureOwner.EvidenceRootIdentity.FileIdHex -ceq $binding.RootIdentity.FileIdHex -and
+                        $fixtureOwner.OwnerMarker.file_id_hex -ceq $binding.OwnerMarker.file_id_hex -and
+                        (Test-D32ProfileNoReparsePath -Path $OutputRoot)
+                    $compactStoragePassed = (Test-D32ProfilePathEqual -Left $storage.RunRoot -Right (Join-Path $OutputRoot 'r')) -and
+                        (Test-D32ProfilePathEqual -Left $storage.CargoHome -Right (Join-Path (Join-Path $OutputRoot 'r') 'c')) -and
+                        (Test-D32ProfilePathEqual -Left $storage.TempRoot -Right (Join-Path (Join-Path $OutputRoot 'r') 't')) -and
+                        (Test-D32CargoHome -Path $storage.CargoHome -Repository $Repository -RequireEmpty).Empty -and
+                        $storage.StorageContext.run_id -ceq $RunId
+                    $boundaryStoppedBeforeCargo = $fakeBoundaryState.Called -and
+                        $boundaryFailure -ceq 'PHASE0_SELFTEST_FAKE_PRE_CARGO_STOP' -and
+                        $diagnostic.primary_error -ceq 'PHASE0_SELFTEST_FAKE_PRE_CARGO_STOP'
+                    $boundaryRejectsChangedIdentity = -not $tamperedBoundaryState.Called -and
+                        -not [String]::IsNullOrWhiteSpace([string]$tamperedBoundaryFailure)
+
+                    $requiredContextUnverified = @('failing_fixed_command', 'process_identity', 'stream.stdout', 'stream.stderr')
+                    $requiredTraceUnverified = @(
+                        'trace.dedicated_debugger_thread', 'trace.debugger_kill_on_exit_enabled', 'trace.debugger_thread_exited',
+                        'trace.debugger_thread_joined', 'trace.retained_process_handles_signaled',
+                        'trace.debugger_association_query_verified', 'trace.debugger_association_absent',
+                        'trace.job_accounting_verified', 'trace.accounting_consistent', 'trace.event_chain_complete',
+                        'trace.job_active_processes'
+                    )
+                    $requiredCleanupUnverified = @(
+                        'cleanup.CleanupSucceeded', 'cleanup.JobCloseSucceeded', 'cleanup.JobActiveProcessCountVerified',
+                        'cleanup.DebuggerThreadJoined', 'cleanup.RetainedProcessHandlesSignaled',
+                        'cleanup.DebuggerAssociationQueryVerified', 'cleanup.DebuggerAssociationAbsent'
+                    )
+                    $noProcessSidecarPassed = $diagnostic.status -ceq 'BLOCKED' -and
+                        $diagnostic.gate_authority -ceq 'NONE' -and $diagnostic.phase1_allowed -eq $false -and $diagnostic.aggregate_allowed -eq $false -and
+                        $null -eq $diagnostic.failing_fixed_command -and $null -eq $diagnostic.process_identity -and $null -eq $diagnostic.raw_v2_trace -and
+                        @($requiredContextUnverified | Where-Object { $diagnostic.unverified_fields -cnotcontains $_ }).Count -eq 0 -and
+                        $diagnostic.job_debug_cleanup.verification -ceq 'UNVERIFIED' -and $null -eq $diagnostic.job_debug_cleanup.raw_native_cleanup -and
+                        @($requiredTraceUnverified | Where-Object { $diagnostic.job_debug_cleanup.unverified_fields -cnotcontains $_ }).Count -eq 0 -and
+                        @($requiredCleanupUnverified | Where-Object { $diagnostic.job_debug_cleanup.unverified_fields -cnotcontains $_ }).Count -eq 0 -and
+                        $diagnostic.ordered_stream_captures.Count -eq 2 -and
+                        $diagnostic.ordered_stream_captures[0].ordinal -eq 1 -and $diagnostic.ordered_stream_captures[0].stream -ceq 'stdout' -and
+                        $diagnostic.ordered_stream_captures[0].status -ceq 'UNAVAILABLE' -and $null -eq $diagnostic.ordered_stream_captures[0].path -and $null -eq $diagnostic.ordered_stream_captures[0].reference -and
+                        $diagnostic.ordered_stream_captures[1].ordinal -eq 2 -and $diagnostic.ordered_stream_captures[1].stream -ceq 'stderr' -and
+                        $diagnostic.ordered_stream_captures[1].status -ceq 'UNAVAILABLE' -and $null -eq $diagnostic.ordered_stream_captures[1].path -and $null -eq $diagnostic.ordered_stream_captures[1].reference
+
+                    return @(
+                        [PSCustomObject]@{ Name = 'fixture startup validates fresh exclusive owner/root and creates compact directories with opened-handle identities'; Passed = [bool]$rootAndOwnerPassed -and [bool]$compactStoragePassed },
+                        [PSCustomObject]@{ Name = 'pre-Cargo boundary reaches fake fail-closed callback without running Cargo'; Passed = [bool]$boundaryStoppedBeforeCargo },
+                        [PSCustomObject]@{ Name = 'pre-Cargo boundary rejects tampered TEMP handle identity before invoking fetch callback'; Passed = [bool]$boundaryRejectsChangedIdentity },
+                        [PSCustomObject]@{ Name = 'no-process blocked diagnostic preserves explicit V2/Job/stream UNVERIFIED fields and no gate authority'; Passed = [bool]$noProcessSidecarPassed }
+                    )
+                }
+                finally { $script:D32Phase0FailureContext = $previousFailureContext }
+            }
+            Export-ModuleMember -Function Invoke-D32Phase0StartupSelfTest
+        }
+        $startupSelfTestModule = New-Module `
+            -Name $startupSelfTestModuleName `
+            -ArgumentList @($script:D32Phase0ScriptPath, $fixtureStartupScriptPath) `
+            -ScriptBlock $startupTestModuleBody
+        Import-Module $startupSelfTestModule -Force
+        $startupSelfTestCases = @(Invoke-D32Phase0StartupSelfTest `
+            -OutputRoot $startupSelfTestRoot `
+            -Repository $testRepository `
+            -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile `
+            -RunId 'abcdef0123456789abcdef0123456789')
+        foreach ($startupCase in $startupSelfTestCases) { & $add $startupCase.Name ([bool]$startupCase.Passed) }
+        Remove-Module -Name $startupSelfTestModuleName -Force -ErrorAction SilentlyContinue
+        $startupSelfTestModule = $null
+
         $ownerRootNoReparse = Test-D32ProfileNoReparsePath -Path $selfTestRoot
         $staleOwnerRunRejected = $false
         try {
@@ -3022,9 +3198,17 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'file references reject string-coerced zero-byte size' $stringBytesRejected
     }
     finally {
+        if ($null -ne $startupSelfTestModule) {
+            Remove-Module -Name $startupSelfTestModuleName -Force -ErrorAction SilentlyContinue
+            $startupSelfTestModule = $null
+        }
         if (Test-Path -LiteralPath $selfTestRoot) {
             if (-not (Test-D32ProfileNoReparsePath -Path $selfTestRoot) -or -not (Test-D32ProfilePathEqual -Left ([IO.Path]::GetDirectoryName($selfTestRoot)) -Right $tempBase)) { throw 'Phase0 sidecar self-test cleanup target no longer resolves to its exact regular temp child' }
             [IO.Directory]::Delete($selfTestRoot, $true)
+        }
+        if (Test-Path -LiteralPath $startupSelfTestRoot) {
+            if (-not (Test-D32ProfileNoReparsePath -Path $startupSelfTestRoot) -or -not (Test-D32ProfilePathEqual -Left ([IO.Path]::GetDirectoryName($startupSelfTestRoot)) -Right $tempBase)) { throw 'Phase0 startup self-test cleanup target no longer resolves to its exact regular temp child' }
+            [IO.Directory]::Delete($startupSelfTestRoot, $true)
         }
         if (Test-Path -LiteralPath $profileSelfTestRoot) {
             if (-not (Test-D32ProfileNoReparsePath -Path $profileSelfTestRoot) -or -not (Test-D32ProfilePathEqual -Left ([IO.Path]::GetDirectoryName($profileSelfTestRoot)) -Right $tempBase)) { throw 'Phase0 profile self-test cleanup target no longer resolves to its exact regular temp child' }

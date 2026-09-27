@@ -4870,8 +4870,8 @@ function Test-D32FixturePhase0OwnerBinding {
         $marker.volume_serial_hex -cne [string]$markerReference.volume_serial_hex -or $marker.file_id_hex -cne [string]$markerReference.file_id_hex) {
         throw 'PHASE0_OWNER_BLOCKED: create-new owner marker bytes or opened-handle identity changed'
     }
-    if (-not (Test-D32NoReparsePath -Path $expectedMarkerPath) -or
-        [IO.File]::ReadAllText($expectedMarkerPath, [Text.Encoding]::UTF8) -notmatch '"record_type"\s*:\s*"D32_PHASE0_EVIDENCE_OWNER_V1"') {
+    $null = Assert-D32NoReparsePath -Path $expectedMarkerPath
+    if ([IO.File]::ReadAllText($expectedMarkerPath, [Text.Encoding]::UTF8) -notmatch '"record_type"\s*:\s*"D32_PHASE0_EVIDENCE_OWNER_V1"') {
         throw 'PHASE0_OWNER_BLOCKED: owner marker is missing, reparse-backed, or has an unsupported type'
     }
     $ownerDocument = [IO.File]::ReadAllText($expectedMarkerPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable
@@ -4908,6 +4908,111 @@ function Test-D32FixturePhase0OwnerBinding {
             file_id_hex = [string]$marker.file_id_hex
         }
     }
+}
+
+function Initialize-D32FixturePhase0Storage {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][object]$OwnerBinding
+    )
+
+    $ownerContext = Test-D32FixturePhase0OwnerBinding `
+        -OutputRoot $OutputRoot `
+        -ExpectedCandidateSha $ExpectedCandidateSha `
+        -ValidatedProfile $ValidatedProfile `
+        -OwnerBinding $OwnerBinding
+    $runRoot = Join-Path $OutputRoot 'r'
+    $runRootIdentity = New-D32ProfileDirectoryCreateNew -Path $runRoot
+    $cargoHome = Join-Path $runRoot 'c'
+    $cargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $cargoHome
+    $null = Test-D32CargoHome -Path $cargoHome -Repository $Repository -RequireEmpty
+    $tempRoot = Join-Path $runRoot 't'
+    $tempRootIdentity = New-D32ProfileDirectoryCreateNew -Path $tempRoot
+
+    $null = Test-D32ProfileDirectoryIdentity `
+        -Path $OutputRoot `
+        -VolumeSerialHex $ownerContext.EvidenceRootIdentity.VolumeSerialHex `
+        -FileIdHex $ownerContext.EvidenceRootIdentity.FileIdHex
+    $null = Test-D32ProfileDirectoryIdentity -Path $runRoot -VolumeSerialHex $runRootIdentity.VolumeSerialHex -FileIdHex $runRootIdentity.FileIdHex
+    $null = Test-D32ProfileDirectoryIdentity -Path $cargoHome -VolumeSerialHex $cargoHomeIdentity.VolumeSerialHex -FileIdHex $cargoHomeIdentity.FileIdHex
+    $null = Test-D32ProfileDirectoryIdentity -Path $tempRoot -VolumeSerialHex $tempRootIdentity.VolumeSerialHex -FileIdHex $tempRootIdentity.FileIdHex
+
+    $storageContext = [ordered]@{
+        evidence_root = [ordered]@{
+            path = [string]$ownerContext.EvidenceRootIdentity.Path
+            volume_serial_hex = [string]$ownerContext.EvidenceRootIdentity.VolumeSerialHex
+            file_id_hex = [string]$ownerContext.EvidenceRootIdentity.FileIdHex
+        }
+        owner_marker = $ownerContext.OwnerMarker
+        run_root = [ordered]@{ path = [string]$runRootIdentity.Path; volume_serial_hex = [string]$runRootIdentity.VolumeSerialHex; file_id_hex = [string]$runRootIdentity.FileIdHex }
+        cargo_home = [ordered]@{ path = [string]$cargoHomeIdentity.Path; volume_serial_hex = [string]$cargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$cargoHomeIdentity.FileIdHex }
+        temp_root = [ordered]@{ path = [string]$tempRootIdentity.Path; volume_serial_hex = [string]$tempRootIdentity.VolumeSerialHex; file_id_hex = [string]$tempRootIdentity.FileIdHex }
+        run_id = [string]$ownerContext.RunId
+    }
+    return [PSCustomObject]@{
+        OwnerContext = $ownerContext
+        RunRoot = [string]$runRootIdentity.Path
+        CargoHome = [string]$cargoHomeIdentity.Path
+        TempRoot = [string]$tempRootIdentity.Path
+        StorageContext = $storageContext
+    }
+}
+
+function Invoke-D32FixturePreCargoBoundary {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][object]$OwnerBinding,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$StorageContext,
+        [Parameter(Mandatory = $true)][scriptblock]$FetchAction
+    )
+
+    $ownerContext = Test-D32FixturePhase0OwnerBinding `
+        -OutputRoot $OutputRoot `
+        -ExpectedCandidateSha $ExpectedCandidateSha `
+        -ValidatedProfile $ValidatedProfile `
+        -OwnerBinding $OwnerBinding
+    $expectedStorageFields = @('evidence_root', 'owner_marker', 'run_root', 'cargo_home', 'temp_root', 'run_id')
+    $actualStorageFields = @($StorageContext.Keys | ForEach-Object { [string]$_ })
+    if ($actualStorageFields.Count -ne $expectedStorageFields.Count -or
+        @($actualStorageFields | Where-Object { $_ -cnotin $expectedStorageFields }).Count -ne 0 -or
+        @($expectedStorageFields | Where-Object { $_ -cnotin $actualStorageFields }).Count -ne 0) {
+        throw 'PHASE0_STORAGE_BLOCKED: pre-Cargo storage context has missing or extra fields'
+    }
+    if (-not (Test-D32FixtureExactProperties -Object $StorageContext.evidence_root -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32FixtureExactProperties -Object $StorageContext.owner_marker -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32PathEqual -Left ([string]$StorageContext.evidence_root.path) -Right $OutputRoot) -or
+        $StorageContext.evidence_root.volume_serial_hex -cne [string]$ownerContext.EvidenceRootIdentity.VolumeSerialHex -or
+        $StorageContext.evidence_root.file_id_hex -cne [string]$ownerContext.EvidenceRootIdentity.FileIdHex -or
+        $StorageContext.run_id -cne [string]$ownerContext.RunId -or
+        -not (Test-D32PathEqual -Left ([string]$StorageContext.owner_marker.path) -Right ([string]$ownerContext.OwnerMarker.path)) -or
+        $StorageContext.owner_marker.sha256 -cne [string]$ownerContext.OwnerMarker.sha256 -or
+        $StorageContext.owner_marker.bytes -ne [Int64]$ownerContext.OwnerMarker.bytes -or
+        $StorageContext.owner_marker.volume_serial_hex -cne [string]$ownerContext.OwnerMarker.volume_serial_hex -or
+        $StorageContext.owner_marker.file_id_hex -cne [string]$ownerContext.OwnerMarker.file_id_hex) {
+        throw 'PHASE0_STORAGE_BLOCKED: pre-Cargo root/owner/run binding changed'
+    }
+
+    $expectedDirectories = @(
+        [PSCustomObject]@{ Name = 'run_root'; Path = (Join-Path $OutputRoot 'r') },
+        [PSCustomObject]@{ Name = 'cargo_home'; Path = (Join-Path (Join-Path $OutputRoot 'r') 'c') },
+        [PSCustomObject]@{ Name = 'temp_root'; Path = (Join-Path (Join-Path $OutputRoot 'r') 't') }
+    )
+    foreach ($directory in $expectedDirectories) {
+        $record = $StorageContext.($directory.Name)
+        if (-not (Test-D32FixtureExactProperties -Object $record -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32PathEqual -Left ([string]$record.path) -Right $directory.Path)) {
+            throw "PHASE0_STORAGE_BLOCKED: pre-Cargo $($directory.Name) path/identity record is malformed"
+        }
+        $null = Test-D32ProfileDirectoryIdentity -Path $directory.Path -VolumeSerialHex ([string]$record.volume_serial_hex) -FileIdHex ([string]$record.file_id_hex)
+    }
+    $null = Test-D32CargoHome -Path ([string]$StorageContext.cargo_home.path) -Repository $Repository -RequireEmpty
+    return & $FetchAction
 }
 
 function Write-D32NewFixtureBuildProvenance {
@@ -7490,44 +7595,44 @@ if (-not [bool]$validatedToolchainProfile.IsValid) {
 }
 $script:ValidatedToolchainProfile = $validatedToolchainProfile
 if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: operational fixture builds require the fixed Phase0 runner owner binding' }
-$phase0OwnerContext = Test-D32FixturePhase0OwnerBinding -OutputRoot $OutputRoot -ExpectedCandidateSha $candidateSha -ValidatedProfile $validatedToolchainProfile -OwnerBinding $Phase0OwnerBinding
 $cargo = [string]$validatedToolchainProfile.Profile.toolchain.cargo.path
 $cargo = Assert-D32NoReparsePath -Path $cargo
 $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
-$toolchainRunId = [string]$phase0OwnerContext.RunId
-$toolchainRunRoot = Join-Path $OutputRoot 'r'
-$toolchainRunRootIdentity = New-D32ProfileDirectoryCreateNew -Path $toolchainRunRoot
-$fixtureCargoHome = Join-Path $toolchainRunRoot 'c'
-$fixtureCargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $fixtureCargoHome
-$null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot -RequireEmpty
-$fixtureTempRoot = Join-Path $toolchainRunRoot 't'
-$fixtureTempRootIdentity = New-D32ProfileDirectoryCreateNew -Path $fixtureTempRoot
-$null = Test-D32ProfileDirectoryIdentity -Path $OutputRoot -VolumeSerialHex $phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex -FileIdHex $phase0OwnerContext.EvidenceRootIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $toolchainRunRootIdentity.VolumeSerialHex -FileIdHex $toolchainRunRootIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $fixtureCargoHomeIdentity.VolumeSerialHex -FileIdHex $fixtureCargoHomeIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $fixtureTempRoot -VolumeSerialHex $fixtureTempRootIdentity.VolumeSerialHex -FileIdHex $fixtureTempRootIdentity.FileIdHex
-$script:D32Phase0StorageContext = [ordered]@{
-    evidence_root = [ordered]@{ path = [string]$phase0OwnerContext.EvidenceRootIdentity.Path; volume_serial_hex = [string]$phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex; file_id_hex = [string]$phase0OwnerContext.EvidenceRootIdentity.FileIdHex }
-    owner_marker = $phase0OwnerContext.OwnerMarker
-    run_root = [ordered]@{ path = [string]$toolchainRunRootIdentity.Path; volume_serial_hex = [string]$toolchainRunRootIdentity.VolumeSerialHex; file_id_hex = [string]$toolchainRunRootIdentity.FileIdHex }
-    cargo_home = [ordered]@{ path = [string]$fixtureCargoHomeIdentity.Path; volume_serial_hex = [string]$fixtureCargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$fixtureCargoHomeIdentity.FileIdHex }
-    temp_root = [ordered]@{ path = [string]$fixtureTempRootIdentity.Path; volume_serial_hex = [string]$fixtureTempRootIdentity.VolumeSerialHex; file_id_hex = [string]$fixtureTempRootIdentity.FileIdHex }
-    run_id = $toolchainRunId
-}
+$phase0Storage = Initialize-D32FixturePhase0Storage `
+    -OutputRoot $OutputRoot `
+    -Repository $RepoRoot `
+    -ExpectedCandidateSha $candidateSha `
+    -ValidatedProfile $validatedToolchainProfile `
+    -OwnerBinding $Phase0OwnerBinding
+$phase0OwnerContext = $phase0Storage.OwnerContext
+$toolchainRunRoot = [string]$phase0Storage.RunRoot
+$fixtureCargoHome = [string]$phase0Storage.CargoHome
+$fixtureTempRoot = [string]$phase0Storage.TempRoot
+$script:D32Phase0StorageContext = $phase0Storage.StorageContext
+$toolchainRunId = [string]$script:D32Phase0StorageContext.run_id
 $script:D32Phase0FailurePayloadEmitted = $false
 $fixtureManifestEnvironment = Get-D32EnvironmentPlan -EnvironmentRoot (Join-Path $toolchainRunRoot 'manifest-environment')
 Assert-D32FixtureManifestEnvironmentShape -Environment $fixtureManifestEnvironment
 $phaseEvidence = [System.Collections.Generic.List[object]]::new()
-$fixtureFetches = Invoke-D32LockedCargoFetches `
+$fixtureFetches = Invoke-D32FixturePreCargoBoundary `
+    -OutputRoot $OutputRoot `
+    -Repository $RepoRoot `
+    -ExpectedCandidateSha $candidateSha `
     -ValidatedProfile $validatedToolchainProfile `
-    -CargoPath $cargo `
-    -CargoHome $fixtureCargoHome `
-    -TempRoot $fixtureTempRoot `
-    -RepoRoot $RepoRoot `
-    -LogRoot $logRoot `
-    -TimeoutSeconds $TimeoutSeconds `
-    -LogPrefix 'fixture' `
-    -PhaseEvidence $phaseEvidence
+    -OwnerBinding $Phase0OwnerBinding `
+    -StorageContext $script:D32Phase0StorageContext `
+    -FetchAction {
+        Invoke-D32LockedCargoFetches `
+            -ValidatedProfile $validatedToolchainProfile `
+            -CargoPath $cargo `
+            -CargoHome $fixtureCargoHome `
+            -TempRoot $fixtureTempRoot `
+            -RepoRoot $RepoRoot `
+            -LogRoot $logRoot `
+            -TimeoutSeconds $TimeoutSeconds `
+            -LogPrefix 'fixture' `
+            -PhaseEvidence $phaseEvidence
+    }
 $null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot
 $offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
     -ValidatedProfile $validatedToolchainProfile `
@@ -7535,9 +7640,9 @@ $offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
     -TempRoot $fixtureTempRoot `
     -Offline $true
 $null = Test-D32ProfileDirectoryIdentity -Path $OutputRoot -VolumeSerialHex $phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex -FileIdHex $phase0OwnerContext.EvidenceRootIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $toolchainRunRootIdentity.VolumeSerialHex -FileIdHex $toolchainRunRootIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $fixtureCargoHomeIdentity.VolumeSerialHex -FileIdHex $fixtureCargoHomeIdentity.FileIdHex
-$null = Test-D32ProfileDirectoryIdentity -Path $fixtureTempRoot -VolumeSerialHex $fixtureTempRootIdentity.VolumeSerialHex -FileIdHex $fixtureTempRootIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $script:D32Phase0StorageContext.run_root.volume_serial_hex -FileIdHex $script:D32Phase0StorageContext.run_root.file_id_hex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $script:D32Phase0StorageContext.cargo_home.volume_serial_hex -FileIdHex $script:D32Phase0StorageContext.cargo_home.file_id_hex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureTempRoot -VolumeSerialHex $script:D32Phase0StorageContext.temp_root.volume_serial_hex -FileIdHex $script:D32Phase0StorageContext.temp_root.file_id_hex
 $fixtureEnvironmentPlan = [ordered]@{
     toolchain_profile_path = [string]$validatedToolchainProfile.ProfilePath
     toolchain_profile_sha256 = [string]$validatedToolchainProfile.Digest

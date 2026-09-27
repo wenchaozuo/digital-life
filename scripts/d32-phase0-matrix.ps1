@@ -9,7 +9,8 @@ param(
     [Alias('ExpectedToolchainProfileSha256')][string]$Phase0ExpectedToolchainProfileSha256,
     [Alias('PinnedGitPath')][string]$Phase0PinnedGitPath,
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
-    [Alias('TimeoutSeconds')][ValidateRange(60, 7200)][int]$Phase0TimeoutSeconds = 1800
+    # Keep the original 1800-second default; callers may explicitly pin at most one hour.
+    [Alias('TimeoutSeconds')][ValidateRange(60, 3600)][int]$Phase0TimeoutSeconds = 1800
 )
 
 Set-StrictMode -Version Latest
@@ -2045,7 +2046,7 @@ function Invoke-D32Phase0Matrix {
         ToolchainProfilePath = $ProfilePath
         ExpectedToolchainProfileSha256 = $ProfileSha256
         Phase0OwnerBinding = $outputBinding
-        TimeoutSeconds = [Math]::Min($TimeoutSeconds, 1800)
+        TimeoutSeconds = [Math]::Min($TimeoutSeconds, 3600)
     }
     $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
     $fixtureCapture = Invoke-D32Phase0FixtureProducerCapture -Producer $fixtureProducer

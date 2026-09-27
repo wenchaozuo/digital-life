@@ -1231,7 +1231,12 @@ function Get-D32GitOutput {
         '-C', $rootFull
     ) + @($Arguments)
     if ($null -ne $testSetup -and $Arguments.Count -gt 0 -and $Arguments[0] -ceq 'commit') {
-        $gitCommandArguments = @('-c', 'user.name=D32 Selftest', '-c', 'user.email=d32-selftest@example.invalid') + $gitCommandArguments
+        $gitCommandArguments = @(
+            '-c', 'user.name=D32 Selftest',
+            '-c', 'user.email=d32-selftest@example.invalid',
+            '-c', 'maintenance.auto=false',
+            '-c', 'gc.auto=0'
+        ) + $gitCommandArguments
     }
     $commandLine = ConvertTo-D32CommandLine (@($script:PinnedGit.path) + $gitCommandArguments)
     $childEnvironment = [ordered]@{

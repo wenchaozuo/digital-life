@@ -21,9 +21,11 @@ SC-D32-V1 的建立日期不声称存在先前 ratification；它以列明的 e9
 
 ## 3. 本批次范围和状态
 
-- 本批次只同步通用治理入口至 v1.2、保留候选 D32 §§16.1.1–16.1.5 supplement 并建立 SC-D32-V1，同时修复 fixture child stdout/stderr raw capture。
-- 本批次不改变 F-01 至 F-17、既有 D32 ADR 的实质语义、fixture manifest v3、证据 schema/trace/trust、fixed Cargo argv、provider/tool two-turn contract、Host authority 或 gate 要求。
-- Raw stdout/stderr 字节变化后，须对新的 exact candidate 重建受影响的 fixture、Phase 0 及下游 evidence；旧 candidate gate 不继承。
+- Earlier governance/raw-stream repair synchronized protocol v1.2 and SC-D32-V1, then repaired fixture child stdout/stderr raw capture. Its evidence remains bound to its old exact SHA.
+- The current prospective repair batch implements ADR-D32-PHASE0-COMPACT-EVIDENCE-V1: exclusive fresh external EvidenceRoot, identity-bound owner marker, fixed `r\c`/`r\t` storage, fixture provenance V3, Phase0 V3, release attestation V4, aggregate V3, and failure-only blocked-diagnostic V1. Profile V2, debug/Job trace V2, fixture manifest v3, and D31 recovery-seeder provenance V2 remain unchanged.
+- Path-budget correction: 286 characters is the failing `.snap` path's **full** length, not a suffix length. The old Cargo-home prefix is 74 characters, leaving a 212-character suffix; replacing that prefix with compact `E:\p0r3\r\c` (11 characters) yields 223 characters. The Coordinator's read-only pinned-tree census reported 6,800 files / 878 directories and a longest projected compact path of 230 characters, 17 below the 247-character successful directory-path probe. This arithmetic/census is not Phase 0 evidence; the proposed `E:\p0r3` root is currently absent and still needs exclusive, canonical, non-reparse creation and opened-handle identity verification at run time.
+- Old-SHA quarantine ledger/leaves are preserved and remain locked; they are not rebound as evidence for this candidate. Before any new Phase 0 run, prove all five fixture source paths absent and produce fresh outputs. No Phase 0, Cargo, network, release, move, canary, or gate has been run for this repair batch.
+- The exact candidate remains NOT FROZEN. New Phase 0 and downstream evidence must be regenerated for the committed exact SHA; prior SHA evidence and PASS never transfer.
 - 当前没有因此关闭任何 D32 final gate，候选状态仍为 NOT FROZEN。
 
 ## 4. 尚未关闭的门禁

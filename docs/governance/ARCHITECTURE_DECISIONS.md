@@ -21,6 +21,7 @@
 | ADR-D32-GOVERNANCE-V12-RECONCILIATION | APPROVED WITH CONDITIONS | D32 candidate governance v1.2 reconciliation and prospective SC-D32-V1 | GPT-6 Sol Max | D32 final-gate candidate only |
 | ADR-D32-PINNED-GIT-ROOT-IDENTITY | APPROVED WITH CONDITIONS | D32 fixture tooling caller-pinned direct Git root identity under V2 trace | GPT-6 Sol Max | D32 fixture Git metadata queries only |
 | ADR-D32-RELEASE-OUTPUT-FRESHNESS-QUARANTINE | APPROVED WITH CONDITIONS | Exact D32 release-output freshness quarantine exception | GPT-6 Sol Max | Three named Phase 1 release leaves only |
+| ADR-D32-PHASE0-COMPACT-EVIDENCE-V1 | APPROVED WITH CONDITIONS | D32 Phase 0 compact external storage and failure-only diagnostic | GPT-6 Sol Max | Prospective D32 Phase 0 schema/storage migration only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -542,6 +543,45 @@ The fixed Phase 1 release commands must produce fresh artifacts at their contrac
 
 - Supersedes only (a) ADR-D32-PHASE0-TOOLCHAIN-PROFILE decision 7's prospective sentence that the three release outputs are “never quarantined,” and (b) ADR-D32-EVIDENCE-BUNDLE-V1's statement that the attestor does not move a prior output, solely to permit this exact pre-build quarantine. The attestor must still fail closed if any exact output remains present immediately before a fixed command; all existing pre-existing-output negative checks, fixed paths, fresh generated artifacts, opened-handle identity, attestation, and other requirements remain mandatory.
 - Supersedes no other D32 output policy, gate, or Stage Contract requirement.
+
+---
+
+### ADR-D32-PHASE0-COMPACT-EVIDENCE-V1 — Phase 0 紧凑外部存储与失败诊断
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-27
+**Related milestone:** D32-A final-gate readiness
+**Related baseline:** `92ce5f7ac48e87c4ddeee3f92f1e6851c4172c49`
+**Related decisions:** ADR-D32-PHASE0-TOOLCHAIN-PROFILE; ADR-D32-PROCESS-EVENT-TRACE-V2; ADR-D32-EVIDENCE-BUNDLE-V1; ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP
+
+#### Context
+
+The current Phase 0 output basename combined with the pinned source/output paths can exceed the practical Windows path budget. A prospective compact layout can shorten only the fresh external evidence storage paths while retaining the fixed source, command, toolchain, trace, and gate contracts. Failed runs also need durable failure evidence that cannot be confused with a Phase 0 PASS.
+
+#### Decision
+
+1. **Fresh owner-bound root.** A Phase 0 run uses one caller-selected canonical absolute `EvidenceRoot` outside and non-overlapping with the candidate repository. Its parent must already exist and be non-reparse; the exact root must be absent and created exclusively. Reparse-backed roots, collisions, stale IDs, or changed opened-handle identities fail closed. After exclusive root creation, a create-new identity-bound owner marker binds the exact candidate SHA, caller-pinned profile path/SHA/bytes/opened-file identity, opened EvidenceRoot path/identity, and full lowercase 32-hex `run_id`. The run ID is also retained in code-owned records. Validate the root and every compact child directory by opened-handle identity.
+2. **Fixed compact Cargo storage.** The per-run root is exactly `EvidenceRoot\r`; fresh `CARGO_HOME` and `TEMP` are exactly `EvidenceRoot\r\c` and `EvidenceRoot\r\t`. `CARGO_HOME` must be empty before the exact locked fetches. Do not use a junction, `subst`, system LongPaths policy change, alternate source path, reused cache, or a changed fixed Cargo argv, toolchain profile, or process trace.
+3. **Prospective strict schema migration.** The new candidate uses fixture-build provenance V3, Phase0 matrix V3, release-build attestation V4, and post-bundle aggregate V3. Each reader/consumer accepts only its exact current version and rejects previous and unknown versions. Toolchain profile V2, debug/Job process trace V2, fixture manifest v3, and the separate D31 recovery-seeder provenance V2 remain unchanged. This decision does not relabel, upgrade, or rebind evidence from the prior candidate; old-SHA quarantine evidence and leaves remain preserved and locked.
+4. **Failure-only diagnostic sidecar.** After owner binding, an early Phase 0 failure may create `D32-PHASE0-BLOCKED-DIAGNOSTIC.json` as `D32_PHASE0_BLOCKED_DIAGNOSTIC_V1`, using create-new semantics only. It records the candidate/profile/root/run binding, failing fixed command and process identity when available, raw V2 trace, raw Job/debug cleanup including explicitly unverified fields, ordered raw stdout/stderr references with hash/bytes/opened-file identities when captured, and primary plus secondary errors. Unavailable command/process/capture/cleanup evidence must remain explicitly unverified. The sidecar grants no PASS or Gate authority; Phase 1 and aggregate consumers reject any such sidecar regardless of its contents. If diagnostic persistence fails, preserve the original primary error and append the diagnostic-capture error; never infer cleanup or PASS from missing diagnostic evidence.
+5. **Existing stage contract is unchanged.** Keep all five fixture phases, full required protocol/Vita/Host suites, named checks, fixed inventory and negative evidence. This decision authorizes no Phase 0/Cargo/network execution, release build, real move, canary, independent gate, or stage closure by itself.
+
+#### Frozen invariants
+
+1. Compact storage changes only prospective external evidence paths and record versions. Candidate source paths, exact commands, profile/toolchain authority, fixture manifest shape, trace semantics, cleanup semantics, provider/tool contract, and downstream gate requirements remain unchanged.
+2. A blocked diagnostic is failure evidence only and can never authorize Phase 1, aggregate PASS, or any downstream gate.
+
+#### Required tests and evidence
+
+- Verify the fixed compact layout against the longest known 286-character Codex `.snap` full path (replace its old 74-character Cargo-home prefix with the 11-character compact `E:\p0r3\r\c` prefix) and, when safe, a full pinned-tree path census. The resulting reference path is 223 characters; the read-only pinned-tree census reported a maximum projected compact path of 230 characters against the measured 247-character directory-path limit. This does not replace exclusive-root, non-reparse, or opened-handle identity checks at run time. If the approved paths cannot meet the applicable path budget without a prohibited policy/path workaround, stop as an architecture blocker.
+- Test exclusive fresh-root creation, owner-marker binding, reparse/collision/stale-run-ID refusal, and opened-handle identity changes for root and compact child directories.
+- Test strict old/unknown schema rejection at each producer/reader/consumer, forged log/sidecar refusal, early-failure diagnostic persistence and cleanup representation, and release/aggregate refusal when a blocked diagnostic exists.
+- Preserve the existing exact five fixture phases, required full suites and named checks, and all required negative/canary obligations; no PASS is established by focused self-tests.
+
+#### Supersedes / Superseded by
+
+- Supersedes only the prospective Phase 0 storage basenames and the affected schema-version numbers in earlier D32 tooling decisions. It does not supersede or alter the profile, trace, fixture-manifest, D31 seeder, fixed argv, real-canary, negative-evidence, independent-gate, or final-freeze requirements.
 
 ---
 

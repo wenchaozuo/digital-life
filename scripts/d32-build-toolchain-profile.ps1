@@ -139,6 +139,14 @@ public sealed class D32BuildProfileFileRecordV1
     public long LastWriteTimeUtcTicks { get; set; }
 }
 
+public sealed class D32BuildProfileDirectoryRecordV1
+{
+    public string FullName { get; set; }
+    public string VolumeSerialHex { get; set; }
+    public string FileIdHex { get; set; }
+    public int Attributes { get; set; }
+}
+
 public static class D32BuildProfileFileIdentityV1
 {
     [StructLayout(LayoutKind.Sequential)]
@@ -164,6 +172,12 @@ public static class D32BuildProfileFileIdentityV1
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, IntPtr info, uint size);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateFileW", SetLastError = true)]
+    private static extern SafeFileHandle CreateFileForDirectory(string path, uint access, uint share, IntPtr securityAttributes, uint creationDisposition, uint flags, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateDirectoryW", SetLastError = true)]
+    private static extern bool CreateDirectoryExclusive(string path, IntPtr securityAttributes);
 
     private static long Ticks(FILETIME value)
     {
@@ -244,6 +258,38 @@ public static class D32BuildProfileFileIdentityV1
             };
         }
     }
+
+    public static string CreateDirectoryNew(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (!CreateDirectoryExclusive(full, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return full;
+    }
+
+    public static D32BuildProfileDirectoryRecordV1 ReadDirectory(string path)
+    {
+        string full = Path.GetFullPath(path);
+        const uint FileReadAttributes = 0x00000080;
+        const uint ShareAll = 0x00000007;
+        const uint OpenExisting = 3;
+        const uint BackupSemantics = 0x02000000;
+        const uint OpenReparsePoint = 0x00200000;
+        using (SafeFileHandle handle = CreateFileForDirectory(full, FileReadAttributes, ShareAll, IntPtr.Zero,
+            OpenExisting, BackupSemantics | OpenReparsePoint, IntPtr.Zero))
+        {
+            if (handle == null || handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            NativeRecord native = ReadNative(handle);
+            if ((native.Attributes & (int)FileAttributes.Directory) == 0 ||
+                (native.Attributes & (int)FileAttributes.ReparsePoint) != 0)
+                throw new IOException("expected a regular non-reparse directory");
+            return new D32BuildProfileDirectoryRecordV1 {
+                FullName = full,
+                VolumeSerialHex = native.Volume,
+                FileIdHex = native.FileId,
+                Attributes = native.Attributes
+            };
+        }
+    }
 }
 '@
     }
@@ -269,6 +315,47 @@ function Get-D32ProfileFileSnapshot {
         CreationTimeUtcTicks = [Int64]$native.CreationTimeUtcTicks
         LastWriteTimeUtcTicks = [Int64]$native.LastWriteTimeUtcTicks
     }
+}
+
+function Get-D32ProfileDirectoryIdentity {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-D32ProfileWindows)) { throw 'profile directory IDs require Windows opened-handle identity' }
+    if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "directory is missing or traverses a reparse point: $Path" }
+    Initialize-D32ProfileFileIdentityType
+    $native = [D32BuildProfileFileIdentityV1]::ReadDirectory($Path)
+    if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "directory path changed or traverses a reparse point: $Path" }
+    return [PSCustomObject]@{
+        Path = [string]$native.FullName
+        VolumeSerialHex = [string]$native.VolumeSerialHex
+        FileIdHex = [string]$native.FileIdHex
+        Attributes = [int]$native.Attributes
+    }
+}
+
+function New-D32ProfileDirectoryCreateNew {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-D32ProfileWindows)) { throw 'exclusive directory creation requires Windows' }
+    $full = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetDirectoryName($full)
+    if ([String]::IsNullOrWhiteSpace($parent) -or -not (Test-D32ProfileNoReparsePath -Path $parent)) { throw 'exclusive directory parent is missing or traverses a reparse point' }
+    Initialize-D32ProfileFileIdentityType
+    $null = [D32BuildProfileFileIdentityV1]::CreateDirectoryNew($full)
+    return Get-D32ProfileDirectoryIdentity -Path $full
+}
+
+function Test-D32ProfileDirectoryIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$VolumeSerialHex,
+        [Parameter(Mandatory = $true)][string]$FileIdHex
+    )
+
+    if ($VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$' -or $FileIdHex -cnotmatch '^[0-9a-f]{32}$') { throw 'directory opened-handle identity is malformed' }
+    $actual = Get-D32ProfileDirectoryIdentity -Path $Path
+    if ($actual.VolumeSerialHex -cne $VolumeSerialHex -or $actual.FileIdHex -cne $FileIdHex) { throw "directory opened-handle identity changed: $Path" }
+    return $actual
 }
 
 function Test-D32ProfileIdentityRecord {

@@ -126,10 +126,10 @@ $script:D32ReleaseBuildCommands = @(
     }
 )
 $script:D32BundleSchemaVersion = 1
-$script:D32AttestationSchemaVersion = 3
-$script:D32PostBundleAggregateSchemaVersion = 2
+$script:D32AttestationSchemaVersion = 4
+$script:D32PostBundleAggregateSchemaVersion = 3
 $script:D32PostBundleAggregateRecordName = 'D32-POST-BUNDLE-AGGREGATE.json'
-$script:D32PostBundleAggregateRecordType = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V2'
+$script:D32PostBundleAggregateRecordType = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V3'
 $script:D32PostBundleAggregateScope = 'PRE_DOWNSTREAM_LOCAL_SCOPE'
 $script:D32BundleDirectoryName = 'd32-gate-bundle'
 $script:D32BundleManifestName = 'BUNDLE-MANIFEST.json'
@@ -2628,7 +2628,7 @@ function Test-D32ReleaseEvidenceBundle {
     $attestationSchemaVersion = Get-D32JsonProperty -Object $Attestation -Name 'schema_version'
     $attestationSchemaValue = [Int64]0
     $attestationSchemaIsInteger = $null -ne $attestationSchemaVersion -and @([byte], [sbyte], [uint16], [int16], [uint32], [int32], [uint64], [int64]) -contains $attestationSchemaVersion.GetType()
-    if (-not $attestationSchemaIsInteger -or -not (Test-D32NonNegativeInt64 -Value $attestationSchemaVersion -Parsed ([ref]$attestationSchemaValue)) -or $attestationSchemaValue -ne $script:D32AttestationSchemaVersion -or (Get-D32JsonProperty -Object $Attestation -Name 'attestation_type') -cne 'D32_RELEASE_BUILD_ATTESTATION_V3') {
+    if (-not $attestationSchemaIsInteger -or -not (Test-D32NonNegativeInt64 -Value $attestationSchemaVersion -Parsed ([ref]$attestationSchemaValue)) -or $attestationSchemaValue -ne $script:D32AttestationSchemaVersion -or (Get-D32JsonProperty -Object $Attestation -Name 'attestation_type') -cne 'D32_RELEASE_BUILD_ATTESTATION_V4') {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'attestation.schema' -Message 'attestation schema version or type is not the fixed D32 release-build format'
     }
     $attestationRunnerPid = Get-D32JsonProperty -Object $Attestation -Name 'runner_process_id'
@@ -2773,10 +2773,12 @@ function Test-D32ReleaseEvidenceBundle {
         $phase0Raw = [IO.File]::ReadAllText([string]$phase0MatrixReference.path, [Text.Encoding]::UTF8)
         if (Test-D32JsonDuplicateKeys -Json $phase0Raw) { throw 'referenced Phase0 matrix has duplicate/invalid JSON keys' }
         $phase0Document = $phase0Raw | ConvertFrom-D32Json
-        $phase0Fields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
-        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or $phase0Document.schema_version -ne 2 -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V2' -or $phase0Document.candidate_sha -cne $candidate -or $phase0Document.final_candidate_sha -cne $candidate -or $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'referenced Phase0 matrix has unsupported schema, candidate, status, clean state, or bundle-hash status' }
+        $phase0Fields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or $phase0Document.schema_version -ne 3 -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V3' -or $phase0Document.candidate_sha -cne $candidate -or $phase0Document.final_candidate_sha -cne $candidate -or $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'referenced Phase0 matrix has unsupported schema, candidate, status, clean state, or bundle-hash status' }
+        $blockedDiagnosticPath = Join-Path $phase0OutputRoot 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
+        if (Test-D32Phase0DirectoryEntryExists -Path $blockedDiagnosticPath) { throw 'Phase0 blocked-diagnostic sidecar exists; failure evidence forbids release attestation/aggregate use' }
         if (-not (Test-D32ProfilePathEqual -Left $phase0Document.source_repo -Right $Repository) -or -not (Test-D32ProfilePathEqual -Left $phase0Document.output_root -Right $phase0OutputRoot)) { throw "referenced Phase0 source/output roots do not match current candidate and record path (source=$($phase0Document.source_repo); repository=$Repository; output=$($phase0Document.output_root); record_parent=$phase0OutputRoot)" }
-        if (-not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 2 -or
+        if (-not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 3 -or
             -not (Test-D32Phase0ExactProperties -Object $phase0Document.toolchain_profile -Expected @('path', 'sha256', 'file_identity', 'target_triple', 'toolchain', 'executable_inventory', 'script_inventory', 'windows_image_inventory', 'lock_inputs', 'env_policy')) -or
             -not (Test-D32Phase0ExactProperties -Object $phase0Document.toolchain_profile.file_identity -Expected @('bytes', 'volume_serial_hex', 'file_id_hex')) -or
             -not (Test-D32Phase0Integer -Value $phase0Document.toolchain_profile.file_identity.bytes -Positive) -or
@@ -2784,11 +2786,33 @@ function Test-D32ReleaseEvidenceBundle {
             $phase0Document.toolchain_profile.file_identity.bytes -ne $toolchainProfileReference.bytes -or $phase0Document.toolchain_profile.file_identity.volume_serial_hex -cne $toolchainProfileReference.volume_serial_hex -or $phase0Document.toolchain_profile.file_identity.file_id_hex -cne $toolchainProfileReference.file_id_hex) { throw 'Phase0 matrix does not bind the attested caller-pinned toolchain profile reference' }
         $releaseToolchainProfile = Test-D32BuildToolchainProfile -ProfilePath ([string]$toolchainProfileReference.path) -ExpectedSha256 ([string]$toolchainProfileReference.sha256) -Repository $Repository
         if (-not $releaseToolchainProfile.IsValid) { throw "caller-pinned v2 toolchain profile is not current: $($releaseToolchainProfile.Failure)" }
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.evidence_root_identity -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.evidence_root_identity.path -Right $phase0OutputRoot) -or
+            $phase0Document.evidence_root_identity.volume_serial_hex -isnot [string] -or $phase0Document.evidence_root_identity.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+            $phase0Document.evidence_root_identity.file_id_hex -isnot [string] -or $phase0Document.evidence_root_identity.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { throw 'Phase0 EvidenceRoot opened-handle identity record is malformed' }
+        $phase0RootIdentity = Test-D32ProfileDirectoryIdentity -Path $phase0OutputRoot -VolumeSerialHex ([string]$phase0Document.evidence_root_identity.volume_serial_hex) -FileIdHex ([string]$phase0Document.evidence_root_identity.file_id_hex)
+        $null = Test-D32Phase0FileReference -Reference $phase0Document.owner_marker -AllowedRoot $phase0OutputRoot
+        $phase0Owner = Test-D32Phase0OwnerBinding -EvidenceRoot $phase0OutputRoot -ExpectedCandidateSha $candidate -ValidatedProfile $releaseToolchainProfile -ExpectedRunId ([string]$phase0Document.cargo_home.run_id) -ExpectedRootIdentity $phase0RootIdentity -ExpectedMarkerReference $phase0Document.owner_marker
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.cargo_home -Expected @('path', 'temp_root', 'run_root', 'run_id', 'nonempty_after_fetch', 'run_root_identity', 'cargo_home_identity', 'temp_root_identity')) -or
+            $phase0Document.cargo_home.run_id -isnot [string] -or $phase0Document.cargo_home.run_id -cnotmatch '^[0-9a-f]{32}$' -or
+            $phase0Document.cargo_home.run_id -cne $phase0Owner.RunId -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.run_root -Right (Join-Path $phase0OutputRoot 'r')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.path -Right (Join-Path $phase0OutputRoot 'r\c')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.temp_root -Right (Join-Path $phase0OutputRoot 'r\t'))) { throw 'Phase0 compact r\c and r\t paths/run_id do not match the fresh owner-bound evidence root' }
+        foreach ($directoryField in @('run_root_identity', 'cargo_home_identity', 'temp_root_identity')) {
+            $directoryIdentity = $phase0Document.cargo_home.$directoryField
+            if (-not (Test-D32Phase0ExactProperties -Object $directoryIdentity -Expected @('volume_serial_hex', 'file_id_hex')) -or
+                $directoryIdentity.volume_serial_hex -isnot [string] -or $directoryIdentity.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+                $directoryIdentity.file_id_hex -isnot [string] -or $directoryIdentity.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { throw "Phase0 $directoryField is malformed" }
+        }
+        $null = Test-D32ProfileDirectoryIdentity -Path $phase0Document.cargo_home.run_root -VolumeSerialHex ([string]$phase0Document.cargo_home.run_root_identity.volume_serial_hex) -FileIdHex ([string]$phase0Document.cargo_home.run_root_identity.file_id_hex)
+        $null = Test-D32ProfileDirectoryIdentity -Path $phase0Document.cargo_home.path -VolumeSerialHex ([string]$phase0Document.cargo_home.cargo_home_identity.volume_serial_hex) -FileIdHex ([string]$phase0Document.cargo_home.cargo_home_identity.file_id_hex)
+        $null = Test-D32ProfileDirectoryIdentity -Path $phase0Document.cargo_home.temp_root -VolumeSerialHex ([string]$phase0Document.cargo_home.temp_root_identity.volume_serial_hex) -FileIdHex ([string]$phase0Document.cargo_home.temp_root_identity.file_id_hex)
         $expectedScripts = @($releaseToolchainProfile.ScriptInventory | ForEach-Object { [ordered]@{ path = $_.Path; sha256 = $_.Sha256; bytes = [Int64]$_.Bytes; volume_serial_hex = $_.VolumeSerialHex; file_id_hex = $_.FileIdHex } })
         $expectedWindowsImages = @($releaseToolchainProfile.WindowsImageInventory | ForEach-Object { [ordered]@{ path = $_.Path; sha256 = $_.Sha256; bytes = [Int64]$_.Bytes; volume_serial_hex = $_.VolumeSerialHex; file_id_hex = $_.FileIdHex } })
         if ((ConvertTo-Json -InputObject $phase0Document.toolchain_profile.script_inventory -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $expectedScripts -Depth 12 -Compress) -or
             (ConvertTo-Json -InputObject $phase0Document.toolchain_profile.windows_image_inventory -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $expectedWindowsImages -Depth 12 -Compress)) { throw 'Phase0 matrix dormant-script/Windows-child inventory differs from the independently revalidated profile' }
-        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.cargo_home -Expected @('path', 'temp_root', 'run_id', 'nonempty_after_fetch')) -or $phase0Document.cargo_home.nonempty_after_fetch -isnot [bool] -or -not $phase0Document.cargo_home.nonempty_after_fetch -or
+        if ($phase0Document.cargo_home.nonempty_after_fetch -isnot [bool] -or -not $phase0Document.cargo_home.nonempty_after_fetch -or
             -not (Test-D32Phase0ExactProperties -Object $cargoHomeEvidence -Expected @('path', 'temp_root', 'run_id')) -or $cargoHomeEvidence.path -isnot [string] -or $cargoHomeEvidence.temp_root -isnot [string] -or $cargoHomeEvidence.run_id -isnot [string] -or
             -not (Test-D32ProfileCanonicalPathString -Path $cargoHomeEvidence.path) -or -not (Test-D32ProfileCanonicalPathString -Path $cargoHomeEvidence.temp_root) -or
             -not (Test-D32ProfilePathWithin -Child $cargoHomeEvidence.path -Parent $phase0OutputRoot) -or -not (Test-D32ProfilePathWithin -Child $cargoHomeEvidence.temp_root -Parent $phase0OutputRoot) -or
@@ -3265,6 +3289,33 @@ function Test-D32PostBundleAggregateRecord {
         foreach ($name in $referenceFields) {
             $null = Test-D32PostBundleAggregateFileReference -Reference $references.$name -Name "aggregate.references.$name" -ExpectedPath ([string]$expectedSources[$name]) -Repository $repo
         }
+        $phase0Path = [string]$references.phase0_matrix.path
+        $phase0OutputRoot = [IO.Path]::GetDirectoryName($phase0Path)
+        $blockedDiagnosticPath = Join-Path $phase0OutputRoot 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
+        if (Test-D32Phase0DirectoryEntryExists -Path $blockedDiagnosticPath) { throw 'Phase0 blocked-diagnostic sidecar exists; failure evidence forbids aggregate use' }
+        $phase0Raw = [IO.File]::ReadAllText($phase0Path, [Text.Encoding]::UTF8)
+        if (Test-D32JsonDuplicateKeys -Json $phase0Raw) { throw 'aggregate-referenced Phase0 matrix has duplicate/invalid JSON keys' }
+        $phase0Document = $phase0Raw | ConvertFrom-D32Json
+        $phase0Fields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or
+            -not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 3 -or
+            $phase0Document.record_type -isnot [string] -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V3' -or
+            $phase0Document.candidate_sha -isnot [string] -or $phase0Document.candidate_sha -cne $ExpectedCandidateSha -or
+            $phase0Document.final_candidate_sha -isnot [string] -or $phase0Document.final_candidate_sha -cne $ExpectedCandidateSha -or
+            $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or
+            $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'aggregate-referenced Phase0 matrix is not the supported exact V3 local PASS schema' }
+        $phase0Profile = Test-D32BuildToolchainProfile -ProfilePath ([string]$references.toolchain_profile.path) -ExpectedSha256 ([string]$references.toolchain_profile.sha256) -Repository $repo -EvidenceRoot $phase0OutputRoot
+        if (-not $phase0Profile.IsValid) { throw "aggregate-referenced Phase0 caller-pinned profile is not current: $($phase0Profile.Failure)" }
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.evidence_root_identity -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.evidence_root_identity.path -Right $phase0OutputRoot)) { throw 'aggregate-referenced Phase0 EvidenceRoot identity shape/path is invalid' }
+        $phase0RootIdentity = Test-D32ProfileDirectoryIdentity -Path $phase0OutputRoot -VolumeSerialHex ([string]$phase0Document.evidence_root_identity.volume_serial_hex) -FileIdHex ([string]$phase0Document.evidence_root_identity.file_id_hex)
+        $null = Test-D32Phase0FileReference -Reference $phase0Document.owner_marker -AllowedRoot $phase0OutputRoot
+        $phase0Owner = Test-D32Phase0OwnerBinding -EvidenceRoot $phase0OutputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ValidatedProfile $phase0Profile -ExpectedRunId ([string]$phase0Document.cargo_home.run_id) -ExpectedRootIdentity $phase0RootIdentity -ExpectedMarkerReference $phase0Document.owner_marker
+        if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.cargo_home -Expected @('path', 'temp_root', 'run_root', 'run_id', 'nonempty_after_fetch', 'run_root_identity', 'cargo_home_identity', 'temp_root_identity')) -or
+            $phase0Document.cargo_home.run_id -cne $phase0Owner.RunId -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.run_root -Right (Join-Path $phase0OutputRoot 'r')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.path -Right (Join-Path $phase0OutputRoot 'r\c')) -or
+            -not (Test-D32ProfilePathEqual -Left $phase0Document.cargo_home.temp_root -Right (Join-Path $phase0OutputRoot 'r\t'))) { throw 'aggregate-referenced Phase0 compact r\c and r\t owner/run binding is invalid' }
         Add-D32Finding -Findings $Findings -Severity PASS -Check 'aggregate.record' -Message "independently SHA-pinned pre-downstream aggregate record binds a validated local-scope pass, VERIFIED bundle hashes, NOT RUN downstream gates, this candidate, and all seven current external source files; record SHA-256=$($recordDigest.Hash)"
         return [PSCustomObject]@{ IsValid = $true; Record = $record; Digest = $recordDigest.Hash; Identity = $recordDigest.Identity; RecordPath = $recordDigest.Path; EvidenceRoot = $evidence }
     }
@@ -4048,7 +4099,7 @@ function Invoke-D32GenerateBundle {
         $bundleManifestPath = Join-Path $bundleDirectory $script:D32BundleManifestName
         $attestationDocument = [ordered]@{
             schema_version = $script:D32AttestationSchemaVersion
-            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V3'
+            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V4'
             runner_process_id = [int]$PID
             candidate_sha = $ExpectedCandidateSha
             source_clone = $repoCanonical
@@ -4496,11 +4547,14 @@ function Invoke-D32SelfTest {
         $fakeCargo = [string]$profileDocument.toolchain.cargo.path
         $fakeCargoDigest = Get-D32EvidenceFileDigest -Path $fakeCargo
         $phase0Root = Join-Path $root 'phase0'
-        $phase0RunRoot = Join-Path $phase0Root 'phase0-run-selftest'
-        $phase0CargoHome = Join-Path $phase0RunRoot 'cargo-home'
-        $phase0TempRoot = Join-Path $phase0RunRoot 'temp'
-        [void][System.IO.Directory]::CreateDirectory($phase0CargoHome)
-        [void][System.IO.Directory]::CreateDirectory($phase0TempRoot)
+        $phase0RunId = '0123456789abcdef0123456789abcdef'
+        $phase0Binding = New-D32Phase0FixtureOutputRoot -Path $phase0Root -Repository $fixture -ExpectedCandidateSha $head -ValidatedProfile $profileValidation -RunId $phase0RunId
+        $phase0RunRoot = Join-Path $phase0Root 'r'
+        $phase0CargoHome = Join-Path $phase0RunRoot 'c'
+        $phase0TempRoot = Join-Path $phase0RunRoot 't'
+        $phase0RunRootIdentity = New-D32ProfileDirectoryCreateNew -Path $phase0RunRoot
+        $phase0CargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $phase0CargoHome
+        $phase0TempRootIdentity = New-D32ProfileDirectoryCreateNew -Path $phase0TempRoot
         [System.IO.File]::WriteAllText((Join-Path $phase0CargoHome 'selftest-cache-marker'), 'fetched locked sources')
         $phase0ToolProfile = [ordered]@{
             path = $profileValidation.ProfilePath
@@ -4545,12 +4599,14 @@ function Invoke-D32SelfTest {
         $phase0RecordPath = Join-Path $phase0Root 'D32-PHASE0-MATRIX.json'
         $phase0Started = [DateTimeOffset]::UtcNow.ToString('o')
         $phase0Document = [ordered]@{
-            schema_version = 2
-            record_type = 'D32_PHASE0_MATRIX_RECORD_V2'
+            schema_version = 3
+            record_type = 'D32_PHASE0_MATRIX_RECORD_V3'
             runner_process_id = [int]$PID
             candidate_sha = $head
             source_repo = [IO.Path]::GetFullPath($fixture)
             output_root = [IO.Path]::GetFullPath($phase0Root)
+            evidence_root_identity = [ordered]@{ path = [string]$phase0Binding.RootIdentity.Path; volume_serial_hex = [string]$phase0Binding.RootIdentity.VolumeSerialHex; file_id_hex = [string]$phase0Binding.RootIdentity.FileIdHex }
+            owner_marker = $phase0Binding.OwnerMarker
             status = 'PASS'
             bundle_hashes = 'PENDING'
             started_at_utc = $phase0Started
@@ -4559,7 +4615,16 @@ function Invoke-D32SelfTest {
             final_clean = $true
             powershell = $profileValidation.Profile.powershell
             toolchain_profile = $phase0ToolProfile
-            cargo_home = [ordered]@{ path = [IO.Path]::GetFullPath($phase0CargoHome); temp_root = [IO.Path]::GetFullPath($phase0TempRoot); run_id = 'phase0-run-selftest'; nonempty_after_fetch = $true }
+            cargo_home = [ordered]@{
+                path = [IO.Path]::GetFullPath($phase0CargoHome)
+                temp_root = [IO.Path]::GetFullPath($phase0TempRoot)
+                run_root = [IO.Path]::GetFullPath($phase0RunRoot)
+                run_id = $phase0RunId
+                nonempty_after_fetch = $true
+                run_root_identity = [ordered]@{ volume_serial_hex = [string]$phase0RunRootIdentity.VolumeSerialHex; file_id_hex = [string]$phase0RunRootIdentity.FileIdHex }
+                cargo_home_identity = [ordered]@{ volume_serial_hex = [string]$phase0CargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$phase0CargoHomeIdentity.FileIdHex }
+                temp_root_identity = [ordered]@{ volume_serial_hex = [string]$phase0TempRootIdentity.VolumeSerialHex; file_id_hex = [string]$phase0TempRootIdentity.FileIdHex }
+            }
             fetches = @()
             fixture = [ordered]@{}
             commands = @()
@@ -4660,7 +4725,7 @@ function Invoke-D32SelfTest {
         }
         $attestationDocument = [ordered]@{
             schema_version = $script:D32AttestationSchemaVersion
-            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V3'
+            attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V4'
             candidate_sha = $head
             source_clone = Get-D32CanonicalPath -Path $fixture
             git_status = 'clean'
@@ -4676,7 +4741,7 @@ function Invoke-D32SelfTest {
             cargo_home = [ordered]@{
                 path = [IO.Path]::GetFullPath($phase0CargoHome)
                 temp_root = [IO.Path]::GetFullPath($phase0TempRoot)
-                run_id = 'phase0-run-selftest'
+                run_id = $phase0RunId
             }
             fresh_outputs = @($artifactSpecs | ForEach-Object {
                     [ordered]@{
@@ -4749,14 +4814,50 @@ function Invoke-D32SelfTest {
             foreach ($finding in $aggregateRecordFindings) { Write-Host ("  AGGREGATE RECORD SELFTEST [{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message) }
         }
         Assert-D32SelfTest -Condition ($aggregateRecordValidation.IsValid -and @($aggregateRecordFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'PASS' }).Count -eq 1) -Name 'exact-SHA aggregate record schema binds current sources and explicitly defers downstream gates' -Failures $failures
+        $phase0RawForAggregateSchemaTests = [IO.File]::ReadAllText($phase0RecordPath, [Text.Encoding]::UTF8)
+        $aggregateRawForPhase0SchemaTests = [IO.File]::ReadAllText($aggregateRecordPath, [Text.Encoding]::UTF8)
+        try {
+            foreach ($phase0SchemaCase in @(
+                    [PSCustomObject]@{ Version = 2; Type = 'D32_PHASE0_MATRIX_RECORD_V2'; Name = 'prior V2' },
+                    [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
+                )) {
+                $phase0Variant = $phase0RawForAggregateSchemaTests | ConvertFrom-D32Json
+                $phase0Variant.schema_version = [int]$phase0SchemaCase.Version
+                $phase0Variant.record_type = [string]$phase0SchemaCase.Type
+                Write-D32Json -Path $phase0RecordPath -Value $phase0Variant
+                $phase0VariantSnapshot = Get-D32ProfileFileSnapshot -Path $phase0RecordPath
+                $aggregateVariant = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+                $aggregateVariant.references.phase0_matrix.sha256 = [string]$phase0VariantSnapshot.Sha256
+                $aggregateVariant.references.phase0_matrix.bytes = [Int64]$phase0VariantSnapshot.Bytes
+                $aggregateVariant.references.phase0_matrix.volume_serial_hex = [string]$phase0VariantSnapshot.VolumeSerialHex
+                $aggregateVariant.references.phase0_matrix.file_id_hex = [string]$phase0VariantSnapshot.FileIdHex
+                Write-D32Json -Path $aggregateRecordPath -Value $aggregateVariant
+                $aggregateVariantDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+                $phase0SchemaFindings = New-D32FindingList
+                $phase0SchemaValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateVariantDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $phase0SchemaFindings
+                Assert-D32SelfTest -Condition (-not $phase0SchemaValidation.IsValid -and @($phase0SchemaFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*not the supported exact V3 local PASS schema*' }).Count -eq 1) -Name "aggregate reader rejects $($phase0SchemaCase.Name) Phase0 after a fresh complete reference pin" -Failures $failures
+            }
+        }
+        finally {
+            [IO.File]::WriteAllText($phase0RecordPath, $phase0RawForAggregateSchemaTests, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($aggregateRecordPath, $aggregateRawForPhase0SchemaTests, [Text.UTF8Encoding]::new($false))
+        }
         $legacyAggregateRecord = [System.IO.File]::ReadAllText($aggregateRecordPath) | ConvertFrom-D32Json
-        $legacyAggregateRecord.schema_version = 1
-        $legacyAggregateRecord.record_type = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V1'
+        $legacyAggregateRecord.schema_version = 2
+        $legacyAggregateRecord.record_type = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V2'
         Write-D32Json -Path $aggregateRecordPath -Value $legacyAggregateRecord
         $legacyAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
         $legacyAggregateFindings = New-D32FindingList
         $legacyAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $legacyAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $legacyAggregateFindings
-        Assert-D32SelfTest -Condition (-not $legacyAggregateValidation.IsValid -and @($legacyAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects legacy V1 after the synchronized process-trace schema upgrade' -Failures $failures
+        Assert-D32SelfTest -Condition (-not $legacyAggregateValidation.IsValid -and @($legacyAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects legacy V2 after compact Phase0 migration' -Failures $failures
+        $unknownAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $unknownAggregateRecord.schema_version = 99
+        $unknownAggregateRecord.record_type = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V99'
+        Write-D32Json -Path $aggregateRecordPath -Value $unknownAggregateRecord
+        $unknownAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $unknownAggregateFindings = New-D32FindingList
+        $unknownAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $unknownAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $unknownAggregateFindings
+        Assert-D32SelfTest -Condition (-not $unknownAggregateValidation.IsValid -and @($unknownAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects an unknown future version with a fresh exact-SHA pin' -Failures $failures
         Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
         $invalidAggregateRecord = [System.IO.File]::ReadAllText($aggregateRecordPath) | ConvertFrom-D32Json
         $invalidAggregateRecord.status = 'ARTIFACT_ONLY'
@@ -4783,34 +4884,64 @@ function Invoke-D32SelfTest {
         $validAttestationObject = ([System.IO.File]::ReadAllText($attestationPath) | ConvertFrom-D32Json)
         $attestationSha = (Get-D32EvidenceFileDigest -Path $attestationPath).Hash
 
+        $blockedDiagnosticPath = Join-Path $phase0Root 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
+        try {
+            $blockedDiagnosticJson = '{"schema_version":1,"record_type":"D32_PHASE0_BLOCKED_DIAGNOSTIC_V1","status":"PASS"}'
+            $blockedDiagnosticBytes = [Text.UTF8Encoding]::new($false).GetBytes($blockedDiagnosticJson + [Environment]::NewLine)
+            $blockedDiagnosticStream = [IO.File]::Open($blockedDiagnosticPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $blockedDiagnosticStream.Write($blockedDiagnosticBytes, 0, $blockedDiagnosticBytes.Length); $blockedDiagnosticStream.Flush($true) }
+            finally { $blockedDiagnosticStream.Dispose() }
+
+            $blockedAttestationFindings = New-D32FindingList
+            Test-D32ReleaseEvidenceBundle -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleFilePath $bundleManifest -Attestation $validAttestationObject -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $blockedAttestationFindings
+            Assert-D32SelfTest -Condition (@($blockedAttestationFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*blocked-diagnostic sidecar exists*' }).Count -gt 0) -Name 'release attestor rejects any blocked-diagnostic sidecar, including forged PASS content' -Failures $failures
+
+            Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
+            $aggregateRecordDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+            $blockedAggregateFindings = New-D32FindingList
+            $blockedAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateRecordDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $blockedAggregateFindings
+            Assert-D32SelfTest -Condition (-not $blockedAggregateValidation.IsValid -and @($blockedAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*blocked-diagnostic sidecar exists*' }).Count -eq 1) -Name 'aggregate reader refuses a forged PASS blocked-diagnostic sidecar' -Failures $failures
+        }
+        finally { if (Test-Path -LiteralPath $blockedDiagnosticPath) { [IO.File]::Delete($blockedDiagnosticPath) } }
+
         $legacyAttestationObject = ([System.IO.File]::ReadAllText($attestationPath) | ConvertFrom-D32Json)
-        $legacyAttestationObject.schema_version = 2
-        $legacyAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V2'
+        $legacyAttestationObject.schema_version = 3
+        $legacyAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V3'
         $legacyAttestationFindings = Get-D32ReleaseBundleSelfTestFindings -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleManifest $bundleManifest -Attestation $legacyAttestationObject -AttestationPath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture
-        Assert-D32SelfTest -Condition (@($legacyAttestationFindings | Where-Object { $_.Check -eq 'attestation.schema' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'release attestation rejects legacy V2 without synchronized process traces' -Failures $failures
+        Assert-D32SelfTest -Condition (@($legacyAttestationFindings | Where-Object { $_.Check -eq 'attestation.schema' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'release attestation rejects prior V3 after Phase0 compact-schema migration' -Failures $failures
+        $unknownAttestationObject = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($validAttestationObject))
+        $unknownAttestationObject.schema_version = 99
+        $unknownAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V99'
+        $unknownAttestationFindings = Get-D32ReleaseBundleSelfTestFindings -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleManifest $bundleManifest -Attestation $unknownAttestationObject -AttestationPath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture
+        Assert-D32SelfTest -Condition (@($unknownAttestationFindings | Where-Object { $_.Check -eq 'attestation.schema' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'release attestation rejects an unknown future version instead of guessing its schema' -Failures $failures
 
         $phase0OriginalRaw = [System.IO.File]::ReadAllText($phase0RecordPath)
         $attestationOriginalRaw = [System.IO.File]::ReadAllText($attestationPath)
         $bundleOriginalRaw = [System.IO.File]::ReadAllText($bundleManifest)
         try {
-            $legacyPhase0 = $phase0OriginalRaw | ConvertFrom-D32Json
-            $legacyPhase0.schema_version = 1
-            $legacyPhase0.record_type = 'D32_PHASE0_MATRIX_RECORD_V1'
-            Write-D32Json -Path $phase0RecordPath -Value $legacyPhase0
-            $legacyPhase0Snapshot = Get-D32ProfileFileSnapshot -Path $phase0RecordPath
-            $legacyPhase0Attestation = $attestationOriginalRaw | ConvertFrom-D32Json
-            $legacyPhase0Attestation.phase0_matrix.sha256 = $legacyPhase0Snapshot.Sha256
-            $legacyPhase0Attestation.phase0_matrix.bytes = [Int64]$legacyPhase0Snapshot.Bytes
-            $legacyPhase0Attestation.phase0_matrix.volume_serial_hex = [string]$legacyPhase0Snapshot.VolumeSerialHex
-            $legacyPhase0Attestation.phase0_matrix.file_id_hex = [string]$legacyPhase0Snapshot.FileIdHex
-            Write-D32Json -Path $attestationPath -Value $legacyPhase0Attestation
-            $legacyAttestationSnapshot = Get-D32EvidenceFileDigest -Path $attestationPath
-            $legacyBundle = $bundleOriginalRaw | ConvertFrom-D32Json
-            $legacyBundle.attestation_sha256 = $legacyAttestationSnapshot.Hash
-            Write-D32Json -Path $bundleManifest -Value $legacyBundle
-            $legacyPhase0Findings = New-D32FindingList
-            Test-D32ReleaseEvidenceBundle -Bundle $legacyBundle -BundleFilePath $bundleManifest -Attestation $legacyPhase0Attestation -AttestationFilePath $attestationPath -AttestationSha256 $legacyAttestationSnapshot.Hash -Head $head -Repository $fixture -ExpectedPhase0RecordPath $legacyPhase0Snapshot.Path -ExpectedPhase0RecordSha256 $legacyPhase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $legacyPhase0Findings
-            Assert-D32SelfTest -Condition (@($legacyPhase0Findings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*unsupported schema*' }).Count -gt 0) -Name 'Phase0 matrix rejects legacy V1 even when its current bytes are re-pinned' -Failures $failures
+            foreach ($phase0SchemaCase in @(
+                    [PSCustomObject]@{ Version = 2; Type = 'D32_PHASE0_MATRIX_RECORD_V2'; Name = 'prior V2' },
+                    [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
+                )) {
+                $phase0Variant = $phase0OriginalRaw | ConvertFrom-D32Json
+                $phase0Variant.schema_version = [int]$phase0SchemaCase.Version
+                $phase0Variant.record_type = [string]$phase0SchemaCase.Type
+                Write-D32Json -Path $phase0RecordPath -Value $phase0Variant
+                $phase0VariantSnapshot = Get-D32ProfileFileSnapshot -Path $phase0RecordPath
+                $phase0VariantAttestation = $attestationOriginalRaw | ConvertFrom-D32Json
+                $phase0VariantAttestation.phase0_matrix.sha256 = $phase0VariantSnapshot.Sha256
+                $phase0VariantAttestation.phase0_matrix.bytes = [Int64]$phase0VariantSnapshot.Bytes
+                $phase0VariantAttestation.phase0_matrix.volume_serial_hex = [string]$phase0VariantSnapshot.VolumeSerialHex
+                $phase0VariantAttestation.phase0_matrix.file_id_hex = [string]$phase0VariantSnapshot.FileIdHex
+                Write-D32Json -Path $attestationPath -Value $phase0VariantAttestation
+                $phase0VariantAttestationSnapshot = Get-D32EvidenceFileDigest -Path $attestationPath
+                $phase0VariantBundle = $bundleOriginalRaw | ConvertFrom-D32Json
+                $phase0VariantBundle.attestation_sha256 = $phase0VariantAttestationSnapshot.Hash
+                Write-D32Json -Path $bundleManifest -Value $phase0VariantBundle
+                $phase0VariantFindings = New-D32FindingList
+                Test-D32ReleaseEvidenceBundle -Bundle $phase0VariantBundle -BundleFilePath $bundleManifest -Attestation $phase0VariantAttestation -AttestationFilePath $attestationPath -AttestationSha256 $phase0VariantAttestationSnapshot.Hash -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0VariantSnapshot.Path -ExpectedPhase0RecordSha256 $phase0VariantSnapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $phase0VariantFindings
+                Assert-D32SelfTest -Condition (@($phase0VariantFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*unsupported schema*' }).Count -gt 0) -Name "Phase1 reader rejects $($phase0SchemaCase.Name) even when its current bytes are fully re-pinned" -Failures $failures
+            }
         }
         finally {
             [System.IO.File]::WriteAllText($phase0RecordPath, $phase0OriginalRaw, [Text.UTF8Encoding]::new($false))

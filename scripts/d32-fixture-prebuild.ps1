@@ -47,6 +47,7 @@ param(
     [string]$ExpectedCandidateSha,
     [string]$ToolchainProfilePath,
     [string]$ExpectedToolchainProfileSha256,
+    [AllowNull()][object]$Phase0OwnerBinding,
     [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 600,
@@ -1698,7 +1699,12 @@ function Invoke-D32LockedCargoFetches {
                 process_trace = $result.process_trace
             })
         if ($result.status -ne 'succeeded' -or $result.exit_code -ne 0) {
-            throw "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); see $($result.phase_log)"
+            $failure = "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); see $($result.phase_log)"
+            try {
+                Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+            }
+            catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
+            throw $failure
         }
         $results.Add([ordered]@{
                 manifest_path = [string]$lock.ManifestPath
@@ -4376,6 +4382,69 @@ function Test-D32NoOwnedCargoDescendants {
     }
 }
 
+function Write-D32FixturePhase0FailurePayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [AllowNull()][object]$ProcessResult,
+        [Parameter(Mandatory = $true)][string]$PrimaryError,
+        [AllowEmptyCollection()][string[]]$SecondaryErrors = @(),
+        [AllowNull()][string]$PhaseLogPath
+    )
+
+    if ($null -eq $script:D32Phase0StorageContext -or $null -eq $Phase0OwnerBinding -or [bool]$script:D32Phase0FailurePayloadEmitted) { return }
+    $image = @($script:ValidatedToolchainProfile.ExecutableInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $Executable })
+    if ($image.Count -ne 1) { throw 'PHASE0_FAILURE_CAPTURE_BLOCKED: failing executable is not uniquely present in the caller-pinned profile inventory' }
+    $image = $image[0]
+    $commandLine = ConvertTo-D32CommandLine (@($Executable) + @($Arguments))
+    $stdoutPath = if ($null -ne $ProcessResult -and -not [String]::IsNullOrWhiteSpace([string]$ProcessResult.stdout_log)) { [string]$ProcessResult.stdout_log } elseif (-not [String]::IsNullOrWhiteSpace($PhaseLogPath)) { Get-D32FullPath "$PhaseLogPath.stdout.log" } else { $null }
+    $stderrPath = if ($null -ne $ProcessResult -and -not [String]::IsNullOrWhiteSpace([string]$ProcessResult.stderr_log)) { [string]$ProcessResult.stderr_log } elseif (-not [String]::IsNullOrWhiteSpace($PhaseLogPath)) { Get-D32FullPath "$PhaseLogPath.stderr.log" } else { $null }
+    $streams = @(
+        [ordered]@{ ordinal = 1; stream = 'stdout'; path = $stdoutPath },
+        [ordered]@{ ordinal = 2; stream = 'stderr'; path = $stderrPath }
+    )
+    $rawEvidence = if ($null -ne $ProcessResult -and $null -ne $ProcessResult.raw_debug_job_evidence) { $ProcessResult.raw_debug_job_evidence } else { $script:D32LastProcessEvidence }
+    $rawDebugEvidence = $rawEvidence
+    $processIdentity = if ($null -ne $ProcessResult) { $ProcessResult.root_identity } elseif ($null -ne $rawEvidence) { ConvertTo-D32IdentityDocument $rawEvidence.root_record } else { $null }
+    $rawTrace = if ($null -ne $ProcessResult -and $null -ne $ProcessResult.process_trace) { $ProcessResult.process_trace } elseif ($null -ne $rawEvidence) { $rawEvidence.process_trace } else { $null }
+    $nativeCleanup = if ($null -ne $ProcessResult -and $null -ne $ProcessResult.native_cleanup) { $ProcessResult.native_cleanup } elseif ($null -ne $rawEvidence -and $null -ne $rawEvidence.native_cleanup) { ConvertTo-D32NativeCleanupDocument $rawEvidence.native_cleanup } else { $null }
+    $payload = [ordered]@{
+        schema_version = 1
+        record_type = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_PAYLOAD_V1'
+        candidate_sha = [string]$candidateSha
+        toolchain_profile_path = [string]$script:ValidatedToolchainProfile.ProfilePath
+        toolchain_profile_sha256 = [string]$script:ValidatedToolchainProfile.Digest
+        run_id = [string]$script:D32Phase0StorageContext.run_id
+        failing_fixed_command = [ordered]@{
+            name = $Name
+            executable = [string]$image.Path
+            executable_sha256 = [string]$image.Sha256
+            executable_bytes = [Int64]$image.Bytes
+            executable_volume_serial_hex = [string]$image.VolumeSerialHex
+            executable_file_id_hex = [string]$image.FileIdHex
+            arguments = @($Arguments)
+            command_line = $commandLine
+            working_directory = [IO.Path]::GetFullPath($WorkingDirectory)
+        }
+        process_identity = $processIdentity
+        raw_v2_trace = $rawTrace
+        raw_job_debug_cleanup = [ordered]@{
+            raw_native_cleanup = $nativeCleanup
+            raw_process_evidence = $rawDebugEvidence
+            trace_state = if ($null -eq $rawTrace) { $null } else { [string]$rawTrace.state }
+            cleanup_status = if ($null -eq $nativeCleanup) { 'UNVERIFIED' } elseif ([bool]$nativeCleanup.cleanup_succeeded) { 'VERIFIED' } else { 'UNVERIFIED' }
+        }
+        ordered_stream_paths = $streams
+        primary_error = $PrimaryError
+        secondary_errors = @($SecondaryErrors)
+    }
+    $json = ConvertTo-Json -InputObject $payload -Depth 40 -Compress
+    $script:D32Phase0FailurePayloadEmitted = $true
+    Write-Output ('D32_PHASE0_BLOCKED_DIAGNOSTIC_PAYLOAD_V1:' + $json)
+}
+
 function Invoke-D32BoundedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -4711,6 +4780,7 @@ function Invoke-D32BoundedProcess {
         native_launch = $script:D32LastProcessEvidence.native_launch
         native_cleanup = ConvertTo-D32NativeCleanupDocument $nativeCleanup
         process_trace = $script:D32LastProcessEvidence.process_trace
+        raw_debug_job_evidence = $script:D32LastProcessEvidence
         reap = if ($null -eq $reap) { $null } else {
             [ordered]@{
                 process_ids = @($reap.ProcessIds)
@@ -4760,6 +4830,83 @@ function Assert-D32FixtureManifestEnvironmentShape {
         @($actual | Where-Object { $_ -notin $required }).Count -ne 0 -or
         @($required | Where-Object { $_ -notin $actual }).Count -ne 0) {
         throw 'FIXTURE_MANIFEST_ENVIRONMENT_INVALID: schema-v3 environment must retain exactly the six consumer wire fields'
+    }
+}
+
+function Test-D32FixtureExactProperties {
+    param([AllowNull()][object]$Object, [Parameter(Mandatory = $true)][string[]]$Expected)
+
+    if ($null -eq $Object -or $Object -is [string] -or $Object -is [Array] -or $Object -is [ValueType]) { return $false }
+    $actual = @(Get-D32ObjectFieldNames -Object $Object)
+    if ($actual.Count -ne $Expected.Count) { return $false }
+    foreach ($name in $Expected) { if ($actual -cnotcontains $name) { return $false } }
+    return $true
+}
+
+function Test-D32FixturePhase0OwnerBinding {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][object]$OwnerBinding
+    )
+
+    if (-not (Test-D32FixtureExactProperties -Object $OwnerBinding -Expected @('Path', 'RunId', 'RootIdentity', 'OwnerMarker')) -or
+        -not (Test-D32PathEqual -Left ([string]$OwnerBinding.Path) -Right $OutputRoot) -or
+        [string]$OwnerBinding.RunId -cnotmatch '^[0-9a-f]{32}$') { throw 'PHASE0_OWNER_BLOCKED: Phase0 runner did not supply an exact fresh owner binding' }
+    $rootIdentityRecord = $OwnerBinding.RootIdentity
+    if (-not (Test-D32FixtureExactProperties -Object $rootIdentityRecord -Expected @('Path', 'VolumeSerialHex', 'FileIdHex', 'Attributes'))) { throw 'PHASE0_OWNER_BLOCKED: EvidenceRoot opened-handle identity record is malformed' }
+    $rootIdentity = Get-D32ProfileDirectoryIdentity -Path $OutputRoot
+    if (-not (Test-D32PathEqual -Left ([string]$rootIdentityRecord.Path) -Right $OutputRoot) -or
+        $rootIdentity.VolumeSerialHex -cne [string]$rootIdentityRecord.VolumeSerialHex -or $rootIdentity.FileIdHex -cne [string]$rootIdentityRecord.FileIdHex) {
+        throw 'PHASE0_OWNER_BLOCKED: EvidenceRoot opened-handle identity changed before fixture setup'
+    }
+    $markerReference = $OwnerBinding.OwnerMarker
+    if (-not (Test-D32FixtureExactProperties -Object $markerReference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) { throw 'PHASE0_OWNER_BLOCKED: owner marker file reference is malformed' }
+    $expectedMarkerPath = Join-Path $OutputRoot 'D32-PHASE0-OWNER.json'
+    if (-not (Test-D32PathEqual -Left ([string]$markerReference.path) -Right $expectedMarkerPath)) { throw 'PHASE0_OWNER_BLOCKED: owner marker path is not fixed beneath EvidenceRoot' }
+    $marker = Get-D32BoundArtifactWithFileId -Path $expectedMarkerPath
+    if ([uint64]$marker.bytes -ne [uint64]$markerReference.bytes -or $marker.sha256 -cne [string]$markerReference.sha256 -or
+        $marker.volume_serial_hex -cne [string]$markerReference.volume_serial_hex -or $marker.file_id_hex -cne [string]$markerReference.file_id_hex) {
+        throw 'PHASE0_OWNER_BLOCKED: create-new owner marker bytes or opened-handle identity changed'
+    }
+    if (-not (Test-D32NoReparsePath -Path $expectedMarkerPath) -or
+        [IO.File]::ReadAllText($expectedMarkerPath, [Text.Encoding]::UTF8) -notmatch '"record_type"\s*:\s*"D32_PHASE0_EVIDENCE_OWNER_V1"') {
+        throw 'PHASE0_OWNER_BLOCKED: owner marker is missing, reparse-backed, or has an unsupported type'
+    }
+    $ownerDocument = [IO.File]::ReadAllText($expectedMarkerPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable
+    $ownerFields = @('schema_version', 'record_type', 'candidate_sha', 'toolchain_profile_path', 'toolchain_profile_sha256', 'toolchain_profile_bytes', 'toolchain_profile_volume_serial_hex', 'toolchain_profile_file_id_hex', 'evidence_root_path', 'evidence_root_volume_serial_hex', 'evidence_root_file_id_hex', 'run_id')
+    $ownerActualFields = @(Get-D32ObjectFieldNames -Object $ownerDocument)
+    if ($ownerActualFields.Count -ne $ownerFields.Count -or @($ownerActualFields | Where-Object { $_ -notin $ownerFields }).Count -ne 0 -or @($ownerFields | Where-Object { $_ -notin $ownerActualFields }).Count -ne 0 -or
+        [int]$ownerDocument.schema_version -ne 1 -or $ownerDocument.record_type -cne 'D32_PHASE0_EVIDENCE_OWNER_V1' -or
+        $ownerDocument.candidate_sha -cne $ExpectedCandidateSha -or
+        -not (Test-D32PathEqual -Left ([string]$ownerDocument.toolchain_profile_path) -Right ([string]$ValidatedProfile.ProfilePath)) -or
+        $ownerDocument.toolchain_profile_sha256 -cne [string]$ValidatedProfile.Digest -or
+        [Int64]$ownerDocument.toolchain_profile_bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $ownerDocument.toolchain_profile_volume_serial_hex -cne [string]$ValidatedProfile.Identity.VolumeSerialHex -or
+        $ownerDocument.toolchain_profile_file_id_hex -cne [string]$ValidatedProfile.Identity.FileIdHex -or
+        -not (Test-D32PathEqual -Left ([string]$ownerDocument.evidence_root_path) -Right $OutputRoot) -or
+        $ownerDocument.evidence_root_volume_serial_hex -cne $rootIdentity.VolumeSerialHex -or
+        $ownerDocument.evidence_root_file_id_hex -cne $rootIdentity.FileIdHex -or
+        $ownerDocument.run_id -cne [string]$OwnerBinding.RunId) {
+        throw 'PHASE0_OWNER_BLOCKED: marker content does not bind the exact candidate/profile/root/run identity'
+    }
+    $profileSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$ValidatedProfile.ProfilePath)
+    if ($profileSnapshot.Sha256 -cne [string]$ValidatedProfile.Digest -or $profileSnapshot.Bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $profileSnapshot.VolumeSerialHex -cne [string]$ValidatedProfile.Identity.VolumeSerialHex -or $profileSnapshot.FileIdHex -cne [string]$ValidatedProfile.Identity.FileIdHex) {
+        throw 'PHASE0_OWNER_BLOCKED: profile path/hash/opened-handle identity changed before fixture setup'
+    }
+    return [PSCustomObject]@{
+        RunId = [string]$OwnerBinding.RunId
+        EvidenceRoot = $OutputRoot
+        EvidenceRootIdentity = $rootIdentity
+        OwnerMarker = [ordered]@{
+            path = [string]$marker.path
+            bytes = [uint64]$marker.bytes
+            sha256 = [string]$marker.sha256
+            volume_serial_hex = [string]$marker.volume_serial_hex
+            file_id_hex = [string]$marker.file_id_hex
+        }
     }
 }
 
@@ -4846,12 +4993,12 @@ function Assert-D32FixtureBuildProvenanceShape {
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
-        'fixture_manifest_file_id_hex', 'environment', 'process_traces')
+        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces')
     $actual = @($Document.Keys | ForEach-Object { [string]$_ })
     if ($actual.Count -ne $expected.Count -or
         @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
         @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
-        [int]$Document.schema_version -ne 2 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V2' -or
+        [int]$Document.schema_version -ne 3 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V3' -or
         [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [uint64]$Document.fixture_manifest_bytes -le 0 -or
@@ -4872,6 +5019,49 @@ function Assert-D32FixtureBuildProvenanceShape {
         $Document.environment.fetch_manifests.Count -eq 0 -or
         -not [bool]$Document.environment.offline_after_fetch) {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar environment must match the exact ten-field versioned provenance shape'
+    }
+    $storageFields = @('evidence_root', 'owner_marker', 'run_root', 'cargo_home', 'temp_root', 'run_id')
+    $storage = $Document.storage
+    $storageKeys = @(Get-D32ObjectFieldNames -Object $storage)
+    if ($storageKeys.Count -ne $storageFields.Count -or
+        @($storageKeys | Where-Object { $_ -notin $storageFields }).Count -ne 0 -or
+        @($storageFields | Where-Object { $_ -notin $storageKeys }).Count -ne 0 -or
+        $storage.run_id -isnot [string] -or $storage.run_id -cne [string]$Document.environment.run_id) {
+        throw 'FIXTURE_PROVENANCE_INVALID: compact storage identity schema/run_id is invalid'
+    }
+    foreach ($directoryName in @('evidence_root', 'run_root', 'cargo_home', 'temp_root')) {
+        $directory = $storage.$directoryName
+        $directoryFields = @('path', 'volume_serial_hex', 'file_id_hex')
+        $directoryKeys = @(Get-D32ObjectFieldNames -Object $directory)
+        if ($directoryKeys.Count -ne $directoryFields.Count -or
+            @($directoryKeys | Where-Object { $_ -notin $directoryFields }).Count -ne 0 -or
+            @($directoryFields | Where-Object { $_ -notin $directoryKeys }).Count -ne 0 -or
+            $directory.path -isnot [string] -or -not [IO.Path]::IsPathRooted([string]$directory.path) -or
+            $directory.volume_serial_hex -isnot [string] -or [string]$directory.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+            $directory.file_id_hex -isnot [string] -or [string]$directory.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+            throw "FIXTURE_PROVENANCE_INVALID: compact storage $directoryName path/opened-handle identity is malformed"
+        }
+    }
+    $ownerFields = @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')
+    $ownerKeys = @(Get-D32ObjectFieldNames -Object $storage.owner_marker)
+    if ($ownerKeys.Count -ne $ownerFields.Count -or
+        @($ownerKeys | Where-Object { $_ -notin $ownerFields }).Count -ne 0 -or
+        @($ownerFields | Where-Object { $_ -notin $ownerKeys }).Count -ne 0 -or
+        $storage.owner_marker.path -isnot [string] -or
+        [string]$storage.owner_marker.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [uint64]$storage.owner_marker.bytes -le 0 -or
+        [string]$storage.owner_marker.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        [string]$storage.owner_marker.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'FIXTURE_PROVENANCE_INVALID: create-new owner marker reference is malformed'
+    }
+    $storageRoot = [IO.Path]::GetFullPath([string]$storage.evidence_root.path)
+    if (-not (Test-D32ProfilePathEqual -Left ([string]$storage.owner_marker.path) -Right (Join-Path $storageRoot 'D32-PHASE0-OWNER.json')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$storage.run_root.path) -Right (Join-Path $storageRoot 'r')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$storage.cargo_home.path) -Right (Join-Path $storageRoot 'r\c')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$storage.temp_root.path) -Right (Join-Path $storageRoot 'r\t')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.environment.cargo_home) -Right ([string]$storage.cargo_home.path)) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.environment.temp_root) -Right ([string]$storage.temp_root.path))) {
+        throw 'FIXTURE_PROVENANCE_INVALID: CARGO_HOME/TEMP must use the exact compact r\\c and r\\t layout beneath the bound EvidenceRoot'
     }
     foreach ($fetchManifest in @($Document.environment.fetch_manifests)) {
         $fetchFields = @(Get-D32ObjectFieldNames -Object $fetchManifest)
@@ -6448,6 +6638,10 @@ public static class D32DebugSelfTestLauncher
 
         $provenanceCargoPath = Join-Path $root 'cargo.exe'
         $provenanceManifestPath = Join-Path $fakeRepo 'vita-agent/Cargo.toml'
+        $provenanceEvidenceRoot = Join-Path $root 'evidence'
+        $provenanceRunRoot = Join-Path $provenanceEvidenceRoot 'r'
+        $provenanceCargoHome = Join-Path $provenanceRunRoot 'c'
+        $provenanceTempRoot = Join-Path $provenanceRunRoot 't'
         $provenanceFetchArguments = @(
             'fetch', '--locked', '--manifest-path', $provenanceManifestPath,
             '--target', 'x86_64-pc-windows-msvc'
@@ -6458,8 +6652,8 @@ public static class D32DebugSelfTestLauncher
             target_triple = 'x86_64-pc-windows-msvc'
             env_policy = 'D32_BUILD_ENV_V1'
             cargo_policy = 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER'
-            cargo_home = (Join-Path $root 'run/cargo-home')
-            temp_root = (Join-Path $root 'run/temp')
+            cargo_home = $provenanceCargoHome
+            temp_root = $provenanceTempRoot
             run_id = '0123456789abcdef0123456789abcdef'
             fetch_manifests = @([ordered]@{
                     manifest_path = 'vita-agent/Cargo.toml'
@@ -6550,8 +6744,8 @@ public static class D32DebugSelfTestLauncher
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
         $provenanceDocument = [ordered]@{
-            schema_version = 2
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V2'
+            schema_version = 3
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
             candidate_sha = '0123456789abcdef0123456789abcdef01234567'
             source_repo = $fakeRepo
             fixture_manifest_path = $sample
@@ -6560,6 +6754,14 @@ public static class D32DebugSelfTestLauncher
             fixture_manifest_volume_serial_hex = $boundManifestArtifact.volume_serial_hex
             fixture_manifest_file_id_hex = $boundManifestArtifact.file_id_hex
             environment = $provenanceEnvironment
+            storage = [ordered]@{
+                evidence_root = [ordered]@{ path = $provenanceEvidenceRoot; volume_serial_hex = '0000000000000001'; file_id_hex = ('01' * 16) }
+                owner_marker = [ordered]@{ path = (Join-Path $provenanceEvidenceRoot 'D32-PHASE0-OWNER.json'); bytes = 1; sha256 = ('e' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = ('02' * 16) }
+                run_root = [ordered]@{ path = $provenanceRunRoot; volume_serial_hex = '0000000000000001'; file_id_hex = ('03' * 16) }
+                cargo_home = [ordered]@{ path = $provenanceCargoHome; volume_serial_hex = '0000000000000001'; file_id_hex = ('04' * 16) }
+                temp_root = [ordered]@{ path = $provenanceTempRoot; volume_serial_hex = '0000000000000001'; file_id_hex = ('05' * 16) }
+                run_id = $provenanceEnvironment.run_id
+            }
             process_traces = @($traceRecords.ToArray())
         }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
@@ -7287,15 +7489,32 @@ if (-not [bool]$validatedToolchainProfile.IsValid) {
     throw "TOOLCHAIN_PROFILE_BLOCKED: $($validatedToolchainProfile.Failure)"
 }
 $script:ValidatedToolchainProfile = $validatedToolchainProfile
+if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: operational fixture builds require the fixed Phase0 runner owner binding' }
+$phase0OwnerContext = Test-D32FixturePhase0OwnerBinding -OutputRoot $OutputRoot -ExpectedCandidateSha $candidateSha -ValidatedProfile $validatedToolchainProfile -OwnerBinding $Phase0OwnerBinding
 $cargo = [string]$validatedToolchainProfile.Profile.toolchain.cargo.path
 $cargo = Assert-D32NoReparsePath -Path $cargo
 $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
-$toolchainRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
-$toolchainRunRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot ("fixture-toolchain-run-$toolchainRunId"))
-$fixtureCargoHome = New-D32FreshCargoHome -RunRoot $toolchainRunRoot -Repository $RepoRoot
-$fixtureTempRoot = Join-Path $toolchainRunRoot 'temp'
-[void][IO.Directory]::CreateDirectory($fixtureTempRoot)
-$fixtureTempRoot = Assert-D32NoReparsePath -Path $fixtureTempRoot
+$toolchainRunId = [string]$phase0OwnerContext.RunId
+$toolchainRunRoot = Join-Path $OutputRoot 'r'
+$toolchainRunRootIdentity = New-D32ProfileDirectoryCreateNew -Path $toolchainRunRoot
+$fixtureCargoHome = Join-Path $toolchainRunRoot 'c'
+$fixtureCargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $fixtureCargoHome
+$null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot -RequireEmpty
+$fixtureTempRoot = Join-Path $toolchainRunRoot 't'
+$fixtureTempRootIdentity = New-D32ProfileDirectoryCreateNew -Path $fixtureTempRoot
+$null = Test-D32ProfileDirectoryIdentity -Path $OutputRoot -VolumeSerialHex $phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex -FileIdHex $phase0OwnerContext.EvidenceRootIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $toolchainRunRootIdentity.VolumeSerialHex -FileIdHex $toolchainRunRootIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $fixtureCargoHomeIdentity.VolumeSerialHex -FileIdHex $fixtureCargoHomeIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureTempRoot -VolumeSerialHex $fixtureTempRootIdentity.VolumeSerialHex -FileIdHex $fixtureTempRootIdentity.FileIdHex
+$script:D32Phase0StorageContext = [ordered]@{
+    evidence_root = [ordered]@{ path = [string]$phase0OwnerContext.EvidenceRootIdentity.Path; volume_serial_hex = [string]$phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex; file_id_hex = [string]$phase0OwnerContext.EvidenceRootIdentity.FileIdHex }
+    owner_marker = $phase0OwnerContext.OwnerMarker
+    run_root = [ordered]@{ path = [string]$toolchainRunRootIdentity.Path; volume_serial_hex = [string]$toolchainRunRootIdentity.VolumeSerialHex; file_id_hex = [string]$toolchainRunRootIdentity.FileIdHex }
+    cargo_home = [ordered]@{ path = [string]$fixtureCargoHomeIdentity.Path; volume_serial_hex = [string]$fixtureCargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$fixtureCargoHomeIdentity.FileIdHex }
+    temp_root = [ordered]@{ path = [string]$fixtureTempRootIdentity.Path; volume_serial_hex = [string]$fixtureTempRootIdentity.VolumeSerialHex; file_id_hex = [string]$fixtureTempRootIdentity.FileIdHex }
+    run_id = $toolchainRunId
+}
+$script:D32Phase0FailurePayloadEmitted = $false
 $fixtureManifestEnvironment = Get-D32EnvironmentPlan -EnvironmentRoot (Join-Path $toolchainRunRoot 'manifest-environment')
 Assert-D32FixtureManifestEnvironmentShape -Environment $fixtureManifestEnvironment
 $phaseEvidence = [System.Collections.Generic.List[object]]::new()
@@ -7315,6 +7534,10 @@ $offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
     -CargoHome $fixtureCargoHome `
     -TempRoot $fixtureTempRoot `
     -Offline $true
+$null = Test-D32ProfileDirectoryIdentity -Path $OutputRoot -VolumeSerialHex $phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex -FileIdHex $phase0OwnerContext.EvidenceRootIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $toolchainRunRootIdentity.VolumeSerialHex -FileIdHex $toolchainRunRootIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $fixtureCargoHomeIdentity.VolumeSerialHex -FileIdHex $fixtureCargoHomeIdentity.FileIdHex
+$null = Test-D32ProfileDirectoryIdentity -Path $fixtureTempRoot -VolumeSerialHex $fixtureTempRootIdentity.VolumeSerialHex -FileIdHex $fixtureTempRootIdentity.FileIdHex
 $fixtureEnvironmentPlan = [ordered]@{
     toolchain_profile_path = [string]$validatedToolchainProfile.ProfilePath
     toolchain_profile_sha256 = [string]$validatedToolchainProfile.Digest
@@ -7416,6 +7639,13 @@ try {
             if ($null -ne $artifactError) {
                 $status = 'artifact_missing'
             }
+            if ($status -ne 'succeeded' -or $processResult.exit_code -ne 0 -or $null -ne $artifactError) {
+                $primaryFailure = if ($null -ne $artifactError) { "FIXTURE_ARTIFACT_BLOCKED: $artifactError" } else { "FIXTURE_BUILD_BLOCKED: $($spec.name) status=$status exit=$($processResult.exit_code)" }
+                try {
+                    Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
+                }
+                catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
+            }
             $results += [ordered]@{
                 phase          = $phase
                 name           = $spec.name
@@ -7441,6 +7671,11 @@ try {
             }
         }
         catch {
+            $primaryFailure = $_.Exception.Message
+            try {
+                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $null -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
+            }
+            catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
             if ($_.Exception.Message -match '^(CANDIDATE_SHA_|WORKTREE_DIRTY:|GIT_PIN_|GIT_CONFIG_|GIT_REPOSITORY_|PATH_REPARSE:|TOOLCHAIN_PROFILE_|CARGO_FETCH_|CARGO_HOME_|CARGO_PROCESS_IDENTITY_)') {
                 throw
             }
@@ -7651,8 +7886,8 @@ $processTraceRecords = @($phaseEvidence | ForEach-Object {
     }
 })
 $fixtureBuildProvenance = [ordered]@{
-    schema_version = 2
-    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V2'
+    schema_version = 3
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
     candidate_sha = $candidateSha
     source_repo = $RepoRoot
     fixture_manifest_path = $ManifestPath
@@ -7661,6 +7896,7 @@ $fixtureBuildProvenance = [ordered]@{
     fixture_manifest_volume_serial_hex = [string]$manifestArtifact.volume_serial_hex
     fixture_manifest_file_id_hex = [string]$manifestArtifact.file_id_hex
     environment = $fixtureEnvironmentPlan
+    storage = $script:D32Phase0StorageContext
     process_traces = $processTraceRecords
 }
 Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance

@@ -8,6 +8,8 @@ param(
 
     [switch]$SelfTest,
 
+    [switch]$GitProcessSelfTest,
+
     [Alias('Root')]
     [string]$RepoRoot,
 
@@ -73,6 +75,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:D32PreflightGitCaptureModule = $null
+$script:D32GitCaptureContext = $null
+$script:D32LastPreflightGitCapture = $null
 . (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
 if ($Phase0DependencyLibraryOnly -and -not $LibraryOnly) {
     throw 'PHASE0_DEPENDENCY_IMPORT_INVALID: dependency-only import requires -LibraryOnly'
@@ -1198,6 +1203,14 @@ function Test-D32TrustedGitImage {
         return [PSCustomObject]$result
     }
 
+    $approved = [ordered]@{
+        Path = 'E:\Program Files\Git\mingw64\bin\git.exe'
+        Sha256 = '1f2ee2de971b6d0a7a13f053014998b66c22df47f30f1907a767346392eb8d78'
+        Bytes = [Int64]4238224
+        VolumeSerialHex = '749614a1961465c0'
+        FileIdHex = '4aff000000000b000000000000000000'
+    }
+
     try {
         $digest = Get-D32EvidenceFileDigest -Path $Path
         if ($null -eq $digest) {
@@ -1207,8 +1220,12 @@ function Test-D32TrustedGitImage {
         $result.Path = [string]$digest.Path
         $result.ActualSha256 = [string]$digest.Hash
         $result.Identity = $digest.Identity
-        if ($digest.Hash -cne $ExpectedSha256) {
-            $result.Failure = 'trusted Git SHA-256 does not match the supplied digest'
+        if (-not [String]::Equals([string]$digest.Path, [string]$approved.Path, [StringComparison]::OrdinalIgnoreCase) -or
+            $digest.Hash -cne [string]$approved.Sha256 -or $ExpectedSha256 -cne [string]$approved.Sha256 -or
+            [Int64]$digest.Length -ne [Int64]$approved.Bytes -or
+            [string]$digest.Identity.VolumeSerialHex -cne [string]$approved.VolumeSerialHex -or
+            [string]$digest.Identity.FileIdHex -cne [string]$approved.FileIdHex) {
+            $result.Failure = 'trusted Git path/hash/bytes/volume/file-ID do not match the Coordinator-approved direct root'
             return [PSCustomObject]$result
         }
         $result.IsValid = $true
@@ -1367,101 +1384,63 @@ function Invoke-D32Git {
         TrustedGitBefore = $null
         TrustedGitAfter  = $null
     }
+    $script:D32LastPreflightGitCapture = $null
     $before = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
     $result.TrustedGitBefore = $before
     if (-not $before.IsValid) {
         $result.Failure = $before.Failure
         return [PSCustomObject]$result
     }
-    $owned = $null
-    $process = $null
     try {
-        $owned = New-D32OwnedTempRoot -Purpose 'git'
-        $hooks = Join-Path $owned.Root 'hooks'
-        [void](New-Item -ItemType Directory -Path $hooks -Force -ErrorAction Stop)
-
-        $processArguments = @(
-            '--no-optional-locks',
-            '-c', 'core.fsmonitor=false',
-            '-c', 'core.untrackedCache=false',
-            '-c', "core.hooksPath=$hooks",
-            '-C', $Repository
-        ) + @($Arguments)
-        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $startInfo.FileName = $before.Path
-        $startInfo.Arguments = ConvertTo-D32ProcessArguments -Arguments $processArguments
-        $startInfo.WorkingDirectory = $Repository
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        $startInfo.RedirectStandardOutput = $true
-        $startInfo.RedirectStandardError = $true
-
-        # Remove ambient Git/credential/SSH controls before adding only the
-        # fixed isolated values.  The executable itself is still the explicit
-        # hash-checked path, never PATH lookup.
-        $environmentKeys = @($startInfo.EnvironmentVariables.Keys)
-        foreach ($key in $environmentKeys) {
-            if ($key -like 'GIT_*' -or $key -like 'GCM_*' -or $key -like 'SSH_*' -or
-                $key -in @('BASH_ENV', 'ENV', 'CDPATH', 'PROMPT_COMMAND', 'MSYS2_PATH_TYPE')) {
-                [void]$startInfo.EnvironmentVariables.Remove($key)
-            }
+        $context = $script:D32GitCaptureContext
+        if ($null -eq $context -or $null -eq $context.Profile) {
+            throw 'caller-pinned V2 Git/toolchain profile context is unavailable'
         }
-        $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
-        $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'
-        $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
-        $startInfo.EnvironmentVariables['GIT_CONFIG_COUNT'] = '0'
-        $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
-        $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = 'Never'
-        $startInfo.EnvironmentVariables['GIT_ASKPASS'] = ''
-        $startInfo.EnvironmentVariables['GIT_EDITOR'] = 'd32-disabled-editor'
-        $startInfo.EnvironmentVariables['GIT_PAGER'] = 'cat'
-        $startInfo.EnvironmentVariables['PAGER'] = 'cat'
-        $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
-        $startInfo.EnvironmentVariables['HOME'] = $owned.Root
-        $startInfo.EnvironmentVariables['USERPROFILE'] = $owned.Root
-        $startInfo.EnvironmentVariables['APPDATA'] = $owned.Root
-        $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $owned.Root
-        $startInfo.EnvironmentVariables['XDG_CONFIG_HOME'] = $owned.Root
-        $startInfo.EnvironmentVariables['TMP'] = $owned.Root
-        $startInfo.EnvironmentVariables['TEMP'] = $owned.Root
-        if ($env:SystemRoot) { $startInfo.EnvironmentVariables['SystemRoot'] = $env:SystemRoot }
-        if ($env:WINDIR) { $startInfo.EnvironmentVariables['WINDIR'] = $env:WINDIR }
-        if ($env:ComSpec) { $startInfo.EnvironmentVariables['ComSpec'] = $env:ComSpec }
-        $gitDirectory = Split-Path -Parent $before.Path
-        $startInfo.EnvironmentVariables['Path'] = $gitDirectory
-
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $startInfo
-        if (-not $process.Start()) {
-            throw 'process did not start'
+        if (-not [String]::Equals([string]$context.GitPath, [string]$before.Path, [StringComparison]::OrdinalIgnoreCase) -or
+            [string]$context.GitSha256 -cne [string]$TrustedGitSha256) {
+            throw 'requested Git image does not match the established caller-pinned V2 capture context'
         }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($script:D32GitTimeoutMilliseconds)) {
-            try { $process.Kill() } catch { }
-            [void]$process.WaitForExit(5000)
-            $result.Failure = 'trusted Git process timed out'
+        $setupSignatures = @("init`0-q", "add`0.", "commit`0-q`0-m`0selftest fixture")
+        $signature = @($Arguments) -join "`0"
+        $isSelfTestSetup = $setupSignatures -ccontains $signature
+        if ($isSelfTestSetup -and
+            ([String]::IsNullOrWhiteSpace([string]$context.SelfTestOwnedRoot) -or
+             [String]::IsNullOrWhiteSpace([string]$context.SelfTestMarkerPath) -or
+             [String]::IsNullOrWhiteSpace([string]$context.SelfTestMarkerToken))) {
+            throw 'Git fixture setup is allowed only under the live exact-marker SelfTest context'
         }
-        else {
-            $stdout = ''
-            $stderr = ''
-            try { $stdout = $stdoutTask.Result } catch { }
-            try { $stderr = $stderrTask.Result } catch { }
-            $safeOutput = ConvertTo-D32GitOutput -Arguments $Arguments -StdOut $stdout -StdErr $stderr
-            $result.ExitCode = $process.ExitCode
-            $result.Text = $safeOutput.Text
-            $result.HasOutput = $safeOutput.HasOutput
-            $result.HasErrorOutput = $safeOutput.HasErrorOutput
-            $result.OutputTruncated = $safeOutput.OutputTruncated
-            if ($result.ExitCode -ne 0) {
-                $result.Failure = 'trusted Git command returned a non-zero exit code'
-            }
+        $module = Get-D32PreflightGitCaptureModule
+        $call = [ordered]@{
+            Repository = $Repository
+            Arguments = @($Arguments)
+            TrustedGitPath = $before.Path
+            TrustedGitSha256 = [string]$TrustedGitSha256
+            ProfilePath = [string]$context.Profile.ProfilePath
+            ProfileSha256 = [string]$context.Profile.Digest
+            TimeoutSeconds = [int]$context.TimeoutSeconds
+            SelfTestFixtureSetup = [bool]$isSelfTestSetup
+            SelfTestOwnedRoot = if ($isSelfTestSetup) { [string]$context.SelfTestOwnedRoot } else { '' }
+            SelfTestMarkerPath = if ($isSelfTestSetup) { [string]$context.SelfTestMarkerPath } else { '' }
+            SelfTestMarkerToken = if ($isSelfTestSetup) { [string]$context.SelfTestMarkerToken } else { '' }
+        }
+        $capture = & $module { param($parameters) Invoke-D32PreflightPinnedGitCapture @parameters } $call
+        $script:D32LastPreflightGitCapture = $capture.Attempt
+        if (-not [bool]$capture.ProcessValidated) {
+            $result.Failure = 'trusted Git V2 process capture, metadata fence, or cleanup failed'
+            return [PSCustomObject]$result
+        }
+        $safeOutput = ConvertTo-D32GitOutput -Arguments $Arguments -StdOut ([string]$capture.StdOut) -StdErr ([string]$capture.StdErr)
+        $result.ExitCode = [int]$capture.ExitCode
+        $result.Text = [string]$safeOutput.Text
+        $result.HasOutput = [bool]$safeOutput.HasOutput
+        $result.HasErrorOutput = [bool]$safeOutput.HasErrorOutput
+        $result.OutputTruncated = [bool]$safeOutput.OutputTruncated
+        if ($result.ExitCode -ne 0) {
+            $result.Failure = 'trusted Git command returned a non-zero exit code'
         }
     }
     catch {
-        if ($null -eq $result.Failure) {
-            $result.Failure = 'trusted Git process invocation failed'
-        }
+        $result.Failure = 'trusted Git V2 process capture, metadata fence, or cleanup failed'
     }
     finally {
         $after = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
@@ -1474,12 +1453,268 @@ function Invoke-D32Git {
             $result.ExitCode = -1
             $result.Failure = 'trusted Git image identity changed during execution'
         }
-        if ($null -ne $owned -and -not (Remove-D32OwnedTempRoot -Root $owned.Root -Marker $owned.Marker -Token $owned.Token)) {
-            $result.ExitCode = -1
-            $result.Failure = 'owned Git environment cleanup failed'
-        }
     }
     return [PSCustomObject]$result
+}
+
+function Get-D32PreflightGitCaptureModule {
+    if ($null -ne $script:D32PreflightGitCaptureModule) { return $script:D32PreflightGitCaptureModule }
+    $fixtureScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
+    if (-not (Test-D32NoReparseComponents -Path $fixtureScript) -or -not (Test-Path -LiteralPath $fixtureScript -PathType Leaf)) {
+        throw 'trusted Git V2 launcher path is missing or reparse-backed'
+    }
+    $script:D32PreflightGitCaptureModule = New-Module -Name D32PreflightGitCapture -ArgumentList $fixtureScript -ScriptBlock {
+        param([string]$FixtureScriptPath)
+        . $FixtureScriptPath -D32LauncherLibraryOnly
+
+        function Invoke-D32PreflightPinnedGitCapture {
+            param(
+                [Parameter(Mandatory = $true)][string]$Repository,
+                [Parameter(Mandatory = $true)][string[]]$Arguments,
+                [Parameter(Mandatory = $true)][string]$TrustedGitPath,
+                [Parameter(Mandatory = $true)][string]$TrustedGitSha256,
+                [Parameter(Mandatory = $true)][string]$ProfilePath,
+                [Parameter(Mandatory = $true)][string]$ProfileSha256,
+                [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+                [bool]$SelfTestFixtureSetup = $false,
+                [string]$SelfTestOwnedRoot,
+                [string]$SelfTestMarkerPath,
+                [string]$SelfTestMarkerToken
+            )
+
+            $script:PinnedGit = Get-D32PinnedGit -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
+            Assert-D32ApprovedPinnedGitRoot
+            $profile = Test-D32BuildToolchainProfile -ProfilePath $ProfilePath -ExpectedSha256 $ProfileSha256 -Repository $Repository -ExpectedTargetTriple 'x86_64-pc-windows-msvc'
+            if ($null -eq $profile -or -not [bool]$profile.IsValid) {
+                throw 'caller-pinned toolchain profile or Windows child-image inventory failed validation'
+            }
+            $script:ValidatedToolchainProfile = $profile
+            $script:TimeoutSeconds = [Math]::Max(1, [Math]::Min(3600, $TimeoutSeconds))
+            Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $profile | Out-Null
+            try {
+                $captured = if ($SelfTestFixtureSetup) {
+                    Get-D32GitOutput -Root $Repository -Arguments $Arguments -PreserveOutput -CaptureResult `
+                        -SelfTestFixtureSetup -SelfTestOwnedRoot $SelfTestOwnedRoot -SelfTestMarkerPath $SelfTestMarkerPath -SelfTestMarkerToken $SelfTestMarkerToken
+                }
+                else {
+                    Get-D32GitOutput -Root $Repository -Arguments $Arguments -PreserveOutput -CaptureResult
+                }
+                return [PSCustomObject]@{
+                    ProcessValidated = $true
+                    ExitCode = [int]$captured.ExitCode
+                    StdOut = [string]$captured.StdOut
+                    StdErr = [string]$captured.StdErr
+                    Attempt = $captured.Attempt
+                }
+            }
+            catch {
+                return [PSCustomObject]@{
+                    ProcessValidated = $false
+                    ExitCode = -1
+                    StdOut = ''
+                    StdErr = ''
+                    Attempt = $script:D32LastPinnedGitAttempt
+                }
+            }
+        }
+    }
+    return $script:D32PreflightGitCaptureModule
+}
+
+function Set-D32GitCaptureContext {
+    param(
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter(Mandatory = $true)][string]$GitSha256,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 120
+    )
+
+    if ($null -eq $ValidatedProfile -or -not [bool]$ValidatedProfile.IsValid -or
+        -not (Test-D32Sha64 -Value ([string]$ValidatedProfile.Digest)) -or
+        -not (Test-D32AbsoluteFilesystemPath -Path ([string]$ValidatedProfile.ProfilePath))) {
+        throw 'caller-pinned toolchain profile is invalid or incomplete for V2 Git capture'
+    }
+    $trustedGit = Test-D32TrustedGitImage -Path $GitPath -ExpectedSha256 $GitSha256
+    if (-not $trustedGit.IsValid) { throw 'caller-pinned direct Git root identity failed V2 capture context validation' }
+    $profileCurrent = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+    if (@($profileCurrent.WindowsImageInventory).Count -ne 1 -or
+        -not [String]::Equals([IO.Path]::GetFileName([string]$profileCurrent.WindowsImageInventory[0].Path), 'conhost.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'caller-pinned toolchain profile must contain exactly the approved conhost child image'
+    }
+    $script:D32GitCaptureContext = [PSCustomObject]@{
+        GitPath = [string]$trustedGit.Path
+        GitSha256 = [string]$trustedGit.ActualSha256
+        Profile = $ValidatedProfile
+        TimeoutSeconds = [int]$TimeoutSeconds
+        SelfTestOwnedRoot = $null
+        SelfTestMarkerPath = $null
+        SelfTestMarkerToken = $null
+    }
+}
+
+function Assert-D32PreflightGitCaptureAttempt {
+    param([Parameter(Mandatory = $true)][object]$Attempt, [Parameter(Mandatory = $true)][string]$Name)
+
+    $trace = $Attempt.process_trace
+    $cleanup = $Attempt.native_cleanup
+    $runtime = $Attempt.cleanup_runtime
+    if ($null -eq $trace -or $null -eq $cleanup -or $null -eq $runtime -or
+        $trace.state -cne 'COMPLETED' -or -not [bool]$trace.event_chain_complete -or
+        -not [bool]$trace.job_accounting_verified -or -not [bool]$trace.accounting_consistent -or
+        [int]$trace.process_create_event_count -le 0 -or
+        [int]$trace.process_create_event_count -ne [int]$trace.process_exit_event_count -or
+        [uint32]$trace.job_total_processes -ne [uint32]$trace.process_create_event_count -or
+        [uint32]$trace.job_active_processes -ne 0 -or
+        -not [bool]$cleanup.cleanup_succeeded -or -not [bool]$cleanup.job_active_process_count_verified -or
+        [uint32]$cleanup.job_active_process_count -ne 0 -or
+        -not [bool]$runtime.debugger_thread_exited -or -not [bool]$runtime.debugger_thread_joined -or
+        -not [bool]$runtime.debugger_kill_on_exit_enabled -or -not [bool]$runtime.retained_process_handles_signaled -or
+        -not [bool]$runtime.debugger_association_query_verified -or -not [bool]$runtime.debugger_association_absent) {
+        throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: $Name lacks complete V2 CREATE/EXIT, Job, debugger, handle, or cleanup accounting"
+    }
+    foreach ($process in @($trace.processes)) {
+        if (-not [bool]$process.image_verified -or -not [bool]$process.exited) {
+            throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: $Name contains a process without a pre-continue verified and exited image"
+        }
+    }
+}
+
+function Invoke-D32PreflightGitProcessSelfTest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter(Mandatory = $true)][string]$GitSha256
+    )
+
+    $priorContext = $script:D32GitCaptureContext
+    $owned = New-D32OwnedTempRoot -Purpose 'preflight-git-v2-selftest'
+    try {
+        $validatedProfile = $null
+        $profileCases = @(Test-D32BuildToolchainProfileSelfTest -Root $owned.Root -Repository $Repository -ValidatedProfileOutput ([ref]$validatedProfile))
+        $profileFailures = @($profileCases | Where-Object { -not [bool]$_.Passed })
+        if ($profileFailures.Count -gt 0 -or $null -eq $validatedProfile -or -not [bool]$validatedProfile.IsValid) {
+            $failedNames = @($profileFailures | ForEach-Object { [string]$_.Name }) -join ', '
+            throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: a temporary exact V2 test profile was unavailable: $failedNames"
+        }
+        Set-D32GitCaptureContext -ValidatedProfile $validatedProfile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 30
+
+        $commands = @(
+            [PSCustomObject]@{ Name = 'rev-parse'; Arguments = @('rev-parse', '--verify', 'HEAD'); RequireText = $true },
+            [PSCustomObject]@{ Name = 'status'; Arguments = @('status', '--porcelain=v1', '--untracked-files=all'); RequireText = $false },
+            [PSCustomObject]@{ Name = 'ls-files'; Arguments = @('ls-files', '-v', '-z'); RequireText = $false }
+        )
+        $expectedHead = $null
+        foreach ($command in $commands) {
+            $result = Invoke-D32Git -Repository $Repository -Arguments $command.Arguments -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
+            if ($result.ExitCode -ne 0 -or $null -ne $result.Failure -or $null -eq $script:D32LastPreflightGitCapture) {
+                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: direct-root $($command.Name) did not complete through V2: $($result.Failure)"
+            }
+            Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name $command.Name
+            if ($command.RequireText) {
+                if (-not (Test-D32Sha40 -Value ([string]$result.Text))) { throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: direct-root rev-parse did not preserve an exact full HEAD' }
+                $expectedHead = [string]$result.Text
+            }
+        }
+        if ([String]::IsNullOrWhiteSpace($expectedHead)) { throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: no exact HEAD was captured for the focused V2 Git checks' }
+        $phase0State = Get-D32Phase0GitState -Repository $Repository -GitPath $GitPath -GitSha256 $GitSha256
+        if ($phase0State.Head -cne $expectedHead -or -not [bool]$phase0State.Clean) {
+            throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: Phase0 Git-state consumer did not preserve exact HEAD and clean-state semantics'
+        }
+
+        $fixtureRepository = Join-Path $owned.Root 'fixture-repository'
+        [void][IO.Directory]::CreateDirectory($fixtureRepository)
+        [IO.File]::WriteAllText((Join-Path $fixtureRepository 'selftest.txt'), 'D32 preflight Git V2 fixture', [Text.UTF8Encoding]::new($false))
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestOwnedRoot -NotePropertyValue $owned.Root -Force
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestMarkerPath -NotePropertyValue $owned.Marker -Force
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestMarkerToken -NotePropertyValue $owned.Token -Force
+        foreach ($setup in @(
+            [PSCustomObject]@{ Name = 'init'; Arguments = @('init', '-q') },
+            [PSCustomObject]@{ Name = 'add'; Arguments = @('add', '.') },
+            [PSCustomObject]@{ Name = 'commit'; Arguments = @('commit', '-q', '-m', 'selftest fixture') }
+        )) {
+            $setupResult = Invoke-D32Git -Repository $fixtureRepository -Arguments $setup.Arguments -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
+            if ($setupResult.ExitCode -ne 0 -or $null -ne $setupResult.Failure -or $null -eq $script:D32LastPreflightGitCapture) {
+                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture $($setup.Name) did not complete through V2: $($setupResult.Failure)"
+            }
+            Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name "fixture-$($setup.Name)"
+        }
+        $fixtureHead = Invoke-D32Git -Repository $fixtureRepository -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
+        Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name 'fixture-rev-parse'
+        $fixtureStatus = Invoke-D32Git -Repository $fixtureRepository -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
+        Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name 'fixture-status'
+        if ($fixtureHead.ExitCode -ne 0 -or $fixtureHead.Text.Trim() -cnotmatch '^[0-9a-f]{40}$' -or
+            $fixtureStatus.ExitCode -ne 0 -or $fixtureStatus.HasOutput -or $null -ne $fixtureHead.Failure -or $null -ne $fixtureStatus.Failure) {
+            throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture setup did not preserve exact commit and clean-status semantics'
+        }
+
+        $gitInstallRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent (Split-Path -Parent $GitPath)) '..'))
+        $wrapperPath = Join-Path $gitInstallRoot 'cmd\git.exe'
+        if (-not (Test-Path -LiteralPath $wrapperPath -PathType Leaf)) { throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: installed Git wrapper is unavailable for path-denial evidence' }
+        $wrapperDigest = Get-D32EvidenceFileDigest -Path $wrapperPath
+        if ($null -eq $wrapperDigest) { throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: installed Git wrapper identity could not be captured' }
+        $script:D32LastPreflightGitCapture = $null
+        $wrapperResult = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $wrapperPath -TrustedGitSha256 $wrapperDigest.Hash
+        if ($wrapperResult.ExitCode -ne -1 -or $null -eq $wrapperResult.Failure -or $null -ne $script:D32LastPreflightGitCapture) {
+            throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: wrapper Git image was not rejected before any process trace'
+        }
+        $script:D32LastPreflightGitCapture = $null
+        $hashMismatch = Invoke-D32Git -Repository $Repository -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $GitPath -TrustedGitSha256 ('0' * 64)
+        if ($hashMismatch.ExitCode -ne -1 -or $null -eq $hashMismatch.Failure -or $null -ne $script:D32LastPreflightGitCapture) {
+            throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: Coordinator Git SHA mismatch was not rejected before process creation'
+        }
+
+        $metadataRoot = Join-Path $owned.Root 'metadata-indirection-repository'
+        $gitDirectory = Join-Path $metadataRoot '.git'
+        foreach ($relativeDirectory in @('.git/objects/info', '.git/refs/heads', '.git/info', 'vita-agent/target')) {
+            [void][IO.Directory]::CreateDirectory((Join-Path $metadataRoot $relativeDirectory))
+        }
+        [IO.File]::WriteAllText((Join-Path $gitDirectory 'HEAD'), "ref: refs/heads/main`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllBytes((Join-Path $gitDirectory 'index'), [byte[]]@())
+        [IO.File]::WriteAllText((Join-Path $gitDirectory 'info/exclude'), "# allowed comments`n`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
+        $ordinaryConfig = "[core]`n`t repositoryformatversion = 0`n`t filemode = false`n`t bare = false`n`t logallrefupdates = true`n"
+        [IO.File]::WriteAllText((Join-Path $gitDirectory 'config'), $ordinaryConfig, [Text.UTF8Encoding]::new($false))
+        $module = Get-D32PreflightGitCaptureModule
+        foreach ($negative in @(
+            [PSCustomObject]@{ Name = 'source-config includeIf'; Configure = { param($gitDir) [IO.File]::WriteAllText((Join-Path $gitDir 'config'), "[includeIf `"gitdir:outside/`"]`n`t path = outside.gitconfig`n", [Text.UTF8Encoding]::new($false)) }; Expected = 'GIT_CONFIG_REJECTED:*' },
+            [PSCustomObject]@{ Name = 'metadata alternates indirection'; Configure = { param($gitDir) [IO.File]::WriteAllText((Join-Path $gitDir 'config'), $ordinaryConfig, [Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $gitDir 'objects/info/alternates'), 'outside-objects', [Text.UTF8Encoding]::new($false)) }; Expected = 'GIT_REPOSITORY_INVALID:*' }
+        )) {
+            $configure = $negative.Configure
+            & $configure $gitDirectory
+            $probe = & $module {
+                param($Repository, $PinnedPath, $PinnedHash, $Profile, $ExpectedPattern)
+                $script:PinnedGit = Get-D32PinnedGit -Path $PinnedPath -ExpectedSha256 $PinnedHash
+                $script:ValidatedToolchainProfile = $Profile
+                $script:TimeoutSeconds = 30
+                $script:D32LastPinnedGitAttempt = $null
+                try {
+                    $null = Get-D32GitOutput -Root $Repository -Arguments @('rev-parse', '--verify', 'HEAD')
+                    return [PSCustomObject]@{ Rejected = $false; Error = $null; Attempt = $script:D32LastPinnedGitAttempt }
+                }
+                catch {
+                    return [PSCustomObject]@{ Rejected = $_.Exception.Message -like $ExpectedPattern; Error = $_.Exception.Message; Attempt = $script:D32LastPinnedGitAttempt }
+                }
+            } $metadataRoot $GitPath $GitSha256 $validatedProfile ([string]$negative.Expected)
+            if (-not [bool]$probe.Rejected -or $null -ne $probe.Attempt) {
+                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: $($negative.Name) was not rejected before a V2 process was created"
+            }
+            if ($negative.Name -ceq 'metadata alternates indirection') {
+                Remove-Item -LiteralPath (Join-Path $gitDirectory 'objects/info/alternates') -Force -ErrorAction Stop
+            }
+        }
+
+        & $module {
+            param($PinnedPath, $PinnedHash, $Repository)
+            Invoke-D32PinnedGitProcessIdentitySelfTest -PinnedPath $PinnedPath -PinnedSha256 $PinnedHash -Repository $Repository
+        } $GitPath $GitSha256 $Repository
+        Write-Host 'D32_PREFLIGHT_GIT_PROCESS_SELFTEST PASS (preflight and Phase0 consumers use V2 fast rev-parse/status/ls-files with exact clean-state semantics; wrapper and root-hash mismatch denied before launch; config/source and alternates indirection blocked pre-launch; pinned-root PID/parent/descendant/cleanup negatives verified)'
+        return $true
+    }
+    finally {
+        $script:D32GitCaptureContext = $priorContext
+        if (-not (Remove-D32OwnedTempRoot -Root $owned.Root -Marker $owned.Marker -Token $owned.Token)) {
+            throw 'PREFLIGHT_GIT_SELFTEST_CLEANUP_BLOCKED: owned focused Git self-test temp root did not clean up'
+        }
+    }
 }
 
 function Test-D32Sha40 {
@@ -3876,6 +4111,9 @@ function Invoke-D32SelfTest {
         [void](New-Item -ItemType Directory -Path $fixture -Force)
         [System.IO.File]::WriteAllText($rootMarker, $rootToken, (New-Object System.Text.UTF8Encoding($false)))
         $rootOwned = $true
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestOwnedRoot -NotePropertyValue $root -Force
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestMarkerPath -NotePropertyValue $rootMarker -Force
+        $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestMarkerToken -NotePropertyValue $rootToken -Force
         $profileSelfTestCases = @(Test-D32BuildToolchainProfileSelfTest -Root $root -Repository (Split-Path -Parent $PSScriptRoot))
         foreach ($profileCase in $profileSelfTestCases) {
             if (-not $profileCase.Passed -and -not [String]::IsNullOrWhiteSpace([string]$profileCase.Detail)) { Write-Host "SELFTEST DETAIL: $($profileCase.Name): $($profileCase.Detail)" }
@@ -3932,14 +4170,10 @@ function Invoke-D32SelfTest {
             [System.IO.File]::WriteAllBytes($fixtureArtifactPath, [Text.Encoding]::UTF8.GetBytes("fixture-$($fixtureSpec.name)"))
         }
 
-        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-        $trustedGitPath = [string]$gitCommand.Source
-        if ([String]::IsNullOrWhiteSpace($trustedGitPath)) {
-            $trustedGitPath = [string]$gitCommand.Path
-        }
-        $trustedGitHash = (Get-FileHash -LiteralPath $trustedGitPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $trustedGitPath = [string]$script:D32GitCaptureContext.GitPath
+        $trustedGitHash = [string]$script:D32GitCaptureContext.GitSha256
         $validTrustedGit = Test-D32TrustedGitImage -Path $trustedGitPath -ExpectedSha256 $trustedGitHash
-        Assert-D32SelfTest -Condition $validTrustedGit.IsValid -Name 'explicit fixed trusted Git image is accepted' -Failures $failures
+        Assert-D32SelfTest -Condition $validTrustedGit.IsValid -Name 'Coordinator-approved direct Git root identity is accepted' -Failures $failures
         Assert-D32SelfTest -Condition (-not (Test-D32TrustedGitImage -Path $null -ExpectedSha256 $trustedGitHash).IsValid) -Name 'missing trusted Git path is rejected' -Failures $failures
         Assert-D32SelfTest -Condition (-not (Test-D32TrustedGitImage -Path $trustedGitPath -ExpectedSha256 ('0' * 64)).IsValid) -Name 'wrong trusted Git hash is rejected' -Failures $failures
         $vitaTargetIndex = [Array]::IndexOf([string[]]$script:D32ReleaseBuildCommands[0].arguments, '--target-dir')
@@ -4013,8 +4247,6 @@ function Invoke-D32SelfTest {
         Assert-D32SelfTest -Condition ($staleOutputRecords.Count -lt 3 -and @($staleOutputFindings | Where-Object { $_.Check -like 'bundle.build.fresh-output.*' -and $_.Severity -eq 'ERROR' }).Count -eq 3) -Name 'any pre-existing exact release artifact fails fresh-output preflight' -Failures $failures
         $git = Invoke-D32Git -Repository $fixture -Arguments @('init', '-q') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         if ($git.ExitCode -ne 0) { throw 'trusted Git init failed' }
-        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.email', 'd32-selftest@example.invalid') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash)
-        [void](Invoke-D32Git -Repository $fixture -Arguments @('config', 'user.name', 'D32 Selftest') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash)
         $git = Invoke-D32Git -Repository $fixture -Arguments @('add', '.') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         if ($git.ExitCode -ne 0) { throw 'trusted Git add failed' }
         $git = Invoke-D32Git -Repository $fixture -Arguments @('commit', '-q', '-m', 'selftest fixture') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
@@ -4955,13 +5187,44 @@ if (-not (Test-D32SupportedPowerShellVersion -Version $PSVersionTable.PSVersion)
     exit 2
 }
 
-if ($SelfTest) {
-    if (Invoke-D32SelfTest) { exit 0 }
-    exit 1
-}
-
 if ([String]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Split-Path -Parent $PSScriptRoot
+}
+
+if ($GitProcessSelfTest) {
+    if ($SelfTest -or $GenerateManifest -or $GenerateBundle -or $GenerateAggregateRecord -or $ValidateOnly) {
+        Write-Output 'D32 preflight Git process self-test: BLOCKED — choose only -GitProcessSelfTest'
+        exit 2
+    }
+    if ([String]::IsNullOrWhiteSpace($TrustedGitPath) -or [String]::IsNullOrWhiteSpace($TrustedGitSha256)) {
+        Write-Output 'D32 preflight Git process self-test: BLOCKED — exact Coordinator-pinned Git path/SHA are mandatory'
+        exit 2
+    }
+    try {
+        $null = Invoke-D32PreflightGitProcessSelfTest -Repository $RepoRoot -GitPath $TrustedGitPath -GitSha256 $TrustedGitSha256
+        exit 0
+    }
+    catch {
+        Write-Output "D32 preflight Git process self-test: BLOCKED — $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+if ($SelfTest) {
+    if ([String]::IsNullOrWhiteSpace($TrustedGitPath) -or [String]::IsNullOrWhiteSpace($TrustedGitSha256) -or
+        [String]::IsNullOrWhiteSpace($ToolchainProfilePath) -or [String]::IsNullOrWhiteSpace($ExpectedToolchainProfileSha256)) {
+        Write-Output 'D32 preflight self-test: BLOCKED — exact Git path/SHA and caller-pinned toolchain-profile path/SHA are mandatory for V2 capture'
+        exit 2
+    }
+    $selfTestGitProfile = Test-D32BuildToolchainProfile -ProfilePath $ToolchainProfilePath -ExpectedSha256 $ExpectedToolchainProfileSha256 -Repository $RepoRoot -ExpectedTargetTriple 'x86_64-pc-windows-msvc'
+    if (-not $selfTestGitProfile.IsValid) {
+        Write-Output "D32 preflight self-test: BLOCKED — caller-pinned V2 Git profile failed validation: $($selfTestGitProfile.Failure)"
+        exit 2
+    }
+    try { Set-D32GitCaptureContext -ValidatedProfile $selfTestGitProfile -GitPath $TrustedGitPath -GitSha256 $TrustedGitSha256 -TimeoutSeconds 120 }
+    catch { Write-Output "D32 preflight self-test: BLOCKED — V2 capture context failed: $($_.Exception.Message)"; exit 2 }
+    if (Invoke-D32SelfTest) { exit 0 }
+    exit 1
 }
 if ([String]::IsNullOrWhiteSpace($ManifestPath)) {
     $ManifestPath = Join-Path $RepoRoot 'artifacts\d32-candidate-provenance.json'
@@ -4984,6 +5247,23 @@ if (@([bool]$GenerateManifest, [bool]$GenerateBundle, [bool]$GenerateAggregateRe
 }
 if (-not $GenerateAggregateRecord -and -not [String]::IsNullOrWhiteSpace($AggregateRecordSha256) -and -not $ValidateOnly) {
     Write-Output 'D32 preflight: -AggregateRecordSha256 is accepted only with -ValidateOnly'
+    exit 2
+}
+
+if ([String]::IsNullOrWhiteSpace($ToolchainProfilePath) -or [String]::IsNullOrWhiteSpace($ExpectedToolchainProfileSha256)) {
+    Write-Output 'D32 preflight: BLOCKED — caller-pinned toolchain-profile path/SHA are mandatory for V2 Git process identity and the optional conhost child pin'
+    exit 2
+}
+$gitCaptureProfile = Test-D32BuildToolchainProfile -ProfilePath $ToolchainProfilePath -ExpectedSha256 $ExpectedToolchainProfileSha256 -Repository $RepoRoot -ExpectedTargetTriple 'x86_64-pc-windows-msvc'
+if (-not $gitCaptureProfile.IsValid) {
+    Write-Output "D32 preflight: BLOCKED — caller-pinned V2 Git toolchain profile failed validation: $($gitCaptureProfile.Failure)"
+    exit 2
+}
+try {
+    Set-D32GitCaptureContext -ValidatedProfile $gitCaptureProfile -GitPath $TrustedGitPath -GitSha256 $TrustedGitSha256 -TimeoutSeconds ([int][Math]::Ceiling($script:D32GitTimeoutMilliseconds / 1000.0))
+}
+catch {
+    Write-Output "D32 preflight: BLOCKED — caller-pinned V2 Git capture context failed: $($_.Exception.Message)"
     exit 2
 }
 

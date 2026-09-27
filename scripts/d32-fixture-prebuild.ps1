@@ -1115,18 +1115,84 @@ function Close-D32GitMetadataLocks {
     foreach ($lock in $Locks.Items) { $lock.Stream.Dispose() }
 }
 
+function Assert-D32PreflightSelfTestGitSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$OwnedRoot,
+        [Parameter(Mandatory = $true)][string]$MarkerPath,
+        [Parameter(Mandatory = $true)][string]$MarkerToken,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$AfterExecution
+    )
+
+    $rootFull = Assert-D32NoReparsePath -Path $Root
+    $ownedFull = Assert-D32NoReparsePath -Path $OwnedRoot
+    $markerFull = Assert-D32NoReparsePath -Path $MarkerPath
+    if (-not [String]::Equals((Split-Path -Parent $rootFull).TrimEnd('\'), $ownedFull.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [String]::Equals((Split-Path -Parent $markerFull).TrimEnd('\'), $ownedFull.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $markerFull -PathType Leaf) -or
+        -not [String]::Equals([IO.File]::ReadAllText($markerFull), $MarkerToken, [StringComparison]::Ordinal)) {
+        throw 'SELFTEST_GIT_SETUP_BLOCKED: fixture root is not beneath the exact owned marker root'
+    }
+    $signature = @($Arguments) -join "`0"
+    if (@("init`0-q", "add`0.", "commit`0-q`0-m`0selftest fixture") -cnotcontains $signature) {
+        throw 'SELFTEST_GIT_SETUP_BLOCKED: Git fixture setup argv is outside the exact code-owned test allowlist'
+    }
+    $gitDirectory = Join-Path $rootFull '.git'
+    if ($signature -ceq "init`0-q") {
+        if (-not $AfterExecution -and (Test-Path -LiteralPath $gitDirectory)) { throw 'SELFTEST_GIT_SETUP_BLOCKED: init target already contains Git metadata' }
+        if ($AfterExecution -and (-not (Test-Path -LiteralPath $gitDirectory -PathType Container) -or
+            -not (Test-D32NoReparsePath -Path $gitDirectory))) {
+            throw 'SELFTEST_GIT_SETUP_BLOCKED: init did not create direct non-reparse Git metadata beneath the exact owned marker root'
+        }
+        if ($AfterExecution) {
+            $infoDirectory = Join-Path $gitDirectory 'info'
+            if (-not (Test-Path -LiteralPath $infoDirectory -PathType Container) -or
+                -not (Test-D32NoReparsePath -Path $infoDirectory)) {
+                throw 'SELFTEST_GIT_SETUP_BLOCKED: init did not create direct non-reparse Git info metadata'
+            }
+            $excludePath = Join-Path $infoDirectory 'exclude'
+            if ((Test-Path -LiteralPath $excludePath) -and -not (Test-D32NoReparsePath -Path $excludePath)) {
+                throw 'SELFTEST_GIT_SETUP_BLOCKED: init created a reparse-backed Git exclude file'
+            }
+            [IO.File]::WriteAllText($excludePath, "# allowed comments`nvita-agent/target/`n", [Text.UTF8Encoding]::new($false))
+        }
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container) -or
+            -not (Test-D32NoReparsePath -Path $gitDirectory)) {
+            throw 'SELFTEST_GIT_SETUP_BLOCKED: Git fixture metadata is absent or reparse-backed before add/commit'
+        }
+        [void](Assert-D32RepositoryGitConfig -Root $rootFull)
+    }
+    return [PSCustomObject]@{ Root = $rootFull; GitDirectory = $gitDirectory }
+}
+
 function Get-D32GitOutput {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [AllowNull()][object]$MetadataLocks,
-        [switch]$PreserveOutput
+        [switch]$PreserveOutput,
+        [switch]$CaptureResult,
+        [switch]$SelfTestFixtureSetup,
+        [string]$SelfTestOwnedRoot,
+        [string]$SelfTestMarkerPath,
+        [string]$SelfTestMarkerToken
     )
 
+    $script:D32LastPinnedGitAttempt = $null
     Assert-D32PinnedGitCurrent
     Assert-D32ApprovedPinnedGitRoot
     $rootFull = Assert-D32NoReparsePath -Path $Root
-    $gitDirectory = Assert-D32RepositoryGitConfig -Root $rootFull
+    $testSetup = $null
+    if ($SelfTestFixtureSetup) {
+        $testSetup = Assert-D32PreflightSelfTestGitSetup -Root $rootFull -OwnedRoot $SelfTestOwnedRoot -MarkerPath $SelfTestMarkerPath -MarkerToken $SelfTestMarkerToken -Arguments $Arguments
+        $gitDirectory = [string]$testSetup.GitDirectory
+    }
+    else {
+        $gitDirectory = Assert-D32RepositoryGitConfig -Root $rootFull
+    }
     $temporaryRoot = Assert-D32NoReparsePath -Path ([IO.Path]::GetTempPath())
     $environmentRoot = Join-Path $temporaryRoot ('d32-fixture-git-env-' + [Guid]::NewGuid().ToString('N'))
     [void](Ensure-D32OwnedDirectory $environmentRoot)
@@ -1153,6 +1219,9 @@ function Get-D32GitOutput {
         '-c', ('safe.directory=' + $rootFull),
         '-C', $rootFull
     ) + @($Arguments)
+    if ($null -ne $testSetup -and $Arguments.Count -gt 0 -and $Arguments[0] -ceq 'commit') {
+        $gitCommandArguments = @('-c', 'user.name=D32 Selftest', '-c', 'user.email=d32-selftest@example.invalid') + $gitCommandArguments
+    }
     $commandLine = ConvertTo-D32CommandLine (@($script:PinnedGit.path) + $gitCommandArguments)
     $childEnvironment = [ordered]@{
         PATH = $searchDirectories -join [IO.Path]::PathSeparator
@@ -1187,13 +1256,14 @@ function Get-D32GitOutput {
     $stdout = ''
     $stderr = ''
     $profileCurrent = $null
-    $script:D32LastPinnedGitAttempt = $null
     try {
-        if ($null -eq $MetadataLocks) {
-            $MetadataLocks = Open-D32GitMetadataLocks -Root $rootFull -GitDirectory $gitDirectory
-            $ownsMetadataLocks = $true
+        if ($null -eq $testSetup) {
+            if ($null -eq $MetadataLocks) {
+                $MetadataLocks = Open-D32GitMetadataLocks -Root $rootFull -GitDirectory $gitDirectory
+                $ownsMetadataLocks = $true
+            }
+            Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
         }
-        Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
         $pinnedGitHandle = Open-D32PinnedGitHandle
         Assert-D32PinnedGitCurrent
         if ($null -eq $script:ValidatedToolchainProfile -or -not [bool]$script:ValidatedToolchainProfile.IsValid) {
@@ -1280,7 +1350,12 @@ function Get-D32GitOutput {
         $stdout = [Text.Encoding]::UTF8.GetString($stdoutBuffer.ToArray())
         $stderr = [Text.Encoding]::UTF8.GetString($stderrBuffer.ToArray())
         $exitCode = $nativeProcess.ExitCode
-        Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
+        if ($null -eq $testSetup) {
+            Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
+        }
+        else {
+            $null = Assert-D32PreflightSelfTestGitSetup -Root $rootFull -OwnedRoot $SelfTestOwnedRoot -MarkerPath $SelfTestMarkerPath -MarkerToken $SelfTestMarkerToken -Arguments $Arguments -AfterExecution
+        }
     }
     finally {
         if ($null -ne $nativeProcess) { $nativeProcess.Dispose() }
@@ -1291,6 +1366,14 @@ function Get-D32GitOutput {
         Remove-D32OwnedDirectory $environmentRoot
     }
     Assert-D32PinnedGitCurrent
+    if ($CaptureResult) {
+        return [PSCustomObject]@{
+            ExitCode = [int]$exitCode
+            StdOut = [string]$stdout
+            StdErr = [string]$stderr
+            Attempt = $script:D32LastPinnedGitAttempt
+        }
+    }
     if ($exitCode -ne 0) {
         throw "GIT_FAILED: pinned Git $($Arguments -join ' ') ($exitCode): $($stderr.Trim())"
     }
@@ -6969,6 +7052,8 @@ function Invoke-D32PinnedGitProcessIdentitySelfTest {
             [PSCustomObject]@{ Name = 'image file-ID mismatch'; Kind = 'identity'; Property = 'FileIdHex'; Value = ('0' * 32) },
             [PSCustomObject]@{ Name = 'parent identity mismatch'; Kind = 'identity'; Property = 'ParentProcessId'; Value = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 } },
             [PSCustomObject]@{ Name = 'parent creation identity mismatch'; Kind = 'identity'; Property = 'ParentCreationFileTime'; Value = $debuggerCreation + 1 },
+            [PSCustomObject]@{ Name = 'incomplete CREATE/EXIT event chain'; Kind = 'trace'; Property = 'EventChainComplete'; Value = $false },
+            [PSCustomObject]@{ Name = 'debugger timeout'; Kind = 'trace'; Property = 'State'; Value = 'BLOCKED' },
             [PSCustomObject]@{ Name = 'unexpected descendant'; Kind = 'trace'; Property = 'JobTotalProcesses'; Value = 2 },
             [PSCustomObject]@{ Name = 'incomplete cleanup'; Kind = 'cleanup'; Property = 'DebuggerThreadJoined'; Value = $false }
         )
@@ -7038,7 +7123,7 @@ function Invoke-D32PinnedGitProcessIdentitySelfTest {
         if ($profileRootOwned -and (Test-Path -LiteralPath $profileTestRoot)) { Remove-D32OwnedDirectory $profileTestRoot }
     }
 
-    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (direct-root fast Git exits=$fastIdentityRuns for rev-parse/status/ls-files; exact Coordinator-pinned image/process identity; unapproved wrapper root rejected before launch; test-only wrapper child hard-denied before Continue with marker absent and complete cleanup; path/bytes/hash/volume/file-ID/stale-PID/creation/parent/argv/descendant/cleanup negatives rejected)"
+    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (direct-root fast Git exits=$fastIdentityRuns for rev-parse/status/ls-files; exact Coordinator-pinned image/process identity; unapproved wrapper root rejected before launch; test-only wrapper child hard-denied before Continue with marker absent and complete cleanup; path/bytes/hash/volume/file-ID/stale-PID/creation/parent/event/timeout/Job/descendant/cleanup negatives rejected)"
 }
 
 if ($D32LauncherLibraryOnly) {

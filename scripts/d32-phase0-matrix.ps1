@@ -1523,6 +1523,7 @@ function Invoke-D32Phase0Matrix {
     if (-not $profile.IsValid) { throw "PHASE0_TOOLCHAIN_BLOCKED: $($profile.Failure)" }
     $gitProfile = Test-D32TrustedGitImage -Path $GitPath -ExpectedSha256 $GitSha256
     if (-not $gitProfile.IsValid) { throw "PHASE0_GIT_BLOCKED: $($gitProfile.Failure)" }
+    Set-D32GitCaptureContext -ValidatedProfile $profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
     $pre = Get-D32Phase0GitState -Repository $repo -GitPath $GitPath -GitSha256 $GitSha256
     if ($pre.Head -cne $ExpectedSha) { throw 'PHASE0_CANDIDATE_BLOCKED: current HEAD does not equal caller-pinned candidate SHA' }
     $findings = [System.Collections.ArrayList]::new()

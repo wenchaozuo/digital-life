@@ -1382,6 +1382,7 @@ function Protect-D32PreflightSelfTestDiagnosticText {
         }
     }
     $value = [regex]::Replace($value, '(?i)[A-Z]:\\Users\\[^\\\s"<>]+\\AppData\\Local\\Temp\\[^\\\s"<>]+', '<selftest-temp>')
+    $value = [regex]::Replace($value, '(?i)[A-Z]:\\\\Users\\\\[^"<>]*?\\\\AppData\\\\Local\\\\Temp\\\\[^"<>]*', '<selftest-temp>')
     $value = [regex]::Replace($value, '(?i)\b(?:https?|ssh|git)://[^\s''"<>]+', '<redacted-url>')
     $value = [regex]::Replace($value, '(?i)\b(password|passwd|token|secret|authorization|credential)\s*[:=]\s*[^\s,;]+', '$1=<redacted>')
     $value = [regex]::Replace($value, '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '<redacted-email>')

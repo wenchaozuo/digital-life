@@ -1720,7 +1720,38 @@ function Invoke-D32PreflightGitProcessSelfTest {
             param($PinnedPath, $PinnedHash, $Repository)
             Invoke-D32PinnedGitProcessIdentitySelfTest -PinnedPath $PinnedPath -PinnedSha256 $PinnedHash -Repository $Repository
         } $GitPath $GitSha256 $Repository
-        Write-Host 'D32_PREFLIGHT_GIT_PROCESS_SELFTEST PASS (preflight and Phase0 consumers use V2 fast rev-parse/status/ls-files with exact clean-state semantics; wrapper and root-hash mismatch denied before launch; config/source and alternates indirection blocked pre-launch; pinned-root PID/parent/descendant/cleanup negatives verified)'
+        $timeoutProcess = [Diagnostics.Process]::GetCurrentProcess()
+        try { $timeoutExecutablePath = [string]$timeoutProcess.MainModule.FileName }
+        finally { $timeoutProcess.Dispose() }
+        $timeoutImageSnapshot = & $module { param($Path) Get-D32BoundArtifactWithFileId -Path $Path } $timeoutExecutablePath
+        $timeoutImage = [PSCustomObject]@{
+            Path = [string]$timeoutImageSnapshot.path
+            Bytes = [long]$timeoutImageSnapshot.bytes
+            Sha256 = [string]$timeoutImageSnapshot.sha256
+            VolumeSerialHex = [string]$timeoutImageSnapshot.volume_serial_hex
+            FileIdHex = [string]$timeoutImageSnapshot.file_id_hex
+        }
+        $timeoutMarker = Join-Path $owned.Root 'wait-timeout-user-code-must-not-run.marker'
+        $timeoutMarkerLiteral = $timeoutMarker.Replace("'", "''")
+        $timeoutCommand = "Set-Content -LiteralPath '$timeoutMarkerLiteral' -Value ran"
+        $timeoutResult = & $module {
+            param($FilePath, $ExpectedRootPin, $WorkingDirectory, $Arguments)
+            Invoke-D32DebugSelfTestProcess -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory `
+                -ExpectedRootPin $ExpectedRootPin -FailureInjection 'wait-timeout' -TimeoutMilliseconds 5000
+        } $timeoutExecutablePath (& $module { param($Image) ConvertTo-D32DebugImagePinText -Image $Image } $timeoutImage) $owned.Root @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $timeoutCommand)
+        $timeoutTrace = $timeoutResult.Trace
+        $timeoutCleanup = $timeoutResult.Cleanup
+        if ($timeoutTrace.State -cne 'BLOCKED' -or [bool]$timeoutTrace.EventChainComplete -or
+            [int]$timeoutTrace.DebugEventCount -ne 0 -or [int]$timeoutResult.ContinueCalls -ne 0 -or
+            [int]$timeoutTrace.UncontinuedCreateContinueCallCount -ne 0 -or [uint32]$timeoutTrace.JobActiveProcesses -ne 0 -or
+            (Test-Path -LiteralPath $timeoutMarker) -or $null -eq $timeoutCleanup -or
+            -not [bool]$timeoutCleanup.CleanupSucceeded -or -not [bool]$timeoutCleanup.JobActiveProcessCountVerified -or
+            [uint32]$timeoutCleanup.JobActiveProcessCount -ne 0 -or -not [bool]$timeoutCleanup.DebuggerThreadExited -or
+            -not [bool]$timeoutCleanup.DebuggerThreadJoined -or -not [bool]$timeoutCleanup.RetainedProcessHandlesSignaled -or
+            -not [bool]$timeoutCleanup.DebuggerAssociationAbsent) {
+            throw 'PREFLIGHT_GIT_SELFTEST_BLOCKED: injected V2 debugger timeout did not block before CREATE continuation and prove complete Job/debugger/handle cleanup'
+        }
+        Write-Host 'D32_PREFLIGHT_GIT_PROCESS_SELFTEST PASS (preflight and Phase0 consumers use V2 fast rev-parse/status/ls-files with exact clean-state semantics; wrapper and root-hash mismatch denied before launch; config/source and alternates indirection blocked pre-launch; pinned-root PID/parent/event/Job/descendant/cleanup negatives verified; injected V2 wait-timeout blocked before CREATE continuation with marker absent and complete cleanup)'
         return $true
     }
     finally {

@@ -19,6 +19,8 @@
 | ADR-D32-PROCESS-EVENT-TRACE-V1 | SUPERSEDED | D32 Phase 0/release evidence command-processor denial and complete process trace (historical trace-source conditions) | GPT-6 Sol Max | Historical; superseded for implementation by V2 |
 | ADR-D32-PROCESS-EVENT-TRACE-V2 | APPROVED | Synchronous Win32 debug events plus independent Job accounting | GPT-6 Sol Max | D32 Phase 0、release evidence build 与相应 provenance only |
 | ADR-D32-GOVERNANCE-V12-RECONCILIATION | APPROVED WITH CONDITIONS | D32 candidate governance v1.2 reconciliation and prospective SC-D32-V1 | GPT-6 Sol Max | D32 final-gate candidate only |
+| ADR-D32-PINNED-GIT-ROOT-IDENTITY | APPROVED WITH CONDITIONS | D32 fixture tooling caller-pinned direct Git root identity under V2 trace | GPT-6 Sol Max | D32 fixture Git metadata queries only |
+| ADR-D32-RELEASE-OUTPUT-FRESHNESS-QUARANTINE | APPROVED WITH CONDITIONS | Exact D32 release-output freshness quarantine exception | GPT-6 Sol Max | Three named Phase 1 release leaves only |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -463,6 +465,85 @@ This clarification is approved under ADR-D32-PROCESS-EVENT-TRACE-V2 and retains 
 
 - 取代 ADR-D32-PROCESS-EVENT-TRACE-V2 中过时的通用 root governance v1.1/no-worktree 规则，以及其被后续 D32 bootstrap/toolchain ADR 与 §16.1.5 supersede 的 Phase 0 release-build 排期概述；不取代该 ADR 的任何 trace-source、process launch、identity、cleanup、schema、trust、negative evidence 或 downstream gate requirement。
 - 无 D33 Stage Contract。
+
+### ADR-D32-PINNED-GIT-ROOT-IDENTITY — Caller-Pinned Direct Git Root Identity Under V2 Trace
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-27
+**Related milestone:** D32 final-gate candidate
+**Related baseline:** `e902a05bf3193212c131c78ec7dfe6b72e2c292f`
+**Related decisions:** ADR-D32-PHASE0-TOOLCHAIN-PROFILE, ADR-D32-PROCESS-EVENT-TRACE-V2, ADR-D32-GOVERNANCE-V12-RECONCILIATION
+
+#### Context
+
+D32 fixture preflight obtains candidate identity and clean-tree metadata through local Git queries. The existing V2 debugger/Job mechanism can verify a fast process before continuing its initial image, while a post-exit `.NET Process` identity query cannot establish that a short-lived image was verified before execution. This decision authorizes only the exact direct Git root independently pinned by the Coordinator; it is not general Git or helper execution authority.
+
+#### Decision
+
+1. **Exact caller-pinned root.** For D32 fixture-tooling Git metadata queries, the only authorized root image is `E:\Program Files\Git\mingw64\bin\git.exe`, independently bound by the Coordinator from an opened-handle snapshot with SHA-256 `1f2ee2de971b6d0a7a13f053014998b66c22df47f30f1907a767346392eb8d78`, length `4238224` bytes, volume serial `749614a1961465c0`, and 128-bit file ID `4aff000000000b000000000000000000`. The canonical path must have no reparse component. The caller-supplied path/hash is not self-authorizing: the implementation must revalidate the exact path, SHA-256, bytes, volume serial, file ID, and native identity immediately before process creation and against the retained executable handle.
+2. **V2 pre-continuation identity and accounting remain mandatory.** Launch the direct root only through the synchronous V2 Win32 debug-event and non-breakaway Job path. For every CREATE event, before `ContinueDebugEvent`, verify the opened image handle's canonical path, SHA-256, bytes, volume serial, and file ID, plus the exact parent PID and retained parent creation identity. Retain process handles through matching EXIT events; reconcile every CREATE/EXIT pair, Job total and active counts, debugger-thread join/exit, signaled handles, debugger association absence, and zero active Job processes. Fast exit does not waive any identity or cleanup check; uncertainty is BLOCKED.
+3. **Narrow descendant rule.** The root is the only Git process. At most one optional direct child is permitted: the exact caller-pinned `conhost.exe` image from the V2 System32 Windows-image inventory. No wrapper, PATH-selected root, shell/command processor, second Git process, indirect descendant, or other child is authorized. Git/SSH/credential helpers remain hard-denied, including when launched by Cargo or any build/test process. The root exception must not change the generic V2 image-denial policy outside this dedicated caller-pinned Git capture.
+4. **Fixed caller-owned use.** Git argv remains the exact code-owned metadata-query argv supplied by the fixture tooling; no arbitrary command, configuration override, trust, repository authority, schema, or protocol behavior is granted. Raw stdout/stderr capture, current fail-closed repository/metadata checks, toolchain-profile validation, and cleanup obligations remain in force.
+5. **Required focused evidence.** Positive evidence covers fast successful direct-root `rev-parse`, `status`, and `ls-files` exits with complete V2 CREATE/EXIT and Job accounting. Negative evidence covers wrapper containment with a persistent exact rejection trace, positive uncontinued CREATE PID and zero Continue calls, absent side-effect marker, and complete cleanup; root/child path, hash, bytes, volume/file-ID, parent/creation, stale or reused PID, unexpected descendant, command-line, and incomplete-cleanup mismatches must be rejected. These focused tests do not constitute Phase 0, a release build, canary, independent gate, or freeze.
+
+#### Frozen invariants
+
+1. V2 synchronous debug events, pre-continuation image identity, exact parent/creation binding, retained handles, independent Job accounting, and fail-closed cleanup remain the sole process-trace contract.
+2. No production Host authority, product/protocol/schema semantics, build command, or downstream D32 gate requirement changes.
+3. D32 Cargo/build/test Jobs continue to deny Git, SSH, and credential-helper images; this ADR does not authorize those descendants.
+
+#### Supersedes / Superseded by
+
+- Supersedes only the blanket Git-root denial in ADR-D32-PROCESS-EVENT-TRACE-V2 to the exact, standalone caller-pinned root and optional direct pinned conhost described above. All other V2 denials and requirements remain unchanged.
+- Supersedes none of the Stage Contract or gate requirements. No D32 gate is declared satisfied.
+
+---
+
+### ADR-D32-RELEASE-OUTPUT-FRESHNESS-QUARANTINE — Exact Release-Output Freshness Exception
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-27
+**Related milestone:** D32 final-gate candidate
+**Related baseline:** `e902a05bf3193212c131c78ec7dfe6b72e2c292f`
+**Related decisions:** ADR-D32-EVIDENCE-BUNDLE-V1, ADR-D32-PHASE0-TOOLCHAIN-PROFILE, ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP, ADR-D32-GOVERNANCE-V12-RECONCILIATION
+
+#### Context
+
+The fixed Phase 1 release commands must produce fresh artifacts at their contractually fixed target paths, while an already-present stale leaf currently blocks that build. This prospective, D32-only decision defines a recoverable way to clear only the three exact stale leaves without reusing them or weakening the fixed command, clean-candidate, identity, aggregate, or canary requirements.
+
+#### Decision
+
+1. **Exact prospective scope.** A future authorized Phase 1 freshness implementation may quarantine only these leaf files, and only when they already exist at the exact fixed path:
+   - `<repo>\vita-agent\target\release\vita-agent.exe`
+   - `<repo>\src-tauri\target\release\d32a-production-canary-host.exe`
+   - `<repo>\src-tauri\target\release\digital_life_lib.dll`
+
+   No other file, output, directory, target tree, build artifact, candidate, or phase is covered. This ADR authorizes no move in the present repair task.
+2. **Recoverable no-overwrite move.** Before any move, require the exact canonical source leaf and all path components to be non-reparse, verify it is a regular file, and establish that no other holder prevents an exclusive opened-handle check. Derive path, bytes, SHA-256, volume serial, and file ID from the same retained opened handle, and preserve that identity fence through the move; a later path re-resolution after releasing it is insufficient. The destination and all of its path components must also be canonical and non-reparse; it must be under a newly created, unique, external quarantine location on the same volume, outside and non-overlapping with the candidate repository. Destination names must be unique and absent. Move only the exact leaf with an atomic no-replace operation bound to that source object. If any precondition or identity is uncertain, do not move and fail closed.
+3. **Exact post-move verification.** After the move, prove the original source path is absent and the quarantine leaf is a non-reparse regular file. Reopen it with the required no-holder check and verify its canonical path, bytes, SHA-256, volume serial, and file ID against the pre-move opened-handle snapshot. Any mismatch or inability to prove the move is BLOCKED; retain the quarantined item recoverably and do not delete or overwrite it.
+4. **Fresh output is still required.** After the unchanged fixed Phase 1 Cargo commands, each produced release artifact must be established at its unchanged source path using opened-handle identity/hash/bytes evidence. Its volume/file identity must be a newly created identity distinct from the corresponding quarantined stale leaf identity, even if the fresh output has identical bytes and hash. Quarantined content is never build input, reused output, attestation evidence for the new build, or a substitute for the fresh artifact.
+5. **All existing gates remain.** Preserve the exact fixed argv, target directories, clean-candidate checks, phase ordering, release attestation/schema, full post-bundle aggregate, required negative evidence, ordered real Host canary, and independent gate. No broad deletion, `cargo clean`, alternate target directory, overwrite, or reuse is allowed.
+
+#### Frozen invariants
+
+1. This is only a release-output freshness-handling exception; production behavior, schema/protocol/trust semantics, toolchain authority, shipping resources, and Stage Contract are unchanged.
+2. Phase 0 fixture-output freshness handling remains governed by ADR-D32-PHASE0-TOOLCHAIN-PROFILE and its exact five-file scope.
+3. Absence immediately before each fixed Phase 1 command and proof of a fresh file identity after each command remain mandatory.
+
+#### Required evidence
+
+- Future implementation must test each exact source leaf, no-holder and non-reparse refusal, destination collision/no-overwrite refusal, same-volume enforcement, exact pre/post identity/hash/bytes preservation, source absence after move, and new output file identity distinct from the quarantined file.
+- Record the exact candidate SHA and clean status around the fixed commands, then run all existing attestation validation and the full required downstream gates against the newly generated artifacts.
+- This ADR is authorization of a narrowly defined prospective handling procedure only; it does not itself establish freshness, run Phase 0, pass the aggregate, satisfy a canary, or close D32.
+
+#### Supersedes / Superseded by
+
+- Supersedes only (a) ADR-D32-PHASE0-TOOLCHAIN-PROFILE decision 7's prospective sentence that the three release outputs are “never quarantined,” and (b) ADR-D32-EVIDENCE-BUNDLE-V1's statement that the attestor does not move a prior output, solely to permit this exact pre-build quarantine. The attestor must still fail closed if any exact output remains present immediately before a fixed command; all existing pre-existing-output negative checks, fixed paths, fresh generated artifacts, opened-handle identity, attestation, and other requirements remain mandatory.
+- Supersedes no other D32 output policy, gate, or Stage Contract requirement.
+
+---
 
 ## ADR 模板
 

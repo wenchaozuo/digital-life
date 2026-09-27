@@ -63,6 +63,7 @@ $script:OwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:SchemaVersion = 3
 $script:D32FixtureProcessTreePolicy = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
+$script:D32PinnedGitIdentitySelfTestOverride = $null
 $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $script:ScriptRoot 'd32-build-toolchain-profile.ps1')
 
@@ -496,7 +497,7 @@ function Get-D32PinnedGit {
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
         throw "GIT_PIN_INVALID: pinned Git executable is not a file: $full"
     }
-    $artifact = Get-D32BoundArtifact $full
+    $artifact = Get-D32BoundArtifactWithFileId $full
     $expected = $ExpectedSha256.ToLowerInvariant()
     if ($artifact.sha256 -ne $expected) {
         throw 'GIT_PIN_INVALID: pinned Git executable did not match its independent SHA-256'
@@ -504,7 +505,42 @@ function Get-D32PinnedGit {
     return [ordered]@{
         path = $full
         sha256 = $expected
+        bytes = [uint64]$artifact.bytes
+        volume_serial_hex = [string]$artifact.volume_serial_hex
+        file_id_hex = [string]$artifact.file_id_hex
         file_identity = $artifact.file_identity
+    }
+}
+
+function Assert-D32ApprovedPinnedGitRoot {
+    $approved = [ordered]@{
+        path = 'E:\Program Files\Git\mingw64\bin\git.exe'
+        sha256 = '1f2ee2de971b6d0a7a13f053014998b66c22df47f30f1907a767346392eb8d78'
+        bytes = [uint64]4238224
+        volume_serial_hex = '749614a1961465c0'
+        file_id_hex = '4aff000000000b000000000000000000'
+    }
+    if ($null -eq $script:PinnedGit) {
+        throw 'GIT_ROOT_NOT_APPROVED: caller-pinned Git root is unavailable'
+    }
+    $isApproved = [string]::Equals((Get-D32FullPath ([string]$script:PinnedGit.path)), $approved.path, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]$script:PinnedGit.sha256 -ceq $approved.sha256 -and
+        [uint64]$script:PinnedGit.bytes -eq [uint64]$approved.bytes -and
+        [string]$script:PinnedGit.volume_serial_hex -ceq $approved.volume_serial_hex -and
+        [string]$script:PinnedGit.file_id_hex -ceq $approved.file_id_hex
+    if ($isApproved) { return }
+
+    # This narrowly scoped alternate pin exists only to exercise the installed
+    # wrapper's blocked descendant behavior inside the explicit identity self-test.
+    $negativeTestPin = $script:D32PinnedGitIdentitySelfTestOverride
+    $isExactNegativeTestPin = $null -ne $negativeTestPin -and
+        [string]::Equals((Get-D32FullPath ([string]$script:PinnedGit.path)), [string]$negativeTestPin.path, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]$script:PinnedGit.sha256 -ceq [string]$negativeTestPin.sha256 -and
+        [uint64]$script:PinnedGit.bytes -eq [uint64]$negativeTestPin.bytes -and
+        [string]$script:PinnedGit.volume_serial_hex -ceq [string]$negativeTestPin.volume_serial_hex -and
+        [string]$script:PinnedGit.file_id_hex -ceq [string]$negativeTestPin.file_id_hex
+    if (-not $isExactNegativeTestPin) {
+        throw 'GIT_ROOT_NOT_APPROVED: only the Coordinator-bound direct Git root identity is launchable'
     }
 }
 
@@ -512,10 +548,13 @@ function Assert-D32PinnedGitCurrent {
     if ($null -eq $script:PinnedGit) {
         throw 'GIT_PIN_REQUIRED: operational Git calls require the caller-supplied path and SHA-256 pins'
     }
-    $artifact = Get-D32BoundArtifact $script:PinnedGit.path
+    $artifact = Get-D32BoundArtifactWithFileId $script:PinnedGit.path
     if ($artifact.sha256 -ne $script:PinnedGit.sha256 -or
+        [uint64]$artifact.bytes -ne [uint64]$script:PinnedGit.bytes -or
+        [string]$artifact.volume_serial_hex -cne [string]$script:PinnedGit.volume_serial_hex -or
+        [string]$artifact.file_id_hex -cne [string]$script:PinnedGit.file_id_hex -or
         -not (Test-D32SameArtifactFileIdentity -Left $artifact.file_identity -Right $script:PinnedGit.file_identity)) {
-        throw 'GIT_PIN_CHANGED: pinned Git executable identity or SHA-256 changed'
+        throw 'GIT_PIN_CHANGED: pinned Git executable bytes, SHA-256, volume, file ID, or native identity changed'
     }
 }
 
@@ -573,10 +612,16 @@ function Open-D32PinnedGitHandle {
     try {
         $identity = Get-D32NativeFileIdentity $stream
         $identityRecord = ConvertTo-D32FileIdentityRecord $identity
-        $snapshot = Get-D32BoundArtifact $script:PinnedGit.path
+        $fileId = Get-D32NativeFileIdInfo -Stream $stream
+        $snapshot = Get-D32BoundArtifactWithFileId $script:PinnedGit.path
         if ($snapshot.sha256 -cne $script:PinnedGit.sha256 -or
+            [uint64]$snapshot.bytes -ne [uint64]$script:PinnedGit.bytes -or
+            [string]$snapshot.volume_serial_hex -cne [string]$script:PinnedGit.volume_serial_hex -or
+            [string]$snapshot.file_id_hex -cne [string]$script:PinnedGit.file_id_hex -or
             -not (Test-D32SameArtifactFileIdentity -Left $identityRecord -Right $script:PinnedGit.file_identity) -or
-            -not (Test-D32SameArtifactFileIdentity -Left $snapshot.file_identity -Right $identityRecord)) {
+            -not (Test-D32SameArtifactFileIdentity -Left $snapshot.file_identity -Right $identityRecord) -or
+            [string]([uint64]$fileId.volume_serial).ToString('x16') -cne [string]$script:PinnedGit.volume_serial_hex -or
+            [string]$fileId.file_id_hex -cne [string]$script:PinnedGit.file_id_hex) {
             throw 'GIT_PIN_CHANGED: pinned Git changed before the retained executable handle was acquired'
         }
         return $stream
@@ -715,58 +760,134 @@ function Assert-D32NativeProcessIdentityRecord {
 }
 
 function Assert-D32PinnedGitProcessIdentity {
-    param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process, [Parameter(Mandatory = $true)][string[]]$Arguments)
+    param(
+        [Parameter(Mandatory = $true)][object]$Trace,
+        [Parameter(Mandatory = $true)][object]$Cleanup,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        [Parameter(Mandatory = $true)][int]$ExpectedParentProcessId,
+        [Parameter(Mandatory = $true)][object[]]$ApprovedChildImages
+    )
+
+    Assert-D32ApprovedPinnedGitRoot
+    if ($null -eq $Cleanup -or -not [bool]$Cleanup.CleanupSucceeded -or
+        -not [bool]$Cleanup.JobCloseSucceeded -or -not [bool]$Cleanup.JobTerminateCallSucceeded -or
+        -not [bool]$Cleanup.JobActiveProcessCountVerified -or [uint32]$Cleanup.JobActiveProcessCount -ne 0 -or
+        -not [bool]$Cleanup.ProcessWaitSignaled -or -not [bool]$Cleanup.DebuggerThreadExited -or
+        -not [bool]$Cleanup.DebuggerThreadJoined -or -not [bool]$Cleanup.DebuggerKillOnExitEnabled -or
+        -not [bool]$Cleanup.RetainedProcessHandlesSignaled -or
+        -not [bool]$Cleanup.DebuggerAssociationQueryVerified -or -not [bool]$Cleanup.DebuggerAssociationAbsent) {
+        throw 'GIT_PROCESS_CLEANUP_FAILED: pinned Git process Job, retained-handle, debugger-thread, or zero-active-process cleanup proof is incomplete'
+    }
+    if ($null -eq $Trace -or $Trace.RecordType -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or
+        [int]$Trace.SchemaVersion -ne 2 -or $Trace.State -cne 'COMPLETED' -or
+        -not [bool]$Trace.AccountingConsistent -or -not [bool]$Trace.EventChainComplete -or
+        -not [bool]$Trace.DedicatedDebuggerThread -or -not [bool]$Trace.DebuggerKillOnExitEnabled -or
+        -not [bool]$Trace.RootResumedAfterKillOnExit -or -not [bool]$Trace.DebuggerThreadExited -or
+        -not [bool]$Trace.DebuggerThreadJoined -or -not [bool]$Trace.RetainedProcessHandlesSignaled -or
+        -not [bool]$Trace.DebuggerAssociationQueryVerified -or -not [bool]$Trace.DebuggerAssociationAbsent -or
+        -not [bool]$Trace.JobAccountingVerified -or
+        [int]$Trace.ProcessCreateEventCount -lt 1 -or [int]$Trace.ProcessCreateEventCount -gt 2 -or
+        [int]$Trace.ProcessExitEventCount -ne [int]$Trace.ProcessCreateEventCount -or
+        [int]$Trace.ProcessEventCount -ne (2 * [int]$Trace.ProcessCreateEventCount) -or
+        [int]$Trace.JobTotalProcesses -ne [int]$Trace.ProcessCreateEventCount -or [int]$Trace.JobActiveProcesses -ne 0 -or
+        [int]$Trace.UncontinuedCreateProcessId -ne 0 -or [int]$Trace.UncontinuedCreateContinueCallCount -ne 0 -or
+        @($Trace.ProcessEvents).Count -ne [int]$Trace.ProcessEventCount -or
+        @($Trace.Processes).Count -ne [int]$Trace.ProcessCreateEventCount -or
+        @($ApprovedChildImages).Count -ne 1) {
+        throw "GIT_PROCESS_IDENTITY_MISMATCH: pinned Git process trace is incomplete, ambiguous, or contains an unexpected descendant (state=$($Trace.State); create=$($Trace.ProcessCreateEventCount); exit=$($Trace.ProcessExitEventCount); events=$($Trace.ProcessEventCount); total=$($Trace.JobTotalProcesses); active=$($Trace.JobActiveProcesses); processes=$(@($Trace.Processes).Count); eventRecords=$(@($Trace.ProcessEvents).Count); approvedChildImages=$(@($ApprovedChildImages).Count); block=$($Trace.BlockReason))"
+    }
+
+    $approvedChild = @($ApprovedChildImages)[0]
+    foreach ($propertyName in @('Path', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex')) {
+        if ($null -eq $approvedChild.PSObject.Properties[$propertyName] -or
+            [String]::IsNullOrWhiteSpace([string]$approvedChild.$propertyName)) {
+            throw 'GIT_PROCESS_IDENTITY_MISMATCH: caller-pinned Windows child-image identity is incomplete'
+        }
+    }
+    $approvedChildPath = Get-D32FullPath ([string]$approvedChild.Path)
+    if (-not [string]::Equals([IO.Path]::GetFileName($approvedChildPath), 'conhost.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: caller-pinned Git child inventory is not the single approved conhost image'
+    }
 
     $expectedPath = Get-D32FullPath $script:PinnedGit.path
-    $expectedStartTime = $null
-    try {
-        if ($Process.HasExited) { throw 'process exited before identity verification' }
-        $expectedArguments = ConvertTo-D32CommandLine $Arguments
-        $expectedCommand = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
-        $startInfo = $Process.StartInfo
-        if ($null -eq $startInfo -or
-            -not [string]::Equals((Get-D32FullPath ([string]$startInfo.FileName)), $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
-            -not [string]::Equals([string]$startInfo.Arguments, $expectedArguments, [StringComparison]::OrdinalIgnoreCase) -or
-            [bool]$startInfo.UseShellExecute) {
-            throw 'PROCESS_IDENTITY_MISMATCH: ProcessStartInfo image, direct-launch mode, or exact requested arguments changed before identity verification'
-        }
-        $expectedStartTime = $Process.StartTime
-        Initialize-D32NativeProcessIdentityType
-        $observed = [D32NativeProcessIdentityV1]::Query($Process.Handle, [int]$PID, $expectedCommand)
-        $null = Assert-D32NativeProcessIdentityRecord `
-            -ProcessIdentity $observed `
-            -ExpectedProcessId ([int]$Process.Id) `
-            -ExpectedParentProcessId ([int]$PID) `
-            -ExpectedImagePath $expectedPath `
-            -ExpectedCommandLine $expectedCommand `
-            -ExpectedStartTime $expectedStartTime
-    }
-    catch {
-        $identityError = $_.Exception.Message
-        if ($identityError -like 'PROCESS_IDENTITY_MISMATCH:*') {
-            throw "GIT_PROCESS_IDENTITY_MISMATCH: $identityError"
-        }
-        if ($identityError -like 'GIT_PROCESS_IDENTITY_UNAVAILABLE:*') { throw }
-        throw "GIT_PROCESS_IDENTITY_UNVERIFIED: $identityError"
+    $expectedCommandLine = ConvertTo-D32CommandLine (@($expectedPath) + $Arguments)
+    if (-not [string]::Equals($CommandLine, $expectedCommandLine, [StringComparison]::Ordinal)) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: CreateProcessW command line differs from the exact caller-requested Git argv'
     }
 
-    # Capture handle-bound process identity before hashing the pinned image. Short
-    # read-only Git commands can exit during the file hash; the caller-owned image
-    # handle was already retained and locked before Process.Start.
-    if (-not [string]::Equals((Get-D32FullPath ([string]$observed.ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image path does not match the caller-pinned Git executable'
+    if ([int]$Trace.DebuggerProcessId -ne $ExpectedParentProcessId) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: debug trace belongs to a different runner process'
     }
-    $image = Get-D32BoundArtifact $expectedPath
-    if ($image.sha256 -cne $script:PinnedGit.sha256 -or
+    $roots = @($Trace.Processes | Where-Object {
+        [int]$_.ParentProcessId -eq $ExpectedParentProcessId -and
+        [long]$_.ParentCreationFileTime -eq [long]$Trace.DebuggerCreationFileTime
+    })
+    if ($roots.Count -ne 1) { throw 'GIT_PROCESS_IDENTITY_MISMATCH: trace does not contain one exact pinned Git root identity' }
+    $identity = $roots[0]
+    $children = @($Trace.Processes | Where-Object { [int]$_.ProcessId -ne [int]$identity.ProcessId })
+    if ($children.Count -gt 1) { throw 'GIT_PROCESS_IDENTITY_MISMATCH: pinned Git trace contains more than one child process' }
+    if ($children.Count -eq 1) {
+        $child = $children[0]
+        if ([int]$child.ParentProcessId -ne [int]$identity.ProcessId -or
+            [long]$child.ParentCreationFileTime -ne [long]$identity.CreationFileTime -or
+            -not [bool]$child.ImageVerified -or -not [bool]$child.Exited -or
+            -not [string]::Equals((Get-D32FullPath ([string]$child.ImagePath)), $approvedChildPath, [StringComparison]::OrdinalIgnoreCase) -or
+            [long]$child.Bytes -ne [long]$approvedChild.Bytes -or [string]$child.Sha256 -cne [string]$approvedChild.Sha256 -or
+            [string]$child.VolumeSerialHex -cne [string]$approvedChild.VolumeSerialHex -or
+            [string]$child.FileIdHex -cne [string]$approvedChild.FileIdHex) {
+            throw 'GIT_PROCESS_IDENTITY_MISMATCH: Git child process is not the exact caller-pinned Windows conhost image and direct descendant'
+        }
+    }
+    foreach ($processIdentity in @($identity) + $children) {
+        $createMatches = @($Trace.ProcessEvents | Where-Object {
+            $_.Kind -ceq 'CREATE' -and [int]$_.ProcessId -eq [int]$processIdentity.ProcessId -and
+            [long]$_.CreationFileTime -eq [long]$processIdentity.CreationFileTime
+        })
+        $exitMatches = @($Trace.ProcessEvents | Where-Object {
+            $_.Kind -ceq 'EXIT' -and [int]$_.ProcessId -eq [int]$processIdentity.ProcessId -and
+            [long]$_.CreationFileTime -eq [long]$processIdentity.CreationFileTime
+        })
+        if ($createMatches.Count -ne 1 -or $exitMatches.Count -ne 1) {
+            throw 'GIT_PROCESS_IDENTITY_MISMATCH: process record lacks one matching CREATE and EXIT event for its exact PID/creation identity'
+        }
+        $createEvent = $createMatches[0]
+        $exitEvent = $exitMatches[0]
+        if ([long]$createEvent.Sequence -le 0 -or [long]$exitEvent.Sequence -le [long]$createEvent.Sequence -or
+            [int]$createEvent.ParentProcessId -ne [int]$processIdentity.ParentProcessId -or
+            [long]$createEvent.ParentCreationFileTime -ne [long]$processIdentity.ParentCreationFileTime -or
+            [int]$exitEvent.ParentProcessId -ne [int]$processIdentity.ParentProcessId -or
+            [long]$exitEvent.ParentCreationFileTime -ne [long]$processIdentity.ParentCreationFileTime -or
+            [int]$exitEvent.ExitCode -ne [int]$processIdentity.ExitCode -or
+            -not [bool]$processIdentity.ImageVerified -or -not [bool]$processIdentity.Exited -or
+            [long]$processIdentity.CreateSequence -ne [long]$createEvent.Sequence -or
+            [long]$processIdentity.ExitSequence -ne [long]$exitEvent.Sequence) {
+            throw 'GIT_PROCESS_IDENTITY_MISMATCH: CREATE/EXIT event chain does not bind the exact process, parent, and creation identity'
+        }
+    }
+    $rootCreateEvent = @($Trace.ProcessEvents | Where-Object {
+        $_.Kind -ceq 'CREATE' -and [int]$_.ProcessId -eq [int]$identity.ProcessId -and
+        [long]$_.CreationFileTime -eq [long]$identity.CreationFileTime
+    })[0]
+    if ([int]$rootCreateEvent.ParentProcessId -ne $ExpectedParentProcessId -or
+        [long]$rootCreateEvent.ParentCreationFileTime -ne [long]$Trace.DebuggerCreationFileTime) {
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: root CREATE event parent PID/creation identity differs from this runner'
+    }
+
+    $image = Get-D32BoundArtifactWithFileId -Path $expectedPath
+    if (-not [string]::Equals((Get-D32FullPath ([string]$identity.ImagePath)), $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+        [long]$identity.Bytes -ne [long]$image.bytes -or [string]$identity.Sha256 -cne [string]$image.sha256 -or
+        [string]$identity.VolumeSerialHex -cne [string]$image.volume_serial_hex -or
+        [string]$identity.FileIdHex -cne [string]$image.file_id_hex -or
+        [uint64]$image.bytes -ne [uint64]$script:PinnedGit.bytes -or
+        [string]$image.volume_serial_hex -cne [string]$script:PinnedGit.volume_serial_hex -or
+        [string]$image.file_id_hex -cne [string]$script:PinnedGit.file_id_hex -or
+        [string]$image.sha256 -cne [string]$script:PinnedGit.sha256 -or
         -not (Test-D32SameArtifactFileIdentity -Left $image.file_identity -Right $script:PinnedGit.file_identity)) {
-        throw 'GIT_PROCESS_IDENTITY_MISMATCH: started process image hash or native file identity differs from pinned Git'
+        throw 'GIT_PROCESS_IDENTITY_MISMATCH: pre-continuation Git image handle differs from the caller-pinned path, bytes, SHA-256, or file identity'
     }
-    try {
-        Assert-D32PinnedGitCurrent
-    }
-    catch {
-        throw "GIT_PROCESS_IDENTITY_MISMATCH: caller-pinned Git changed after the process identity query: $($_.Exception.Message)"
-    }
+    try { Assert-D32PinnedGitCurrent }
+    catch { throw "GIT_PROCESS_IDENTITY_MISMATCH: caller-pinned Git changed after identity verification: $($_.Exception.Message)" }
 }
 
 function Assert-D32NoNestedGitReparse {
@@ -1003,6 +1124,7 @@ function Get-D32GitOutput {
     )
 
     Assert-D32PinnedGitCurrent
+    Assert-D32ApprovedPinnedGitRoot
     $rootFull = Assert-D32NoReparsePath -Path $Root
     $gitDirectory = Assert-D32RepositoryGitConfig -Root $rootFull
     $temporaryRoot = Assert-D32NoReparsePath -Path ([IO.Path]::GetTempPath())
@@ -1022,9 +1144,7 @@ function Get-D32GitOutput {
     $searchDirectories = @($gitBin, (Join-Path $installRoot 'bin'), (Join-Path $installRoot 'mingw64/bin'), (Join-Path $installRoot 'usr/bin'), (Join-Path $systemRoot 'System32'))
     $searchDirectories = @($searchDirectories | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | ForEach-Object { Assert-D32NoReparsePath -Path $_ })
     if ($searchDirectories.Count -eq 0) { throw 'GIT_ENV_INVALID: pinned Git has no safe executable search path' }
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $script:PinnedGit.path
-    $startInfo.Arguments = ConvertTo-D32CommandLine (@(
+    $gitCommandArguments = @(
         '-c', 'core.fsmonitor=false',
         '-c', ('core.worktree=' + $rootFull),
         '-c', 'core.bare=false',
@@ -1032,38 +1152,42 @@ function Get-D32GitOutput {
         '-c', ('core.hooksPath=' + $emptyHooks),
         '-c', ('safe.directory=' + $rootFull),
         '-C', $rootFull
-    ) + $Arguments)
-    $startInfo.WorkingDirectory = $rootFull
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    Clear-D32ChildEnvironment -StartInfo $startInfo
-    $childEnvironment = $startInfo.EnvironmentVariables
-    $childEnvironment['PATH'] = $searchDirectories -join [IO.Path]::PathSeparator
-    $childEnvironment['SystemRoot'] = $systemRoot
-    $childEnvironment['WINDIR'] = $systemRoot
-    $childEnvironment['TEMP'] = $environmentRoot
-    $childEnvironment['TMP'] = $environmentRoot
-    $childEnvironment['HOME'] = $environmentRoot
-    $childEnvironment['USERPROFILE'] = $environmentRoot
-    $childEnvironment['XDG_CONFIG_HOME'] = $environmentRoot
-    $childEnvironment['GIT_CONFIG_NOSYSTEM'] = '1'
-    $childEnvironment['GIT_CONFIG_SYSTEM'] = $emptyConfig
-    $childEnvironment['GIT_CONFIG_GLOBAL'] = $emptyConfig
-    $childEnvironment['GIT_DIR'] = $gitDirectory
-    $childEnvironment['GIT_WORK_TREE'] = $rootFull
-    $childEnvironment['GIT_INDEX_FILE'] = Join-Path $gitDirectory 'index'
-    $childEnvironment['GIT_OPTIONAL_LOCKS'] = '0'
-    $childEnvironment['GIT_TERMINAL_PROMPT'] = '0'
-    $childEnvironment['GIT_PAGER'] = 'cat'
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
+    ) + @($Arguments)
+    $commandLine = ConvertTo-D32CommandLine (@($script:PinnedGit.path) + $gitCommandArguments)
+    $childEnvironment = [ordered]@{
+        PATH = $searchDirectories -join [IO.Path]::PathSeparator
+        SystemRoot = $systemRoot
+        WINDIR = $systemRoot
+        TEMP = $environmentRoot
+        TMP = $environmentRoot
+        HOME = $environmentRoot
+        USERPROFILE = $environmentRoot
+        XDG_CONFIG_HOME = $environmentRoot
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_SYSTEM = $emptyConfig
+        GIT_CONFIG_GLOBAL = $emptyConfig
+        GIT_DIR = $gitDirectory
+        GIT_WORK_TREE = $rootFull
+        GIT_INDEX_FILE = Join-Path $gitDirectory 'index'
+        GIT_OPTIONAL_LOCKS = '0'
+        GIT_TERMINAL_PROMPT = '0'
+        GIT_PAGER = 'cat'
+    }
+    $environmentBlock = ConvertTo-D32EnvironmentBlock -Environment $childEnvironment
+    $nativeProcess = $null
+    $trace = $null
+    $cleanup = $null
+    $stdoutBuffer = $null
+    $stderrBuffer = $null
+    $stdoutCopy = $null
+    $stderrCopy = $null
     $pinnedGitHandle = $null
     $ownsMetadataLocks = $false
     $exitCode = $null
     $stdout = ''
     $stderr = ''
+    $profileCurrent = $null
+    $script:D32LastPinnedGitAttempt = $null
     try {
         if ($null -eq $MetadataLocks) {
             $MetadataLocks = Open-D32GitMetadataLocks -Root $rootFull -GitDirectory $gitDirectory
@@ -1072,39 +1196,96 @@ function Get-D32GitOutput {
         Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
         $pinnedGitHandle = Open-D32PinnedGitHandle
         Assert-D32PinnedGitCurrent
-        Initialize-D32NativeProcessIdentityType
-        if (-not $process.Start()) { throw 'GIT_FAILED: pinned Git process did not start' }
-        try {
-            Assert-D32PinnedGitProcessIdentity -Process $process -Arguments (@(
-                    '-c', 'core.fsmonitor=false',
-                    '-c', ('core.worktree=' + $rootFull),
-                    '-c', 'core.bare=false',
-                    '-c', ('core.attributesFile=' + $emptyConfig),
-                    '-c', ('core.hooksPath=' + $emptyHooks),
-                    '-c', ('safe.directory=' + $rootFull),
-                    '-C', $rootFull
-                ) + $Arguments)
+        if ($null -eq $script:ValidatedToolchainProfile -or -not [bool]$script:ValidatedToolchainProfile.IsValid) {
+            throw 'GIT_TOOLCHAIN_PROFILE_REQUIRED: caller-pinned Windows child-image inventory is unavailable'
         }
-        catch {
-            try {
-                if (-not $process.HasExited) {
-                    $process.Kill()
-                    $process.WaitForExit()
-                }
+        $profileCurrent = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $script:ValidatedToolchainProfile
+        if (@($profileCurrent.WindowsImageInventory).Count -ne 1) {
+            throw 'GIT_TOOLCHAIN_PROFILE_INVALID: pinned Git requires exactly one caller-pinned Windows child image'
+        }
+        $approvedChildImage = @($profileCurrent.WindowsImageInventory)[0]
+        if (-not [string]::Equals([IO.Path]::GetFileName([string]$approvedChildImage.Path), 'conhost.exe', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'GIT_TOOLCHAIN_PROFILE_INVALID: pinned Git child inventory must be the exact conhost.exe profile image'
+        }
+        $approvedChildImagePin = @(
+            [string]$approvedChildImage.Path,
+            [string]$approvedChildImage.Bytes,
+            [string]$approvedChildImage.Sha256,
+            [string]$approvedChildImage.VolumeSerialHex,
+            [string]$approvedChildImage.FileIdHex
+        ) -join "`t"
+        $image = Get-D32BoundArtifactWithFileId -Path $script:PinnedGit.path
+        if ($image.sha256 -cne $script:PinnedGit.sha256 -or
+            [uint64]$image.bytes -ne [uint64]$script:PinnedGit.bytes -or
+            [string]$image.volume_serial_hex -cne [string]$script:PinnedGit.volume_serial_hex -or
+            [string]$image.file_id_hex -cne [string]$script:PinnedGit.file_id_hex -or
+            -not (Test-D32SameArtifactFileIdentity -Left $image.file_identity -Right $script:PinnedGit.file_identity)) {
+            throw 'GIT_PIN_CHANGED: pinned Git image bytes, SHA-256, volume, file ID, or native identity differs before the suspended process launch'
+        }
+        $expectedRootPin = @(
+            [string]$image.path,
+            [string]$image.bytes,
+            [string]$image.sha256,
+            [string]$image.volume_serial_hex,
+            [string]$image.file_id_hex
+        ) -join "`t"
+        Ensure-D32NativeLauncher
+        $nativeProcess = [D32FixtureNativeProcessV2]::StartDebug(
+            $script:PinnedGit.path,
+            $commandLine,
+            $rootFull,
+            $environmentBlock)
+        $stdoutBuffer = [IO.MemoryStream]::new()
+        $stderrBuffer = [IO.MemoryStream]::new()
+        $stdoutCopy = $nativeProcess.OpenStdoutStream().CopyToAsync($stdoutBuffer)
+        $stderrCopy = $nativeProcess.OpenStderrStream().CopyToAsync($stderrBuffer)
+        $timeoutMilliseconds = [int][Math]::Min([int]::MaxValue, ([long]$script:TimeoutSeconds * 1000))
+        $nativeProcess.ConfigurePinnedGitDebugCapture($expectedRootPin, $approvedChildImagePin, $timeoutMilliseconds)
+        $traceTimeoutMilliseconds = [int][Math]::Min([int]::MaxValue, ([long]$timeoutMilliseconds + 20000))
+        $trace = $nativeProcess.WaitForDebugTrace($traceTimeoutMilliseconds)
+        $cleanup = $nativeProcess.CloseJobAndWait(10000)
+        $script:D32LastPinnedGitAttempt = [ordered]@{
+            root_path = [string]$script:PinnedGit.path
+            root_sha256 = [string]$script:PinnedGit.sha256
+            root_bytes = [uint64]$script:PinnedGit.bytes
+            root_volume_serial_hex = [string]$script:PinnedGit.volume_serial_hex
+            root_file_id_hex = [string]$script:PinnedGit.file_id_hex
+            arguments = @($gitCommandArguments)
+            command_line = $commandLine
+            process_trace = ConvertTo-D32DebugProcessTraceDocument -Trace $trace
+            native_cleanup = ConvertTo-D32NativeCleanupDocument -Evidence $cleanup
+            cleanup_runtime = [ordered]@{
+                debugger_thread_exited = [bool]$cleanup.DebuggerThreadExited
+                debugger_thread_joined = [bool]$cleanup.DebuggerThreadJoined
+                debugger_kill_on_exit_enabled = [bool]$cleanup.DebuggerKillOnExitEnabled
+                retained_process_handles_signaled = [bool]$cleanup.RetainedProcessHandlesSignaled
+                debugger_association_query_verified = [bool]$cleanup.DebuggerAssociationQueryVerified
+                debugger_association_absent = [bool]$cleanup.DebuggerAssociationAbsent
             }
-            catch { }
-            throw
         }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $exitCode = $process.ExitCode
+        Assert-D32PinnedGitProcessIdentity `
+            -Trace $trace `
+            -Cleanup $cleanup `
+            -Arguments $gitCommandArguments `
+            -CommandLine $commandLine `
+            -ExpectedParentProcessId ([int]$PID) `
+            -ApprovedChildImages @($profileCurrent.WindowsImageInventory)
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $profileCurrent
+        if (-not $stdoutCopy.Wait(10000) -or $stdoutCopy.IsFaulted -or
+            -not $stderrCopy.Wait(10000) -or $stderrCopy.IsFaulted) {
+            throw 'GIT_CAPTURE_FAILED: pinned Git stdout/stderr raw-pipe capture did not complete'
+        }
+        $null = $stdoutCopy.GetAwaiter().GetResult()
+        $null = $stderrCopy.GetAwaiter().GetResult()
+        $stdout = [Text.Encoding]::UTF8.GetString($stdoutBuffer.ToArray())
+        $stderr = [Text.Encoding]::UTF8.GetString($stderrBuffer.ToArray())
+        $exitCode = $nativeProcess.ExitCode
         Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
     }
     finally {
-        $process.Dispose()
+        if ($null -ne $nativeProcess) { $nativeProcess.Dispose() }
+        if ($null -ne $stdoutBuffer) { $stdoutBuffer.Dispose() }
+        if ($null -ne $stderrBuffer) { $stderrBuffer.Dispose() }
         if ($null -ne $pinnedGitHandle) { $pinnedGitHandle.Dispose() }
         if ($ownsMetadataLocks -and $null -ne $MetadataLocks) { Close-D32GitMetadataLocks -Locks $MetadataLocks }
         Remove-D32OwnedDirectory $environmentRoot
@@ -1592,6 +1773,7 @@ internal sealed class D32DebugLaunchCoordinator
     public int TimeoutMilliseconds;
     public bool InjectFirstCreateInterruption;
     public bool InjectFirstCreateIdentityMismatch;
+    public bool AllowPinnedGitRoot;
     public string FailureInjection;
 }
 
@@ -2245,6 +2427,24 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
     public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection)
     {
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false);
+    }
+
+    public void ConfigurePinnedGitDebugCapture(string expectedRootPin, string approvedWindowsImagePin, int timeoutMilliseconds)
+    {
+        string[] pin = ParseDebugPin(expectedRootPin);
+        if (!String.Equals(Path.GetFileName(pin[0]), "git.exe", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("standalone pinned-Git capture requires an exact git.exe root image");
+        string[] childPin = ParseDebugPin(approvedWindowsImagePin);
+        if (!String.Equals(Path.GetFileName(childPin[0]), "conhost.exe", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("standalone pinned-Git capture requires the caller-pinned conhost.exe child image");
+        ConfigureDebugCapture(expectedRootPin, new string[] { approvedWindowsImagePin }, new string[0], timeoutMilliseconds,
+            false, false, null, true);
+    }
+
+    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot)
+    {
         if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
             throw new ArgumentException("expected root pin, image inventories, and a positive deadline are mandatory");
@@ -2258,6 +2458,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             _debugCoordinator.InjectFirstCreateInterruption = injectFirstCreateInterruption;
             _debugCoordinator.InjectFirstCreateIdentityMismatch = injectFirstCreateIdentityMismatch;
             _debugCoordinator.FailureInjection = failureInjection;
+            _debugCoordinator.AllowPinnedGitRoot = allowPinnedGitRoot;
             _debugCoordinator.CapturePlanReady.Set();
         }
     }
@@ -2338,11 +2539,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         _debugAssociationQueryVerified = handles.Count > 0;
         _debugAssociationAbsent = handles.Count > 0;
         List<string> handleStates = new List<string>();
+        DateTime processSignalDeadline = DateTime.UtcNow.AddSeconds(10);
         for (int i = 0; i < handles.Count; i++)
         {
             IntPtr handle = handles[i];
             uint pid = i < processIds.Count ? processIds[i] : 0;
-            uint waitResult = handle == IntPtr.Zero ? UInt32.MaxValue : WaitForSingleObject(handle, 0);
+            int remainingMilliseconds = Math.Max(0, (int)(processSignalDeadline - DateTime.UtcNow).TotalMilliseconds);
+            uint waitResult = handle == IntPtr.Zero ? UInt32.MaxValue : WaitForSingleObject(handle, (uint)remainingMilliseconds);
             int waitError = waitResult == UInt32.MaxValue ? Marshal.GetLastWin32Error() : 0;
             bool present = true;
             bool debuggerQueryOk = handle != IntPtr.Zero && CheckRemoteDebuggerPresent(handle, out present);
@@ -2387,8 +2590,14 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             trace.DedicatedDebuggerThread && trace.DebuggerKillOnExitEnabled && trace.RootResumedAfterKillOnExit &&
             trace.DebuggerThreadExited && trace.DebuggerThreadJoined && trace.RetainedProcessHandlesSignaled &&
             trace.DebuggerAssociationQueryVerified && trace.DebuggerAssociationAbsent;
-        if (!trace.AccountingConsistent) TraceBlock(trace, "CREATE/EXIT, dedicated-thread cleanup, retained handles, debugger association, and independent Job accounting do not reconcile");
-        if (trace.State == "RUNNING") trace.State = trace.AccountingConsistent ? "COMPLETED" : "BLOCKED";
+        const string accountingBlockReason = "CREATE/EXIT, dedicated-thread cleanup, retained handles, debugger association, and independent Job accounting do not reconcile";
+        if (!trace.AccountingConsistent) TraceBlock(trace, accountingBlockReason);
+        else if (trace.State == "RUNNING" || trace.BlockReason == accountingBlockReason)
+        {
+            trace.State = "COMPLETED";
+            if (trace.BlockReason == accountingBlockReason) trace.BlockReason = null;
+        }
+        if (trace.State == "RUNNING") trace.State = "BLOCKED";
         trace.CompletedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
     }
 
@@ -3081,7 +3290,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 if (parentPid != (uint)trace.DebuggerProcessId) throw new InvalidOperationException("fixed root parent PID differs from the current runner");
                                 parentCreation = debuggerCreation;
                                 string rootDeny = GetHardDeniedImageReason(image.Path);
-                                if (rootDeny != null) throw new InvalidOperationException(rootDeny + ": " + image.Path);
+                                bool pinnedGitRootAllowed = _debugCoordinator.AllowPinnedGitRoot &&
+                                    String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase);
+                                if (rootDeny != null && !pinnedGitRootAllowed) throw new InvalidOperationException(rootDeny + ": " + image.Path);
                                 if (!DebugImageMatches(image, expectedRoot)) throw new InvalidOperationException("fixed root image differs from its caller-pinned path/bytes/SHA/file ID");
                                 reason = "exact-caller-pinned-fixed-root-image";
                                 verified = true;
@@ -3093,6 +3304,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 parentCreation = parent.Record.CreationFileTime;
                                 string denied = GetHardDeniedImageReason(image.Path);
                                 if (denied != null) throw new InvalidOperationException(denied + ": " + image.Path);
+                                if (_debugCoordinator.AllowPinnedGitRoot &&
+                                    (trace.ProcessCreateEventCount != 2 || trace.Processes.Count != 1 || parentPid != trace.Processes[0].ProcessId))
+                                    throw new InvalidOperationException("standalone pinned Git permits only one direct caller-pinned Windows console-host child; observed " + image.Path + " parent=" + parent.Record.ImagePath);
                                 foreach (string[] pin in pins)
                                 {
                                     if (DebugImageMatches(image, pin)) { reason = "caller-pinned-toolchain-native-or-Windows-image"; break; }
@@ -6535,59 +6749,296 @@ function Invoke-D32PinnedGitProcessIdentitySelfTest {
     $repo = Assert-D32NoReparsePath -Path $Repository
     if (-not (Test-Path -LiteralPath (Join-Path $repo '.git'))) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: supplied repository root is not a Git repository' }
     $script:PinnedGit = Get-D32PinnedGit -Path $PinnedPath -ExpectedSha256 $PinnedSha256
-
-    # Repeat a fast read-only command to exercise process-start identity binding
-    # across short-lived PIDs and the retained Git image handle.
-    $liveIdentityRuns = 0
-    for ($attempt = 1; $attempt -le 16; $attempt++) {
-        $head = Get-D32GitOutput -Root $repo -Arguments @('rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}')
-        if ($head -notmatch '^[0-9a-fA-F]{40}$') { throw "SELFTEST_GIT_IDENTITY_BLOCKED: pinned Git read-only command $attempt returned no exact commit identity" }
-        $liveIdentityRuns++
-    }
-
-    # A process that has already exited before identity capture must not be accepted
-    # from a path, exit code, or stale PID alone.
-    $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot', 'Process')
-    if ([String]::IsNullOrWhiteSpace($systemRoot)) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: Windows SystemRoot is unavailable' }
-    $systemRoot = Assert-D32NoReparsePath -Path $systemRoot
-    $searchPath = @((Split-Path -Parent $script:PinnedGit.path), (Join-Path $systemRoot 'System32')) |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
-        ForEach-Object { Assert-D32NoReparsePath -Path $_ }
-    if ($searchPath.Count -lt 2) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: pinned Git and Windows system executable roots are unavailable' }
-
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $script:PinnedGit.path
-    $startInfo.Arguments = ConvertTo-D32CommandLine @('--version')
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    Clear-D32ChildEnvironment -StartInfo $startInfo
-    $startInfo.EnvironmentVariables['PATH'] = $searchPath -join [IO.Path]::PathSeparator
-    $startInfo.EnvironmentVariables['SystemRoot'] = $systemRoot
-    $startInfo.EnvironmentVariables['WINDIR'] = $systemRoot
-    $shortProcess = [Diagnostics.Process]::new()
-    $shortProcess.StartInfo = $startInfo
+    $originalTimeout = [int]$script:TimeoutSeconds
+    $profileVariable = Get-Variable -Name ValidatedToolchainProfile -Scope Script -ErrorAction SilentlyContinue
+    $hadOriginalProfile = $null -ne $profileVariable
+    $originalProfile = if ($hadOriginalProfile) { $profileVariable.Value } else { $null }
+    $profileTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('d32-git-identity-profile-' + [Guid]::NewGuid().ToString('N'))
+    $profileRootOwned = $false
     try {
-        if (-not $shortProcess.Start()) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: short-lived pinned Git process did not start' }
-        $stdoutTask = $shortProcess.StandardOutput.ReadToEndAsync()
-        $stderrTask = $shortProcess.StandardError.ReadToEndAsync()
-        if (-not $shortProcess.WaitForExit(5000)) {
-            try { $shortProcess.Kill(); $shortProcess.WaitForExit() } catch { }
-            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: bounded --version process did not exit'
+        [void](Ensure-D32OwnedDirectory $profileTestRoot)
+        $profileRootOwned = $true
+        $validatedProfile = $null
+        $profileCases = @(Test-D32BuildToolchainProfileSelfTest `
+            -Root $profileTestRoot `
+            -Repository $repo `
+            -ValidatedProfileOutput ([ref]$validatedProfile))
+        $profileFailures = @($profileCases | Where-Object { -not [bool]$_.Passed })
+        if ($profileFailures.Count -ne 0 -or $null -eq $validatedProfile -or -not [bool]$validatedProfile.IsValid -or
+            @($validatedProfile.WindowsImageInventory).Count -ne 1) {
+            $failedNames = @($profileFailures | ForEach-Object { [string]$_.Name }) -join ', '
+            throw "SELFTEST_GIT_IDENTITY_BLOCKED: valid caller-pinned Windows child image profile unavailable: $failedNames"
         }
-        $null = $stdoutTask.GetAwaiter().GetResult()
-        $null = $stderrTask.GetAwaiter().GetResult()
-        if ($shortProcess.ExitCode -ne 0) { throw 'SELFTEST_GIT_IDENTITY_BLOCKED: bounded pinned Git --version did not exit successfully' }
-        try {
-            Assert-D32PinnedGitProcessIdentity -Process $shortProcess -Arguments @('--version')
-            throw 'SELFTEST_FAILED: already-exited pinned Git was accepted without a live handle-bound identity capture'
+        $script:ValidatedToolchainProfile = $validatedProfile
+        $script:TimeoutSeconds = 30
+        $head = Get-D32GitOutput -Root $repo -Arguments @('rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}')
+        if ($head -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git rev-parse returned no exact commit identity'
         }
-        catch { if ($_.Exception.Message -notlike 'GIT_PROCESS_IDENTITY_UNVERIFIED:*') { throw } }
-    }
-    finally { $shortProcess.Dispose() }
+        $statusOutput = Get-D32GitOutput -Root $repo -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -PreserveOutput
+        if ($statusOutput -isnot [string] -or -not $statusOutput.Contains('scripts/d32-fixture-prebuild.ps1')) {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git status output was not captured as raw text'
+        }
+        $indexOutput = Get-D32GitOutput -Root $repo -Arguments @('ls-files', '-v', '-z') -PreserveOutput
+        if ($indexOutput -isnot [string] -or -not $indexOutput.Contains([char]0)) {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: fast direct-root Git ls-files output was not preserved as raw NUL-delimited text'
+        }
+        $fastIdentityRuns = 3
 
-    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (live pinned Git=$liveIdentityRuns; public handle-bound PID/image/time plus exact caller StartInfo argv; exited Git fail-closed)"
+        $image = Get-D32BoundArtifactWithFileId -Path $script:PinnedGit.path
+        $expectedPath = Get-D32FullPath $script:PinnedGit.path
+        $expectedArguments = @('--version')
+        $expectedCommandLine = ConvertTo-D32CommandLine (@($expectedPath) + $expectedArguments)
+        $debuggerProcess = [Diagnostics.Process]::GetCurrentProcess()
+        try { $debuggerCreation = [long]$debuggerProcess.StartTime.ToUniversalTime().ToFileTimeUtc() }
+        finally { $debuggerProcess.Dispose() }
+        $rootCreation = [DateTime]::UtcNow.ToFileTimeUtc()
+        $rootProcessId = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 }
+        $makeTrace = {
+            param([object]$Image, [int]$RootProcessId, [int]$ParentProcessId, [long]$DebuggerCreation, [long]$RootCreation)
+            $identity = [PSCustomObject]@{
+                ProcessId = $RootProcessId
+                ParentProcessId = $ParentProcessId
+                CreationFileTime = $RootCreation
+                ParentCreationFileTime = $DebuggerCreation
+                ImagePath = [string]$Image.path
+                Bytes = [long]$Image.bytes
+                Sha256 = [string]$Image.sha256
+                VolumeSerialHex = [string]$Image.volume_serial_hex
+                FileIdHex = [string]$Image.file_id_hex
+                ImageVerified = $true
+                Exited = $true
+                ExitCode = 0
+                CreateSequence = 1
+                ExitSequence = 2
+            }
+            $createEvent = [PSCustomObject]@{
+                Kind = 'CREATE'; Sequence = 1; ProcessId = $RootProcessId; ParentProcessId = $ParentProcessId
+                CreationFileTime = $RootCreation; ParentCreationFileTime = $DebuggerCreation; ExitCode = 0
+            }
+            $exitEvent = [PSCustomObject]@{
+                Kind = 'EXIT'; Sequence = 2; ProcessId = $RootProcessId; ParentProcessId = $ParentProcessId
+                CreationFileTime = $RootCreation; ParentCreationFileTime = $DebuggerCreation; ExitCode = 0
+            }
+            return [PSCustomObject]@{
+                RecordType = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'; SchemaVersion = 2; State = 'COMPLETED'
+                BlockReason = $null
+                AccountingConsistent = $true; EventChainComplete = $true; DedicatedDebuggerThread = $true
+                DebuggerProcessId = $ParentProcessId; DebuggerCreationFileTime = $DebuggerCreation
+                DebuggerKillOnExitEnabled = $true; RootResumedAfterKillOnExit = $true
+                DebuggerThreadExited = $true; DebuggerThreadJoined = $true
+                RetainedProcessHandlesSignaled = $true; DebuggerAssociationQueryVerified = $true
+                DebuggerAssociationAbsent = $true; JobAccountingVerified = $true
+                ProcessCreateEventCount = 1; ProcessExitEventCount = 1; ProcessEventCount = 2
+                JobTotalProcesses = 1; JobActiveProcesses = 0
+                UncontinuedCreateProcessId = 0; UncontinuedCreateContinueCallCount = 0
+                ProcessEvents = @($createEvent, $exitEvent); Processes = @($identity)
+            }
+        }
+        $makeTraceWithPinnedChild = {
+            param([object]$Image, [object]$ChildImage, [int]$RootProcessId, [int]$ParentProcessId, [long]$DebuggerCreation, [long]$RootCreation)
+            $trace = & $makeTrace $Image $RootProcessId $ParentProcessId $DebuggerCreation $RootCreation
+            $childProcessId = if ($RootProcessId -lt [int]::MaxValue - 1) { $RootProcessId + 1 } else { $RootProcessId - 1 }
+            $childCreation = $RootCreation + 100
+            $rootIdentity = $trace.Processes[0]
+            $rootIdentity.ExitSequence = 4
+            $rootExitEvent = $trace.ProcessEvents[1]
+            $rootExitEvent.Sequence = 4
+            $childIdentity = [PSCustomObject]@{
+                ProcessId = $childProcessId; ParentProcessId = $RootProcessId; CreationFileTime = $childCreation
+                ParentCreationFileTime = $RootCreation; ImagePath = [string]$ChildImage.Path; Bytes = [long]$ChildImage.Bytes
+                Sha256 = [string]$ChildImage.Sha256; VolumeSerialHex = [string]$ChildImage.VolumeSerialHex
+                FileIdHex = [string]$ChildImage.FileIdHex; ImageVerified = $true; Exited = $true; ExitCode = 0
+                CreateSequence = 2; ExitSequence = 3
+            }
+            $childCreateEvent = [PSCustomObject]@{
+                Kind = 'CREATE'; Sequence = 2; ProcessId = $childProcessId; ParentProcessId = $RootProcessId
+                CreationFileTime = $childCreation; ParentCreationFileTime = $RootCreation; ExitCode = 0
+            }
+            $childExitEvent = [PSCustomObject]@{
+                Kind = 'EXIT'; Sequence = 3; ProcessId = $childProcessId; ParentProcessId = $RootProcessId
+                CreationFileTime = $childCreation; ParentCreationFileTime = $RootCreation; ExitCode = 0
+            }
+            $trace.ProcessEvents = @($trace.ProcessEvents[0], $childCreateEvent, $childExitEvent, $rootExitEvent)
+            $trace.Processes = @($rootIdentity, $childIdentity)
+            $trace.ProcessCreateEventCount = 2; $trace.ProcessExitEventCount = 2; $trace.ProcessEventCount = 4
+            $trace.JobTotalProcesses = 2; $trace.JobActiveProcesses = 0
+            return $trace
+        }
+        $makeCleanup = {
+            return [PSCustomObject]@{
+                CleanupSucceeded = $true; JobCloseSucceeded = $true; JobTerminateCallSucceeded = $true
+                JobActiveProcessCountVerified = $true; JobActiveProcessCount = 0; ProcessWaitSignaled = $true
+                DebuggerThreadExited = $true; DebuggerThreadJoined = $true; DebuggerKillOnExitEnabled = $true
+                RetainedProcessHandlesSignaled = $true; DebuggerAssociationQueryVerified = $true
+                DebuggerAssociationAbsent = $true
+            }
+        }
+        $validTrace = & $makeTrace $image $rootProcessId ([int]$PID) $debuggerCreation $rootCreation
+        $validCleanup = & $makeCleanup
+        Assert-D32PinnedGitProcessIdentity -Trace $validTrace -Cleanup $validCleanup `
+            -Arguments $expectedArguments -CommandLine $expectedCommandLine -ExpectedParentProcessId ([int]$PID) `
+            -ApprovedChildImages @($validatedProfile.WindowsImageInventory)
+        $validPinnedChildTrace = & $makeTraceWithPinnedChild $image $validatedProfile.WindowsImageInventory[0] `
+            $rootProcessId ([int]$PID) $debuggerCreation $rootCreation
+        Assert-D32PinnedGitProcessIdentity -Trace $validPinnedChildTrace -Cleanup $validCleanup `
+            -Arguments $expectedArguments -CommandLine $expectedCommandLine -ExpectedParentProcessId ([int]$PID) `
+            -ApprovedChildImages @($validatedProfile.WindowsImageInventory)
+
+        $directPinnedGit = $script:PinnedGit
+        $gitInstallRoot = Get-D32FullPath (Join-Path (Split-Path -Parent (Split-Path -Parent $expectedPath)) '..')
+        $wrapperPath = Join-Path $gitInstallRoot 'cmd\git.exe'
+        if (-not (Test-Path -LiteralPath $wrapperPath -PathType Leaf)) {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: installed Git wrapper path for the negative containment case is unavailable'
+        }
+        $wrapperImage = Get-D32BoundArtifactWithFileId -Path $wrapperPath
+        $wrapperMarker = Join-Path $profileTestRoot 'wrapper-child-must-not-execute.marker'
+        $wrapperMarkerUnixPath = '/' + $wrapperMarker.Substring(0, 1).ToLowerInvariant() + $wrapperMarker.Substring(2).Replace('\', '/')
+        $wrapperAlias = "alias.d32-no-side-effect=!echo marker > '$wrapperMarkerUnixPath'"
+        $script:PinnedGit = Get-D32PinnedGit -Path $wrapperPath -ExpectedSha256 ([string]$wrapperImage.sha256)
+        $wrapperTestPin = $script:PinnedGit
+        $script:D32LastPinnedGitAttempt = $null
+        try {
+            try {
+                $null = Get-D32GitOutput -Root $repo -Arguments @('--version')
+                throw 'SELFTEST_FAILED: wrapper Git root was launchable without the explicit descendant-test override'
+            }
+            catch { if ($_.Exception.Message -notlike 'GIT_ROOT_NOT_APPROVED:*') { throw } }
+            if ($null -ne $script:D32LastPinnedGitAttempt) {
+                throw 'SELFTEST_FAILED: unapproved wrapper root reached process creation before policy rejection'
+            }
+        }
+        finally { $script:PinnedGit = $directPinnedGit }
+
+        $script:PinnedGit = $wrapperTestPin
+        $script:D32PinnedGitIdentitySelfTestOverride = $wrapperTestPin
+        try {
+            try {
+                $null = Get-D32GitOutput -Root $repo -Arguments @('-c', $wrapperAlias, 'd32-no-side-effect')
+                throw 'SELFTEST_FAILED: wrapper Git descendant was accepted as a pinned direct Git root'
+            }
+            catch {
+                if ($_.Exception.Message -notlike 'GIT_PROCESS_IDENTITY_MISMATCH:*') { throw }
+            }
+        }
+        finally {
+            $script:PinnedGit = $directPinnedGit
+            $script:D32PinnedGitIdentitySelfTestOverride = $null
+        }
+
+        $wrapperAttempt = $script:D32LastPinnedGitAttempt
+        if ($null -eq $wrapperAttempt -or $wrapperAttempt.root_path -cne (Get-D32FullPath $wrapperPath) -or
+            $wrapperAttempt.root_sha256 -cne [string]$wrapperImage.sha256) {
+            throw 'SELFTEST_GIT_IDENTITY_BLOCKED: structured wrapper-rejection trace was not retained after the blocked launch'
+        }
+        $wrapperTrace = $wrapperAttempt.process_trace
+        $wrapperCleanup = $wrapperAttempt.native_cleanup
+        $wrapperCleanupRuntime = $wrapperAttempt.cleanup_runtime
+        $wrapperRoot = @($wrapperTrace.processes | Where-Object { [string]::Equals([string]$_.image_path, (Get-D32FullPath $wrapperPath), [StringComparison]::OrdinalIgnoreCase) })
+        $wrapperRootIdentityExact = $wrapperRoot.Count -eq 1 -and
+            [long]$wrapperRoot[0].bytes -eq [long]$wrapperImage.bytes -and
+            [string]$wrapperRoot[0].sha256 -ceq [string]$wrapperImage.sha256 -and
+            [string]$wrapperRoot[0].volume_serial_hex -ceq [string]$wrapperImage.volume_serial_hex -and
+            [string]$wrapperRoot[0].file_id_hex -ceq [string]$wrapperImage.file_id_hex
+        if ($wrapperTrace.state -cne 'BLOCKED' -or
+            $wrapperTrace.block_reason -notlike '*Git/SSH/credential helper image is never launchable*' -or
+            [uint32]$wrapperTrace.uncontinued_create_process_id -le 0 -or
+            [int]$wrapperTrace.uncontinued_create_continue_call_count -ne 0 -or
+            -not $wrapperRootIdentityExact -or -not [bool]$wrapperRoot[0].image_verified -or
+            -not [bool]$wrapperCleanupRuntime.debugger_thread_exited -or
+            -not [bool]$wrapperCleanupRuntime.debugger_thread_joined -or
+            -not [bool]$wrapperCleanupRuntime.debugger_kill_on_exit_enabled -or
+            -not [bool]$wrapperCleanupRuntime.retained_process_handles_signaled -or
+            -not [bool]$wrapperCleanupRuntime.debugger_association_query_verified -or
+            -not [bool]$wrapperCleanupRuntime.debugger_association_absent -or
+            -not [bool]$wrapperCleanup.cleanup_succeeded -or
+            -not [bool]$wrapperCleanup.job_active_process_count_verified -or
+            [uint32]$wrapperCleanup.job_active_process_count -ne 0 -or
+            (Test-Path -LiteralPath $wrapperMarker)) {
+            throw "SELFTEST_GIT_IDENTITY_BLOCKED: wrapper rejection lacks pre-continue, marker, or complete cleanup proof: $($wrapperAttempt | ConvertTo-Json -Depth 20 -Compress)"
+        }
+        Write-Host ('D32_PINNED_GIT_WRAPPER_REJECTION_TRACE=' + ($wrapperAttempt | ConvertTo-Json -Depth 20 -Compress))
+
+        $identityNegativeCases = @(
+            [PSCustomObject]@{ Name = 'stale or reused PID'; Kind = 'identity'; Property = 'ProcessId'; Value = $rootProcessId + 1 },
+            [PSCustomObject]@{ Name = 'stale creation identity'; Kind = 'identity'; Property = 'CreationFileTime'; Value = $rootCreation + 1 },
+            [PSCustomObject]@{ Name = 'image path mismatch'; Kind = 'identity'; Property = 'ImagePath'; Value = (Join-Path $repo 'other-git.exe') },
+            [PSCustomObject]@{ Name = 'image byte-count mismatch'; Kind = 'identity'; Property = 'Bytes'; Value = [long]$image.bytes + 1 },
+            [PSCustomObject]@{ Name = 'image hash mismatch'; Kind = 'identity'; Property = 'Sha256'; Value = ('0' * 64) },
+            [PSCustomObject]@{ Name = 'image volume-serial mismatch'; Kind = 'identity'; Property = 'VolumeSerialHex'; Value = ('0' * 16) },
+            [PSCustomObject]@{ Name = 'image file-ID mismatch'; Kind = 'identity'; Property = 'FileIdHex'; Value = ('0' * 32) },
+            [PSCustomObject]@{ Name = 'parent identity mismatch'; Kind = 'identity'; Property = 'ParentProcessId'; Value = if ([int]$PID -eq [int]::MaxValue) { [int]$PID - 1 } else { [int]$PID + 1 } },
+            [PSCustomObject]@{ Name = 'parent creation identity mismatch'; Kind = 'identity'; Property = 'ParentCreationFileTime'; Value = $debuggerCreation + 1 },
+            [PSCustomObject]@{ Name = 'unexpected descendant'; Kind = 'trace'; Property = 'JobTotalProcesses'; Value = 2 },
+            [PSCustomObject]@{ Name = 'incomplete cleanup'; Kind = 'cleanup'; Property = 'DebuggerThreadJoined'; Value = $false }
+        )
+        foreach ($case in $identityNegativeCases) {
+            $trace = & $makeTrace $image $rootProcessId ([int]$PID) $debuggerCreation $rootCreation
+            $cleanup = & $makeCleanup
+            $identity = $trace.Processes[0]
+            $commandLine = $expectedCommandLine
+            if ($case.Kind -ceq 'identity') { $identity.($case.Property) = $case.Value }
+            elseif ($case.Kind -ceq 'trace') {
+                $trace.($case.Property) = $case.Value
+                $trace.AccountingConsistent = $false
+            }
+            else { $cleanup.($case.Property) = $case.Value }
+            try {
+                Assert-D32PinnedGitProcessIdentity -Trace $trace -Cleanup $cleanup `
+                    -Arguments $expectedArguments -CommandLine $commandLine -ExpectedParentProcessId ([int]$PID) `
+                    -ApprovedChildImages @($validatedProfile.WindowsImageInventory)
+                throw "SELFTEST_FAILED: Git process identity negative '$($case.Name)' was accepted"
+            }
+            catch {
+                $expectedPrefix = if ($case.Kind -ceq 'cleanup') { 'GIT_PROCESS_CLEANUP_FAILED:*' } else { 'GIT_PROCESS_IDENTITY_MISMATCH:*' }
+                if ($_.Exception.Message -notlike $expectedPrefix) { throw }
+            }
+        }
+
+        foreach ($case in @(
+            [PSCustomObject]@{ Name = 'Windows child image path mismatch'; Property = 'ImagePath'; Value = (Join-Path $repo 'other-conhost.exe') },
+            [PSCustomObject]@{ Name = 'Windows child image byte-count mismatch'; Property = 'Bytes'; Value = [long]$validatedProfile.WindowsImageInventory[0].Bytes + 1 },
+            [PSCustomObject]@{ Name = 'Windows child image hash mismatch'; Property = 'Sha256'; Value = ('0' * 64) },
+            [PSCustomObject]@{ Name = 'Windows child volume-serial mismatch'; Property = 'VolumeSerialHex'; Value = ('0' * 16) },
+            [PSCustomObject]@{ Name = 'Windows child file-ID mismatch'; Property = 'FileIdHex'; Value = ('0' * 32) },
+            [PSCustomObject]@{ Name = 'Windows child PID reuse'; Property = 'ProcessId'; Value = if ($rootProcessId -lt [int]::MaxValue - 1) { $rootProcessId + 2 } else { $rootProcessId - 2 } },
+            [PSCustomObject]@{ Name = 'Windows child stale creation identity'; Property = 'CreationFileTime'; Value = $rootCreation + 101 },
+            [PSCustomObject]@{ Name = 'Windows child parent PID mismatch'; Property = 'ParentProcessId'; Value = if ($rootProcessId -eq [int]::MaxValue) { $rootProcessId - 1 } else { $rootProcessId + 1 } },
+            [PSCustomObject]@{ Name = 'Windows child parent creation mismatch'; Property = 'ParentCreationFileTime'; Value = $rootCreation + 1 }
+        )) {
+            $trace = & $makeTraceWithPinnedChild $image $validatedProfile.WindowsImageInventory[0] `
+                $rootProcessId ([int]$PID) $debuggerCreation $rootCreation
+            $cleanup = & $makeCleanup
+            $trace.Processes[1].($case.Property) = $case.Value
+            try {
+                Assert-D32PinnedGitProcessIdentity -Trace $trace -Cleanup $cleanup `
+                    -Arguments $expectedArguments -CommandLine $expectedCommandLine -ExpectedParentProcessId ([int]$PID) `
+                    -ApprovedChildImages @($validatedProfile.WindowsImageInventory)
+                throw "SELFTEST_FAILED: Git child-image negative '$($case.Name)' was accepted"
+            }
+            catch { if ($_.Exception.Message -notlike 'GIT_PROCESS_IDENTITY_MISMATCH:*') { throw } }
+        }
+
+        $commandLineMismatchTrace = & $makeTrace $image $rootProcessId ([int]$PID) $debuggerCreation $rootCreation
+        $commandLineMismatchCleanup = & $makeCleanup
+        try {
+            Assert-D32PinnedGitProcessIdentity -Trace $commandLineMismatchTrace -Cleanup $commandLineMismatchCleanup `
+                -Arguments $expectedArguments -CommandLine ($expectedCommandLine + ' --extra') -ExpectedParentProcessId ([int]$PID) `
+                -ApprovedChildImages @($validatedProfile.WindowsImageInventory)
+            throw 'SELFTEST_FAILED: Git process command-line mismatch was accepted'
+        }
+        catch { if ($_.Exception.Message -notlike 'GIT_PROCESS_IDENTITY_MISMATCH:*') { throw } }
+
+        Assert-D32PinnedGitCurrent
+    }
+    finally {
+        $script:TimeoutSeconds = $originalTimeout
+        if ($hadOriginalProfile) { $script:ValidatedToolchainProfile = $originalProfile }
+        else { Remove-Variable -Name ValidatedToolchainProfile -Scope Script -Force -ErrorAction SilentlyContinue }
+        if ($profileRootOwned -and (Test-Path -LiteralPath $profileTestRoot)) { Remove-D32OwnedDirectory $profileTestRoot }
+    }
+
+    Write-Host "D32_FIXTURE_GIT_PROCESS_IDENTITY_SELFTEST PASS (direct-root fast Git exits=$fastIdentityRuns for rev-parse/status/ls-files; exact Coordinator-pinned image/process identity; unapproved wrapper root rejected before launch; test-only wrapper child hard-denied before Continue with marker absent and complete cleanup; path/bytes/hash/volume/file-ID/stale-PID/creation/parent/argv/descendant/cleanup negatives rejected)"
 }
 
 if ($D32LauncherLibraryOnly) {

@@ -1193,6 +1193,7 @@ function Get-D32GitOutput {
     )
 
     $script:D32LastPinnedGitAttempt = $null
+    $script:D32LastPinnedGitCaptureResult = $null
     Assert-D32PinnedGitCurrent
     Assert-D32ApprovedPinnedGitRoot
     $rootFull = Assert-D32NoReparsePath -Path $Root
@@ -1349,6 +1350,43 @@ function Get-D32GitOutput {
                 debugger_association_absent = [bool]$cleanup.DebuggerAssociationAbsent
             }
         }
+        if (-not $stdoutCopy.Wait(10000) -or $stdoutCopy.IsFaulted -or
+            -not $stderrCopy.Wait(10000) -or $stderrCopy.IsFaulted) {
+            throw 'GIT_CAPTURE_FAILED: pinned Git stdout/stderr raw-pipe capture did not complete'
+        }
+        $null = $stdoutCopy.GetAwaiter().GetResult()
+        $null = $stderrCopy.GetAwaiter().GetResult()
+        $stdoutRawBytes = [byte[]]$stdoutBuffer.ToArray()
+        $stderrRawBytes = [byte[]]$stderrBuffer.ToArray()
+        $stdout = [Text.Encoding]::UTF8.GetString($stdoutRawBytes)
+        $stderr = [Text.Encoding]::UTF8.GetString($stderrRawBytes)
+        $exitCode = $nativeProcess.ExitCode
+        if ($SelfTestFixtureSetup) {
+            $rawHasher = [Security.Cryptography.SHA256]::Create()
+            try {
+                $stdoutHash = ([BitConverter]::ToString($rawHasher.ComputeHash($stdoutRawBytes))).Replace('-', '').ToLowerInvariant()
+                $stderrHash = ([BitConverter]::ToString($rawHasher.ComputeHash($stderrRawBytes))).Replace('-', '').ToLowerInvariant()
+            }
+            finally { $rawHasher.Dispose() }
+            $stdoutExcerptLength = [Math]::Min(4096, $stdoutRawBytes.Length)
+            $stderrExcerptLength = [Math]::Min(4096, $stderrRawBytes.Length)
+            $stdoutExcerpt = [Text.Encoding]::UTF8.GetString($stdoutRawBytes, 0, $stdoutExcerptLength)
+            $stderrExcerpt = [Text.Encoding]::UTF8.GetString($stderrRawBytes, 0, $stderrExcerptLength)
+            $script:D32LastPinnedGitCaptureResult = [PSCustomObject]@{
+                ExitCode = [int]$exitCode
+                StdOutExcerpt = [string]$stdoutExcerpt
+                StdErrExcerpt = [string]$stderrExcerpt
+                StdOutBytes = [long]$stdoutRawBytes.Length
+                StdErrBytes = [long]$stderrRawBytes.Length
+                StdOutSha256 = [string]$stdoutHash
+                StdErrSha256 = [string]$stderrHash
+                StdOutTruncated = ($stdoutRawBytes.Length -gt $stdoutExcerptLength)
+                StdErrTruncated = ($stderrRawBytes.Length -gt $stderrExcerptLength)
+                HasOutput = ($stdoutRawBytes.Length -gt 0)
+                HasErrorOutput = ($stderrRawBytes.Length -gt 0)
+                OutputTruncated = $false
+            }
+        }
         Assert-D32PinnedGitProcessIdentity `
             -Trace $trace `
             -Cleanup $cleanup `
@@ -1357,15 +1395,6 @@ function Get-D32GitOutput {
             -ExpectedParentProcessId ([int]$PID) `
             -ApprovedChildImages @($profileCurrent.WindowsImageInventory)
         $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $profileCurrent
-        if (-not $stdoutCopy.Wait(10000) -or $stdoutCopy.IsFaulted -or
-            -not $stderrCopy.Wait(10000) -or $stderrCopy.IsFaulted) {
-            throw 'GIT_CAPTURE_FAILED: pinned Git stdout/stderr raw-pipe capture did not complete'
-        }
-        $null = $stdoutCopy.GetAwaiter().GetResult()
-        $null = $stderrCopy.GetAwaiter().GetResult()
-        $stdout = [Text.Encoding]::UTF8.GetString($stdoutBuffer.ToArray())
-        $stderr = [Text.Encoding]::UTF8.GetString($stderrBuffer.ToArray())
-        $exitCode = $nativeProcess.ExitCode
         if ($null -eq $testSetup) {
             Assert-D32GitMetadataLocksCurrent -Locks $MetadataLocks -Root $rootFull
         }

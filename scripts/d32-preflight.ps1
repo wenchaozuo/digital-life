@@ -79,6 +79,7 @@ $script:D32PreflightGitCaptureModule = $null
 $script:D32GitCaptureContext = $null
 $script:D32LastPreflightGitCapture = $null
 $script:D32LastPreflightGitCaptureFailure = $null
+$script:D32LastPreflightGitProcessCapture = $null
 . (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
 if ($Phase0DependencyLibraryOnly -and -not $LibraryOnly) {
     throw 'PHASE0_DEPENDENCY_IMPORT_INVALID: dependency-only import requires -LibraryOnly'
@@ -1367,6 +1368,74 @@ function Remove-D32OwnedTempRoot {
     }
 }
 
+function Protect-D32PreflightSelfTestDiagnosticText {
+    param(
+        [AllowNull()][string]$Text,
+        [AllowNull()][string]$OwnedRoot,
+        [AllowNull()][string]$FixtureRepository
+    )
+
+    $value = [string]$Text
+    foreach ($path in @($OwnedRoot, $FixtureRepository)) {
+        if (-not [String]::IsNullOrWhiteSpace([string]$path)) {
+            $value = [regex]::Replace($value, [regex]::Escape([string]$path), '<selftest-root>', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+    }
+    $value = [regex]::Replace($value, '(?i)[A-Z]:\\Users\\[^\\\s"<>]+\\AppData\\Local\\Temp\\[^\\\s"<>]+', '<selftest-temp>')
+    $value = [regex]::Replace($value, '(?i)\b(?:https?|ssh|git)://[^\s''"<>]+', '<redacted-url>')
+    $value = [regex]::Replace($value, '(?i)\b(password|passwd|token|secret|authorization|credential)\s*[:=]\s*[^\s,;]+', '$1=<redacted>')
+    $value = [regex]::Replace($value, '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '<redacted-email>')
+    $value = $value.Replace("`r", '\\r').Replace("`n", '\\n').Replace("`t", '\\t')
+    return $value
+}
+
+function Format-D32PreflightGitSelfTestFailureEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][object]$Result,
+        [AllowNull()][object]$RawCapture,
+        [AllowNull()][object]$Attempt,
+        [AllowNull()][string]$CaptureFailure,
+        [AllowNull()][string]$AttemptValidationFailure,
+        [Parameter(Mandatory = $true)][string]$OwnedRoot,
+        [Parameter(Mandatory = $true)][string]$FixtureRepository
+    )
+
+    $stdoutBytes = if ($null -ne $RawCapture) { [long]$RawCapture.StdOutBytes } else { 0L }
+    $stderrBytes = if ($null -ne $RawCapture) { [long]$RawCapture.StdErrBytes } else { 0L }
+    $stdoutHash = if ($null -ne $RawCapture) { [string]$RawCapture.StdOutSha256 } else { 'unavailable' }
+    $stderrHash = if ($null -ne $RawCapture) { [string]$RawCapture.StdErrSha256 } else { 'unavailable' }
+    $stdoutText = if ($null -ne $RawCapture) { [string]$RawCapture.StdOutExcerpt } else { '' }
+    $stderrText = if ($null -ne $RawCapture) { [string]$RawCapture.StdErrExcerpt } else { '' }
+    $stdoutText = Protect-D32PreflightSelfTestDiagnosticText -Text $stdoutText -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+    $stderrText = Protect-D32PreflightSelfTestDiagnosticText -Text $stderrText -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+    $stdoutTruncated = ($null -ne $RawCapture -and [bool]$RawCapture.StdOutTruncated) -or $stdoutText.Length -gt 512
+    $stderrTruncated = ($null -ne $RawCapture -and [bool]$RawCapture.StdErrTruncated) -or $stderrText.Length -gt 512
+    if ($stdoutText.Length -gt 512) { $stdoutText = $stdoutText.Substring(0, 512) }
+    if ($stderrText.Length -gt 512) { $stderrText = $stderrText.Substring(0, 512) }
+
+    $attemptJson = 'unavailable'
+    $attemptJsonTruncated = $false
+    if ($null -ne $Attempt) {
+        $attemptJson = ConvertTo-Json -InputObject $Attempt -Depth 32 -Compress
+        $attemptJson = Protect-D32PreflightSelfTestDiagnosticText -Text $attemptJson -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+        if ($attemptJson.Length -gt 48000) {
+            $attemptJson = $attemptJson.Substring(0, 48000)
+            $attemptJsonTruncated = $true
+        }
+    }
+    $captureFailureText = Protect-D32PreflightSelfTestDiagnosticText -Text $CaptureFailure -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+    $attemptFailureText = Protect-D32PreflightSelfTestDiagnosticText -Text $AttemptValidationFailure -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+    $resultFailureText = Protect-D32PreflightSelfTestDiagnosticText -Text ([string]$Result.Failure) -OwnedRoot $OwnedRoot -FixtureRepository $FixtureRepository
+    if ($captureFailureText.Length -gt 512) { $captureFailureText = $captureFailureText.Substring(0, 512) }
+    if ($attemptFailureText.Length -gt 512) { $attemptFailureText = $attemptFailureText.Substring(0, 512) }
+    if ($resultFailureText.Length -gt 512) { $resultFailureText = $resultFailureText.Substring(0, 512) }
+    $stdoutJson = ConvertTo-Json -InputObject ([string]$stdoutText) -Compress
+    $stderrJson = ConvertTo-Json -InputObject ([string]$stderrText) -Compress
+
+    return "name=$Name exitCode=$($Result.ExitCode) failure=$resultFailureText captureFailure=$captureFailureText attemptValidationFailure=$attemptFailureText rawStdout={bytes:$stdoutBytes,sha256:$stdoutHash,truncated:$stdoutTruncated,excerpt:$stdoutJson} rawStderr={bytes:$stderrBytes,sha256:$stderrHash,truncated:$stderrTruncated,excerpt:$stderrJson} attemptJsonTruncated=$attemptJsonTruncated attempt=$attemptJson"
+}
+
 function Invoke-D32Git {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
@@ -1387,6 +1456,7 @@ function Invoke-D32Git {
     }
     $script:D32LastPreflightGitCapture = $null
     $script:D32LastPreflightGitCaptureFailure = $null
+    $script:D32LastPreflightGitProcessCapture = $null
     $before = Test-D32TrustedGitImage -Path $TrustedGitPath -ExpectedSha256 $TrustedGitSha256
     $result.TrustedGitBefore = $before
     if (-not $before.IsValid) {
@@ -1427,8 +1497,15 @@ function Invoke-D32Git {
         }
         $capture = & $module { param($parameters) Invoke-D32PreflightPinnedGitCapture @parameters } $call
         $script:D32LastPreflightGitCapture = $capture.Attempt
+        if ($isSelfTestSetup) { $script:D32LastPreflightGitProcessCapture = $capture.RawCapture }
         $script:D32LastPreflightGitCaptureFailure = if ([bool]$capture.ProcessValidated) { $null } else { [string]$capture.Failure }
         if (-not [bool]$capture.ProcessValidated) {
+            if ($isSelfTestSetup -and $null -ne $capture.RawCapture) {
+                $result.ExitCode = [int]$capture.RawCapture.ExitCode
+                $result.HasOutput = [bool]$capture.RawCapture.HasOutput
+                $result.HasErrorOutput = [bool]$capture.RawCapture.HasErrorOutput
+                $result.OutputTruncated = [bool]$capture.RawCapture.OutputTruncated
+            }
             $result.Failure = 'trusted Git V2 process capture, metadata fence, or cleanup failed'
             return [PSCustomObject]$result
         }
@@ -1509,15 +1586,17 @@ function Get-D32PreflightGitCaptureModule {
                     StdOut = [string]$captured.StdOut
                     StdErr = [string]$captured.StdErr
                     Attempt = $captured.Attempt
+                    RawCapture = $script:D32LastPinnedGitCaptureResult
                 }
             }
             catch {
                 return [PSCustomObject]@{
                     ProcessValidated = $false
-                    ExitCode = -1
-                    StdOut = ''
-                    StdErr = ''
+                    ExitCode = if ($SelfTestFixtureSetup -and $null -ne $script:D32LastPinnedGitCaptureResult) { [int]$script:D32LastPinnedGitCaptureResult.ExitCode } else { -1 }
+                    StdOut = if ($SelfTestFixtureSetup -and $null -ne $script:D32LastPinnedGitCaptureResult) { [string]$script:D32LastPinnedGitCaptureResult.StdOutExcerpt } else { '' }
+                    StdErr = if ($SelfTestFixtureSetup -and $null -ne $script:D32LastPinnedGitCaptureResult) { [string]$script:D32LastPinnedGitCaptureResult.StdErrExcerpt } else { '' }
                     Attempt = $script:D32LastPinnedGitAttempt
+                    RawCapture = if ($SelfTestFixtureSetup) { $script:D32LastPinnedGitCaptureResult } else { $null }
                     Failure = $_.Exception.Message
                 }
             }
@@ -1647,10 +1726,27 @@ function Invoke-D32PreflightGitProcessSelfTest {
             [PSCustomObject]@{ Name = 'commit'; Arguments = @('commit', '-q', '-m', 'selftest fixture') }
         )) {
             $setupResult = Invoke-D32Git -Repository $fixtureRepository -Arguments $setup.Arguments -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
-            if ($setupResult.ExitCode -ne 0 -or $null -ne $setupResult.Failure -or $null -eq $script:D32LastPreflightGitCapture) {
-                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture $($setup.Name) did not complete through V2: $($script:D32LastPreflightGitCaptureFailure)"
+            $attempt = $script:D32LastPreflightGitCapture
+            $attemptValidationFailure = $null
+            if ($null -eq $attempt) {
+                $attemptValidationFailure = 'V2 attempt trace was unavailable; no process identity or cleanup proof can be asserted'
             }
-            Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name "fixture-$($setup.Name)"
+            else {
+                try { Assert-D32PreflightGitCaptureAttempt -Attempt $attempt -Name "fixture-$($setup.Name)" }
+                catch { $attemptValidationFailure = $_.Exception.Message }
+            }
+            if ($setupResult.ExitCode -ne 0 -or $null -ne $setupResult.Failure -or $null -eq $attempt -or $null -ne $attemptValidationFailure) {
+                $failureEvidence = Format-D32PreflightGitSelfTestFailureEvidence `
+                    -Name "fixture-$($setup.Name)" `
+                    -Result $setupResult `
+                    -RawCapture $script:D32LastPreflightGitProcessCapture `
+                    -Attempt $attempt `
+                    -CaptureFailure $script:D32LastPreflightGitCaptureFailure `
+                    -AttemptValidationFailure $attemptValidationFailure `
+                    -OwnedRoot $owned.Root `
+                    -FixtureRepository $fixtureRepository
+                throw "PREFLIGHT_GIT_SELFTEST_BLOCKED: marker-owned fixture setup failed with retained bounded Git and V2 evidence: $failureEvidence"
+            }
         }
         $fixtureHead = Invoke-D32Git -Repository $fixtureRepository -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $GitPath -TrustedGitSha256 $GitSha256
         Assert-D32PreflightGitCaptureAttempt -Attempt $script:D32LastPreflightGitCapture -Name 'fixture-rev-parse'

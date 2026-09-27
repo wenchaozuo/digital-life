@@ -1443,6 +1443,7 @@ function Invoke-D32Git {
         }
     }
     catch {
+        $script:D32LastPreflightGitCaptureFailure = $_.Exception.Message
         $result.Failure = 'trusted Git V2 process capture, metadata fence, or cleanup failed'
     }
     finally {
@@ -1627,6 +1628,15 @@ function Invoke-D32PreflightGitProcessSelfTest {
 
         $fixtureRepository = Join-Path $owned.Root 'fixture-repository'
         [void][IO.Directory]::CreateDirectory($fixtureRepository)
+        $candidateRepository = Split-Path -Parent $PSScriptRoot
+        foreach ($lockInput in @(Get-D32BuildToolchainLockInputs -Repository $candidateRepository)) {
+            foreach ($relativePath in @($lockInput.ManifestPath, $lockInput.LockPath)) {
+                $sourcePath = Join-Path $candidateRepository $relativePath
+                $fixturePath = Join-Path $fixtureRepository $relativePath
+                [void][IO.Directory]::CreateDirectory((Split-Path -Parent $fixturePath))
+                [IO.File]::WriteAllBytes($fixturePath, [IO.File]::ReadAllBytes($sourcePath))
+            }
+        }
         [IO.File]::WriteAllText((Join-Path $fixtureRepository 'selftest.txt'), 'D32 preflight Git V2 fixture', [Text.UTF8Encoding]::new($false))
         $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestOwnedRoot -NotePropertyValue $owned.Root -Force
         $script:D32GitCaptureContext | Add-Member -NotePropertyName SelfTestMarkerPath -NotePropertyValue $owned.Marker -Force

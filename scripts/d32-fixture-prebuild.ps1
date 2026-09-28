@@ -49,7 +49,7 @@ param(
     [string]$ExpectedToolchainProfileSha256,
     [AllowNull()][object]$Phase0OwnerBinding,
     [switch]$BuildD31RecoverySeeder,
-    [ValidateRange(1, 7200)]
+    [ValidateRange(1, 14400)]
     [int]$TimeoutSeconds = 600,
     [ValidateRange(1, 16)]
     [int]$BuildJobs = 1,
@@ -5617,10 +5617,10 @@ function Invoke-D32SelfTest {
             throw 'SELFTEST_FAILED: timeout above the non-Phase0 ceiling was accepted without an owner binding'
         }
         catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
-        Assert-D32FixtureTimeoutScope -TimeoutSeconds 7200 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false
+        Assert-D32FixtureTimeoutScope -TimeoutSeconds 14400 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false
         try {
-            Assert-D32FixtureTimeoutScope -TimeoutSeconds 7200 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $true
-            throw 'SELFTEST_FAILED: two-hour timeout was accepted for a D31 recovery-seeder run'
+            Assert-D32FixtureTimeoutScope -TimeoutSeconds 14400 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $true
+            throw 'SELFTEST_FAILED: four-hour timeout was accepted for a D31 recovery-seeder run'
         }
         catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
         $passed++

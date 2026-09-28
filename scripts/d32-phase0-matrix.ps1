@@ -9,8 +9,8 @@ param(
     [Alias('ExpectedToolchainProfileSha256')][string]$Phase0ExpectedToolchainProfileSha256,
     [Alias('PinnedGitPath')][string]$Phase0PinnedGitPath,
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
-    # Keep the original 1800-second default; callers may explicitly pin a bounded two-hour per-command limit.
-    [Alias('TimeoutSeconds')][ValidateRange(60, 7200)][int]$Phase0TimeoutSeconds = 1800
+    # Keep the original 1800-second default; owner-bound Phase0 callers may explicitly pin a bounded four-hour per-command limit.
+    [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800
 )
 
 Set-StrictMode -Version Latest
@@ -2444,8 +2444,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     $timeoutContractFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($timeoutContract in @(
-        [PSCustomObject]@{ Path = $script:D32Phase0ScriptPath; Name = 'Phase0TimeoutSeconds'; Minimum = 60; Maximum = 7200; Default = 1800 },
-        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'TimeoutSeconds'; Minimum = 1; Maximum = 7200; Default = 600 }
+        [PSCustomObject]@{ Path = $script:D32Phase0ScriptPath; Name = 'Phase0TimeoutSeconds'; Minimum = 60; Maximum = 14400; Default = 1800 },
+        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'TimeoutSeconds'; Minimum = 1; Maximum = 14400; Default = 600 }
     )) {
         $tokens = $null
         $parseErrors = $null
@@ -2472,7 +2472,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $timeoutForwardingValid = $phase0SourceText -match 'TimeoutSeconds\s*=\s*\$TimeoutSeconds' -and
         $phase0SourceText -notmatch 'TimeoutSeconds\s*=\s*\[Math\]::Min\s*\(\s*\$TimeoutSeconds\s*,\s*3600\s*\)'
     if (-not $timeoutForwardingValid) { $timeoutContractFailures.Add('Phase0TimeoutSeconds:unclamped-forwarding') }
-    & $add 'Phase0 and fixture timeouts retain defaults and enforce the 7200-second Phase0 ceiling' `
+    & $add 'Phase0 and fixture timeouts retain defaults and enforce the 14400-second Phase0 ceiling' `
         ($timeoutContractFailures.Count -eq 0) ($timeoutContractFailures -join ', ')
 
     $preflightLibraryPath = Join-Path $script:D32Phase0ScriptRoot 'd32-preflight.ps1'

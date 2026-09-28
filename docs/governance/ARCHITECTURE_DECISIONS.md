@@ -619,6 +619,47 @@ The approved caller-pinned MSVC toolchain launches `vctip.exe` as a Cargo build 
 
 ---
 
+## ADR-D32-LOCKED-VENDORED-PROTOC-V1 — Exact locked protoc image authority for D32 builds
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-28
+**Related milestone:** D32-A-R2 / Phase0 and Phase1
+**Related baseline:** `db77636fbb8e6afcfb25a8dd026b0f75e4879ddd`
+
+### Context
+
+The first locked Vita fetch can introduce a vendored `protoc.exe` from a crates.io package into the run's fresh Cargo registry source tree. The existing process policy intentionally rejects that executable by name. The exception must prove exact immutable source, exact extracted bytes and opened identity before any child is continued, while preserving fixed Cargo commands and the existing V2 Job/debug authority.
+
+### Decision
+
+1. A Coordinator-created external `D32_VENDORED_PROTOC_AUTHORITY_V1` record is create-new and independently pinned by SHA-256 before a Phase0 run. It binds the exact candidate SHA, Profile V2 path/hash/opened identity, fresh EvidenceRoot and fixed `r\c`/`r\t` layout, Vita lock identity, package tuples, and immutable archive/image pins. The authority is valid only for D32 Phase0/Phase1; its hash must never be inferred from the record being validated.
+2. The only accepted package tuples are `protoc-bin-vendored` and `protoc-bin-vendored-win32`, both version `3.2.0`, source `registry+https://github.com/rust-lang/crates.io-index`; their lock checksums are respectively `d1c381df33c98266b5f08186583660090a4ffa0889e76c7e9a5e175f645a67fa` and `95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3`. The win32 archive must be the canonical Cargo cache entry under the exact owner-bound fresh CargoHome, hash/length bound to the locked checksum, and contain one unique regular `bin/protoc.exe` member of 11,934,496 bytes with SHA-256 `cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2`.
+3. After the three fixed online fetches, in-process code may validate the exact archive and create-new materialize its package tree only at Cargo's canonical registry source slot. Traversal, aliases, duplicate/case-colliding entries, reparse points, unexpected files, stale or foreign home, and existing mismatched content are blocked. No tar executable, helper process, extra Cargo argument, copied executable, alternate source, or reused cache is authorized.
+4. A create-new `D32_PHASE0_VENDORED_PROTOC_RUN_GRANT_V1` binds the authority reference, current candidate/profile, owner marker, fresh run ID/root/CargoHome, lock/archive/source tree, and extracted executable opened identities. Each debug CREATE is continued only when the exact granted path, bytes, hash, volume serial, file ID, accepted parent chain, and existing non-breakaway Job conditions pass. Unknown helpers remain denied; rejected CREATE retains `Continue=0`, no user marker, and full V2 debugger/Job cleanup proof.
+5. Set `PROTOC` only for the fixed D32 `src-tauri` fixture/test/release Cargo commands, using the exact granted path. Vita code-mode resolves its vendored path without `PROTOC`; ambient `PROTOC`, shell, command processor, Git, SSH, credential helper, script, or other helper authority remains prohibited. Fixed Cargo argv, target, features, toolchain pins, Profile V2, Trace V2, production Host authority, SC-D32-V1 and frozen §16.1.5 do not change.
+6. Migrate fixture-build provenance V3→V4, Phase0 matrix V3→V4, release attestation V4→V5, and aggregate V3→V4. All readers reject prior and unknown versions. Fixture manifest v3, D31 seeder provenance V2, Profile V2, and debug/Job trace V2 remain unchanged. The Phase0 failure payload latch must preserve the terminal failing phase's trace and cleanup in the one existing blocked-diagnostic V1 record; it does not gain PASS or Gate authority.
+7. The post-aggregate D31 recovery seeder may use the same immutable locked source/image pin only under a distinct fresh seeder run/home, create-new owner marker, and separate per-run grant. Phase0/Phase1 authority cannot be replayed. A separate D32-only versioned companion helper-auth/trace attestation must bind the unchanged D31 seeder provenance V2 record and artifact by hash/identity and be validated by Coordinator/Luna High. This is a separate required implementation batch and is not included in the Phase0/Phase1 authority record or the current Phase0 implementation scope.
+
+### Frozen invariants and forbidden implementation
+
+- Do not change SC-D32-V1, Stage Contract, fixed command arguments, Cargo jobs, target directories, feature set, toolchain/profile schema, V2 trace schema, Job policy, Host production authority, §16.1.5, or the V1 blocked-diagnostic schema.
+- Do not admit protoc by basename, signature, wildcard path, package name alone, ambient resolution, detached copied bytes, stale CargoHome, old run, mismatched profile, unexpected parent, or changed file identity.
+- Do not run formal Phase0/Phase1, release, canary, aggregate PASS, Gate, or D33 as part of the implementation batch.
+
+### Required tests and negative evidence
+
+- Verify exact lock/package/archive/member pins and canonical Cargo slots; reject wrong package/version/source/checksum, archive alias/traversal/special or duplicate member, copied/renamed/changed image, wrong run/root/profile/home, stale grant, changed file ID, unexpected parent, breakaway Job, ambient PROTOC, and any unknown helper.
+- Verify a denied protoc CREATE stays uncontinued with zero Continue calls and no user marker, with complete V2 event accounting and Job/debug cleanup.
+- Verify V4/V4/V5/V4 consumers reject prior and unknown versions; Phase1 and aggregate refuse blocked diagnostics; a later fatal phase's raw V2 trace and cleanup are not hidden by an earlier failure.
+- Keep D31 seeder V2 Host consumption unchanged until its separate companion attestation and grant are implemented; never replay Phase0/Phase1 authority.
+
+### Supersedes / Superseded by
+
+- Supersedes only the blanket denial of the exact, locked, per-run-authorized vendored protoc image within D32 Phase0/Phase1. The separate D31 seeder allowance requires its own grant and companion evidence. All other launch denials and gates remain in force.
+
+---
+
 ## ADR 模板
 
 ### ADR-XXXX — <标题>

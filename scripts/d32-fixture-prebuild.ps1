@@ -48,6 +48,8 @@ param(
     [string]$ToolchainProfilePath,
     [string]$ExpectedToolchainProfileSha256,
     [AllowNull()][object]$Phase0OwnerBinding,
+    [string]$VendoredProtocAuthorityPath,
+    [string]$ExpectedVendoredProtocAuthoritySha256,
     [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 14400)]
     [int]$TimeoutSeconds = 600,
@@ -77,8 +79,10 @@ $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:SchemaVersion = 3
 $script:D32FixtureProcessTreePolicy = 'native Job Object kill-on-close, then verify every captured identity and relevant descendant'
 $script:D32PinnedGitIdentitySelfTestOverride = $null
+$script:D32LastProcessEvidence = $null
 $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $script:ScriptRoot 'd32-build-toolchain-profile.ps1')
+. (Join-Path $script:ScriptRoot 'd32-vendored-protoc-authority.ps1')
 
 $script:FixtureSpecs = @(
     [ordered]@{
@@ -1933,6 +1937,9 @@ internal sealed class D32DebugLaunchCoordinator
     public bool InjectFirstCreateIdentityMismatch;
     public bool AllowPinnedGitRoot;
     public bool AllowPinnedCargoVctip;
+    public bool AllowPinnedVendoredProtoc;
+    public string VendoredProtocCargoHomePath;
+    public string VendoredProtocPin;
     public string FailureInjection;
 }
 
@@ -1956,6 +1963,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private const string PinnedVctipBytes = "335328";
     private const string PinnedVctipVolumeSerial = "749614a1961465c0";
     private const string PinnedVctipFileId = "0b5d2000000001000000000000000000";
+    private const string PinnedVendoredProtocBytes = "11934496";
+    private const string PinnedVendoredProtocSha256 = "cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2";
+    private const string PinnedVendoredProtocPathSuffix = @"\registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe";
     private const uint WaitObject0 = 0x00000000;
     private const int ErrorInsufficientBuffer = 122;
     private const uint DebugEventException = 1;
@@ -2633,7 +2643,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection)
     {
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false, false);
+            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false, false, false, null, null);
     }
 
     public static bool IsApprovedPinnedCargoVctipConfiguration(string expectedRootPin, string[] approvedImagePins)
@@ -2682,6 +2692,94 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         catch { return false; }
     }
 
+    public static bool IsApprovedPinnedCargoVendoredProtocConfiguration(string expectedRootPin, string[] approvedImagePins, string expectedCargoHome, string vendoredProtocPin)
+    {
+        try
+        {
+            string[] root = ParseDebugPin(expectedRootPin);
+            if (!String.Equals(Path.GetFileName(root[0]), "cargo.exe", StringComparison.OrdinalIgnoreCase) || approvedImagePins == null || String.IsNullOrWhiteSpace(expectedCargoHome)) return false;
+            string[] grantPin = ParseDebugPin(vendoredProtocPin);
+            if (!IsExactPinnedVendoredProtocPin(grantPin, expectedCargoHome)) return false;
+            List<string[]> protocPins = new List<string[]>();
+            for (int i = 0; i < approvedImagePins.Length; i++)
+            {
+                string[] pin = ParseDebugPin(approvedImagePins[i]);
+                if (String.Equals(Path.GetFileName(pin[0]), "protoc.exe", StringComparison.OrdinalIgnoreCase) || IsPinnedVendoredProtocContentIdentity(pin[1], pin[2]))
+                    protocPins.Add(pin);
+            }
+            return protocPins.Count == 1 && DebugImagePinsEqual(protocPins[0], grantPin);
+        }
+        catch { return false; }
+    }
+
+    public static bool IsPinnedCargoVendoredProtocChildAllowed(
+        string expectedRootPath,
+        bool allowPinnedVendoredProtoc,
+        string imagePath,
+        long imageBytes,
+        string imageSha256,
+        string imageVolumeSerialHex,
+        string imageFileIdHex,
+        string expectedCargoHome,
+        string vendoredProtocPin)
+    {
+        if (!allowPinnedVendoredProtoc || String.IsNullOrWhiteSpace(expectedRootPath) ||
+            !String.Equals(Path.GetFileName(expectedRootPath), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(imagePath), "protoc.exe", StringComparison.OrdinalIgnoreCase) || String.IsNullOrWhiteSpace(expectedCargoHome)) return false;
+        try
+        {
+            string[] pin = ParseDebugPin(vendoredProtocPin);
+            if (!IsExactPinnedVendoredProtocPin(pin, expectedCargoHome)) return false;
+            DebugImageSnapshot image = new DebugImageSnapshot {
+                Path = NormalizeDebugPath(imagePath), Bytes = imageBytes, Sha256 = imageSha256,
+                VolumeSerialHex = imageVolumeSerialHex, FileIdHex = imageFileIdHex
+            };
+            return DebugImageMatches(image, pin);
+        }
+        catch { return false; }
+    }
+
+    private static bool IsExactPinnedVendoredProtocPin(string[] pin, string expectedCargoHome)
+    {
+        string expectedPath = NormalizeDebugPath(Path.Combine(Path.GetFullPath(expectedCargoHome),
+            @"registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe"));
+        if (pin == null || pin.Length != 5 ||
+            !String.Equals(Path.GetFileName(pin[0]), "protoc.exe", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(NormalizeDebugPath(pin[0]), expectedPath, StringComparison.OrdinalIgnoreCase) ||
+            !NormalizeDebugPath(pin[0]).EndsWith(PinnedVendoredProtocPathSuffix, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(pin[1], PinnedVendoredProtocBytes, StringComparison.Ordinal) ||
+            !String.Equals(pin[2], PinnedVendoredProtocSha256, StringComparison.Ordinal) ||
+            !IsLowerHex(pin[3], 16) || !IsLowerHex(pin[4], 32)) return false;
+        return true;
+    }
+
+    private static bool IsLowerHex(string value, int expectedLength)
+    {
+        if (String.IsNullOrWhiteSpace(value) || value.Length != expectedLength) return false;
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        }
+        return true;
+    }
+
+    private static bool IsPinnedVendoredProtocContentIdentity(string bytes, string sha256)
+    {
+        return String.Equals(bytes, PinnedVendoredProtocBytes, StringComparison.Ordinal) &&
+            String.Equals(sha256, PinnedVendoredProtocSha256, StringComparison.Ordinal);
+    }
+
+    private static bool DebugImagePinsEqual(string[] left, string[] right)
+    {
+        if (left == null || right == null || left.Length != 5 || right.Length != 5) return false;
+        return String.Equals(NormalizeDebugPath(left[0]), NormalizeDebugPath(right[0]), StringComparison.OrdinalIgnoreCase) &&
+            String.Equals(left[1], right[1], StringComparison.Ordinal) &&
+            String.Equals(left[2], right[2], StringComparison.Ordinal) &&
+            String.Equals(left[3], right[3], StringComparison.Ordinal) &&
+            String.Equals(left[4], right[4], StringComparison.Ordinal);
+    }
+
     private static bool IsExactPinnedVctipPin(string[] pin)
     {
         return pin != null && pin.Length == 5 &&
@@ -2708,7 +2806,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
             throw new InvalidOperationException("D32_VCTIP_PROFILE_PIN_BLOCKED: only the exact approved caller-pinned Profile V2 VCTIP entry may be configured beneath a fixed Cargo root");
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            false, false, null, false, true);
+            false, false, null, false, true, false, null, null);
+    }
+
+    public void ConfigurePinnedCargoDebugCaptureWithVendoredProtoc(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, string expectedCargoHome, string vendoredProtocPin)
+    {
+        if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
+            throw new InvalidOperationException("D32_VCTIP_PROFILE_PIN_BLOCKED: only the exact approved caller-pinned Profile V2 VCTIP entry may be configured beneath a fixed Cargo root");
+        if (!IsApprovedPinnedCargoVendoredProtocConfiguration(expectedRootPin, approvedImagePins, expectedCargoHome, vendoredProtocPin))
+            throw new InvalidOperationException("VENDORED_PROTOC_GRANT_BLOCKED: native CREATE continuation requires the unique exact per-run locked protoc image pin beneath the fixed Cargo root");
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+            false, false, null, false, true, true, expectedCargoHome, vendoredProtocPin);
     }
 
     public void ConfigurePinnedGitDebugCapture(string expectedRootPin, string approvedWindowsImagePin, int timeoutMilliseconds)
@@ -2720,10 +2828,10 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!String.Equals(Path.GetFileName(childPin[0]), "conhost.exe", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("standalone pinned-Git capture requires the caller-pinned conhost.exe child image");
         ConfigureDebugCapture(expectedRootPin, new string[] { approvedWindowsImagePin }, new string[0], timeoutMilliseconds,
-            false, false, null, true, false);
+            false, false, null, true, false, false, null, null);
     }
 
-    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot, bool allowPinnedCargoVctip)
+    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot, bool allowPinnedCargoVctip, bool allowPinnedVendoredProtoc, string vendoredProtocCargoHomePath, string vendoredProtocPin)
     {
         if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
@@ -2740,6 +2848,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             _debugCoordinator.FailureInjection = failureInjection;
             _debugCoordinator.AllowPinnedGitRoot = allowPinnedGitRoot;
             _debugCoordinator.AllowPinnedCargoVctip = allowPinnedCargoVctip;
+            _debugCoordinator.AllowPinnedVendoredProtoc = allowPinnedVendoredProtoc;
+            _debugCoordinator.VendoredProtocCargoHomePath = vendoredProtocCargoHomePath;
+            _debugCoordinator.VendoredProtocPin = vendoredProtocPin;
             _debugCoordinator.CapturePlanReady.Set();
         }
     }
@@ -3594,6 +3705,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                             {
                                 if (parentPid != (uint)trace.DebuggerProcessId) throw new InvalidOperationException("fixed root parent PID differs from the current runner");
                                 parentCreation = debuggerCreation;
+                                if (String.Equals(Path.GetFileName(image.Path), "protoc.exe", StringComparison.OrdinalIgnoreCase) ||
+                                    IsPinnedVendoredProtocContentIdentity(image.Bytes.ToString(CultureInfo.InvariantCulture), image.Sha256))
+                                    throw new InvalidOperationException("vendored protoc is authorized only as an exact per-run pinned descendant of the fixed Cargo root");
                                 if (String.Equals(Path.GetFileName(image.Path), "vctip.exe", StringComparison.OrdinalIgnoreCase) ||
                                     IsPinnedVctipContentIdentity(image.Bytes, image.Sha256))
                                     throw new InvalidOperationException("MSVC VCTIP is authorized only as an exact pinned descendant of the fixed Cargo root");
@@ -3616,6 +3730,20 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 if (_debugCoordinator.AllowPinnedGitRoot &&
                                     (trace.ProcessCreateEventCount != 2 || trace.Processes.Count != 1 || parentPid != trace.Processes[0].ProcessId))
                                     throw new InvalidOperationException("standalone pinned Git permits only one direct caller-pinned Windows console-host child; observed " + image.Path + " parent=" + parent.Record.ImagePath);
+                                bool protocName = String.Equals(Path.GetFileName(image.Path), "protoc.exe", StringComparison.OrdinalIgnoreCase);
+                                bool protocContent = IsPinnedVendoredProtocContentIdentity(image.Bytes.ToString(CultureInfo.InvariantCulture), image.Sha256);
+                                if (protocName || protocContent)
+                                {
+                                    if (!protocName)
+                                        throw new InvalidOperationException("copied or renamed vendored protoc image content is not authorized under another path/name");
+                                    reason = IsPinnedCargoVendoredProtocChildAllowed(expectedRoot[0], _debugCoordinator.AllowPinnedVendoredProtoc,
+                                        image.Path, image.Bytes, image.Sha256, image.VolumeSerialHex, image.FileIdHex,
+                                        _debugCoordinator.VendoredProtocCargoHomePath, _debugCoordinator.VendoredProtocPin)
+                                        ? "caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root" : null;
+                                    if (reason == null) throw new InvalidOperationException("vendored protoc descendant does not match the exact per-run locked Cargo source pin or opened hFile identity");
+                                }
+                                else
+                                {
                                 bool vctipName = String.Equals(Path.GetFileName(image.Path), "vctip.exe", StringComparison.OrdinalIgnoreCase);
                                 bool vctipContent = IsPinnedVctipContentIdentity(image.Bytes, image.Sha256);
                                 if (vctipName || vctipContent)
@@ -3639,6 +3767,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                     }
                                 }
                                 if (reason == null) throw new InvalidOperationException("unknown child/helper image outside pinned inventories and declared candidate target roots: " + image.Path);
+                                }
                                 verified = true;
                             }
                         }
@@ -4606,6 +4735,13 @@ function Test-D32NoOwnedCargoDescendants {
     }
 }
 
+function Reset-D32FixturePhaseProcessEvidence {
+    # A later phase can fail before its process launcher is reached. Clear the
+    # previous phase's evidence so the single blocked payload never pairs a
+    # new command/error with stale process, trace, or cleanup records.
+    $script:D32LastProcessEvidence = $null
+}
+
 function Write-D32FixturePhase0FailurePayload {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -4681,11 +4817,27 @@ function Invoke-D32BoundedProcess {
         [string]$FailureInjection = 'none',
         [switch]$RequireDebugEvents,
         [switch]$AllowPinnedCargoVctip,
+        [AllowNull()][object]$VendoredProtocRunGrant,
         [string[]]$CandidateImageRoots
     )
 
     if ($null -ne $ChildEnvironment -and $ChildEnvironment -isnot [System.Collections.IDictionary]) {
         throw 'CHILD_ENVIRONMENT_INVALID: ChildEnvironment must be an IDictionary; values omitted'
+    }
+    $vendoredProtocBeforeStart = $null
+    if ($null -ne $VendoredProtocRunGrant) {
+        if (-not $RequireDebugEvents -or -not $AllowPinnedCargoVctip -or
+            $null -eq $script:ValidatedToolchainProfile -or -not [bool]$script:ValidatedToolchainProfile.IsValid -or
+            -not (Test-D32ProfilePathEqual -Left $FilePath -Right ([string]$script:ValidatedToolchainProfile.Profile.toolchain.cargo.path)) -or
+            $null -eq $ChildEnvironment -or -not $ChildEnvironment.Contains('CARGO_HOME') -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$ChildEnvironment['CARGO_HOME']) -Right ([string]$VendoredProtocRunGrant.Document.cargo_home.path))) {
+            throw 'VENDORED_PROTOC_GRANT_BLOCKED: exact grant requires debug capture under the fixed Cargo root, pinned VCTIP policy, and the same fresh owner-bound CargoHome before process creation'
+        }
+        $vendoredProtocBeforeStart = Get-D32ProfileFileSnapshot -Path ([string]$VendoredProtocRunGrant.Image.Path)
+        if ($vendoredProtocBeforeStart.Bytes -ne [Int64]$VendoredProtocRunGrant.Image.Bytes -or $vendoredProtocBeforeStart.Sha256 -cne [string]$VendoredProtocRunGrant.Image.Sha256 -or
+            $vendoredProtocBeforeStart.VolumeSerialHex -cne [string]$VendoredProtocRunGrant.Image.VolumeSerialHex -or $vendoredProtocBeforeStart.FileIdHex -cne [string]$VendoredProtocRunGrant.Image.FileIdHex) {
+            throw 'VENDORED_PROTOC_GRANT_BLOCKED: opened protoc identity changed before fixed Cargo process creation'
+        }
     }
     Ensure-D32NativeLauncher
     $stdoutPath = "$PhaseLog.stdout.log"
@@ -4834,6 +4986,16 @@ function Invoke-D32BoundedProcess {
                 }
                 $approvedImages = @($profileCurrent.ExecutableInventory) + @($profileCurrent.WindowsImageInventory)
                 $approvedPinText = @($approvedImages | ForEach-Object { ConvertTo-D32DebugImagePinText -Image $_ })
+                if ($null -ne $VendoredProtocRunGrant) {
+                    $currentProtoc = Get-D32ProfileFileSnapshot -Path ([string]$VendoredProtocRunGrant.Image.Path)
+                    if ($currentProtoc.Bytes -ne [Int64]$VendoredProtocRunGrant.Image.Bytes -or $currentProtoc.Sha256 -cne [string]$VendoredProtocRunGrant.Image.Sha256 -or
+                        $currentProtoc.VolumeSerialHex -cne [string]$VendoredProtocRunGrant.Image.VolumeSerialHex -or $currentProtoc.FileIdHex -cne [string]$VendoredProtocRunGrant.Image.FileIdHex -or
+                        $currentProtoc.Bytes -ne $vendoredProtocBeforeStart.Bytes -or $currentProtoc.Sha256 -cne $vendoredProtocBeforeStart.Sha256 -or
+                        $currentProtoc.VolumeSerialHex -cne $vendoredProtocBeforeStart.VolumeSerialHex -or $currentProtoc.FileIdHex -cne $vendoredProtocBeforeStart.FileIdHex) {
+                        throw 'VENDORED_PROTOC_GRANT_BLOCKED: image opened-handle identity changed before Cargo process creation'
+                    }
+                    $approvedPinText += ConvertTo-D32DebugImagePinText -Image $currentProtoc
+                }
                 $targetRoots = if ($CandidateImageRoots) { @($CandidateImageRoots | ForEach-Object { [IO.Path]::GetFullPath($_) }) } else { @(Get-D32DebugCandidateTargetRoots -Repository $profileCurrent.Repository) }
                 $rootPinText = ConvertTo-D32DebugImagePinText -Image $rootImage
                 $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
@@ -4842,7 +5004,14 @@ function Invoke-D32BoundedProcess {
                         throw 'D32_VCTIP_PROFILE_PIN_BLOCKED: VCTIP descendant authority is restricted to the exact caller-pinned Cargo root'
                     }
                     $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $profileCurrent
-                    $nativeProcess.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout)
+                    if ($null -ne $VendoredProtocRunGrant) {
+                        $protocPinText = ConvertTo-D32DebugImagePinText -Image $currentProtoc
+                        $nativeProcess.ConfigurePinnedCargoDebugCaptureWithVendoredProtoc($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout,
+                            [string]$VendoredProtocRunGrant.Document.cargo_home.path, $protocPinText)
+                    }
+                    else {
+                        $nativeProcess.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout)
+                    }
                 }
                 else {
                     $nativeProcess.ConfigureDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout, $false, $false)
@@ -5332,18 +5501,27 @@ function Assert-D32FixtureBuildProvenanceShape {
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
-        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces')
+        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant')
     $actual = @($Document.Keys | ForEach-Object { [string]$_ })
     if ($actual.Count -ne $expected.Count -or
         @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
         @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
-        [int]$Document.schema_version -ne 3 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V3' -or
+        [int]$Document.schema_version -ne 4 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V4' -or
         [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [uint64]$Document.fixture_manifest_bytes -le 0 -or
         [string]$Document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         [string]$Document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar schema, version, manifest hash, bytes, or identity is invalid'
+    }
+    $grant = $Document.vendored_protoc_run_grant
+    if (-not (Test-D32VendoredObjectExactProperties -Object $grant -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+        $grant.path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $grant.path) -or
+        [IO.Path]::GetFileName([string]$grant.path) -cne 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json' -or
+        $grant.bytes -isnot [int64] -or $grant.bytes -le 0 -or $grant.sha256 -isnot [string] -or $grant.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $grant.volume_serial_hex -isnot [string] -or $grant.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        $grant.file_id_hex -isnot [string] -or $grant.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'FIXTURE_PROVENANCE_INVALID: strict per-run vendored-protoc grant reference is malformed'
     }
     Assert-D32FixtureDebugTraceShape -Traces $Document.process_traces
     $environmentFields = @('toolchain_profile_path', 'toolchain_profile_sha256', 'target_triple', 'env_policy',
@@ -5624,6 +5802,15 @@ function Invoke-D32SelfTest {
         }
         catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
         $passed++
+
+        $priorProcessEvidence = $script:D32LastProcessEvidence
+        try {
+            $script:D32LastProcessEvidence = [ordered]@{ process_trace = 'prior-phase-trace'; native_cleanup = 'prior-phase-cleanup' }
+            Reset-D32FixturePhaseProcessEvidence
+            if ($null -ne $script:D32LastProcessEvidence) { throw 'SELFTEST_FAILED: starting a later fixture phase retained stale process evidence' }
+            $passed++
+        }
+        finally { $script:D32LastProcessEvidence = $priorProcessEvidence }
 
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
@@ -6316,6 +6503,36 @@ public static class D32DebugSelfTestLauncher
             throw "SELFTEST_FAILED: exact caller-pinned Cargo/VCTIP policy admitted drift/copy or rejected the approved identity (config=$exactVctipConfigAccepted child=$exactVctipChildAccepted invalid=$vctipInvalidPinsRejected negative=$vctipNegativePolicyValid duplicate=$duplicateVctipPinRejected canonicalDrift=$canonicalVctipDriftRejected copiedPath=$canonicalCopiedVctipPathRejected)"
         }
         Write-Host 'D32_VCTIP_POLICY=PASS exact_profile_record_and_opened_identity_only; drift_copy_wrong_root_and_unpermitted_denied'
+        $passed++
+        $protocPolicyCargoHome = Join-Path $root 'protoc-policy-cargo-home'
+        $protocPolicyPath = Join-Path $protocPolicyCargoHome 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+        $protocPolicyImage = [PSCustomObject]@{
+            Path = $protocPolicyPath; Bytes = [Int64]11934496
+            Sha256 = 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2'
+            VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef'
+        }
+        $protocPolicyPin = ConvertTo-D32DebugImagePinText -Image $protocPolicyImage
+        $protocPolicyPins = @($vctipPolicyPin, $protocPolicyPin)
+        $exactProtocConfigAccepted = [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVendoredProtocConfiguration(
+            $cargoPolicyPin, [string[]]$protocPolicyPins, $protocPolicyCargoHome, $protocPolicyPin)
+        $exactProtocChildAccepted = [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed(
+            $cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256,
+            $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin)
+        $protocPolicyNegatives = @(
+            -not [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]]$protocPolicyPins, (Join-Path $root 'stale-cargo-home'), $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]](@($protocPolicyPins) + @($protocPolicyPin)), $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $false, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed('C:\\other\\not-cargo.exe', $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes + 1, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, ('0' * 64), $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, '0123456789abcdee', $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, '0123456789abcdef0123456789abcdef1', $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath.Replace('protoc.exe', 'protoc-copy.exe'), [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin)
+        )
+        if (-not $exactProtocConfigAccepted -or -not $exactProtocChildAccepted -or @($protocPolicyNegatives | Where-Object { -not $_ }).Count -ne 0) {
+            throw "SELFTEST_FAILED: locked protoc native admission was not unique, exact-home, exact-image, and fail-closed (config=$exactProtocConfigAccepted child=$exactProtocChildAccepted negatives=$(@($protocPolicyNegatives | Where-Object { -not $_ }).Count))"
+        }
+        Write-Host 'D32_VENDORED_PROTOC_POLICY=PASS exact_per_run_CargoHome_and_opened_identity_only; stale_home_duplicate_alias_drift_wrong_root_and_unpermitted_denied'
         $passed++
         $jobFlagsPolicyValid = [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002000) -and
             -not [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002800) -and
@@ -7219,8 +7436,8 @@ public static class D32DebugSelfTestLauncher
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
         $provenanceDocument = [ordered]@{
-            schema_version = 3
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
+            schema_version = 4
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
             candidate_sha = '0123456789abcdef0123456789abcdef01234567'
             source_repo = $fakeRepo
             fixture_manifest_path = $sample
@@ -7238,6 +7455,13 @@ public static class D32DebugSelfTestLauncher
                 run_id = $provenanceEnvironment.run_id
             }
             process_traces = @($traceRecords.ToArray())
+            vendored_protoc_run_grant = [ordered]@{
+                path = (Join-Path $provenanceEvidenceRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json')
+                bytes = [Int64]1
+                sha256 = ('a' * 64)
+                volume_serial_hex = ('0' * 16)
+                file_id_hex = ('0' * 32)
+            }
         }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
         $oldTraceProvenance = [ordered]@{}
@@ -8008,12 +8232,23 @@ $fixtureFetches = Invoke-D32FixturePreCargoBoundary `
             -PhaseEvidence $phaseEvidence `
             -AllowPinnedCargoVctip
     }
+$script:D32VendoredProtocRunGrant = New-D32VendoredProtocRunGrant `
+    -AuthorityPath $VendoredProtocAuthorityPath `
+    -AuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 `
+    -Repository $RepoRoot `
+    -CandidateSha $candidateSha `
+    -ValidatedProfile $validatedToolchainProfile `
+    -EvidenceRoot $OutputRoot `
+    -OwnerMarkerReference $phase0OwnerContext.OwnerMarker `
+    -RunId $toolchainRunId `
+    -CargoHome $fixtureCargoHome
 $null = Test-D32CargoHome -Path $fixtureCargoHome -Repository $RepoRoot
 $offlineFixtureEnvironment = Get-D32BuildToolchainEnvironment `
     -ValidatedProfile $validatedToolchainProfile `
     -CargoHome $fixtureCargoHome `
     -TempRoot $fixtureTempRoot `
     -Offline $true
+if ($offlineFixtureEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: caller profile/base environment must not supply ambient PROTOC' }
 $null = Test-D32ProfileDirectoryIdentity -Path $OutputRoot -VolumeSerialHex $phase0OwnerContext.EvidenceRootIdentity.VolumeSerialHex -FileIdHex $phase0OwnerContext.EvidenceRootIdentity.FileIdHex
 $null = Test-D32ProfileDirectoryIdentity -Path $toolchainRunRoot -VolumeSerialHex $script:D32Phase0StorageContext.run_root.volume_serial_hex -FileIdHex $script:D32Phase0StorageContext.run_root.file_id_hex
 $null = Test-D32ProfileDirectoryIdentity -Path $fixtureCargoHome -VolumeSerialHex $script:D32Phase0StorageContext.cargo_home.volume_serial_hex -FileIdHex $script:D32Phase0StorageContext.cargo_home.file_id_hex
@@ -8061,10 +8296,12 @@ if ($BuildD31RecoverySeeder) {
     $seederRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
 }
 $results = @()
+$pendingFixtureFailures = [System.Collections.Generic.List[object]]::new()
 $startedAt = [DateTimeOffset]::UtcNow
 try {
     $phase = 0
     foreach ($spec in $script:FixtureSpecs) {
+        Reset-D32FixturePhaseProcessEvidence
         $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
         $phase++
         Write-D32FixtureGitState -Phase $phase -Edge before -Root $RepoRoot
@@ -8077,6 +8314,14 @@ try {
         $arguments += @('--jobs', [string]$BuildJobs)
         $phaseLog = Join-Path $logRoot (('{0:D2}-{1}' -f $phase, $spec.name))
         Write-Host "D32_FIXTURE_PHASE=$phase name=$($spec.name) timeout_seconds=$TimeoutSeconds"
+        $phaseEnvironment = $offlineFixtureEnvironment
+        $phaseVendoredGrant = $script:D32VendoredProtocRunGrant
+        if ([string]$spec.project -ceq 'src-tauri') {
+            $phaseEnvironment = New-D32VendoredProtocEnvironment -Environment $offlineFixtureEnvironment -RunGrant $script:D32VendoredProtocRunGrant
+        }
+        elseif ($phaseEnvironment.Contains('PROTOC')) {
+            throw 'VENDORED_PROTOC_ENV_BLOCKED: PROTOC may be set only for fixed src-tauri Cargo commands'
+        }
         $processResult = $null
         try {
             $processResult = Invoke-D32BoundedProcess `
@@ -8085,9 +8330,10 @@ try {
                 -WorkingDirectory $RepoRoot `
                 -PhaseLog $phaseLog `
                 -TimeoutSeconds $TimeoutSeconds `
-                -ChildEnvironment $offlineFixtureEnvironment `
+                -ChildEnvironment $phaseEnvironment `
                 -RequireDebugEvents `
-                -AllowPinnedCargoVctip
+                -AllowPinnedCargoVctip `
+                -VendoredProtocRunGrant $phaseVendoredGrant
             Assert-D32PinnedCargoProcessIdentity `
                 -ProcessIdentity $processResult.root_identity_record `
                 -CargoPath $cargo `
@@ -8120,12 +8366,19 @@ try {
             if ($null -ne $artifactError) {
                 $status = 'artifact_missing'
             }
-            if ($status -ne 'succeeded' -or $processResult.exit_code -ne 0 -or $null -ne $artifactError) {
+            if ($status -notin @('succeeded', 'failed') -or $null -eq $processResult.exit_code) {
                 $primaryFailure = if ($null -ne $artifactError) { "FIXTURE_ARTIFACT_BLOCKED: $artifactError" } else { "FIXTURE_BUILD_BLOCKED: $($spec.name) status=$status exit=$($processResult.exit_code)" }
-                try {
-                    Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
-                }
-                catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
+                throw $primaryFailure
+            }
+            if ($status -ne 'succeeded' -or $processResult.exit_code -ne 0 -or $null -ne $artifactError) {
+                $failure = if ($null -ne $artifactError) { "FIXTURE_ARTIFACT_BLOCKED: $artifactError" } else { "FIXTURE_BUILD_BLOCKED: $($spec.name) status=$status exit=$($processResult.exit_code)" }
+                $pendingFixtureFailures.Add([PSCustomObject]@{
+                    name = [string]$spec.name
+                    arguments = @($arguments)
+                    process_result = $processResult
+                    phase_log = $phaseLog
+                    error = $failure
+                })
             }
             $results += [ordered]@{
                 phase          = $phase
@@ -8153,41 +8406,12 @@ try {
         }
         catch {
             $primaryFailure = $_.Exception.Message
+            $secondary = @($pendingFixtureFailures | ForEach-Object { [string]$_.error })
             try {
-                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -PhaseLogPath $phaseLog
+                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -SecondaryErrors $secondary -PhaseLogPath $phaseLog
             }
-            catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
-            if ($_.Exception.Message -match '^(CANDIDATE_SHA_|WORKTREE_DIRTY:|GIT_PIN_|GIT_CONFIG_|GIT_REPOSITORY_|PATH_REPARSE:|TOOLCHAIN_PROFILE_|CARGO_FETCH_|CARGO_HOME_|CARGO_PROCESS_IDENTITY_)') {
-                throw
-            }
-            $failureEvidence = $script:D32LastProcessEvidence
-            $phaseEvidence.Add([pscustomobject]@{
-                root_record = $failureEvidence.root_record
-                descendant_records = @($failureEvidence.descendant_records)
-            })
-            $results += [ordered]@{
-                phase          = $phase
-                name           = $spec.name
-                project        = $spec.project
-                binary         = $spec.binary
-                manifest_path  = $manifest
-                features       = @($spec.features)
-                command        = ('cargo ' + (ConvertTo-D32CommandLine $arguments))
-                status         = 'phase_error'
-                exit_code      = $null
-                pid            = if ($null -eq $failureEvidence.root_record) { $null } else { [int]$failureEvidence.root_record.ProcessId }
-                descendant_pids = @()
-                root_identity  = ConvertTo-D32IdentityDocument $failureEvidence.root_record
-                descendant_identities = @($failureEvidence.descendant_records | ForEach-Object { ConvertTo-D32IdentityDocument $_ })
-                residual_descendant_identities = @()
-                reap           = $null
-                elapsed_ms     = $null
-                phase_log      = (Get-D32FullPath $phaseLog)
-                stdout_log     = (Get-D32FullPath "$phaseLog.stdout.log")
-                stderr_log     = (Get-D32FullPath "$phaseLog.stderr.log")
-                error          = $_.Exception.Message
-                artifact       = $null
-            }
+            catch { $primaryFailure += '; phase0 failure-capture error=' + $_.Exception.Message }
+            throw $primaryFailure
         }
         finally {
             Write-D32FixtureGitState -Phase $phase -Edge after -Root $RepoRoot
@@ -8327,6 +8551,24 @@ $allProcessErrors = @($phaseTreeErrors)
 if ($null -ne $globalProcessError) { $allProcessErrors += $globalProcessError }
 $manifestProcessError = if ($allProcessErrors.Count -eq 0) { $null } else { $allProcessErrors -join ' | ' }
 
+if ($pendingFixtureFailures.Count -gt 0) {
+    $firstFailure = $pendingFixtureFailures[0]
+    $secondaryFailures = @($pendingFixtureFailures | Select-Object -Skip 1 | ForEach-Object { [string]$_.error })
+    if ($null -ne $manifestProcessError) { $secondaryFailures += "FIXTURE_GLOBAL_CLEANUP_BLOCKED: $manifestProcessError" }
+    try {
+        Write-D32FixturePhase0FailurePayload `
+            -Name ([string]$firstFailure.name) `
+            -Executable $cargo `
+            -Arguments @($firstFailure.arguments) `
+            -WorkingDirectory $RepoRoot `
+            -ProcessResult $firstFailure.process_result `
+            -PrimaryError ([string]$firstFailure.error) `
+            -SecondaryErrors $secondaryFailures `
+            -PhaseLogPath ([string]$firstFailure.phase_log)
+    }
+    catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
+}
+
 $candidateShaAfterBuild = Assert-D32PinnedCleanCandidate -Root $RepoRoot
 if ($candidateShaAfterBuild -ne $candidateSha) {
     throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed before the final manifest write'
@@ -8368,8 +8610,8 @@ $processTraceRecords = @($phaseEvidence | ForEach-Object {
     }
 })
 $fixtureBuildProvenance = [ordered]@{
-    schema_version = 3
-    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
+    schema_version = 4
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
     candidate_sha = $candidateSha
     source_repo = $RepoRoot
     fixture_manifest_path = $ManifestPath
@@ -8380,6 +8622,7 @@ $fixtureBuildProvenance = [ordered]@{
     environment = $fixtureEnvironmentPlan
     storage = $script:D32Phase0StorageContext
     process_traces = $processTraceRecords
+    vendored_protoc_run_grant = $script:D32VendoredProtocRunGrant.Reference
 }
 Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance
 $fixtureBuildProvenanceArtifact = Write-D32NewFixtureBuildProvenance -Path $fixtureProvenancePath -Document $fixtureBuildProvenance

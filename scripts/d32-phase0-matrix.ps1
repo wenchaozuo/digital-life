@@ -9,6 +9,8 @@ param(
     [Alias('ExpectedToolchainProfileSha256')][string]$Phase0ExpectedToolchainProfileSha256,
     [Alias('PinnedGitPath')][string]$Phase0PinnedGitPath,
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
+    [string]$Phase0VendoredProtocAuthorityPath,
+    [string]$Phase0ExpectedVendoredProtocAuthoritySha256,
     # Keep the original 1800-second default; owner-bound Phase0 callers may explicitly pin a bounded four-hour per-command limit.
     [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800
 )
@@ -19,9 +21,10 @@ if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'PHASE0_LOCATION_BLOCK
 $script:D32Phase0ScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
 $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1')
+. (Join-Path $script:D32Phase0ScriptRoot 'd32-vendored-protoc-authority.ps1')
 
-$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V3'
-$script:D32Phase0SchemaVersion = 3
+$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V4'
+$script:D32Phase0SchemaVersion = 4
 $script:D32Phase0FixtureOwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:D32Phase0FixtureOwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:D32Phase0OwnerBindingName = 'D32-PHASE0-OWNER.json'
@@ -189,7 +192,8 @@ function ConvertTo-D32Phase0ProcessRecord {
         [Parameter(Mandatory = $true)][object]$Process,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
         [Parameter(Mandatory = $true)][string]$Repository,
-        [Parameter(Mandatory = $true)][string]$ExpectedRootPath
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
+        [AllowNull()][object]$VendoredProtocGrant
     )
     if ($Process.process_id -le 0 -or $null -eq $Process.parent_process_id -or
         [String]::IsNullOrWhiteSpace([string]$Process.name) -or
@@ -200,7 +204,7 @@ function ConvertTo-D32Phase0ProcessRecord {
     }
     $imagePath = [IO.Path]::GetFullPath([string]$Process.image_path)
     $snapshot = Get-D32ProfileFileSnapshot -Path $imagePath
-    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $snapshot
+    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $snapshot -VendoredProtocGrant $VendoredProtocGrant
     if ([String]::IsNullOrWhiteSpace($allowReason)) { throw 'PHASE0_PROCESS_TREE_BLOCKED: unknown child image is outside the pinned toolchain/native inventory and candidate debug targets' }
     $matching = @($ValidatedProfile.ExecutableInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $imagePath })
     if ($matching.Count -gt 1) { throw "PHASE0_PROCESS_TREE_BLOCKED: duplicate pinned process image identity: $imagePath" }
@@ -233,17 +237,20 @@ function Get-D32Phase0AllowedChildImageReason {
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
-        [AllowNull()][object]$ImageIdentity
+        [AllowNull()][object]$ImageIdentity,
+        [AllowNull()][object]$VendoredProtocGrant
     )
     $imageName = [IO.Path]::GetFileName($ImagePath).ToLowerInvariant()
     $imageBytes = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('bytes', 'Bytes')
     $imageSha256 = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
     $knownVctipContent = Test-D32ProfilePinnedVctipContentIdentity -Bytes $imageBytes -Sha256 $imageSha256
+    $knownVendoredProtocContent = ([Int64]$imageBytes -eq $script:D32VendoredProtocImageBytes -and [string]$imageSha256 -ceq $script:D32VendoredProtocImageSha256)
     if ($imageName -ceq 'vctip.exe' -or $knownVctipContent) {
         if ($imageName -cne 'vctip.exe') { return $null }
         $profileCargoPath = $null
         try { $profileCargoPath = [string]$ValidatedProfile.Profile.toolchain.cargo.path } catch { return $null }
-        if ([String]::IsNullOrWhiteSpace($profileCargoPath) -or -not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right $profileCargoPath)) { return $null }
+        if ([String]::IsNullOrWhiteSpace($profileCargoPath)) { return $null }
+        if (-not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right $profileCargoPath)) { return $null }
         $vctip = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $ValidatedProfile
         if (-not (Test-D32ProfilePathEqual -Left $vctip.Path -Right $ImagePath)) { return $null }
         if ($null -ne $ImageIdentity) {
@@ -252,11 +259,12 @@ function Get-D32Phase0AllowedChildImageReason {
             $openedSha = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
             $openedVolume = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('volume_serial_hex', 'VolumeSerialHex')
             $openedFileId = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('file_id_hex', 'FileIdHex')
-            if (-not (Test-D32ProfilePathEqual -Left ([string]$openedPath) -Right ([string]$vctip.Path)) -or
-                -not (Test-D32Phase0Integer -Value $openedBytes -Positive) -or [Int64]$openedBytes -ne [Int64]$vctip.Bytes -or
-                $openedSha -isnot [string] -or [string]$openedSha -cne [string]$vctip.Sha256 -or
-                $openedVolume -isnot [string] -or [string]$openedVolume -cne [string]$vctip.VolumeSerialHex -or
-                $openedFileId -isnot [string] -or [string]$openedFileId -cne [string]$vctip.FileIdHex) { return $null }
+            if (-not (Test-D32ProfilePathEqual -Left ([string]$openedPath) -Right ([string]$vctip.Path))) { return $null }
+            if (-not (Test-D32Phase0Integer -Value $openedBytes -Positive)) { return $null }
+            if ([Int64]$openedBytes -ne [Int64]$vctip.Bytes) { return $null }
+            if ($openedSha -isnot [string] -or [string]$openedSha -cne [string]$vctip.Sha256) { return $null }
+            if ($openedVolume -isnot [string] -or [string]$openedVolume -cne [string]$vctip.VolumeSerialHex) { return $null }
+            if ($openedFileId -isnot [string] -or [string]$openedFileId -cne [string]$vctip.FileIdHex) { return $null }
         }
         return 'caller-pinned-msvc-vctip-descendant-of-fixed-cargo-root'
     }
@@ -267,6 +275,40 @@ function Get-D32Phase0AllowedChildImageReason {
         $imageName.StartsWith('git-lfs', [StringComparison]::Ordinal) -or $imageName.StartsWith('git-remote-', [StringComparison]::Ordinal) -or
         $imageName.StartsWith('git-credential', [StringComparison]::Ordinal) -or $imageName.Contains('credential') -or $imageName.StartsWith('ssh', [StringComparison]::Ordinal) -or
         $imageName.StartsWith('plink', [StringComparison]::Ordinal) -or $imageName.StartsWith('putty', [StringComparison]::Ordinal) -or $imageName.StartsWith('tortoiseplink', [StringComparison]::Ordinal)) { return $null }
+    if ($imageName -ceq 'protoc.exe' -or $knownVendoredProtocContent) {
+        if ($null -eq $VendoredProtocGrant -or $imageName -cne 'protoc.exe') { return $null }
+        $profileCargoPath = $null
+        $grantCargoHome = $null
+        try {
+            $profileCargoPath = [string]$ValidatedProfile.Profile.toolchain.cargo.path
+            $grantCargoHome = [string]$VendoredProtocGrant.Document.cargo_home.path
+        }
+        catch { return $null }
+        if ([String]::IsNullOrWhiteSpace($profileCargoPath)) { return $null }
+        if (-not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right $profileCargoPath)) { return $null }
+        if ([String]::IsNullOrWhiteSpace($grantCargoHome)) { return $null }
+        $pin = $VendoredProtocGrant.Image
+        $expectedPinPath = Join-Path $grantCargoHome 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+        if ($pin.Path -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$pin.Path)) { return $null }
+        if (-not (Test-D32ProfilePathEqual -Left $pin.Path -Right $expectedPinPath)) { return $null }
+        if (($pin.Bytes -isnot [int]) -and ($pin.Bytes -isnot [long]) -and ($pin.Bytes -isnot [int64]) -and ($pin.Bytes -isnot [uint64])) { return $null }
+        if ([Int64]$pin.Bytes -ne $script:D32VendoredProtocImageBytes) { return $null }
+        if ($pin.Sha256 -isnot [string] -or $pin.Sha256 -cne $script:D32VendoredProtocImageSha256) { return $null }
+        if ($pin.VolumeSerialHex -isnot [string] -or $pin.VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$') { return $null }
+        if ($pin.FileIdHex -isnot [string] -or $pin.FileIdHex -cnotmatch '^[0-9a-f]{32}$') { return $null }
+        if ($null -eq $ImageIdentity) { return $null }
+        if (-not (Test-D32ProfilePathEqual -Left $ImagePath -Right $pin.Path)) { return $null }
+        $openedPath = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('path', 'Path', 'image_path', 'ImagePath')
+        if ($openedPath -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $openedPath -Right $pin.Path)) { return $null }
+        if (($imageBytes -isnot [int]) -and ($imageBytes -isnot [long]) -and ($imageBytes -isnot [int64]) -and ($imageBytes -isnot [uint64])) { return $null }
+        if ([Int64]$imageBytes -ne [Int64]$pin.Bytes) { return $null }
+        if ($imageSha256 -isnot [string] -or $imageSha256 -cne [string]$pin.Sha256) { return $null }
+        $openedVolume = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('volume_serial_hex', 'VolumeSerialHex')
+        if ($openedVolume -isnot [string] -or $openedVolume -cne [string]$pin.VolumeSerialHex) { return $null }
+        $openedFileId = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('file_id_hex', 'FileIdHex')
+        if ($openedFileId -isnot [string] -or $openedFileId -cne [string]$pin.FileIdHex) { return $null }
+        return 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root'
+    }
     $pinned = @($ValidatedProfile.ExecutableInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $ImagePath })
     $windowsPinned = @($ValidatedProfile.WindowsImageInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $ImagePath })
     if ($pinned.Count -eq 1 -or $windowsPinned.Count -eq 1) { return 'caller-pinned-toolchain-native-or-Windows-image' }
@@ -383,7 +425,8 @@ function Test-D32Phase0DebugProcessTrace {
         [Parameter(Mandatory = $true)][object]$ExpectedRootIdentity,
         [Parameter(Mandatory = $true)][int]$ExpectedParentProcessId,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
-        [Parameter(Mandatory = $true)][string]$Repository
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [AllowNull()][object]$VendoredProtocGrant
     )
 
     $fields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id',
@@ -526,7 +569,7 @@ function Test-D32Phase0DebugProcessTrace {
     foreach ($record in $Trace.processes) {
         $identity = "$($record.process_id)|$($record.creation_filetime)"
         if ($identity -eq $rootKey) { continue }
-        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $record
+        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $record -VendoredProtocGrant $VendoredProtocGrant
         if ([String]::IsNullOrWhiteSpace($actualReason) -or $record.allowed_image_reason -cne $actualReason) { throw "PROCESS_TRACE_BLOCKED: child/helper image is outside exact pinned inventory and candidate target roots: $($record.image_path)" }
         $pinned = @($ValidatedProfile.ExecutableInventory + $ValidatedProfile.WindowsImageInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $record.image_path })
         if ($pinned.Count -gt 1) { throw 'PROCESS_TRACE_BLOCKED: pinned process image identity is ambiguous' }
@@ -681,7 +724,8 @@ function Invoke-D32Phase0PinnedProcess {
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][string]$GitPath,
-        [Parameter(Mandatory = $true)][string]$GitSha256
+        [Parameter(Mandatory = $true)][string]$GitSha256,
+        [AllowNull()][object]$VendoredProtocRunGrant
     )
     $script:D32Phase0LastProcessFailure = [ordered]@{
         PrimaryError = $null
@@ -724,7 +768,36 @@ function Invoke-D32Phase0PinnedProcess {
     if ((Test-Path -LiteralPath $stdoutPath) -or (Test-Path -LiteralPath $stderrPath)) { throw 'PHASE0_LOG_BLOCKED: stdout/stderr log path already exists' }
     $commandArguments = @($Executable) + @($Arguments)
     $commandLine = ConvertTo-D32Phase0CommandLine -Arguments $commandArguments
-    $environmentBlock = ConvertTo-D32Phase0EnvironmentBlock -Environment $Environment
+    $launchEnvironment = [ordered]@{}
+    foreach ($environmentKey in $Environment.Keys) { $launchEnvironment[[string]$environmentKey] = [string]$Environment[$environmentKey] }
+    $manifestIndex = [Array]::IndexOf([string[]]$Arguments, '--manifest-path')
+    $fixedVendoredCargo = $false
+    $manifestPath = $null
+    if ($manifestIndex -ge 0 -and ($manifestIndex + 1) -lt $Arguments.Count) {
+        $manifestArgument = [string]$Arguments[$manifestIndex + 1]
+        $manifestPath = if ([IO.Path]::IsPathRooted($manifestArgument)) { [IO.Path]::GetFullPath($manifestArgument) } else { [IO.Path]::GetFullPath((Join-Path $Repository $manifestArgument)) }
+        $fixedVendoredCargo = (Test-D32ProfilePathEqual -Left $manifestPath -Right (Join-Path $Repository 'vita-agent\Cargo.toml')) -or
+            (Test-D32ProfilePathEqual -Left $manifestPath -Right (Join-Path $Repository 'src-tauri\Cargo.toml'))
+    }
+    $isCargoRoot = Test-D32ProfilePathEqual -Left $Executable -Right ([string]$ValidatedProfile.Profile.toolchain.cargo.path)
+    $isBuildOrTest = $Arguments.Count -gt 0 -and [string]$Arguments[0] -cin @('build', 'test')
+    $grantForProcess = $null
+    if ($isCargoRoot -and $isBuildOrTest -and $fixedVendoredCargo) {
+        if ($null -eq $VendoredProtocRunGrant) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: fixed Vita/src-tauri Cargo build/test has no validated per-run image grant' }
+        $grantForProcess = $VendoredProtocRunGrant
+        if (-not $launchEnvironment.Contains('CARGO_HOME') -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$launchEnvironment['CARGO_HOME']) -Right ([string]$grantForProcess.Document.cargo_home.path))) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: Cargo command CARGO_HOME differs from its run grant' }
+        $currentProtoc = Get-D32ProfileFileSnapshot -Path ([string]$grantForProcess.Image.Path)
+        if ($currentProtoc.Bytes -ne [Int64]$grantForProcess.Image.Bytes -or $currentProtoc.Sha256 -cne [string]$grantForProcess.Image.Sha256 -or
+            $currentProtoc.VolumeSerialHex -cne [string]$grantForProcess.Image.VolumeSerialHex -or $currentProtoc.FileIdHex -cne [string]$grantForProcess.Image.FileIdHex) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: opened protoc identity changed before fixed Cargo command' }
+        if (Test-D32ProfilePathEqual -Left $manifestPath -Right (Join-Path $Repository 'src-tauri\Cargo.toml')) {
+            if ($launchEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: ambient PROTOC is forbidden; fixed src-tauri commands receive only the run-grant image' }
+            $launchEnvironment['PROTOC'] = [string]$grantForProcess.Image.Path
+        }
+        elseif ($launchEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: Vita code-mode uses its locked vendored path and must not receive PROTOC' }
+    }
+    elseif ($launchEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: PROTOC is outside the exact fixed src-tauri build/test command scope' }
+    $environmentBlock = ConvertTo-D32Phase0EnvironmentBlock -Environment $launchEnvironment
     $started = [DateTimeOffset]::UtcNow
     $native = $null
     $stdoutTarget = $null
@@ -754,6 +827,9 @@ function Invoke-D32Phase0PinnedProcess {
         $approvedPinText = @($approvedImages | ForEach-Object {
             @([string]$_.Path, [string]$_.Bytes, [string]$_.Sha256, [string]$_.VolumeSerialHex, [string]$_.FileIdHex) -join "`t"
         })
+        if ($null -ne $grantForProcess) {
+            $approvedPinText += @([string]$grantForProcess.Image.Path, [string]$grantForProcess.Image.Bytes, [string]$grantForProcess.Image.Sha256, [string]$grantForProcess.Image.VolumeSerialHex, [string]$grantForProcess.Image.FileIdHex) -join "`t"
+        }
         $candidateRoots = @(
             (Join-Path $Repository 'vita-agent\target\debug'),
             (Join-Path $Repository 'vita-agent\target\release'),
@@ -766,7 +842,15 @@ function Invoke-D32Phase0PinnedProcess {
         $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
         if (Test-D32ProfilePathEqual -Left $image.Path -Right ([string]$currentProfile.Profile.toolchain.cargo.path)) {
             $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $currentProfile
-            $native.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout)
+            if ($null -ne $grantForProcess) {
+                $protocPinText = @([string]$grantForProcess.Image.Path, [string]$grantForProcess.Image.Bytes, [string]$grantForProcess.Image.Sha256,
+                    [string]$grantForProcess.Image.VolumeSerialHex, [string]$grantForProcess.Image.FileIdHex) -join "`t"
+                $native.ConfigurePinnedCargoDebugCaptureWithVendoredProtoc($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout,
+                    [string]$grantForProcess.Document.cargo_home.path, $protocPinText)
+            }
+            else {
+                $native.ConfigurePinnedCargoDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout)
+            }
         }
         else {
             $native.ConfigureDebugCapture($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout, $false, $false)
@@ -774,12 +858,12 @@ function Invoke-D32Phase0PinnedProcess {
         $traceJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
         $traceNative = $native.WaitForDebugTrace($traceJoinTimeout)
         $processTrace = ConvertTo-D32Phase0DebugProcessTraceDocument -Trace $traceNative
-        $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository
+        $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository -VendoredProtocGrant $grantForProcess
         if ($traceNative.State -cne 'COMPLETED' -or -not $traceNative.AccountingConsistent) { throw "PHASE0_PROCESS_TRACE_BLOCKED: $($traceNative.BlockReason)" }
         if ($traceNative.Processes.Count -eq 0) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: root CREATE_PROCESS_DEBUG_EVENT is absent' }
         $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -CommandLine $commandLine
         if ($rootSnapshot.parent_process_id -ne $PID) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: fixed command parent is not the exact runner identity' }
-        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable
+        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess
         if (-not (Test-D32ProfilePathEqual -Left $rootRecord.image_path -Right $image.Path) -or $rootRecord.sha256 -cne $image.Sha256 -or
             $rootRecord.volume_serial_hex -cne $image.VolumeSerialHex -or $rootRecord.file_id_hex -cne $image.FileIdHex -or $rootRecord.command_line -cne $commandLine) {
             throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: root executable path/hash/file ID/argv mismatch'
@@ -788,7 +872,7 @@ function Invoke-D32Phase0PinnedProcess {
             $childSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $child
             $key = "$($childSnapshot.process_id)|$($childSnapshot.creation_date)"
             if ($descendants.Contains($key)) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: duplicate child PID/creation identity' }
-            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable
+            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess
         }
         $exitCode = [int]$native.ExitCode
         $cleanup = $native.CloseJobAndWait(15000)
@@ -885,7 +969,8 @@ function Invoke-D32Phase0LoggedCommand {
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][string]$GitPath,
-        [Parameter(Mandatory = $true)][string]$GitSha256
+        [Parameter(Mandatory = $true)][string]$GitSha256,
+        [AllowNull()][object]$VendoredProtocRunGrant
     )
     $Ordinal.Value++
     $safeName = $Name -replace '[^A-Za-z0-9._-]', '_'
@@ -895,7 +980,7 @@ function Invoke-D32Phase0LoggedCommand {
         -LogPath (Join-Path $LogRoot ('phase0-{0:D2}-{1}' -f $Ordinal.Value, $safeName)) `
         -Environment $Environment -TimeoutSeconds $TimeoutSeconds `
         -ValidatedProfile $ValidatedProfile -Repository $Repository `
-        -ExpectedCandidateSha $ExpectedCandidateSha -GitPath $GitPath -GitSha256 $GitSha256
+        -ExpectedCandidateSha $ExpectedCandidateSha -GitPath $GitPath -GitSha256 $GitSha256 -VendoredProtocRunGrant $VendoredProtocRunGrant
     $Records.Add($record)
     return $record
 }
@@ -1225,7 +1310,10 @@ function Test-D32Phase0FixtureBuildProvenance {
         [Parameter(Mandatory = $true)][string]$OutputRoot,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][int]$ExpectedRunnerProcessId,
-        [Parameter(Mandatory = $true)][object]$ValidatedProfile
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [AllowNull()][string]$VendoredAuthorityPath,
+        [AllowNull()][string]$ExpectedVendoredAuthoritySha256,
+        [AllowNull()][object]$ValidatedVendoredGrant
     )
     $expectedSidecar = [IO.Path]::GetFullPath((Join-Path $OutputRoot 'fixture-build-provenance.json'))
     if (-not (Test-D32ProfilePathEqual -Left $SidecarPath -Right $expectedSidecar) -or -not (Test-D32ProfileNoReparsePath -Path $expectedSidecar)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar path is not the fixed external regular file' }
@@ -1233,9 +1321,9 @@ function Test-D32Phase0FixtureBuildProvenance {
     $raw = [IO.File]::ReadAllText($expectedSidecar, [Text.Encoding]::UTF8)
     if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar has duplicate or invalid JSON keys' }
     $document = $raw | ConvertFrom-D32Phase0Json
-    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces')
-    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 3 -or
-        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V3' -or
+    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant')
+    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 4 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V4' -or
         $document.candidate_sha -isnot [string] -or $document.candidate_sha -cne $ExpectedCandidateSha -or
         $document.source_repo -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.source_repo -Right $Repository) -or
         $document.fixture_manifest_path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.fixture_manifest_path -Right $ManifestPath) -or
@@ -1243,6 +1331,13 @@ function Test-D32Phase0FixtureBuildProvenance {
         $document.fixture_manifest_volume_serial_hex -isnot [string] -or $document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $document.fixture_manifest_file_id_hex -isnot [string] -or $document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         -not (Test-D32Phase0Integer -Value $document.fixture_manifest_bytes -Positive)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar schema/candidate/source/manifest binding is invalid' }
+    $grantPath = Join-Path $OutputRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json'
+    if (-not (Test-D32VendoredObjectExactProperties -Object $document.vendored_protoc_run_grant -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+        $document.vendored_protoc_run_grant.path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.vendored_protoc_run_grant.path -Right $grantPath) -or
+        -not (Test-D32Phase0Integer -Value $document.vendored_protoc_run_grant.bytes -Positive) -or
+        $document.vendored_protoc_run_grant.sha256 -isnot [string] -or $document.vendored_protoc_run_grant.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $document.vendored_protoc_run_grant.volume_serial_hex -isnot [string] -or $document.vendored_protoc_run_grant.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        $document.vendored_protoc_run_grant.file_id_hex -isnot [string] -or $document.vendored_protoc_run_grant.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { throw 'VENDORED_PROTOC_GRANT_BLOCKED: fixture provenance grant reference is malformed or not at its fixed path' }
     $manifestSnapshot = Get-D32ProfileFileSnapshot -Path $ManifestPath
     if ([Int64]$document.fixture_manifest_bytes -ne [Int64]$manifestSnapshot.Bytes -or $document.fixture_manifest_sha256 -cne $manifestSnapshot.Sha256 -or
         $document.fixture_manifest_volume_serial_hex -cne $manifestSnapshot.VolumeSerialHex -or $document.fixture_manifest_file_id_hex -cne $manifestSnapshot.FileIdHex) { throw 'PHASE0_FIXTURE_BLOCKED: sidecar does not bind current fixture manifest bytes and opened-handle identity' }
@@ -1285,6 +1380,20 @@ function Test-D32Phase0FixtureBuildProvenance {
         $null = Test-D32ProfileDirectoryIdentity -Path ([string]$directory.path) -VolumeSerialHex ([string]$directory.volume_serial_hex) -FileIdHex ([string]$directory.file_id_hex)
     }
     if (-not (Test-D32ProfilePathEqual -Left $ownerBinding.EvidenceRoot -Right $OutputRoot)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture provenance owner binding changed EvidenceRoot' }
+    $vendoredGrant = $null
+    if ($null -ne $ValidatedVendoredGrant) {
+        if ((ConvertTo-Json -InputObject $ValidatedVendoredGrant.Reference -Depth 5 -Compress) -cne
+            (ConvertTo-Json -InputObject $document.vendored_protoc_run_grant -Depth 5 -Compress)) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: prevalidated per-run grant differs from fixture sidecar reference' }
+        $vendoredGrant = $ValidatedVendoredGrant
+    }
+    elseif (-not [String]::IsNullOrWhiteSpace($VendoredAuthorityPath) -or -not [String]::IsNullOrWhiteSpace($ExpectedVendoredAuthoritySha256)) {
+        if ([String]::IsNullOrWhiteSpace($VendoredAuthorityPath) -or $ExpectedVendoredAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'VENDORED_PROTOC_GRANT_BLOCKED: authority path and independent expected SHA must be supplied together' }
+        $vendoredGrant = Test-D32VendoredProtocRunGrant `
+            -Reference $document.vendored_protoc_run_grant -Repository $Repository -CandidateSha $ExpectedCandidateSha `
+            -ValidatedProfile $ValidatedProfile -EvidenceRoot $OutputRoot -ExpectedRunId ([string]$environment.run_id) `
+            -CargoHome ([string]$environment.cargo_home) -AuthorityPath $VendoredAuthorityPath `
+            -AuthoritySha256 $ExpectedVendoredAuthoritySha256 -OwnerMarkerReference $document.storage.owner_marker
+    }
     if ($environment.fetch_manifests -isnot [Array] -or $environment.fetch_manifests.Count -ne $ValidatedProfile.LockInputs.Count) { throw 'PHASE0_FETCH_BLOCKED: fixture sidecar fetch array/count differs from the exact locked manifest inventory' }
     $fetchProcessIds = [System.Collections.Generic.HashSet[int]]::new()
     for ($i = 0; $i -lt $ValidatedProfile.LockInputs.Count; $i++) {
@@ -1331,7 +1440,8 @@ function Test-D32Phase0FixtureBuildProvenance {
         }
         if (($entry.arguments -join "`0") -cne ($expectedArgs -join "`0") -or
             $entry.command_line -cne (ConvertTo-D32Phase0CommandLine -Arguments (@([string]$cargoIdentity.path) + $expectedArgs))) { throw "PHASE0_FIXTURE_BLOCKED: fixed process trace command/cwd mismatch at index $i" }
-        $null = Test-D32Phase0DebugProcessTrace -Trace $entry.process_trace -ExpectedRootPath ([string]$cargoIdentity.path) -ExpectedRootIdentity $cargoIdentity -ExpectedParentProcessId $ExpectedRunnerProcessId -ValidatedProfile $ValidatedProfile -Repository $Repository
+        $traceGrant = if ($i -lt $ValidatedProfile.LockInputs.Count) { $null } else { $vendoredGrant }
+        $null = Test-D32Phase0DebugProcessTrace -Trace $entry.process_trace -ExpectedRootPath ([string]$cargoIdentity.path) -ExpectedRootIdentity $cargoIdentity -ExpectedParentProcessId $ExpectedRunnerProcessId -ValidatedProfile $ValidatedProfile -Repository $Repository -VendoredProtocGrant $traceGrant
         $traceRoot = @($entry.process_trace.processes | Where-Object { $_.create_sequence -eq 1 })
         if ($traceRoot.Count -ne 1 -or $traceRoot[0].exit_code -ne 0) { throw "PHASE0_FIXTURE_BLOCKED: command root did not exit successfully in synchronized debug trace at index $i" }
         if ($i -lt $ValidatedProfile.LockInputs.Count) {
@@ -1343,7 +1453,7 @@ function Test-D32Phase0FixtureBuildProvenance {
                 $entry.command_line -cne $fetchIdentity.command_line) { throw "PHASE0_FETCH_BLOCKED: legacy fetch identity disagrees with synchronized process trace at index $i" }
         }
     }
-    return [PSCustomObject]@{ Document = $document; Reference = $sidecarReference; ManifestReference = (Get-D32Phase0FileReference -Path $ManifestPath) }
+    return [PSCustomObject]@{ Document = $document; Reference = $sidecarReference; ManifestReference = (Get-D32Phase0FileReference -Path $ManifestPath); VendoredGrant = $vendoredGrant }
 }
 
 function Get-D32Phase0ExpectedCommandPlan {
@@ -1381,7 +1491,7 @@ function Test-D32Phase0MatrixRecord {
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$GitSha256
     )
-    $result = [ordered]@{ IsValid = $false; Failure = $null; Record = $null; RecordPath = $null; Digest = $null; Identity = $null; CargoHome = $null; OutputRoot = $null }
+    $result = [ordered]@{ IsValid = $false; Failure = $null; Record = $null; RecordPath = $null; Digest = $null; Identity = $null; CargoHome = $null; OutputRoot = $null; VendoredGrant = $null }
     try {
         if ($ExpectedRecordSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'independent Phase0 record SHA-256 must be lowercase 64-hex' }
         if ($ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$') { throw 'expected candidate SHA must be lowercase 40-hex' }
@@ -1398,9 +1508,9 @@ function Test-D32Phase0MatrixRecord {
         $raw = [IO.File]::ReadAllText($recordFull, [Text.Encoding]::UTF8)
         if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'Phase0 record has duplicate object keys or invalid JSON structure' }
         $document = $raw | ConvertFrom-D32Phase0Json
-        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
-        if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw 'Phase0 record schema_version must be the supported JSON integer version 3' }
+        if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw 'Phase0 record schema_version must be the supported JSON integer version 4' }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
         if (-not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive)) { throw 'Phase0 runner_process_id must be a positive JSON integer' }
         foreach ($name in @('candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'phase0_scope')) { if ($document.$name -isnot [string]) { throw "Phase0 $name must be a JSON string" } }
@@ -1470,6 +1580,17 @@ function Test-D32Phase0MatrixRecord {
         $null = Test-D32ProfileDirectoryIdentity -Path $document.cargo_home.temp_root -VolumeSerialHex ([string]$document.cargo_home.temp_root_identity.volume_serial_hex) -FileIdHex ([string]$document.cargo_home.temp_root_identity.file_id_hex)
         $cargoHomeCheck = Test-D32CargoHome -Path $document.cargo_home.path -Repository $repo
         if ($cargoHomeCheck.Empty -or -not (Test-D32ProfileNoReparsePath -Path $document.cargo_home.temp_root)) { throw 'Phase0 Cargo home is empty or temp root is missing/reparse-backed' }
+        if (-not (Test-D32Phase0ExactProperties -Object $document.vendored_protoc -Expected @('authority', 'run_grant')) -or
+            -not (Test-D32VendoredObjectExactProperties -Object $document.vendored_protoc.authority -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) { throw 'Phase0 vendored-protoc authority/grant references are malformed' }
+        $authorityPath = [string]$document.vendored_protoc.authority.path
+        $authoritySha = [string]$document.vendored_protoc.authority.sha256
+        $authorityValidation = Test-D32VendoredProtocAuthority -AuthorityPath $authorityPath -ExpectedAuthoritySha256 $authoritySha -Repository $repo -CandidateSha $ExpectedCandidateSha -ValidatedProfile $profile -EvidenceRoot $outputRoot
+        if ((ConvertTo-Json -InputObject $authorityValidation.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.vendored_protoc.authority -Depth 5 -Compress)) { throw 'Phase0 external vendored-protoc authority reference bytes/identity changed' }
+        $vendoredGrant = Test-D32VendoredProtocRunGrant `
+            -Reference $document.vendored_protoc.run_grant -Repository $repo -CandidateSha $ExpectedCandidateSha `
+            -ValidatedProfile $profile -EvidenceRoot $outputRoot -ExpectedRunId ([string]$document.cargo_home.run_id) `
+            -CargoHome ([string]$document.cargo_home.path) -AuthorityPath $authorityPath -AuthoritySha256 $authoritySha `
+            -OwnerMarkerReference $document.owner_marker
         $expectedFetches = @($profile.LockInputs)
         if ($document.fetches -isnot [Array] -or $document.fetches.Count -ne $expectedFetches.Count) { throw 'Phase0 locked fetch array/count mismatch' }
         for ($i = 0; $i -lt $expectedFetches.Count; $i++) {
@@ -1500,7 +1621,8 @@ function Test-D32Phase0MatrixRecord {
         Test-D32FixtureManifest -FixtureManifest $fixtureDocument -FixtureManifestPath $fixturePath -Head $ExpectedCandidateSha -Repository $repo -Findings $fixtureFindings
         if (@($fixtureFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'Phase0 fixture schema/artifact validation failed' }
         if ([IO.Path]::GetFileName($fixtureProvenanceRef.Path) -cne 'fixture-build-provenance.json') { throw 'Phase0 fixture build provenance path is not fixed' }
-        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile
+        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant
+        if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.vendored_protoc_run_grant -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.vendored_protoc.run_grant -Depth 5 -Compress)) { throw 'Phase0 fixture provenance grant reference differs from matrix run grant reference' }
         if (($fixtureProvenance.Reference | ConvertTo-Json -Depth 5 -Compress) -cne ($document.fixture.build_provenance | ConvertTo-Json -Depth 5 -Compress)) { throw 'Phase0 fixture provenance sidecar reference does not match current opened-handle bytes/identity' }
         if (($document.fixture.fixture_names -join '|') -cne 'd29h1-authority-fixture|d29h7-authority-fixture|d29h7-process-fixture|d29h7-git-helper-fixture|d32a-sandbox-fixture' -or
             ($fixtureDocument.fixtures | ConvertTo-Json -Depth 20 -Compress) -cne ($document.fixture.fixture_records | ConvertTo-Json -Depth 20 -Compress)) { throw 'Phase0 fixture records do not match the independently validated fixture manifest' }
@@ -1592,7 +1714,7 @@ function Test-D32Phase0MatrixRecord {
                 $rootProcess.parent_process_id -ne [int]$document.runner_process_id -or -not (Test-D32ProfilePathEqual -Left $rootProcess.image_path -Right $plan.executable) -or $rootProcess.command_line -cne $expectedLine -or
                 $rootProcess.sha256 -cne $command.executable_sha256 -or [Int64]$rootProcess.bytes -ne [Int64]$command.executable_bytes -or
                 $rootProcess.volume_serial_hex -cne $command.executable_volume_serial_hex -or $rootProcess.file_id_hex -cne $command.executable_file_id_hex) { throw "Phase0 command[$i] root process identity mismatch" }
-            $null = Test-D32Phase0DebugProcessTrace -Trace $command.process_trace -ExpectedRootPath $plan.executable -ExpectedRootIdentity $toolRecord -ExpectedParentProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -Repository $repo
+            $null = Test-D32Phase0DebugProcessTrace -Trace $command.process_trace -ExpectedRootPath $plan.executable -ExpectedRootIdentity $toolRecord -ExpectedParentProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -Repository $repo -VendoredProtocGrant $vendoredGrant
             $traceRoot = @($command.process_trace.processes | Where-Object { $_.create_sequence -eq 1 })
             $rootFileTime = [DateTime]::Parse([string]$rootProcess.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
             if ($traceRoot.Count -ne 1 -or $traceRoot[0].process_id -ne $rootProcess.process_id -or $traceRoot[0].creation_filetime -ne $rootFileTime -or
@@ -1613,7 +1735,7 @@ function Test-D32Phase0MatrixRecord {
                     $traceChild[0].sha256 -cne $child.sha256 -or $traceChild[0].bytes -ne $child.bytes -or
                     $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex -or
                     $traceChild[0].parent_process_id -ne $child.parent_process_id) { throw "Phase0 command[$i] child record differs from synchronized debug CREATE evidence" }
-                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo -ExpectedRootPath ([string]$plan.executable) -ImageIdentity $child
+                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo -ExpectedRootPath ([string]$plan.executable) -ImageIdentity $child -VendoredProtocGrant $vendoredGrant
                 if ([String]::IsNullOrWhiteSpace($actualReason) -or $child.allowed_image_reason -cne $actualReason) { throw "Phase0 command[$i] contains unknown child image" }
             }
         }
@@ -1669,6 +1791,7 @@ function Test-D32Phase0MatrixRecord {
         $result.Identity = $recordSnapshot
         $result.CargoHome = [string]$document.cargo_home.path
         $result.OutputRoot = $outputRoot
+        $result.VendoredGrant = $vendoredGrant
         return [PSCustomObject]$result
     }
     catch {
@@ -1998,6 +2121,8 @@ function Invoke-D32Phase0Matrix {
         [Parameter(Mandatory = $true)][string]$ProfileSha256,
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$GitSha256,
+        [Parameter(Mandatory = $true)][string]$VendoredProtocAuthorityPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedVendoredProtocAuthoritySha256,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
     if ($PSVersionTable.PSVersion -lt [Version]'7.5') { throw 'PHASE0_BLOCKED: PowerShell 7.5 or newer is required' }
@@ -2010,6 +2135,9 @@ function Invoke-D32Phase0Matrix {
     if (-not $profile.IsValid) { throw "PHASE0_TOOLCHAIN_BLOCKED: $($profile.Failure)" }
     $gitProfile = Test-D32TrustedGitImage -Path $GitPath -ExpectedSha256 $GitSha256
     if (-not $gitProfile.IsValid) { throw "PHASE0_GIT_BLOCKED: $($gitProfile.Failure)" }
+    $vendoredAuthority = Test-D32VendoredProtocAuthority `
+        -AuthorityPath $VendoredProtocAuthorityPath -ExpectedAuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 `
+        -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile -EvidenceRoot $output
     Set-D32GitCaptureContext -ValidatedProfile $profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
     $pre = Get-D32Phase0GitState -Repository $repo -GitPath $GitPath -GitSha256 $GitSha256
     if ($pre.Head -cne $ExpectedSha) { throw 'PHASE0_CANDIDATE_BLOCKED: current HEAD does not equal caller-pinned candidate SHA' }
@@ -2046,6 +2174,8 @@ function Invoke-D32Phase0Matrix {
         ToolchainProfilePath = $ProfilePath
         ExpectedToolchainProfileSha256 = $ProfileSha256
         Phase0OwnerBinding = $outputBinding
+        VendoredProtocAuthorityPath = $VendoredProtocAuthorityPath
+        ExpectedVendoredProtocAuthoritySha256 = $ExpectedVendoredProtocAuthoritySha256
         TimeoutSeconds = $TimeoutSeconds
     }
     $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
@@ -2132,7 +2262,10 @@ function Invoke-D32Phase0Matrix {
     if (($fixtureNames -join '|') -cne ($expectedFixtureNames -join '|') -or @($fixtureDoc.fixtures | Where-Object { $_.status -cne 'succeeded' -or $_.exit_code -ne 0 }).Count -ne 0) { throw 'PHASE0_FIXTURE_BLOCKED: fixture phase inventory/result differs from the exact five-phase contract' }
     if ($fixtureDoc.build_policy.cargo_build_jobs -ne 1 -or $fixtureDoc.process_tree_check -cne 'succeeded' -or $null -ne $fixtureDoc.process_tree_error) { throw 'PHASE0_FIXTURE_BLOCKED: fixture process cleanup/build policy did not pass' }
     $fixtureProvenancePath = Join-Path $output 'fixture-build-provenance.json'
-    $fixtureProvenanceEvidence = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenancePath -ManifestPath $fixtureManifestPath -Repository $repo -OutputRoot $output -ExpectedCandidateSha $ExpectedSha -ExpectedRunnerProcessId $PID -ValidatedProfile $profile
+    $fixtureProvenanceEvidence = Test-D32Phase0FixtureBuildProvenance `
+        -SidecarPath $fixtureProvenancePath -ManifestPath $fixtureManifestPath -Repository $repo -OutputRoot $output `
+        -ExpectedCandidateSha $ExpectedSha -ExpectedRunnerProcessId $PID -ValidatedProfile $profile `
+        -VendoredAuthorityPath $VendoredProtocAuthorityPath -ExpectedVendoredAuthoritySha256 $ExpectedVendoredProtocAuthoritySha256
     $fixtureEnvironment = $fixtureProvenanceEvidence.Document.environment
     $cargoHome = [string]$fixtureEnvironment.cargo_home
     $tempRoot = [string]$fixtureEnvironment.temp_root
@@ -2153,6 +2286,7 @@ function Invoke-D32Phase0Matrix {
 
     $phaseRoot = [string]$fixtureEnvironment.temp_root
     $childEnvironment = Get-D32BuildToolchainEnvironment -ValidatedProfile $profile -CargoHome $cargoHome -TempRoot $phaseRoot -Offline $true
+    if ($childEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: base Phase0 environment must not contain ambient PROTOC' }
     $cargo = [string]$profile.Profile.toolchain.cargo.path
     $rustc = [string]$profile.Profile.toolchain.rustc.path
     $rustdoc = [string]$profile.Profile.toolchain.rustdoc.path
@@ -2172,6 +2306,7 @@ function Invoke-D32Phase0Matrix {
         ExpectedCandidateSha = $ExpectedSha
         GitPath = $GitPath
         GitSha256 = $GitSha256
+        VendoredProtocRunGrant = $fixtureProvenanceEvidence.VendoredGrant
     }
 
     $rustcProbe = Invoke-D32Phase0LoggedCommand @commandArgs -Name 'rustc-target-probe' -Executable $rustc -Arguments @('--print', 'cfg', '--target', 'x86_64-pc-windows-msvc')
@@ -2275,6 +2410,10 @@ function Invoke-D32Phase0Matrix {
             file_id_hex = [string]$outputBinding.RootIdentity.FileIdHex
         }
         owner_marker = $outputBinding.OwnerMarker
+        vendored_protoc = [ordered]@{
+            authority = $vendoredAuthority.Reference
+            run_grant = $fixtureProvenanceEvidence.VendoredGrant.Reference
+        }
         status = $script:D32Phase0Status
         bundle_hashes = $script:D32Phase0BundleHashes
         started_at_utc = $started.ToString('o')
@@ -2806,6 +2945,56 @@ function Test-D32Phase0MatrixRecordSelfTest {
     catch { $duplicateVctipProfileRejected = $_.Exception.Message -like '*D32_VCTIP_PROFILE_PIN_BLOCKED*' }
     & $add 'Profile V2 rejects duplicate/copied VCTIP content under a renamed inventory path' $duplicateVctipProfileRejected
 
+    $protocExpectedCargoHome = 'C:\\phase0-protoc-selftest\\r\\c'
+    $protocExpectedImagePath = Join-Path $protocExpectedCargoHome 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+    $protocExpectedIdentity = [PSCustomObject]@{
+        Path = $protocExpectedImagePath; Bytes = [Int64]11934496
+        Sha256 = 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2'
+        VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef'
+    }
+    $protocExpectedGrant = [PSCustomObject]@{
+        Image = $protocExpectedIdentity
+        Document = [PSCustomObject]@{ cargo_home = [PSCustomObject]@{ path = $protocExpectedCargoHome } }
+    }
+    $protocAllowedProfile = [PSCustomObject]@{
+        Profile = [PSCustomObject]@{ toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]@{ path = $cargoRootPath } } }
+        ExecutableInventory = @(); WindowsImageInventory = @()
+    }
+    $exactProtocAdmission = Get-D32Phase0AllowedChildImageReason -ImagePath $protocExpectedImagePath -ValidatedProfile $protocAllowedProfile `
+        -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $protocExpectedIdentity -VendoredProtocGrant $protocExpectedGrant
+    & $add 'locked protoc is classified only by the exact per-run CargoHome grant and complete opened identity' `
+        ($exactProtocAdmission -ceq 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root')
+    $protocPriorHomeImagePath = Join-Path 'C:\\old-cargo-home' 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+    $protocPriorHomeAdmission = Get-D32Phase0AllowedChildImageReason -ImagePath $protocPriorHomeImagePath -ValidatedProfile $protocAllowedProfile `
+        -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $protocExpectedIdentity -VendoredProtocGrant $protocExpectedGrant
+    $protocUnapprovedCases = [ordered]@{
+        missing_grant = Get-D32Phase0AllowedChildImageReason -ImagePath $protocExpectedImagePath -ValidatedProfile $protocAllowedProfile -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $protocExpectedIdentity
+        wrong_root = Get-D32Phase0AllowedChildImageReason -ImagePath $protocExpectedImagePath -ValidatedProfile $protocAllowedProfile -Repository 'C:\\candidate' -ExpectedRootPath 'C:\\other\\cargo.exe' -ImageIdentity $protocExpectedIdentity -VendoredProtocGrant $protocExpectedGrant
+        renamed_alias = Get-D32Phase0AllowedChildImageReason -ImagePath $protocExpectedImagePath.Replace('protoc.exe', 'protoc-copy.exe') -ValidatedProfile $protocAllowedProfile -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $protocExpectedIdentity -VendoredProtocGrant $protocExpectedGrant
+        prior_home = $protocPriorHomeAdmission
+    }
+    $protocIdentityDriftBlocked = $true
+    foreach ($mutation in @(
+        [PSCustomObject]@{ Field = 'Bytes'; Value = [Int64]11934497 },
+        [PSCustomObject]@{ Field = 'Sha256'; Value = ('0' * 64) },
+        [PSCustomObject]@{ Field = 'VolumeSerialHex'; Value = '0123456789abcdee' },
+        [PSCustomObject]@{ Field = 'FileIdHex'; Value = '0123456789abcdef0123456789abcdee' }
+    )) {
+        $driftedProtocIdentity = [PSCustomObject]@{
+            Path = $protocExpectedIdentity.Path; Bytes = $protocExpectedIdentity.Bytes; Sha256 = $protocExpectedIdentity.Sha256
+            VolumeSerialHex = $protocExpectedIdentity.VolumeSerialHex; FileIdHex = $protocExpectedIdentity.FileIdHex
+        }
+        $driftedProtocIdentity.($mutation.Field) = $mutation.Value
+        if ($null -ne (Get-D32Phase0AllowedChildImageReason -ImagePath $protocExpectedImagePath -ValidatedProfile $protocAllowedProfile `
+            -Repository 'C:\\candidate' -ExpectedRootPath $cargoRootPath -ImageIdentity $driftedProtocIdentity -VendoredProtocGrant $protocExpectedGrant)) {
+            $protocIdentityDriftBlocked = $false
+            break
+        }
+    }
+    $protocUnapprovedFailures = @($protocUnapprovedCases.GetEnumerator() | Where-Object { $null -ne $_.Value } | ForEach-Object { '{0}={1}' -f $_.Key,$_.Value })
+    & $add 'protoc prior-home, missing grant, wrong Cargo root, alias, and opened identity drift are blocked' `
+        ($protocUnapprovedFailures.Count -eq 0 -and $protocIdentityDriftBlocked) (($protocUnapprovedFailures -join ';') + ";prior_path=$protocPriorHomeImagePath;grant_path=$($protocExpectedGrant.Image.Path);path_equal=$(Test-D32ProfilePathEqual -Left $protocPriorHomeImagePath -Right $protocExpectedGrant.Image.Path)")
+
     $validCounts = [PSCustomObject][ordered]@{ passed = [Int64]3; failed = [Int64]0; ignored = [Int64]1; measured = [Int64]0; filtered_out = [Int64]1 }
     & $add 'suite counts reconcile with exact list, ignore and skip totals' (Test-D32Phase0SuiteCounts -Counts $validCounts -TestCount 5 -ExpectedIgnored 1 -ExpectedFiltered 1)
     & $add 'suite counts reject a missing field' (-not (Test-D32Phase0SuiteCounts -Counts ([PSCustomObject]@{ passed = 3; failed = 0; ignored = 1; measured = 0 }) -TestCount 5 -ExpectedIgnored 1 -ExpectedFiltered 1))
@@ -2832,7 +3021,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)
-    & $add 'Phase0 record constants label local-only V3 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V3' -and $script:D32Phase0SchemaVersion -eq 3 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+    & $add 'Phase0 record constants label local-only V4 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V4' -and $script:D32Phase0SchemaVersion -eq 4 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
 
     $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $selfTestRoot = Join-Path $tempBase ('d32-phase0-sidecar-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -2862,6 +3051,101 @@ function Test-D32Phase0MatrixRecordSelfTest {
             $failureNames = @($profileSelfTestFailures | ForEach-Object { $_.Name }) -join ', '
             throw "PHASE0_SELFTEST_BLOCKED: profile validator did not provide its passing validated test profile ($failureNames)"
         }
+        $authorityEvidenceRoot = Join-Path $profileSelfTestRoot 'protoc-authority-fresh-root'
+        $authorityPath = Join-Path $profileSelfTestRoot 'D32-VENDORED-PROTOC-AUTHORITY.json'
+        $authorityDocument = New-D32VendoredProtocAuthorityDocument -Repository $testRepository -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        $authorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $authorityPath -Document $authorityDocument
+        $authorityValidated = Test-D32VendoredProtocAuthority -AuthorityPath $authorityPath -ExpectedAuthoritySha256 $authorityReference.sha256 `
+            -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        & $add 'external locked-protoc authority V1 validates only its independently pinned bytes and absent canonical fresh root' `
+            ($authorityValidated.Reference.sha256 -ceq $authorityReference.sha256 -and -not (Test-Path -LiteralPath $authorityEvidenceRoot))
+
+        $oldAuthorityDocument = [ordered]@{}
+        foreach ($field in $authorityDocument.Keys) { $oldAuthorityDocument[$field] = $authorityDocument[$field] }
+        $oldAuthorityDocument.schema_version = 0
+        $oldAuthorityDocument.record_type = 'D32_VENDORED_PROTOC_AUTHORITY_V0'
+        $oldAuthorityPath = Join-Path $profileSelfTestRoot 'D32-VENDORED-PROTOC-AUTHORITY-old.json'
+        $oldAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $oldAuthorityPath -Document $oldAuthorityDocument
+        $oldAuthorityRejected = $false
+        try {
+            $null = Test-D32VendoredProtocAuthority -AuthorityPath $oldAuthorityPath -ExpectedAuthoritySha256 $oldAuthorityReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        }
+        catch { $oldAuthorityRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        & $add 'vendored-protoc authority rejects legacy and unknown record versions' $oldAuthorityRejected
+
+        $extraAuthorityDocument = [ordered]@{}
+        foreach ($field in $authorityDocument.Keys) { $extraAuthorityDocument[$field] = $authorityDocument[$field] }
+        $extraAuthorityDocument.unapproved = $true
+        $extraAuthorityPath = Join-Path $profileSelfTestRoot 'D32-VENDORED-PROTOC-AUTHORITY-extra.json'
+        $extraAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $extraAuthorityPath -Document $extraAuthorityDocument
+        $extraAuthorityRejected = $false
+        try {
+            $null = Test-D32VendoredProtocAuthority -AuthorityPath $extraAuthorityPath -ExpectedAuthoritySha256 $extraAuthorityReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        }
+        catch { $extraAuthorityRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        & $add 'vendored-protoc authority rejects extra fields and schema extension' $extraAuthorityRejected
+
+        $typedAuthorityDocument = [ordered]@{}
+        foreach ($field in $authorityDocument.Keys) { $typedAuthorityDocument[$field] = $authorityDocument[$field] }
+        $typedAuthorityDocument.toolchain_profile = [ordered]@{}
+        foreach ($field in $authorityDocument.toolchain_profile.Keys) { $typedAuthorityDocument.toolchain_profile[$field] = $authorityDocument.toolchain_profile[$field] }
+        $typedAuthorityDocument.toolchain_profile.bytes = [string]$typedAuthorityDocument.toolchain_profile.bytes
+        $typedAuthorityPath = Join-Path $profileSelfTestRoot 'D32-VENDORED-PROTOC-AUTHORITY-string-number.json'
+        $typedAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $typedAuthorityPath -Document $typedAuthorityDocument
+        $typedAuthorityRejected = $false
+        try {
+            $null = Test-D32VendoredProtocAuthority -AuthorityPath $typedAuthorityPath -ExpectedAuthoritySha256 $typedAuthorityReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        }
+        catch { $typedAuthorityRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        & $add 'vendored-protoc authority rejects string-coerced numeric identity fields' $typedAuthorityRejected
+
+        $wrongAuthorityCandidateRejected = $false
+        try {
+            $null = Test-D32VendoredProtocAuthority -AuthorityPath $authorityPath -ExpectedAuthoritySha256 $authorityReference.sha256 `
+                -Repository $testRepository -CandidateSha ('f' * 40) -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        }
+        catch { $wrongAuthorityCandidateRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        $wrongProfileAuthorityDocument = [ordered]@{}
+        foreach ($field in $authorityDocument.Keys) { $wrongProfileAuthorityDocument[$field] = $authorityDocument[$field] }
+        $wrongProfileAuthorityDocument.toolchain_profile = [ordered]@{}
+        foreach ($field in $authorityDocument.toolchain_profile.Keys) { $wrongProfileAuthorityDocument.toolchain_profile[$field] = $authorityDocument.toolchain_profile[$field] }
+        $wrongProfileAuthorityDocument.toolchain_profile.sha256 = '0' * 64
+        $wrongProfileAuthorityPath = Join-Path $profileSelfTestRoot 'D32-VENDORED-PROTOC-AUTHORITY-wrong-profile.json'
+        $wrongProfileAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $wrongProfileAuthorityPath -Document $wrongProfileAuthorityDocument
+        $wrongAuthorityProfileRejected = $false
+        try {
+            $null = Test-D32VendoredProtocAuthority -AuthorityPath $wrongProfileAuthorityPath -ExpectedAuthoritySha256 $wrongProfileAuthorityReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $authorityEvidenceRoot
+        }
+        catch { $wrongAuthorityProfileRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        $wrongAuthorityBindingDetail = 'candidate={0};profile={1}' -f $wrongAuthorityCandidateRejected,$wrongAuthorityProfileRejected
+        & $add 'vendored-protoc authority rejects mismatched candidate and caller Profile V2 pins' `
+            ($wrongAuthorityCandidateRejected -and $wrongAuthorityProfileRejected) $wrongAuthorityBindingDetail
+
+        $tamperedLockRepository = Join-Path $profileSelfTestRoot 'tampered-vita-lock-repository'
+        $tamperedLockVita = Join-Path $tamperedLockRepository 'vita-agent'
+        [void][IO.Directory]::CreateDirectory($tamperedLockVita)
+        $tamperedLockPath = Join-Path $tamperedLockVita 'Cargo.lock'
+        [IO.File]::Copy((Join-Path $testRepository 'vita-agent\Cargo.lock'), $tamperedLockPath)
+        $tamperedLockText = [IO.File]::ReadAllText($tamperedLockPath, [Text.Encoding]::UTF8).Replace(
+            '95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3', ('0' * 64))
+        [IO.File]::WriteAllText($tamperedLockPath, $tamperedLockText, [Text.UTF8Encoding]::new($false))
+        $tamperedLockRejected = $false
+        try { $null = Get-D32VendoredLockPackageRecords -Repository $tamperedLockRepository }
+        catch { $tamperedLockRejected = $_.Exception.Message -like '*VENDORED_PROTOC_LOCK_BLOCKED*' }
+        & $add 'locked protoc authority rejects modified Cargo.lock package checksum before any fetch/build' $tamperedLockRejected
+
+        $tamperedArchivePath = Join-Path $profileSelfTestRoot 'tampered-protoc-win32.crate'
+        [IO.File]::WriteAllBytes($tamperedArchivePath, [byte[]]@(0x44, 0x33, 0x32))
+        $tamperedArchiveRejected = $false
+        try { $null = Read-D32VendoredProtocArchive -ArchivePath $tamperedArchivePath }
+        catch { $tamperedArchiveRejected = $_.Exception.Message -like '*VENDORED_PROTOC_ARCHIVE_BLOCKED*' }
+        & $add 'vendored-protoc archive bytes/hash mismatch is rejected before tar member processing' $tamperedArchiveRejected
+
         $ownerBinding = New-D32Phase0FixtureOutputRoot -Path $fixtureOutputRoot -Repository $testRepository -ExpectedCandidateSha $candidate -ValidatedProfile $fakeProfile -RunId $runId
         $runRootIdentity = New-D32ProfileDirectoryCreateNew -Path $runRoot
         $cargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $cargoHome
@@ -3061,9 +3345,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $compactDirectoryCollisionRejected = $true }
         & $add 'fixed compact Cargo-home child refuses an existing-directory collision' $compactDirectoryCollisionRejected
         $schemaRejectPath = Join-Path $selfTestRoot 'D32-PHASE0-MATRIX.json'
-        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         foreach ($phase0SchemaCase in @(
-                [PSCustomObject]@{ Version = 2; Type = 'D32_PHASE0_MATRIX_RECORD_V2'; Name = 'prior V2' },
+                [PSCustomObject]@{ Version = 3; Type = 'D32_PHASE0_MATRIX_RECORD_V3'; Name = 'prior V3' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
             )) {
             $phase0SchemaDocument = [ordered]@{}
@@ -3073,7 +3357,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             [IO.File]::WriteAllText($schemaRejectPath, (ConvertTo-Json -InputObject $phase0SchemaDocument -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
             $phase0SchemaDigest = Get-D32ProfileFileSnapshot -Path $schemaRejectPath
             $phase0SchemaResult = Test-D32Phase0MatrixRecord -RecordPath $schemaRejectPath -ExpectedRecordSha256 $phase0SchemaDigest.Sha256 -Repository $testRepository -ExpectedCandidateSha $candidate -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest -GitPath 'C:\d32-phase0-selftest\git.exe' -GitSha256 ('b' * 64)
-            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 3*')
+            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 4*')
         }
         [IO.File]::Delete($schemaRejectPath)
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
@@ -3338,8 +3622,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
             }
         }
         $sidecar = [ordered]@{
-            schema_version = 3
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
+            schema_version = 4
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
             candidate_sha = $candidate
             source_repo = $testRepository
             fixture_manifest_path = $manifestSnapshot.Path
@@ -3368,14 +3652,21 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 run_id = $runId
             }
             process_traces = @($traceRecords.ToArray())
+            vendored_protoc_run_grant = [ordered]@{
+                path = (Join-Path $fixtureOutputRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json')
+                bytes = [Int64]1
+                sha256 = ('a' * 64)
+                volume_serial_hex = ('0' * 16)
+                file_id_hex = ('0' * 32)
+            }
         }
         $writeSidecar = { param($value) [IO.File]::WriteAllText($sidecarPath, (ConvertTo-Json -InputObject $value -Depth 12), [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
         & $writeSidecar $sidecar
         try {
             $validSidecar = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $fixtureOutputRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile
-            & $add 'fixture build provenance v3 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V3')
+            & $add 'fixture build provenance v4 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V4')
         }
-        catch { & $add 'fixture build provenance v3 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
+        catch { & $add 'fixture build provenance v4 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
 
         $vctipTraceProfile = [PSCustomObject]@{
             Profile = $fakeProfile.Profile
@@ -3428,6 +3719,82 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         catch { $vctipTraceFailure = $_.Exception.Message }
         & $add 'V2 process-trace validator accepts only an exact VCTIP image with the fixed Cargo root and retained parent chain' $vctipTraceAccepted ([string]$vctipTraceFailure)
+
+        $protocTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
+        $protocTraceImagePath = Join-Path $cargoHome 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+        $protocTraceImage = [PSCustomObject]@{
+            Path = $protocTraceImagePath; Bytes = [Int64]11934496
+            Sha256 = 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2'
+            VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef'
+        }
+        $protocTraceGrant = [PSCustomObject]@{
+            Image = $protocTraceImage
+            Document = [PSCustomObject]@{ cargo_home = [PSCustomObject]@{ path = $cargoHome } }
+        }
+        $protocTrace.processes[1].image_path = $protocTraceImage.Path
+        $protocTrace.processes[1].bytes = [Int64]$protocTraceImage.Bytes
+        $protocTrace.processes[1].sha256 = $protocTraceImage.Sha256
+        $protocTrace.processes[1].volume_serial_hex = $protocTraceImage.VolumeSerialHex
+        $protocTrace.processes[1].file_id_hex = $protocTraceImage.FileIdHex
+        $protocTrace.processes[1].allowed_image_reason = 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root'
+        $protocTraceFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $protocTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository -VendoredProtocGrant $protocTraceGrant
+            $protocTraceAccepted = $true
+        }
+        catch { $protocTraceFailure = $_.Exception.Message; $protocTraceAccepted = $false }
+        & $add 'V2 trace accepts only the exact locked protoc path and hFile identity under its owner-bound run CargoHome' $protocTraceAccepted ([string]$protocTraceFailure)
+        $protocTraceWithoutGrantRejected = $false
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $protocTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+        }
+        catch { $protocTraceWithoutGrantRejected = $_.Exception.Message -like '*outside exact pinned inventory*' }
+        & $add 'V2 trace denies locked protoc when the per-run owner grant is absent' $protocTraceWithoutGrantRejected
+        $protocTraceDriftRejected = $true
+        foreach ($mutation in @(
+            [PSCustomObject]@{ Field = 'bytes'; Value = [Int64]11934497 },
+            [PSCustomObject]@{ Field = 'sha256'; Value = ('0' * 64) },
+            [PSCustomObject]@{ Field = 'volume_serial_hex'; Value = '0123456789abcdee' },
+            [PSCustomObject]@{ Field = 'file_id_hex'; Value = '0123456789abcdef0123456789abcdee' }
+        )) {
+            $driftedProtocTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $protocTrace -Depth 12 -Compress)
+            $driftedProtocTrace.processes[1].($mutation.Field) = $mutation.Value
+            try {
+                $null = Test-D32Phase0DebugProcessTrace -Trace $driftedProtocTrace -ExpectedRootPath $fakeCargoPath `
+                    -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                    -ValidatedProfile $vctipTraceProfile -Repository $testRepository -VendoredProtocGrant $protocTraceGrant
+                $protocTraceDriftRejected = $false
+                break
+            }
+            catch { }
+        }
+        & $add 'V2 trace rejects protoc opened hFile bytes/hash/volume/file-ID drift' $protocTraceDriftRejected
+        $protocOldHomeTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $protocTrace -Depth 12 -Compress)
+        $protocOldHomeTrace.processes[1].image_path = Join-Path (Join-Path $selfTestRoot 'old-r-c') 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
+        $protocOldHomeTraceRejected = $false
+        $protocOldHomeTraceFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $protocOldHomeTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository -VendoredProtocGrant $protocTraceGrant
+        }
+        catch { $protocOldHomeTraceFailure = $_.Exception.Message; $protocOldHomeTraceRejected = $protocOldHomeTraceFailure -like '*PROCESS_TRACE_BLOCKED*' }
+        & $add 'V2 trace rejects a protoc image sourced from a prior/non-owner CargoHome' $protocOldHomeTraceRejected ([string]$protocOldHomeTraceFailure)
+        $renamedProtocTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $protocTrace -Depth 12 -Compress)
+        $renamedProtocTrace.processes[1].image_path = $protocTraceImagePath.Replace('protoc.exe', 'protoc-copy.exe')
+        $renamedProtocTraceRejected = $false
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $renamedProtocTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository -VendoredProtocGrant $protocTraceGrant
+        }
+        catch { $renamedProtocTraceRejected = $_.Exception.Message -like '*outside exact pinned inventory*' }
+        & $add 'V2 trace rejects copied or renamed vendored protoc content before evidence acceptance' $renamedProtocTraceRejected
+
         $unknownVctipParent = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
         $unknownVctipParent.process_events[1].parent_process_id = $vctipChildPid + 1
         $unknownVctipParentRejected = $false
@@ -3557,9 +3924,18 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $oldV2ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
         & $add 'fixture provenance rejects prior V2 compact-layout schema even with a fresh exact file' $oldV2ProvenanceRejected
 
+        $oldV3Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $oldV3Provenance.schema_version = 3
+        $oldV3Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
+        & $writeSidecar $oldV3Provenance
+        $oldV3ProvenanceRejected = $false
+        try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
+        catch { $oldV3ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
+        & $add 'fixture provenance rejects prior V3 after the vendored-authority migration' $oldV3ProvenanceRejected
+
         $unknownV4Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
-        $unknownV4Provenance.schema_version = 4
-        $unknownV4Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
+        $unknownV4Provenance.schema_version = 5
+        $unknownV4Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
         & $writeSidecar $unknownV4Provenance
         $unknownV4ProvenanceRejected = $false
         try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
@@ -3716,11 +4092,11 @@ if ($Phase0SelfTest) {
 }
 
 if ([String]::IsNullOrWhiteSpace($Phase0RepoRoot)) { $Phase0RepoRoot = Split-Path -Parent $script:D32Phase0ScriptRoot }
-foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256))) {
+foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256), @('VendoredProtocAuthorityPath', $Phase0VendoredProtocAuthorityPath), @('ExpectedVendoredProtocAuthoritySha256', $Phase0ExpectedVendoredProtocAuthoritySha256))) {
     if ([String]::IsNullOrWhiteSpace([string]$required[1])) { Write-Output "D32 Phase0: BLOCKED — -$($required[0]) is required"; exit 2 }
 }
 try {
-    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -TimeoutSeconds $Phase0TimeoutSeconds
+    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds
     if ($result.Success) { exit 0 }
     exit 1
 }

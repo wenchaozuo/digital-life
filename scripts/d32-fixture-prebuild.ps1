@@ -4742,6 +4742,41 @@ function Reset-D32FixturePhaseProcessEvidence {
     $script:D32LastProcessEvidence = $null
 }
 
+function Get-D32FixtureFailurePayloadSelection {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$PendingFailures,
+        [AllowNull()][object]$TerminalFailure,
+        [AllowNull()][string]$GlobalCleanupError
+    )
+
+    $selected = $TerminalFailure
+    $secondary = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $selected) {
+        if ($PendingFailures.Count -eq 0) { return $null }
+        # For ordinary nonzero exits, all fixed phases are attempted. Bind the
+        # one failure payload to the last failed phase in contract order and
+        # retain earlier failures as secondary context.
+        $selected = $PendingFailures[$PendingFailures.Count - 1]
+        for ($index = 0; $index -lt ($PendingFailures.Count - 1); $index++) {
+            $secondary.Add([string]$PendingFailures[$index].error)
+        }
+    }
+    else {
+        # A later fatal phase supersedes ordinary failures as the payload's
+        # process/trace/cleanup source; prior ordinary failures remain secondary.
+        foreach ($failure in $PendingFailures) { $secondary.Add([string]$failure.error) }
+    }
+    if (-not [String]::IsNullOrWhiteSpace($GlobalCleanupError)) { $secondary.Add($GlobalCleanupError) }
+    return [PSCustomObject]@{
+        Name = [string]$selected.name
+        Arguments = @($selected.arguments)
+        ProcessResult = $selected.process_result
+        PhaseLogPath = [string]$selected.phase_log
+        PrimaryError = [string]$selected.error
+        SecondaryErrors = @($secondary.ToArray())
+    }
+}
+
 function Write-D32FixturePhase0FailurePayload {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -5812,6 +5847,26 @@ function Invoke-D32SelfTest {
         }
         finally { $script:D32LastProcessEvidence = $priorProcessEvidence }
 
+        $ordinaryFailures = @(
+            [PSCustomObject]@{ name = 'fixture-2'; arguments = @('build', '--bin', 'fixture-2'); process_result = [PSCustomObject]@{ process_trace = [PSCustomObject]@{ state = 'BLOCKED'; marker = 'ordinary-2' }; native_cleanup = [PSCustomObject]@{ cleanup_succeeded = $true } }; phase_log = 'fixture-2.log'; error = 'fixture-2 exited nonzero' },
+            [PSCustomObject]@{ name = 'fixture-4'; arguments = @('build', '--bin', 'fixture-4'); process_result = [PSCustomObject]@{ process_trace = [PSCustomObject]@{ state = 'BLOCKED'; marker = 'ordinary-4' }; native_cleanup = [PSCustomObject]@{ cleanup_succeeded = $true } }; phase_log = 'fixture-4.log'; error = 'fixture-4 exited nonzero' }
+        )
+        $ordinarySelection = Get-D32FixtureFailurePayloadSelection -PendingFailures $ordinaryFailures -GlobalCleanupError 'global cleanup verification failed'
+        $terminalFailure = [PSCustomObject]@{
+            name = 'fixture-5'; arguments = @('build', '--bin', 'fixture-5')
+            process_result = [PSCustomObject]@{ process_trace = [PSCustomObject]@{ state = 'BLOCKED'; marker = 'terminal-fatal-trace' }; native_cleanup = [PSCustomObject]@{ cleanup_succeeded = $false; marker = 'terminal-fatal-cleanup' } }
+            phase_log = 'fixture-5.log'; error = 'fixture-5 failed fatally'
+        }
+        $terminalSelection = Get-D32FixtureFailurePayloadSelection -PendingFailures @($ordinaryFailures[0]) -TerminalFailure $terminalFailure
+        if ($ordinarySelection.Name -cne 'fixture-4' -or $ordinarySelection.PrimaryError -cne 'fixture-4 exited nonzero' -or
+            $ordinarySelection.SecondaryErrors[0] -cne 'fixture-2 exited nonzero' -or $ordinarySelection.SecondaryErrors[1] -cne 'global cleanup verification failed' -or
+            $terminalSelection.Name -cne 'fixture-5' -or $terminalSelection.ProcessResult.process_trace.marker -cne 'terminal-fatal-trace' -or
+            $terminalSelection.ProcessResult.native_cleanup.marker -cne 'terminal-fatal-cleanup' -or
+            $terminalSelection.SecondaryErrors.Count -ne 1 -or $terminalSelection.SecondaryErrors[0] -cne 'fixture-2 exited nonzero') {
+            throw 'SELFTEST_FAILED: blocked payload selection did not prefer the terminal failing phase trace/cleanup while retaining earlier failures'
+        }
+        $passed++
+
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
         Write-Host 'D32_FIXTURE_TRUST_CONTRACT=pins:-PinnedGitPath,-PinnedGitSha256,-ExpectedCandidateSha,-ToolchainProfilePath,-ExpectedToolchainProfileSha256; d31-target:OutputRoot\d31-recovery-seeder-target; d31-record:sibling-d31-recovery-seeder-build.json; d31-env:D31_RECOVERY_SEEDER_RECORD_PATH,D31_RECOVERY_SEEDER_RECORD_SHA256,D31_RECOVERY_SEEDER_RUN_ID,D32_BUILD_TOOLCHAIN_PROFILE_PATH,D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256; profile:D32_BUILD_TOOLCHAIN_PROFILE_V2'
@@ -6393,6 +6448,12 @@ public static class D32DebugSelfTestLauncher
             using (Process child = Start(args[2], new string[] { "exit", args[3] }))
                 return child.WaitForExit(10000) ? 0 : 47;
         }
+        if (mode == "spawn-protoc")
+        {
+            if (args.Length < 4) return 48;
+            using (Process child = Start(args[2], new string[] { "exit", args[3] }))
+                return child.WaitForExit(10000) ? 0 : 49;
+        }
         if (mode == "spawn-cmd")
         {
             if (args.Length < 3) return 44;
@@ -6618,6 +6679,30 @@ public static class D32DebugSelfTestLauncher
             throw "SELFTEST_FAILED: copied/unprofiled VCTIP did not remain uncontinued with no child marker and complete V2 cleanup: $($copiedVctipAttempt.Trace.BlockReason); $($copiedVctipAttempt.Cleanup.Detail)"
         }
         Write-Host 'D32_VCTIP_NEGATIVE=copied_unprofiled_child:PASS uncontinued_create_calls=0 child_marker=false job_active=0'
+        $passed++
+
+        $protocUnapprovedPath = Join-Path $root 'protoc.exe'
+        [IO.File]::Copy($debugLauncherPath, $protocUnapprovedPath)
+        $protocRootMarker = Join-Path $root 'd32-unapproved-protoc-root.marker'
+        $protocChildMarker = Join-Path $root 'd32-unapproved-protoc-child.marker'
+        $protocCreateDenied = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath `
+            -Arguments @('spawn-protoc', $protocRootMarker, $protocUnapprovedPath, $protocChildMarker) `
+            -WorkingDirectory $root -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
+        $protocDeniedTrace = ConvertTo-D32DebugProcessTraceDocument -Trace $protocCreateDenied.Trace
+        if ($protocDeniedTrace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or $protocDeniedTrace.schema_version -ne 2 -or
+            $protocDeniedTrace.state -cne 'BLOCKED' -or $protocDeniedTrace.block_reason -notmatch 'vendored protoc descendant does not match the exact per-run locked Cargo source pin' -or
+            $protocDeniedTrace.uncontinued_create_process_id -le 0 -or $protocDeniedTrace.uncontinued_create_continue_call_count -ne 0 -or
+            $protocDeniedTrace.process_create_event_count -lt 1 -or -not [bool]$protocDeniedTrace.job_accounting_verified -or
+            -not (Test-Path -LiteralPath $protocRootMarker) -or
+            (Test-Path -LiteralPath $protocChildMarker) -or $protocCreateDenied.ContinueCalls -le 0 -or
+            -not $protocCreateDenied.Cleanup.CleanupSucceeded -or -not $protocCreateDenied.Cleanup.ProcessWaitSignaled -or
+            -not $protocCreateDenied.Cleanup.DebuggerThreadExited -or -not $protocCreateDenied.Cleanup.DebuggerThreadJoined -or
+            -not $protocCreateDenied.Cleanup.DebuggerKillOnExitEnabled -or -not $protocCreateDenied.Cleanup.RetainedProcessHandlesSignaled -or
+            -not $protocCreateDenied.Cleanup.DebuggerAssociationQueryVerified -or -not $protocCreateDenied.Cleanup.DebuggerAssociationAbsent -or
+            -not $protocCreateDenied.Cleanup.JobActiveProcessCountVerified -or [uint32]$protocCreateDenied.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: ungranted protoc CREATE did not remain uncontinued with no child marker and complete V2 debugger/Job cleanup: $($protocDeniedTrace.block_reason); $($protocCreateDenied.Cleanup.Detail)"
+        }
+        Write-Host 'D32_PROTOC_CREATE_NEGATIVE=PASS uncontinued_create_calls=0 child_marker=false V2_trace=BLOCKED debugger_joined=true handles_signaled=true debugger_absent=true job_active=0'
         $passed++
 
         foreach ($commandTarget in @([PSCustomObject]@{ Name = 'absolute-cmd'; Command = $cmdScriptPath }, [PSCustomObject]@{ Name = 'PATH-cmd'; Command = 'd32-debug-no-launch.cmd' })) {
@@ -8406,9 +8491,16 @@ try {
         }
         catch {
             $primaryFailure = $_.Exception.Message
-            $secondary = @($pendingFixtureFailures | ForEach-Object { [string]$_.error })
+            $terminalFailure = [PSCustomObject]@{
+                name = [string]$spec.name
+                arguments = @($arguments)
+                process_result = $processResult
+                phase_log = $phaseLog
+                error = $primaryFailure
+            }
+            $payloadSelection = Get-D32FixtureFailurePayloadSelection -PendingFailures @($pendingFixtureFailures.ToArray()) -TerminalFailure $terminalFailure
             try {
-                Write-D32FixturePhase0FailurePayload -Name ([string]$spec.name) -Executable $cargo -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $processResult -PrimaryError $primaryFailure -SecondaryErrors $secondary -PhaseLogPath $phaseLog
+                Write-D32FixturePhase0FailurePayload -Name $payloadSelection.Name -Executable $cargo -Arguments $payloadSelection.Arguments -WorkingDirectory $RepoRoot -ProcessResult $payloadSelection.ProcessResult -PrimaryError $payloadSelection.PrimaryError -SecondaryErrors $payloadSelection.SecondaryErrors -PhaseLogPath $payloadSelection.PhaseLogPath
             }
             catch { $primaryFailure += '; phase0 failure-capture error=' + $_.Exception.Message }
             throw $primaryFailure
@@ -8552,19 +8644,18 @@ if ($null -ne $globalProcessError) { $allProcessErrors += $globalProcessError }
 $manifestProcessError = if ($allProcessErrors.Count -eq 0) { $null } else { $allProcessErrors -join ' | ' }
 
 if ($pendingFixtureFailures.Count -gt 0) {
-    $firstFailure = $pendingFixtureFailures[0]
-    $secondaryFailures = @($pendingFixtureFailures | Select-Object -Skip 1 | ForEach-Object { [string]$_.error })
-    if ($null -ne $manifestProcessError) { $secondaryFailures += "FIXTURE_GLOBAL_CLEANUP_BLOCKED: $manifestProcessError" }
+    $payloadSelection = Get-D32FixtureFailurePayloadSelection -PendingFailures @($pendingFixtureFailures.ToArray()) `
+        -GlobalCleanupError $(if ($null -ne $manifestProcessError) { "FIXTURE_GLOBAL_CLEANUP_BLOCKED: $manifestProcessError" } else { $null })
     try {
         Write-D32FixturePhase0FailurePayload `
-            -Name ([string]$firstFailure.name) `
+            -Name $payloadSelection.Name `
             -Executable $cargo `
-            -Arguments @($firstFailure.arguments) `
+            -Arguments $payloadSelection.Arguments `
             -WorkingDirectory $RepoRoot `
-            -ProcessResult $firstFailure.process_result `
-            -PrimaryError ([string]$firstFailure.error) `
-            -SecondaryErrors $secondaryFailures `
-            -PhaseLogPath ([string]$firstFailure.phase_log)
+            -ProcessResult $payloadSelection.ProcessResult `
+            -PrimaryError $payloadSelection.PrimaryError `
+            -SecondaryErrors $payloadSelection.SecondaryErrors `
+            -PhaseLogPath $payloadSelection.PhaseLogPath
     }
     catch { Write-Output "D32_PHASE0_BLOCKED_DIAGNOSTIC_CAPTURE_ERROR:$($_.Exception.Message)" }
 }

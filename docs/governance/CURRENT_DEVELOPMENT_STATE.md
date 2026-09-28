@@ -34,6 +34,7 @@ SC-D32-V1 的建立日期不声称存在先前 ratification；它以列明的 e9
 - [ ] Phase 1：两条固定 locked release Cargo commands、fresh 三件 flat artifacts、bundle manifest 和 sibling attestation
 - [ ] 完整 post-bundle aggregate，bundle hashes = VERIFIED
 - [ ] 十个 D31 real-process cases（Phase 0 期间明确 NOT RUN）
+- [ ] Post-aggregate D31 recovery-seeder use is blocked until its separate fresh run/home owner marker, per-run grant, and D32-only companion helper-auth/trace attestation are implemented and validated; the Phase0/Phase1 grant is never reusable.
 - [ ] 适用且用户已授权 provider 时运行四个 D29G2 real-provider cases；未授权时不得把 NOT RUN 记为 PASS
 - [ ] 八个按 SC-D32-V1 固定顺序运行的 real Host modes 与全部适用 negative evidence
 - [ ] 对同一 exact candidate 完成 Codex Red Team review 和 Luna High whole-candidate gate
@@ -52,7 +53,7 @@ Phase 0、Phase 1、full aggregate、D31 real-process、适用 D29G2 provider、
 2. 按 ADR-D32-PHASE0-TOOLCHAIN-PROFILE 完成 Phase 0 五个 fixture phases、full local suites 和 named checks。Phase 0 不运行 release build、D31 real-process/seeder、provider request、physical capture 或 Host real canary。
 3. Phase 0 通过后，只运行 ADR-D32-EVIDENCE-BUNDLE-V1 指定的两条 fixed locked release Cargo argv，生成 fresh 三件 flat artifacts、manifest 和 sibling attestation。
 4. 立即验证 schema、SHA、commands、hashes/bytes/file identities、flat layout、runtime_resources = []、Tauri resource map 与 clean state；随后完成 full §16.1.5 aggregate，bundle hashes = VERIFIED。
-5. Aggregate 通过后完成十个 D31 real-process cases，以及适用且用户已授权的四个 D29G2 provider cases。三个 interactive/physical capture cases 继续标为 N/A — NOT RUN。
+5. Aggregate 通过后，先完成独立 D31 recovery-seeder grant/companion-attestation 批次并由 Coordinator/Luna High 验证，方可运行依赖该 seeder 的 D31 real-process case；它必须使用 fresh seeder run/home、create-new owner marker 和独立 per-run grant，绝不复用 Phase0/Phase1 grant。随后完成十个 D31 real-process cases，以及适用且用户已授权的四个 D29G2 provider cases。三个 interactive/physical capture cases 继续标为 N/A — NOT RUN。
 6. 在同一 exact candidate 上按 SC-D32-V1 的精确顺序运行八个 Host real-canary modes，并建立 required negative evidence。
 7. 对同一个 clean exact candidate 完成 Codex Red Team 和 Luna High gate。Repair 后新 SHA 必须重建受影响 evidence 并重新 gate。
 8. Luna High PASS 后交 Sol Max 做 D32 closure。任务在 D32 结束；不做 D33 规划或 Stage Contract。

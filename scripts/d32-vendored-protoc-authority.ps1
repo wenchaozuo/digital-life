@@ -271,6 +271,37 @@ function Test-D32VendoredProtocAuthority {
     return [PSCustomObject]@{ Document = $document; Reference = [ordered]@{ path = $snapshot.Path; bytes = $snapshot.Bytes; sha256 = $snapshot.Sha256; volume_serial_hex = $snapshot.VolumeSerialHex; file_id_hex = $snapshot.FileIdHex }; Snapshot = $snapshot }
 }
 
+function Read-D32VendoredProtocTarMembers {
+    param([Parameter(Mandatory = $true)][IO.Stream]$TarStream)
+    $reader = [System.Formats.Tar.TarReader]::new($TarStream, $true)
+    $files = [System.Collections.Generic.Dictionary[string, byte[]]]::new([StringComparer]::OrdinalIgnoreCase)
+    $expectedPrefix = $script:D32VendoredProtocPackageRoot + '/'
+    $expanded = [Int64]0
+    try {
+        while ($null -ne ($entry = $reader.GetNextEntry($false))) {
+            if ($entry.EntryType -ne [System.Formats.Tar.TarEntryType]::RegularFile) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: non-regular/special tar member is forbidden' }
+            $name = [string]$entry.Name
+            if ([String]::IsNullOrEmpty($name) -or $name.IndexOf([char]92) -ge 0 -or $name.Contains(':') -or $name.StartsWith('/') -or -not $name.StartsWith($expectedPrefix, [StringComparison]::Ordinal)) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member is not in the exact package root or uses an alias' }
+            $relative = $name.Substring($expectedPrefix.Length)
+            $parts = @($relative.Split('/'))
+            if ($parts.Count -eq 0 -or @($parts | Where-Object { [String]::IsNullOrEmpty($_) -or $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member contains an empty/dot/traversal component' }
+            if ($entry.Length -lt 0 -or $entry.Length -gt 50000000 -or $expanded + [Int64]$entry.Length -gt 50000000) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member size exceeds the fixed archive bound' }
+            if ($files.ContainsKey($relative)) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: duplicate or case-colliding tar member' }
+            $memory = [IO.MemoryStream]::new()
+            try {
+                if ($null -eq $entry.DataStream) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: regular tar member has no data stream' }
+                $entry.DataStream.CopyTo($memory)
+                if ($memory.Length -ne [Int64]$entry.Length) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member byte count differs from its header' }
+                $files.Add($relative, $memory.ToArray())
+                $expanded += [Int64]$entry.Length
+            }
+            finally { $memory.Dispose() }
+        }
+    }
+    finally { $reader.Dispose() }
+    return [PSCustomObject]@{ Files = $files; ExpandedBytes = $expanded }
+}
+
 function Read-D32VendoredProtocArchive {
     param([Parameter(Mandatory = $true)][string]$ArchivePath)
     if (-not (Test-D32ProfileNoReparsePath -Path $ArchivePath)) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: locked archive path is missing or reparse-backed' }
@@ -283,32 +314,9 @@ function Read-D32VendoredProtocArchive {
         if ($before.Bytes -ne $script:D32VendoredProtocArchiveBytes -or $before.Sha256 -cne $script:D32VendoredProtocWin32Checksum) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: archive bytes/hash do not match the exact locked win32 crate' }
         $stream.Position = 0
         $gzip = [IO.Compression.GZipStream]::new($stream, [IO.Compression.CompressionMode]::Decompress, $true)
-        $reader = [System.Formats.Tar.TarReader]::new($gzip, $true)
-        $files = [System.Collections.Generic.Dictionary[string, byte[]]]::new([StringComparer]::OrdinalIgnoreCase)
-        $expectedPrefix = $script:D32VendoredProtocPackageRoot + '/'
-        $expanded = [Int64]0
-        try {
-            while ($null -ne ($entry = $reader.GetNextEntry($false))) {
-                if ($entry.EntryType -ne [System.Formats.Tar.TarEntryType]::RegularFile) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: non-regular/special tar member is forbidden' }
-                $name = [string]$entry.Name
-                if ([String]::IsNullOrEmpty($name) -or $name.IndexOf([char]92) -ge 0 -or $name.Contains(':') -or $name.StartsWith('/') -or -not $name.StartsWith($expectedPrefix, [StringComparison]::Ordinal)) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member is not in the exact package root or uses an alias' }
-                $relative = $name.Substring($expectedPrefix.Length)
-                $parts = @($relative.Split('/'))
-                if ($parts.Count -eq 0 -or @($parts | Where-Object { [String]::IsNullOrEmpty($_) -or $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member contains an empty/dot/traversal component' }
-                if ($entry.Length -lt 0 -or $entry.Length -gt 50000000 -or $expanded + [Int64]$entry.Length -gt 50000000) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member size exceeds the fixed archive bound' }
-                if ($files.ContainsKey($relative)) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: duplicate or case-colliding tar member' }
-                $memory = [IO.MemoryStream]::new()
-                try {
-                    if ($null -eq $entry.DataStream) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: regular tar member has no data stream' }
-                    $entry.DataStream.CopyTo($memory)
-                    if ($memory.Length -ne [Int64]$entry.Length) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: tar member byte count differs from its header' }
-                    $files.Add($relative, $memory.ToArray())
-                    $expanded += [Int64]$entry.Length
-                }
-                finally { $memory.Dispose() }
-            }
-        }
-        finally { $reader.Dispose(); $gzip.Dispose() }
+        try { $members = Read-D32VendoredProtocTarMembers -TarStream $gzip }
+        finally { $gzip.Dispose() }
+        $files = $members.Files
         if ($files.Count -ne 21 -or -not $files.ContainsKey('bin/protoc.exe')) { throw 'VENDORED_PROTOC_ARCHIVE_BLOCKED: package entry inventory differs from the unique approved archive' }
         $image = $files['bin/protoc.exe']
         $imageSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($image)).ToLowerInvariant()

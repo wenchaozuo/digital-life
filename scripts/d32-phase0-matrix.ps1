@@ -3146,6 +3146,67 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $tamperedArchiveRejected = $_.Exception.Message -like '*VENDORED_PROTOC_ARCHIVE_BLOCKED*' }
         & $add 'vendored-protoc archive bytes/hash mismatch is rejected before tar member processing' $tamperedArchiveRejected
 
+        function New-D32Phase0SelfTestTarGzip {
+            param([Parameter(Mandatory = $true)][object[]]$Entries)
+            $memory = [IO.MemoryStream]::new()
+            $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Compress, $true)
+            $writer = [System.Formats.Tar.TarWriter]::new($gzip, [System.Formats.Tar.TarEntryFormat]::Pax, $true)
+            try {
+                foreach ($spec in $Entries) {
+                    $tarEntry = [System.Formats.Tar.PaxTarEntry]::new([System.Formats.Tar.TarEntryType]$spec.type, [string]$spec.name)
+                    if ($tarEntry.EntryType -eq [System.Formats.Tar.TarEntryType]::RegularFile) {
+                        $entryData = [IO.MemoryStream]::new([byte[]]$spec.bytes)
+                        try { $tarEntry.DataStream = $entryData; $writer.WriteEntry($tarEntry) }
+                        finally { $entryData.Dispose() }
+                    }
+                    else {
+                        if (-not [String]::IsNullOrWhiteSpace([string]$spec.link_name)) { $tarEntry.LinkName = [string]$spec.link_name }
+                        $writer.WriteEntry($tarEntry)
+                    }
+                }
+                $writer.Dispose(); $writer = $null
+                $gzip.Dispose(); $gzip = $null
+                return ,$memory.ToArray()
+            }
+            finally {
+                if ($null -ne $writer) { $writer.Dispose() }
+                if ($null -ne $gzip) { $gzip.Dispose() }
+                $memory.Dispose()
+            }
+        }
+        $tarPrefix = $script:D32VendoredProtocPackageRoot
+        $regularTarEntry = { param($name) [PSCustomObject]@{ type = [System.Formats.Tar.TarEntryType]::RegularFile; name = $name; bytes = [byte[]]@(0x44, 0x33, 0x32); link_name = $null } }
+        $duplicateEntryA = & $regularTarEntry "$tarPrefix/Cargo.toml"
+        $duplicateEntryB = & $regularTarEntry "$tarPrefix/Cargo.toml"
+        $caseEntryA = & $regularTarEntry "$tarPrefix/Bin/protoc.exe"
+        $caseEntryB = & $regularTarEntry "$tarPrefix/bin/protoc.exe"
+        $malformedTarCases = @(
+            [PSCustomObject]@{ name = 'traversal component'; entries = @(& $regularTarEntry "$tarPrefix/../escape") },
+            [PSCustomObject]@{ name = 'backslash alias'; entries = @(& $regularTarEntry "$tarPrefix/bin\protoc.exe") },
+            [PSCustomObject]@{ name = 'foreign package root'; entries = @(& $regularTarEntry 'different-package-3.2.0/bin/protoc.exe') },
+            [PSCustomObject]@{ name = 'duplicate member'; entries = @($duplicateEntryA, $duplicateEntryB) },
+            [PSCustomObject]@{ name = 'case-colliding member'; entries = @($caseEntryA, $caseEntryB) },
+            [PSCustomObject]@{ name = 'special symbolic link'; entries = @([PSCustomObject]@{ type = [System.Formats.Tar.TarEntryType]::SymbolicLink; name = "$tarPrefix/link"; bytes = [byte[]]@(); link_name = '../outside' }) }
+        )
+        $malformedTarFailures = [System.Collections.Generic.List[string]]::new()
+        foreach ($tarCase in $malformedTarCases) {
+            $compressedTar = New-D32Phase0SelfTestTarGzip -Entries @($tarCase.entries)
+            $compressedMemory = [IO.MemoryStream]::new([byte[]]$compressedTar)
+            $tarGzip = [IO.Compression.GZipStream]::new($compressedMemory, [IO.Compression.CompressionMode]::Decompress, $true)
+            $rejectedTar = $false
+            try { $null = Read-D32VendoredProtocTarMembers -TarStream $tarGzip }
+            catch { $rejectedTar = $_.Exception.Message -like '*VENDORED_PROTOC_ARCHIVE_BLOCKED*' }
+            finally { $tarGzip.Dispose(); $compressedMemory.Dispose() }
+            if (-not $rejectedTar) { $malformedTarFailures.Add([string]$tarCase.name) }
+        }
+        & $add 'tar parser rejects traversal, separators/aliases, foreign root, duplicate/case-colliding and special members' `
+            ($malformedTarFailures.Count -eq 0) (($malformedTarFailures -join '|'))
+
+        $runAuthorityPath = Join-Path $profileSelfTestRoot 'D32-PHASE0-VENDORED-PROTOC-AUTHORITY-RUN.json'
+        $runAuthorityDocument = New-D32VendoredProtocAuthorityDocument -Repository $testRepository -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot
+        $runAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $runAuthorityPath -Document $runAuthorityDocument
+
         $ownerBinding = New-D32Phase0FixtureOutputRoot -Path $fixtureOutputRoot -Repository $testRepository -ExpectedCandidateSha $candidate -ValidatedProfile $fakeProfile -RunId $runId
         $runRootIdentity = New-D32ProfileDirectoryCreateNew -Path $runRoot
         $cargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $cargoHome
@@ -3153,6 +3214,103 @@ function Test-D32Phase0MatrixRecordSelfTest {
         $null = Test-D32ProfileDirectoryIdentity -Path $runRoot -VolumeSerialHex $runRootIdentity.VolumeSerialHex -FileIdHex $runRootIdentity.FileIdHex
         $null = Test-D32ProfileDirectoryIdentity -Path $cargoHome -VolumeSerialHex $cargoHomeIdentity.VolumeSerialHex -FileIdHex $cargoHomeIdentity.FileIdHex
         $null = Test-D32ProfileDirectoryIdentity -Path $tempRoot -VolumeSerialHex $tempRootIdentity.VolumeSerialHex -FileIdHex $tempRootIdentity.FileIdHex
+
+        $archiveSourcePath = Join-Path (Join-Path $env:USERPROFILE '.cargo') $script:D32VendoredProtocArchiveRelativePath
+        if (-not (Test-D32ProfileNoReparsePath -Path $archiveSourcePath)) { throw 'PHASE0_SELFTEST_BLOCKED: read-only source cache lacks the exact approved protoc archive' }
+        $archiveSourceSnapshot = Get-D32ProfileFileSnapshot -Path $archiveSourcePath
+        if ($archiveSourceSnapshot.Bytes -ne $script:D32VendoredProtocArchiveBytes -or $archiveSourceSnapshot.Sha256 -cne $script:D32VendoredProtocWin32Checksum) {
+            throw 'PHASE0_SELFTEST_BLOCKED: read-only source cache archive is not the exact approved locked crate'
+        }
+        $runArchivePath = Join-Path $cargoHome $script:D32VendoredProtocArchiveRelativePath
+        $null = Ensure-D32VendoredDirectoryChain -Path (Split-Path -Parent $runArchivePath) -Boundary $cargoHome
+        [IO.File]::Copy($archiveSourcePath, $runArchivePath, $false)
+        $runGrant = New-D32VendoredProtocRunGrant -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 `
+            -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot `
+            -OwnerMarkerReference $ownerBinding.OwnerMarker -RunId $runId -CargoHome $cargoHome
+        $runGrantValidated = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome $cargoHome `
+            -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        & $add 'run grant validates one owner-bound fresh home and materializes only exact locked source/image bytes' `
+            ($runGrantValidated.Image.Sha256 -ceq $script:D32VendoredProtocImageSha256 -and
+                $runGrantValidated.Image.Bytes -eq $script:D32VendoredProtocImageBytes -and
+                (Test-D32ProfilePathEqual -Left $runGrantValidated.Image.Path -Right (Join-Path (Join-Path $cargoHome $script:D32VendoredProtocSourceRelativePath) 'bin\protoc.exe')) -and
+                (Test-D32ProfileDirectoryIdentity -Path $cargoHome -VolumeSerialHex $cargoHomeIdentity.VolumeSerialHex -FileIdHex $cargoHomeIdentity.FileIdHex) -and
+                $runGrantValidated.Reference.sha256 -ceq $runGrant.Reference.sha256)
+
+        $wrongRunGrantRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId ('f' * 32) -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongRunGrantRejected = $_.Exception.Message -like '*VENDORED_PROTOC_GRANT_BLOCKED*' }
+        $wrongRootGrantRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot (Join-Path $profileSelfTestRoot 'different-root') -ExpectedRunId $runId -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongRootGrantRejected = $_.Exception.Message -like '*VENDORED_PROTOC_BLOCKED*' -or $_.Exception.Message -like '*VENDORED_PROTOC_GRANT_BLOCKED*' }
+        $wrongHomeGrantRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome (Join-Path $runRoot 'old-c') `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongHomeGrantRejected = $_.Exception.Message -like '*VENDORED_PROTOC_GRANT_BLOCKED*' }
+        $wrongOwnerReference = [ordered]@{}
+        foreach ($field in $ownerBinding.OwnerMarker.Keys) { $wrongOwnerReference[$field] = $ownerBinding.OwnerMarker[$field] }
+        $wrongOwnerReference.file_id_hex = ('f' * 32)
+        $wrongOwnerGrantRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $wrongOwnerReference
+        }
+        catch { $wrongOwnerGrantRejected = $_.Exception.Message -like '*VENDORED_PROTOC_GRANT_BLOCKED*' }
+        $wrongAuthorityGrantRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $runGrant.Reference -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 ('0' * 64) -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongAuthorityGrantRejected = $_.Exception.Message -like '*VENDORED_PROTOC_AUTHORITY_BLOCKED*' }
+        $wrongGrantReferenceHash = [ordered]@{}
+        foreach ($field in $runGrant.Reference.Keys) { $wrongGrantReferenceHash[$field] = $runGrant.Reference[$field] }
+        $wrongGrantReferenceHash.sha256 = ('0' * 64)
+        $wrongGrantHashRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $wrongGrantReferenceHash -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongGrantHashRejected = $_.Exception.Message -like '*VENDORED_PROTOC_BLOCKED*' }
+        $wrongGrantReferenceIdentity = [ordered]@{}
+        foreach ($field in $runGrant.Reference.Keys) { $wrongGrantReferenceIdentity[$field] = $runGrant.Reference[$field] }
+        $wrongGrantReferenceIdentity.file_id_hex = ('f' * 32)
+        $wrongGrantIdentityRejected = $false
+        try {
+            $null = Test-D32VendoredProtocRunGrant -Reference $wrongGrantReferenceIdentity -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $fixtureOutputRoot -ExpectedRunId $runId -CargoHome $cargoHome `
+                -AuthorityPath $runAuthorityPath -AuthoritySha256 $runAuthorityReference.sha256 -OwnerMarkerReference $ownerBinding.OwnerMarker
+        }
+        catch { $wrongGrantIdentityRejected = $_.Exception.Message -like '*VENDORED_PROTOC_BLOCKED*' }
+        & $add 'run grant rejects stale/wrong run, root, CargoHome, owner marker, caller authority SHA, and grant hash/file identity' `
+            ($wrongRunGrantRejected -and $wrongRootGrantRejected -and $wrongHomeGrantRejected -and $wrongOwnerGrantRejected -and
+                $wrongAuthorityGrantRejected -and $wrongGrantHashRejected -and $wrongGrantIdentityRejected) `
+            ("run=$wrongRunGrantRejected;root=$wrongRootGrantRejected;home=$wrongHomeGrantRejected;owner=$wrongOwnerGrantRejected;authority=$wrongAuthorityGrantRejected;hash=$wrongGrantHashRejected;identity=$wrongGrantIdentityRejected")
+
+        $mismatchedSourceTreeRejected = $false
+        $mutatedRelativePath = @($runGrant.Archive.Files.Keys | Where-Object { $_ -cne 'bin/protoc.exe' })[0]
+        if ([String]::IsNullOrWhiteSpace([string]$mutatedRelativePath)) { throw 'PHASE0_SELFTEST_BLOCKED: exact package archive has no non-image member for source-tree mismatch test' }
+        $mutatedSourcePath = Join-Path $runGrant.SourcePath ([string]$mutatedRelativePath.Replace('/', '\'))
+        $mutatedSourceBytes = [IO.File]::ReadAllBytes($mutatedSourcePath)
+        if ($mutatedSourceBytes.Length -eq 0) { throw 'PHASE0_SELFTEST_BLOCKED: selected source-tree member is unexpectedly empty' }
+        $mutatedSourceBytes[0] = [byte]($mutatedSourceBytes[0] -bxor 0xff)
+        [IO.File]::WriteAllBytes($mutatedSourcePath, $mutatedSourceBytes)
+        try { $null = Ensure-D32VendoredProtocSource -CargoHome $cargoHome -Authority $runGrantValidated.Authority }
+        catch { $mismatchedSourceTreeRejected = $_.Exception.Message -like '*VENDORED_PROTOC_SOURCE_BLOCKED*' }
+        & $add 'materializer rejects an existing Cargo source tree whose member bytes differ from the locked archive' $mismatchedSourceTreeRejected
 
         $fixtureStartupScriptPath = Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'
         $startupTestModuleBody = {

@@ -2122,6 +2122,7 @@ mod h3r1_tests {
         ) -> Result<Arc<Self>, String> {
             let executable = host_fixture_executable(repo_root)?;
             let mut child = Command::new(executable)
+                .arg("--d29h3-host-fixture")
                 .current_dir(repo_root)
                 .env("CARGO_TERM_COLOR", "never")
                 .stdin(Stdio::piped())
@@ -2243,37 +2244,7 @@ mod h3r1_tests {
     }
 
     fn host_fixture_executable(repo_root: &Path) -> Result<PathBuf, String> {
-        let executable = repo_root
-            .join("src-tauri")
-            .join("target")
-            .join("debug")
-            .join(if cfg!(windows) {
-                "d29h3-authority-fixture.exe"
-            } else {
-                "d29h3-authority-fixture"
-            });
-        if executable.is_file() {
-            return Ok(executable);
-        }
-        let status = Command::new("cargo")
-            .current_dir(repo_root)
-            .args(["build", "--quiet", "--locked", "--manifest-path"])
-            .arg(repo_root.join("src-tauri").join("Cargo.toml"))
-            .args([
-                "--bin",
-                "d29h3-authority-fixture",
-                "--features",
-                "d29-h3-host-fixture",
-            ])
-            .env("CARGO_BUILD_JOBS", "1")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TERM_COLOR", "never")
-            .status()
-            .map_err(|error| format!("build persistent H3 Host fixture: {error}"))?;
-        if !status.success() || !executable.is_file() {
-            return Err("persistent H3 Host fixture executable was not produced".to_string());
-        }
-        Ok(executable)
+        crate::fixture_manifest::existing_fixture(repo_root, "d29h7-authority-fixture")
     }
 
     struct ProcessIsolatedH3Authority {

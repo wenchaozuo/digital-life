@@ -141,6 +141,21 @@ pub const VITA_WORKSPACE_GIT_STATUS_PROFILE_ID: &str = "d29h7c.git.status.v1";
 const H7C_CAPABILITY_ID: &str = VITA_WORKSPACE_GIT_STATUS_CAPABILITY_ID;
 const H7C_TOOL_NAME: &str = VITA_WORKSPACE_GIT_STATUS_TOOL_NAME;
 const H7C_PROFILE_ID: &str = VITA_WORKSPACE_GIT_STATUS_PROFILE_ID;
+const H7C_STATUS_GIT_ARGV: [&str; 13] = [
+    "--no-pager",
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "submodule.recurse=false",
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+    "--ignore-submodules=all",
+];
 const H7_MAX_ARGS: usize = 16;
 const H7_MAX_ARG_BYTES: usize = 1024;
 const H7_STDOUT_BOUND: usize = 65_536;
@@ -8919,11 +8934,52 @@ struct H7CGitStatusProfile {
     git_metadata_fence: Arc<H7CGitMetadataFence>,
     git_metadata_fence_hash: String,
     workspace_root_retained: Arc<H7RetainedDirectory>,
-    _git_home: TempDir,
+    _owned_git_home: Option<TempDir>,
 }
 
 impl H7CGitStatusProfile {
     fn new(root: &TrustedWorkspaceRoot, git_path: PathBuf) -> Result<Self, String> {
+        let git_home = tempfile::tempdir()
+            .map_err(|_| "D29-H7-C could not create the owned Git home".to_string())?;
+        let git_home_path = git_home.path().to_path_buf();
+        let empty_config_path = git_home_path.join("empty.gitconfig");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&empty_config_path)
+            .map_err(|_| "D29-H7-C could not create the owned empty Git config".to_string())?;
+        Self::new_with_git_home(
+            root,
+            git_path,
+            git_home_path,
+            empty_config_path,
+            Some(git_home),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        root: &TrustedWorkspaceRoot,
+        git_path: PathBuf,
+        git_home: &Path,
+        empty_config: &Path,
+    ) -> Result<Self, String> {
+        Self::new_with_git_home(
+            root,
+            git_path,
+            git_home.to_path_buf(),
+            empty_config.to_path_buf(),
+            None,
+        )
+    }
+
+    fn new_with_git_home(
+        root: &TrustedWorkspaceRoot,
+        git_path: PathBuf,
+        git_home_path: PathBuf,
+        empty_config_path: PathBuf,
+        owned_git_home: Option<TempDir>,
+    ) -> Result<Self, String> {
         root.verify_named_path_current()
             .map_err(|_| "D29-H7-C workspace root was not current".to_string())?;
         // Derive every D29-H7-C workspace authority from the already-held
@@ -8947,28 +9003,35 @@ impl H7CGitStatusProfile {
             &workspace_root_retained,
         ));
         let working_directory_identity = working_directory.0.identity().wire();
-        let git_home = tempfile::tempdir()
-            .map_err(|_| "D29-H7-C could not create the owned Git home".to_string())?;
+        if !git_home_path.is_absolute()
+            || !empty_config_path.is_absolute()
+            || !h7_workspace_paths_equal(&empty_config_path, &git_home_path.join("empty.gitconfig"))
+        {
+            return Err(
+                "D29-H7-C empty Git config path was not fixed under the owned Git home".to_string(),
+            );
+        }
+        let git_home_namespace =
+            H7PreparedNamespace::prepare(&git_home_path, true).map_err(|_| {
+                "D29-H7-C Git home was not a canonical non-reparse directory".to_string()
+            })?;
+        let empty_config_namespace = H7PreparedNamespace::prepare(&empty_config_path, false)
+            .map_err(|_| {
+                "D29-H7-C empty Git config was not a canonical non-reparse file".to_string()
+            })?;
+        if git_home_namespace.identity().reparse
+            || !git_home_namespace.identity().directory
+            || empty_config_namespace.identity().reparse
+            || empty_config_namespace.identity().directory
+            || std::fs::metadata(&empty_config_path)
+                .map_err(|_| "D29-H7-C empty Git config could not be inspected".to_string())?
+                .len()
+                != 0
+        {
+            return Err("D29-H7-C Git home or empty config had an unexpected identity".to_string());
+        }
         let mut argv = vec![git_path.to_string_lossy().into_owned()];
-        argv.extend(
-            [
-                "--no-pager",
-                "--no-optional-locks",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-c",
-                "submodule.recurse=false",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=all",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
+        argv.extend(H7C_STATUS_GIT_ARGV.into_iter().map(str::to_string));
         let argv_hash = sha256_hex(
             &serde_json::to_vec(&argv)
                 .map_err(|_| "D29-H7-C Git argv binding serialization failed".to_string())?,
@@ -8987,8 +9050,12 @@ impl H7CGitStatusProfile {
                 ceiling.to_string_lossy().into_owned(),
             ),
             (
+                "GIT_CONFIG_GLOBAL".to_string(),
+                empty_config_path.to_string_lossy().into_owned(),
+            ),
+            (
                 "HOME".to_string(),
-                git_home.path().to_string_lossy().into_owned(),
+                git_home_path.to_string_lossy().into_owned(),
             ),
         ]);
         let environment_policy_hash = sha256_hex(&environment_policy_bytes(&environment));
@@ -9012,7 +9079,7 @@ impl H7CGitStatusProfile {
             git_metadata_fence_hash: git_metadata_fence.fence_hash.clone(),
             git_metadata_fence,
             workspace_root_retained,
-            _git_home: git_home,
+            _owned_git_home: owned_git_home,
         })
     }
 
@@ -10273,23 +10340,213 @@ mod tests {
         }
     }
 
-    fn h7c_installed_git_path() -> PathBuf {
-        [
-            PathBuf::from(r"E:\Program Files\Git\mingw64\bin\git.exe"),
-            PathBuf::from(r"C:\Program Files\Git\mingw64\bin\git.exe"),
-            PathBuf::from(r"E:\Program Files\Git\cmd\git.exe"),
-            PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
-            PathBuf::from(r"C:\Program Files\Git\bin\git.exe"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-        .expect("D29-H7-C installed Git image")
+    const H7C_TEST_GIT_PATH: &str = r"E:\Program Files\Git\mingw64\bin\git.exe";
+    const H7C_TEST_SLOT_COUNT: usize = 35;
+    const H7C_SETUP_GIT_ARGV: [&[&str]; 5] = [
+        &["init", "--quiet"],
+        &["config", "user.name", "D29-H7-C"],
+        &["config", "user.email", "d29h7c@example.invalid"],
+        &["add", "--", "unchanged.txt", "modified.txt"],
+        &["commit", "--quiet", "-m", "initial"],
+    ];
+    static H7C_TEST_SLOT_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Copy)]
+    enum H7CSetupGitCommand {
+        Init,
+        UserName,
+        UserEmail,
+        AddFiles,
+        Commit,
     }
 
-    fn h7c_run_git(git_path: &Path, cwd: &Path, args: &[&str]) {
-        let output = Command::new(git_path)
-            .current_dir(cwd)
-            .args(args)
+    impl H7CSetupGitCommand {
+        fn argv(self) -> &'static [&'static str] {
+            match self {
+                Self::Init => H7C_SETUP_GIT_ARGV[0],
+                Self::UserName => H7C_SETUP_GIT_ARGV[1],
+                Self::UserEmail => H7C_SETUP_GIT_ARGV[2],
+                Self::AddFiles => H7C_SETUP_GIT_ARGV[3],
+                Self::Commit => H7C_SETUP_GIT_ARGV[4],
+            }
+        }
+    }
+
+    fn h7c_installed_git_path() -> PathBuf {
+        let path = PathBuf::from(H7C_TEST_GIT_PATH);
+        assert!(path.is_file(), "D29-H7-C pinned Git image must exist");
+        path
+    }
+
+    fn h7c_require_canonical_non_reparse(path: &Path, directory: bool) {
+        let canonical = fs::canonicalize(path).unwrap_or_else(|error| {
+            panic!(
+                "D29-H7-C canonical path failed for {}: {error}",
+                path.display()
+            )
+        });
+        assert!(
+            h7_workspace_paths_equal(path, &canonical),
+            "D29-H7-C path was not canonical: {}",
+            path.display()
+        );
+        let namespace = H7PreparedNamespace::prepare(path, directory)
+            .unwrap_or_else(|error| panic!("D29-H7-C non-reparse path check failed: {error}"));
+        let identity = namespace.identity();
+        assert_eq!(identity.directory, directory);
+        assert!(!identity.reparse, "D29-H7-C path was a reparse point");
+    }
+
+    fn h7c_directory_entries(path: &Path) -> BTreeSet<OsString> {
+        fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("D29-H7-C cannot enumerate {}: {error}", path.display()))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| panic!("D29-H7-C directory entry failed: {error}"))
+                    .file_name()
+            })
+            .collect()
+    }
+
+    struct H7CTestWorkspace {
+        slot_root: PathBuf,
+        repo: PathBuf,
+        git_home: PathBuf,
+        empty_gitconfig: PathBuf,
+    }
+
+    impl H7CTestWorkspace {
+        fn new() -> Self {
+            let slot_index = H7C_TEST_SLOT_INDEX.fetch_add(1, Ordering::AcqRel);
+            assert!(
+                slot_index < H7C_TEST_SLOT_COUNT,
+                "D29-H7-C fixed workspace slot inventory was exhausted"
+            );
+            let temp_root = std::env::temp_dir();
+            h7c_require_canonical_non_reparse(&temp_root, true);
+            for variable in ["TEMP", "TMP"] {
+                let configured = std::env::var_os(variable)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| panic!("D29-H7-C {variable} was not pinned"));
+                assert!(
+                    h7_workspace_paths_equal(&configured, &temp_root),
+                    "D29-H7-C {variable} did not match the pinned Phase0 TempRoot"
+                );
+            }
+            let slot_root = temp_root.join(format!("d32-h7c-slot-{:02}", slot_index + 1));
+            let repo = slot_root.join("repo");
+            let git_home = slot_root.join("git-home");
+            let empty_gitconfig = git_home.join("empty.gitconfig");
+            for (path, directory) in [
+                (slot_root.as_path(), true),
+                (repo.as_path(), true),
+                (git_home.as_path(), true),
+                (empty_gitconfig.as_path(), false),
+            ] {
+                h7c_require_canonical_non_reparse(path, directory);
+            }
+            assert_eq!(
+                h7c_directory_entries(&slot_root),
+                BTreeSet::from([OsString::from("git-home"), OsString::from("repo")]),
+                "D29-H7-C slot contained an unexpected entry"
+            );
+            assert!(
+                h7c_directory_entries(&repo).is_empty(),
+                "D29-H7-C repository workspace slot was not fresh"
+            );
+            assert_eq!(
+                h7c_directory_entries(&git_home),
+                BTreeSet::from([OsString::from("empty.gitconfig")]),
+                "D29-H7-C Git home contained an unexpected entry"
+            );
+            assert_eq!(
+                fs::metadata(&empty_gitconfig)
+                    .expect("D29-H7-C empty Git config metadata")
+                    .len(),
+                0,
+                "D29-H7-C global/system Git config must be empty"
+            );
+            Self {
+                slot_root,
+                repo,
+                git_home,
+                empty_gitconfig,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+
+        fn slot_root(&self) -> &Path {
+            &self.slot_root
+        }
+
+        fn git_home(&self) -> &Path {
+            &self.git_home
+        }
+
+        fn empty_gitconfig(&self) -> &Path {
+            &self.empty_gitconfig
+        }
+    }
+
+    fn h7c_setup_git_environment(workspace: &H7CTestWorkspace) -> BTreeMap<String, String> {
+        let mut windows_root = [0_u16; 260];
+        let windows_root_len =
+            unsafe { GetWindowsDirectoryW(windows_root.as_mut_ptr(), windows_root.len() as u32) }
+                as usize;
+        assert!(
+            windows_root_len != 0 && windows_root_len < windows_root.len(),
+            "D29-H7-C Windows directory is unavailable"
+        );
+        let windows_root =
+            String::from_utf16(&windows_root[..windows_root_len]).expect("Windows path UTF-16");
+        let temp_root = std::env::temp_dir().to_string_lossy().into_owned();
+        let git_home = workspace.git_home().to_string_lossy().into_owned();
+        let empty_gitconfig = workspace.empty_gitconfig().to_string_lossy().into_owned();
+        let ceiling = workspace.slot_root().to_string_lossy().into_owned();
+        BTreeMap::from([
+            ("GCM_INTERACTIVE".to_string(), "Never".to_string()),
+            ("GIT_CEILING_DIRECTORIES".to_string(), ceiling),
+            ("GIT_CONFIG_GLOBAL".to_string(), empty_gitconfig.clone()),
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+            ("GIT_CONFIG_SYSTEM".to_string(), empty_gitconfig),
+            ("GIT_NO_REPLACE_OBJECTS".to_string(), "1".to_string()),
+            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+            ("GIT_PAGER".to_string(), "cat".to_string()),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ("HOME".to_string(), git_home.clone()),
+            ("SystemRoot".to_string(), windows_root.clone()),
+            ("TMP".to_string(), temp_root.clone()),
+            ("TEMP".to_string(), temp_root),
+            ("USERPROFILE".to_string(), git_home.clone()),
+            ("WINDIR".to_string(), windows_root),
+            ("XDG_CONFIG_HOME".to_string(), git_home),
+        ])
+    }
+
+    fn h7c_git_command(
+        git_path: &Path,
+        workspace: &H7CTestWorkspace,
+        setup_command: H7CSetupGitCommand,
+    ) -> Command {
+        let environment = h7c_setup_git_environment(workspace);
+        let mut command = Command::new(git_path);
+        fixture_manifest::clear_inherited_git_environment(&mut command);
+        command
+            .current_dir(workspace.path())
+            .envs(&environment)
+            .args(setup_command.argv());
+        command
+    }
+
+    fn h7c_run_git(
+        git_path: &Path,
+        workspace: &H7CTestWorkspace,
+        setup_command: H7CSetupGitCommand,
+    ) {
+        let output = h7c_git_command(git_path, workspace, setup_command)
             .output()
             .expect("D29-H7-C local Git setup process");
         assert!(
@@ -10299,23 +10556,16 @@ mod tests {
         );
     }
 
-    fn h7c_initialize_repo(workspace: &Path, git_path: &Path) {
-        fs::write(workspace.join("unchanged.txt"), b"unchanged\n")
+    fn h7c_initialize_repo(workspace: &H7CTestWorkspace, git_path: &Path) {
+        fs::write(workspace.path().join("unchanged.txt"), b"unchanged\n")
             .expect("D29-H7-C unchanged file");
-        fs::write(workspace.join("modified.txt"), b"before\n").expect("D29-H7-C modified file");
-        h7c_run_git(git_path, workspace, &["init", "--quiet"]);
-        h7c_run_git(git_path, workspace, &["config", "user.name", "D29-H7-C"]);
-        h7c_run_git(
-            git_path,
-            workspace,
-            &["config", "user.email", "d29h7c@example.invalid"],
-        );
-        h7c_run_git(
-            git_path,
-            workspace,
-            &["add", "--", "unchanged.txt", "modified.txt"],
-        );
-        h7c_run_git(git_path, workspace, &["commit", "--quiet", "-m", "initial"]);
+        fs::write(workspace.path().join("modified.txt"), b"before\n")
+            .expect("D29-H7-C modified file");
+        h7c_run_git(git_path, workspace, H7CSetupGitCommand::Init);
+        h7c_run_git(git_path, workspace, H7CSetupGitCommand::UserName);
+        h7c_run_git(git_path, workspace, H7CSetupGitCommand::UserEmail);
+        h7c_run_git(git_path, workspace, H7CSetupGitCommand::AddFiles);
+        h7c_run_git(git_path, workspace, H7CSetupGitCommand::Commit);
     }
 
     fn h7c_helper_fixture_executable(repo_root: &Path) -> PathBuf {
@@ -10324,7 +10574,7 @@ mod tests {
     }
 
     struct H7CDirectHarness {
-        _workspace: TempDir,
+        _workspace: H7CTestWorkspace,
         root: TrustedWorkspaceRoot,
         profile: Arc<H7CGitStatusProfile>,
         authority: Arc<H7Authority>,
@@ -10336,16 +10586,16 @@ mod tests {
 
     impl H7CDirectHarness {
         fn new() -> Self {
-            let workspace = tempdir().expect("D29-H7-C workspace directory");
+            let workspace = H7CTestWorkspace::new();
             let git_path = h7c_installed_git_path();
-            h7c_initialize_repo(workspace.path(), &git_path);
+            h7c_initialize_repo(&workspace, &git_path);
             Self::from_initialized_workspace(workspace, git_path)
         }
 
         fn new_with_malicious_core_config(key: &str) -> (Self, PathBuf) {
-            let workspace = tempdir().expect("D29-H7-C malicious workspace directory");
+            let workspace = H7CTestWorkspace::new();
             let git_path = h7c_installed_git_path();
-            h7c_initialize_repo(workspace.path(), &git_path);
+            h7c_initialize_repo(&workspace, &git_path);
             let sentinel = workspace.path().join(format!("{key}-sentinel.txt"));
             let config = h7c_malicious_core_config_text(key, &sentinel);
             h7c_append_raw_config(workspace.path(), &config);
@@ -10355,12 +10605,17 @@ mod tests {
             )
         }
 
-        fn from_initialized_workspace(workspace: TempDir, git_path: PathBuf) -> Self {
+        fn from_initialized_workspace(workspace: H7CTestWorkspace, git_path: PathBuf) -> Self {
             let root = TrustedWorkspaceRoot::acquire(workspace.path())
                 .expect("D29-H7-C trusted workspace root");
             let profile = Arc::new(
-                H7CGitStatusProfile::new(&root, git_path.clone())
-                    .expect("D29-H7-C fixed Git profile"),
+                H7CGitStatusProfile::new_for_test(
+                    &root,
+                    git_path.clone(),
+                    workspace.git_home(),
+                    workspace.empty_gitconfig(),
+                )
+                .expect("D29-H7-C fixed Git profile"),
             );
             let authority = H7Authority::new_git_workspace(&root).expect("D29-H7-C Host authority");
             let (bridge, receiver) = H7PendingConfirmationBridge::new();
@@ -10473,13 +10728,19 @@ mod tests {
     }
 
     fn h7c_profile_rejects_extra_config(config_text: &str) {
-        let workspace = tempdir().expect("D29-H7-C config workspace");
+        let workspace = H7CTestWorkspace::new();
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         h7c_append_raw_config(workspace.path(), config_text);
         let root =
             TrustedWorkspaceRoot::acquire(workspace.path()).expect("D29-H7-C config trusted root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     fn assert_h7c_denied(result: &H7CGitStatusResult, broker: &H7CGitStatusBroker) {
@@ -10569,6 +10830,19 @@ mod tests {
             .windows(2)
             .any(|args| args == ["--no-pager".to_string(), "--no-optional-locks".to_string()]));
         assert!(!action.environment.contains_key("PATH"));
+        assert_eq!(
+            action
+                .environment
+                .get("GIT_CONFIG_GLOBAL")
+                .map(String::as_str),
+            Some(
+                harness
+                    ._workspace
+                    .empty_gitconfig()
+                    .to_str()
+                    .expect("D29-H7-C empty global Git config path is Unicode")
+            )
+        );
         assert!(harness.authority.shutdown());
     }
 
@@ -10922,10 +11196,10 @@ mod tests {
     #[test]
     fn h7c_worktree_config_outside_scope_is_rejected_before_process_creation() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C worktree-config workspace");
+        let workspace = H7CTestWorkspace::new();
         let outside = tempdir().expect("D29-H7-C external worktree directory");
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         h7c_append_raw_config(
             workspace.path(),
             "\n[extensions]\n\tworktreeConfig = true\n",
@@ -10937,16 +11211,22 @@ mod tests {
         .expect("D29-H7-C external worktree config");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C worktree-config trusted root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     #[test]
     fn h7c_worktree_config_include_outside_scope_is_rejected_before_process_creation() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C worktree-config workspace");
+        let workspace = H7CTestWorkspace::new();
         let outside = tempdir().expect("D29-H7-C external include directory");
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         h7c_append_raw_config(
             workspace.path(),
             "\n[extensions]\n\tworktreeConfig = true\n",
@@ -10961,7 +11241,13 @@ mod tests {
         .expect("D29-H7-C external include worktree config");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C worktree-config trusted root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -10989,9 +11275,9 @@ mod tests {
     #[test]
     fn h7c_filter_clean_real_subsection_is_rejected() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C filter-clean workspace");
+        let workspace = H7CTestWorkspace::new();
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         let helper = h7c_helper_fixture_executable(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -11009,15 +11295,21 @@ mod tests {
         .expect("D29-H7-C filter-clean attributes");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C filter-clean trusted root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     #[test]
     fn h7c_filter_process_real_subsection_is_rejected() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C filter-process workspace");
+        let workspace = H7CTestWorkspace::new();
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         let helper = h7c_helper_fixture_executable(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -11035,7 +11327,13 @@ mod tests {
         .expect("D29-H7-C filter-process attributes");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C filter-process trusted root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -11065,8 +11363,13 @@ mod tests {
         let root = TrustedWorkspaceRoot::acquire(harness.root.requested_path())
             .expect("D29-H7-C large trusted workspace root");
         let profile = Arc::new(
-            H7CGitStatusProfile::new(&root, harness.git_path.clone())
-                .expect("D29-H7-C large workspace profile"),
+            H7CGitStatusProfile::new_for_test(
+                &root,
+                harness.git_path.clone(),
+                harness._workspace.git_home(),
+                harness._workspace.empty_gitconfig(),
+            )
+            .expect("D29-H7-C large workspace profile"),
         );
         let broker = H7CGitStatusBroker::new(
             harness.broker.context.clone(),
@@ -11125,9 +11428,9 @@ mod tests {
     #[test]
     fn h7c_large_git_object_area_profile_admission_succeeds() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C large Git profile workspace");
+        let workspace = H7CTestWorkspace::new();
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         fs::create_dir_all(workspace.path().join(".git/logs"))
             .expect("D29-H7-C large Git profile logs");
         fs::write(
@@ -11137,16 +11440,22 @@ mod tests {
         .expect("D29-H7-C large Git profile padding");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C large Git profile root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_ok());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_ok());
     }
 
     #[test]
     fn h7c_alternates_redirect_profile_admission_is_rejected() {
         let _lock = lock_h7_tests();
-        let workspace = tempdir().expect("D29-H7-C alternates profile workspace");
+        let workspace = H7CTestWorkspace::new();
         let outside = tempdir().expect("D29-H7-C alternates profile outside");
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         fs::create_dir_all(workspace.path().join(".git/objects/info"))
             .expect("D29-H7-C alternates profile info");
         fs::write(
@@ -11156,7 +11465,13 @@ mod tests {
         .expect("D29-H7-C alternates profile redirect");
         let root = TrustedWorkspaceRoot::acquire(workspace.path())
             .expect("D29-H7-C alternates profile root");
-        assert!(H7CGitStatusProfile::new(&root, git_path).is_err());
+        assert!(H7CGitStatusProfile::new_for_test(
+            &root,
+            git_path,
+            workspace.git_home(),
+            workspace.empty_gitconfig(),
+        )
+        .is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16207,9 +16522,9 @@ mod tests {
         approve: bool,
     ) -> H7CGitCanaryEvidence {
         let app_data = tempdir().expect("D29-H7-C app-data temp root");
-        let workspace = tempdir().expect("D29-H7-C workspace temp root");
+        let workspace = H7CTestWorkspace::new();
         let git_path = h7c_installed_git_path();
-        h7c_initialize_repo(workspace.path(), &git_path);
+        h7c_initialize_repo(&workspace, &git_path);
         fs::write(workspace.path().join("modified.txt"), b"after\n")
             .expect("D29-H7-C modified tracked file");
         fs::write(workspace.path().join("untracked.txt"), b"untracked\n")
@@ -16219,7 +16534,13 @@ mod tests {
         let before =
             h7c_snapshot_workspace(root.requested_path()).expect("D29-H7-C before snapshot");
         let profile = Arc::new(
-            H7CGitStatusProfile::new(&root, git_path.clone()).expect("D29-H7-C canary profile"),
+            H7CGitStatusProfile::new_for_test(
+                &root,
+                git_path.clone(),
+                workspace.git_home(),
+                workspace.empty_gitconfig(),
+            )
+            .expect("D29-H7-C canary profile"),
         );
         let fixture = H7ResponsesFixture::start_git_status();
         let authority = H7Authority::new_git_workspace(&root).expect("D29-H7-C canary authority");

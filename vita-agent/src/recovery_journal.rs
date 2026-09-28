@@ -2905,24 +2905,12 @@ mod tests {
     }
 
     fn replace_recovery_root_with_junction(fixture: &Fixture) -> RecoveryRootReplacement {
-        use std::process::Command;
-
         let original = fixture.store.recovery_root().to_path_buf();
         let moved = fixture.profile.vita_root().join("recovery-original");
         let outside = tempdir().expect("outside recovery fixture");
         fs::rename(&original, &moved).expect("rename retained recovery root fixture");
-        let status = Command::new("cmd.exe")
-            .args([
-                "/d",
-                "/c",
-                "mklink",
-                "/J",
-                original.to_str().expect("recovery junction path"),
-                outside.path().to_str().expect("outside junction target"),
-            ])
-            .status()
+        crate::fixture_manifest::create_test_junction(&original, outside.path())
             .expect("create recovery junction fixture");
-        assert!(status.success(), "recovery junction fixture must succeed");
         RecoveryRootReplacement {
             original: original.clone(),
             moved,

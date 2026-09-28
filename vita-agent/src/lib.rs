@@ -1660,8 +1660,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn junction_alias_into_forbidden_stock_state_is_rejected() {
-        use std::process::Command;
-
         let app_data = tempdir().expect("app-data temp root");
         let workspace = tempdir().expect("workspace temp root");
         let forbidden = tempdir().expect("synthetic forbidden root");
@@ -1669,18 +1667,8 @@ mod tests {
         std::fs::create_dir_all(&synthetic_stock).expect("synthetic stock root");
         let alias = app_data.path().join("alias");
 
-        let status = Command::new("cmd.exe")
-            .args([
-                "/d",
-                "/c",
-                "mklink",
-                "/J",
-                alias.to_str().expect("junction alias path"),
-                synthetic_stock.to_str().expect("synthetic stock path"),
-            ])
-            .status()
+        fixture_manifest::create_test_junction(&alias, &synthetic_stock)
             .expect("create synthetic junction");
-        assert!(status.success(), "mklink /J must create the test alias");
 
         let error = VitaAgentRuntimeProfile::from_explicit_app_data_root(
             alias,

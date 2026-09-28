@@ -113,3 +113,6 @@ windows = { version = "=0.61.3", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[patch.crates-io]
+tauri-macros = { path = "vendor/tauri-macros-2.6.3" }

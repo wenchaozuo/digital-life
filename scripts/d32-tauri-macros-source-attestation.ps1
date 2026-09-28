@@ -334,4 +334,4 @@ $record = [ordered]@{
     vendor_lock_sha256 = $vendorLockSha256
 }
 
-[Console]::Out.WriteLine(($record | ConvertTo-Json -Depth 8 -Compress))
+Write-Output ($record | ConvertTo-Json -Depth 8 -Compress)

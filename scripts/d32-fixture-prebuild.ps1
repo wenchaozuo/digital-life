@@ -3909,13 +3909,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             !String.Equals(image.VolumeSerialHex, policy.GitVolume, StringComparison.OrdinalIgnoreCase) ||
             !String.Equals(image.FileIdHex, policy.GitFileId, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("H7-C Git CREATE image differs from the exact authority-pinned path/bytes/SHA/volume/file identity");
-        if (!String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase) || parent.Record.ProcessId != parentPid ||
-            parent.Record.CreationFileTime != parentCreationFileTime || rootProcess.Record.ProcessId == parentPid ||
-            parent.Record.ParentProcessId != rootProcess.Record.ProcessId || parent.Record.ParentCreationFileTime != rootProcess.Record.CreationFileTime ||
+        if (!String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase) || parent.ProcessId != parentPid ||
+            parent.CreationFileTime != parentCreationFileTime || rootProcess.Record.ProcessId == parentPid ||
+            parent.ParentProcessId != rootProcess.Record.ProcessId || parent.ParentCreationFileTime != rootProcess.Record.CreationFileTime ||
             !String.Equals(Path.GetFileName(rootProcess.Record.ImagePath), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
-            !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(parent.Record.ImagePath), @"^vita_agent-[0-9a-f]+\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant) ||
-            !String.Equals(Path.GetFileName(Path.GetDirectoryName(parent.Record.ImagePath)), "deps", StringComparison.OrdinalIgnoreCase) ||
-            !IsImageUnderRoot(parent.Record.ImagePath, Path.Combine(policy.Repository, "vita-agent", "target", "debug")))
+            !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(parent.ImagePath), @"^vita_agent-[0-9a-f]+\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant) ||
+            !String.Equals(Path.GetFileName(Path.GetDirectoryName(parent.ImagePath)), "deps", StringComparison.OrdinalIgnoreCase) ||
+            !IsImageUnderRoot(parent.ImagePath, Path.Combine(policy.Repository, "vita-agent", "target", "debug")))
             throw new InvalidOperationException("H7-C Git CREATE must be a direct child of the exact candidate Vita libtest, which is itself a direct child of the fixed Cargo Job root");
         bool wow64;
         if (!IsWow64Process(processHandle, out wow64) || wow64 || IntPtr.Size != 8)
@@ -7279,7 +7279,7 @@ public static class D32DebugSelfTestLauncher
         $protocCreateIdentityBound = $protocCreateIdentityBound -and
             $protocDeniedIdentityDetail.Contains('opened_child_path=' + $protocDeniedImageSnapshot.Path) -and
             $protocDeniedIdentityDetail.Contains('opened_child_sha256=' + $protocDeniedImageSnapshot.Sha256) -and
-            $protocDeniedIdentityDetail.Contains('parent_image_path=' + $debugLauncherPin.Path)
+            $protocDeniedIdentityDetail.Contains('parent_image_path=' + $debugLauncherImage.Path)
         if ($protocDeniedTrace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or $protocDeniedTrace.schema_version -ne 2 -or
             $protocDeniedTrace.state -cne 'BLOCKED' -or $protocDeniedTrace.block_reason -notmatch 'vendored protoc descendant does not match the exact per-run locked Cargo source pin' -or
             -not $protocCreateIdentityBound -or
@@ -8164,7 +8164,7 @@ public static class D32DebugSelfTestLauncher
                 file_id_hex = ('0' * 32)
             }
             tauri_macros_source_patch = [ordered]@{
-                path = 'E:\\D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
+                path = (Join-Path $provenanceEvidenceRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json')
                 bytes = [Int64]1
                 sha256 = ('b' * 64)
                 volume_serial_hex = ('0' * 16)

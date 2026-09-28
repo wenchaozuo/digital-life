@@ -356,8 +356,13 @@ function Test-D32H7CGitRunGrant {
         [Parameter(Mandatory = $true)][object]$OwnerMarker,
         [Parameter(Mandatory = $true)][object]$GitImage
     )
-    if (-not (Test-D32Phase0ExactProperties -Object $Reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
-        -not (Test-D32ProfilePathEqual -Left $Reference.path -Right (Join-Path $EvidenceRoot $script:D32H7CGitRunGrantName))) { throw 'H7C_GIT_GRANT_BLOCKED: grant file reference/path is not fixed' }
+    if (-not (Test-D32Phase0ExactProperties -Object $Reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) {
+        throw 'H7C_GIT_GRANT_BLOCKED: grant file reference properties are not fixed'
+    }
+    $expectedGrantPath = Join-Path $EvidenceRoot $script:D32H7CGitRunGrantName
+    if (-not (Test-D32ProfilePathEqual -Left ([string]$Reference.path) -Right $expectedGrantPath)) {
+        throw "H7C_GIT_GRANT_BLOCKED: grant file path is not fixed (got '$($Reference.path)'; expected '$expectedGrantPath')"
+    }
     $read = Read-D32H7CGitJsonFile -Path ([string]$Reference.path) -ExpectedSha256 ([string]$Reference.sha256)
     $null = Assert-D32H7CGitFileReferenceIdentity -Reference $Reference -Snapshot $read.Snapshot -Name 'H7-C per-run grant'
     $doc = $read.Document

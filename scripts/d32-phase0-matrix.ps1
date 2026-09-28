@@ -1114,7 +1114,12 @@ function ConvertFrom-D32Phase0Json {
 function Test-D32Phase0ExactProperties {
     param([AllowNull()][object]$Object, [Parameter(Mandatory = $true)][string[]]$Expected)
     if ($null -eq $Object -or $Object -is [string] -or $Object -is [Array] -or $Object -is [ValueType]) { return $false }
-    $actual = @($Object.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($Object -is [System.Collections.IDictionary]) {
+        $actual = @($Object.Keys | ForEach-Object { [string]$_ })
+    }
+    else {
+        $actual = @($Object.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    }
     if ($actual.Count -ne $Expected.Count) { return $false }
     foreach ($name in $Expected) { if ($actual -cnotcontains $name) { return $false } }
     return $true
@@ -3909,7 +3914,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath -ExpectedAuthoritySha256 $tauriSourceAuthorityReference.sha256 `
                 -Repository $testRepository -CandidateSha ('b' * 40) -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
         }
-        catch { $wrongSourceCandidateRejected = $_.Exception.Message -like '*exact source-patch schema/candidate/profile*' }
+        catch { $wrongSourceCandidateRejected = $_.Exception.Message -like '*source-patch schema/candidate/profile*' }
         & $add 'source-patch reader rejects a stale/wrong candidate binding' $wrongSourceCandidateRejected
 
         $expectedSelfTestLocks = @(Get-D32BuildToolchainLockInputs -Repository $testRepository)
@@ -4074,7 +4079,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot (Join-Path $profileSelfTestRoot 'wrong-temp-root') -RunId $runId `
                 -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
         }
-        catch { $h7WrongTempRootRejected = $_.Exception.Message -like '*grant file reference/path is not fixed*' }
+        catch { $h7WrongTempRootRejected = $_.Exception.Message -like '*per-run grant candidate/profile/owner/root/temp/image/policy binding is invalid*' }
         $wrongH7Owner = [ordered]@{}
         foreach ($field in $ownerBinding.OwnerMarker.Keys) { $wrongH7Owner[$field] = $ownerBinding.OwnerMarker[$field] }
         $wrongH7Owner.file_id_hex = 'f' * 32
@@ -4090,7 +4095,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 -ValidatedProfile $fakeProfile -EvidenceRoot (Join-Path $profileSelfTestRoot 'wrong-root') -TempRoot $tempRoot -RunId $runId `
                 -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
         }
-        catch { $h7WrongRootRejected = $_.Exception.Message -like '*grant file reference/path is not fixed*' }
+        catch { $h7WrongRootRejected = $_.Exception.Message -like '*grant file path is not fixed*' }
         & $add 'H7-C run-grant reader rejects stale/wrong run ID, EvidenceRoot, TempRoot, and owner identity' `
             ($h7WrongRunRejected -and $h7WrongRootRejected -and $h7WrongTempRootRejected -and $h7WrongOwnerRejected)
         $h7SuiteLogRoot = Join-Path $selfTestRoot 'h7c-suite-logs'

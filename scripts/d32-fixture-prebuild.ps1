@@ -49,7 +49,7 @@ param(
     [string]$ExpectedToolchainProfileSha256,
     [AllowNull()][object]$Phase0OwnerBinding,
     [switch]$BuildD31RecoverySeeder,
-    [ValidateRange(1, 3600)]
+    [ValidateRange(1, 7200)]
     [int]$TimeoutSeconds = 600,
     [ValidateRange(1, 16)]
     [int]$BuildJobs = 1,
@@ -59,6 +59,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Assert-D32FixtureTimeoutScope {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [AllowNull()][object]$OwnerBinding,
+        [bool]$BuildD31RecoverySeeder
+    )
+
+    if ($TimeoutSeconds -gt 3600 -and ($null -eq $OwnerBinding -or $BuildD31RecoverySeeder)) {
+        throw 'PHASE0_TIMEOUT_SCOPE_BLOCKED: timeouts above 3600 seconds require the fixed Phase0 owner binding and cannot include the D31 recovery seeder'
+    }
+}
 
 $script:OwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
@@ -5599,6 +5611,20 @@ function Invoke-D32SelfTest {
     $passed = 0
     $owned = $false
     try {
+        Assert-D32FixtureTimeoutScope -TimeoutSeconds 3600 -OwnerBinding $null -BuildD31RecoverySeeder $false
+        try {
+            Assert-D32FixtureTimeoutScope -TimeoutSeconds 3601 -OwnerBinding $null -BuildD31RecoverySeeder $false
+            throw 'SELFTEST_FAILED: timeout above the non-Phase0 ceiling was accepted without an owner binding'
+        }
+        catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
+        Assert-D32FixtureTimeoutScope -TimeoutSeconds 7200 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false
+        try {
+            Assert-D32FixtureTimeoutScope -TimeoutSeconds 7200 -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $true
+            throw 'SELFTEST_FAILED: two-hour timeout was accepted for a D31 recovery-seeder run'
+        }
+        catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
+        $passed++
+
         [void](Ensure-D32OwnedDirectory $root)
         $owned = $true
         Write-Host 'D32_FIXTURE_TRUST_CONTRACT=pins:-PinnedGitPath,-PinnedGitSha256,-ExpectedCandidateSha,-ToolchainProfilePath,-ExpectedToolchainProfileSha256; d31-target:OutputRoot\d31-recovery-seeder-target; d31-record:sibling-d31-recovery-seeder-build.json; d31-env:D31_RECOVERY_SEEDER_RECORD_PATH,D31_RECOVERY_SEEDER_RECORD_SHA256,D31_RECOVERY_SEEDER_RUN_ID,D32_BUILD_TOOLCHAIN_PROFILE_PATH,D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256; profile:D32_BUILD_TOOLCHAIN_PROFILE_V2'
@@ -7847,6 +7873,10 @@ if ($SelfTest) {
 if ($PSVersionTable.PSVersion -lt [version]'7.5') {
     throw 'TOOLCHAIN_PROFILE_BLOCKED: operational D32 builds require PowerShell 7.5 or later for the shared pinned-profile validator'
 }
+Assert-D32FixtureTimeoutScope `
+    -TimeoutSeconds $TimeoutSeconds `
+    -OwnerBinding $Phase0OwnerBinding `
+    -BuildD31RecoverySeeder ([bool]$BuildD31RecoverySeeder)
 if ([String]::IsNullOrWhiteSpace($PinnedGitPath) -or
     [String]::IsNullOrWhiteSpace($PinnedGitSha256) -or
     [String]::IsNullOrWhiteSpace($ExpectedCandidateSha) -or

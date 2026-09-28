@@ -9,8 +9,8 @@ param(
     [Alias('ExpectedToolchainProfileSha256')][string]$Phase0ExpectedToolchainProfileSha256,
     [Alias('PinnedGitPath')][string]$Phase0PinnedGitPath,
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
-    # Keep the original 1800-second default; callers may explicitly pin at most one hour.
-    [Alias('TimeoutSeconds')][ValidateRange(60, 3600)][int]$Phase0TimeoutSeconds = 1800
+    # Keep the original 1800-second default; callers may explicitly pin a bounded two-hour per-command limit.
+    [Alias('TimeoutSeconds')][ValidateRange(60, 7200)][int]$Phase0TimeoutSeconds = 1800
 )
 
 Set-StrictMode -Version Latest
@@ -2046,7 +2046,7 @@ function Invoke-D32Phase0Matrix {
         ToolchainProfilePath = $ProfilePath
         ExpectedToolchainProfileSha256 = $ProfileSha256
         Phase0OwnerBinding = $outputBinding
-        TimeoutSeconds = [Math]::Min($TimeoutSeconds, 3600)
+        TimeoutSeconds = $TimeoutSeconds
     }
     $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
     $fixtureCapture = Invoke-D32Phase0FixtureProducerCapture -Producer $fixtureProducer
@@ -2441,6 +2441,39 @@ function New-D32Phase0SelfTestDebugTrace {
 function Test-D32Phase0MatrixRecordSelfTest {
     $cases = [System.Collections.Generic.List[object]]::new()
     $add = { param([string]$Name, [bool]$Passed, [AllowNull()][string]$Detail = $null) $cases.Add([PSCustomObject]@{ name = $Name; passed = $Passed; detail = $Detail }) }.GetNewClosure()
+
+    $timeoutContractFailures = [System.Collections.Generic.List[string]]::new()
+    foreach ($timeoutContract in @(
+        [PSCustomObject]@{ Path = $script:D32Phase0ScriptPath; Name = 'Phase0TimeoutSeconds'; Minimum = 60; Maximum = 7200; Default = 1800 },
+        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'TimeoutSeconds'; Minimum = 1; Maximum = 7200; Default = 600 }
+    )) {
+        $tokens = $null
+        $parseErrors = $null
+        $timeoutAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            [IO.Path]::GetFullPath([string]$timeoutContract.Path), [ref]$tokens, [ref]$parseErrors)
+        $parameters = @($timeoutAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq [string]$timeoutContract.Name })
+        if ($parseErrors.Count -ne 0 -or $parameters.Count -ne 1) {
+            $timeoutContractFailures.Add("$($timeoutContract.Name):parse-or-parameter")
+            continue
+        }
+        $rangeAttributes = @($parameters[0].Attributes | Where-Object { $_.TypeName.FullName -ceq 'ValidateRange' })
+        if ($rangeAttributes.Count -ne 1 -or $rangeAttributes[0].PositionalArguments.Count -ne 2) {
+            $timeoutContractFailures.Add("$($timeoutContract.Name):range-attribute")
+            continue
+        }
+        $minimum = [int]$rangeAttributes[0].PositionalArguments[0].Value
+        $maximum = [int]$rangeAttributes[0].PositionalArguments[1].Value
+        $defaultValue = [int]$parameters[0].DefaultValue.Value
+        if ($minimum -ne [int]$timeoutContract.Minimum -or $maximum -ne [int]$timeoutContract.Maximum -or $defaultValue -ne [int]$timeoutContract.Default) {
+            $timeoutContractFailures.Add("$($timeoutContract.Name):expected=$($timeoutContract.Minimum),$($timeoutContract.Maximum),$($timeoutContract.Default);actual=$minimum,$maximum,$defaultValue")
+        }
+    }
+    $phase0SourceText = [IO.File]::ReadAllText($script:D32Phase0ScriptPath)
+    $timeoutForwardingValid = $phase0SourceText -match 'TimeoutSeconds\s*=\s*\$TimeoutSeconds' -and
+        $phase0SourceText -notmatch 'TimeoutSeconds\s*=\s*\[Math\]::Min\s*\(\s*\$TimeoutSeconds\s*,\s*3600\s*\)'
+    if (-not $timeoutForwardingValid) { $timeoutContractFailures.Add('Phase0TimeoutSeconds:unclamped-forwarding') }
+    & $add 'Phase0 and fixture timeouts retain defaults and enforce the 7200-second Phase0 ceiling' `
+        ($timeoutContractFailures.Count -eq 0) ($timeoutContractFailures -join ', ')
 
     $preflightLibraryPath = Join-Path $script:D32Phase0ScriptRoot 'd32-preflight.ps1'
     $preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)

@@ -660,6 +660,47 @@ The first locked Vita fetch can introduce a vendored `protoc.exe` from a crates.
 
 ---
 
+## ADR-D32-PHASE0-TAURI-SOURCE-AND-H7C-GIT-V1 — Exact tauri-macros patch and H7-C suite Git child
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-29
+**Related milestone:** D32-A-R2 / Phase0 and Phase1
+**Related baseline:** `ddfd21a051d2fcefa0fc6cab2112f29a87440d81`
+
+### Context
+
+The full fixed Vita Phase0 suite includes H7-C tests that create deterministic Git workspaces and invoke the pinned Git image. The exact-source tauri-macros 2.6.3 patch also needs a code-owned, verifiable link from the immutable registry archive to its sole candidate-local change. Neither exception may turn the existing child-process policy into basename, wildcard, or general helper authority.
+
+### Decision
+
+1. The only approved tauri-macros patch source is the exact locked crates.io `tauri-macros` 2.6.3 archive (34,903 bytes, SHA-256 `e8b394794f399a421811d06966343e7933fcae92d59f5180b9388d1174497a45`) whose 15 regular members match the pinned source tree. The only local change is `src/command/wrapper.rs`, with patched source SHA-256 `1bac6f2bdb822c890f7c645560dcb3c28737908c5aebaafd2c2e0742cb05593b`, vendor tree SHA-256 `52842cfa519dd31f59d684bcbd7fedc19bb709081ca16c9b9d0741b08594fb1b`, and patch descriptor SHA-256 `a8d76c969d38c9525762906955a51b33fec360a174dc2ff3a6051be3db4021cd`. Root and vendored Cargo metadata are separately pinned by the source attestation implementation. A stdout-only source-facts generator does not itself authorize use: before a run, the external `D32_TAURI_MACROS_SOURCE_PATCH_V1` record must be create-new, independently SHA-pinned, and bind exact candidate, Profile V2 path/SHA/bytes, archive bytes/SHA, source tree, sole diff, vendored tree and all relevant Cargo metadata. Each producer/reader reopens and checks its exact external reference and current candidate-local files.
+2. The only additional child launch admitted by this decision is the exact caller-pinned direct Git.exe image as a child of the accepted Vita libtest, itself a direct child of the fixed Cargo root, during the one fixed `vita-full-local-suite` Phase0 command and in that command's existing nonbreakaway Job. No Git executable by name, alternate path, shell, `cmd.exe`, SSH, credential manager/helper, arbitrary descendant, or per-test process attribution is admitted.
+3. Before the one-shot Phase0 run, the Coordinator creates and independently pins a `D32_PHASE0_H7C_GIT_CHILD_AUTHORITY_V1` record binding candidate/Profile, exact intended EvidenceRoot and TempRoot paths, exact Git opened-file identity, fixed full-suite argv/working directory/timeout, and finite command/environment/parent/Job policy. After the runner binds the fresh root, owner marker, run ID and `r\t` TempRoot, it creates a no-overwrite `D32_PHASE0_H7C_GIT_RUN_GRANT_V1` binding those actual opened identities and 35 exact fresh slots `d32-h7c-slot-01..35`, each with `repo` and `git-home\empty.gitconfig`. Each slot permits only the ordered five setup argv records (`init`, fixed name/email config, `add`, `commit`) and at most one exact fixed read-only status argv. The setup/status environment maps are explicit and deny PATH, shell/helper configuration, ambient config overrides, and other environment keys.
+4. Every admitted Git CREATE is validated before Continue against retained opened image bytes/SHA/volume/file ID, complete argv, current directory handle and authorized slot/config identities, sanitized environment, parent PID+creation chain, and same Job. An unapproved CREATE is left uncontinued with zero CREATE Continue calls, no user marker, and complete V2 debug/Job accounting and cleanup. The companion `D32_H7C_GIT_CHILD_ATTESTATION_V1` binds the Phase0 suite's exact stdout/stderr, V2 process trace and all observed Git process identities, and requires every code-owned 43 `h7c_*` plus three real H7-C test result rows exactly once with `ok`; process-to-test attribution remains `NONE`.
+5. Phase0/Phase1 protoc authority is not silently broadened by this record. The post-aggregate D31 recovery seeder may use the same immutable protoc source/image only with its separately approved fresh seeder run/home, owner marker, independent per-run grant and D32-only companion attestation; it never replays a Phase0/Phase1 grant. D31 seeder provenance V2 and its strict Host consumer remain unchanged.
+6. Migrate fixture-build provenance V4→V5, Phase0 matrix V4→V5, release attestation V5→V6, and aggregate V4→V5. Every current reader rejects prior and unknown versions. Profile V2, debug/Job trace V2, fixture manifest v3, D31 recovery-seeder provenance V2, SC-D32-V1, frozen §16.1.5, fixed Cargo argv/targets/features, the full required Phase0 suites, and required negative evidence remain unchanged.
+
+### Frozen invariants and forbidden implementation
+
+- Do not relax exact candidate/Profile/root/run/owner/home/slot/image identity, the V2 trace/Job requirements, or the pre-Continue boundary.
+- Do not allow package name, Git/protoc basename, signature, wildcard path, copied/renamed image, ambient resolution, arbitrary helper, stale grant, or parent-chain shortcut to create authority.
+- Do not reduce the five fixture phases, full protocol/Vita/Host suites, H7-C real tests, negative tests, or any later Stage Contract requirement.
+- Do not change SC-D32-V1, §16.1.5, fixed Cargo argv/toolchain, Host production authority, Profile V2, Trace V2, fixture manifest v3, or D31 seeder V2.
+
+### Required tests and negative evidence
+
+- Verify archive/member/tree/sole-diff/Cargo metadata binding; reject malformed archive, mismatched vendor tree, wrong candidate/profile/hash/identity, copied or changed bytes, and unknown source authority versions.
+- Verify H7 authority/grant rejects stale or wrong run, candidate, profile, root, TempRoot, owner marker, Git identity, slot identity, argv, environment, parent, or Job; verify rejected CREATE remains uncontinued with no marker and complete V2 cleanup.
+- Verify companion attestation rejects forged/missing/duplicate/failing result rows, altered stdout/stderr or trace, substituted authority/grant, and unmatched Git identities; confirm 46 fixed H7-C result rows are all present.
+- Verify V5/V5/V6/V5 current readers reject prior and unknown versions; Phase1 and aggregate refuse any blocked-diagnostic sidecar.
+
+### Supersedes / Superseded by
+
+- Supersedes only the prior blanket denial of the exact-source tauri-macros local patch and exact granted Git.exe child described above. All other process denials, fixed suites and gates remain unchanged. Any future expansion requires a separate explicit architecture decision.
+
+---
+
 ## ADR 模板
 
 ### ADR-XXXX — <标题>

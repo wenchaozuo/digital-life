@@ -12,6 +12,17 @@ $script:D32VendoredProtocRegistryHash = 'index.crates.io-1949cf8c6b5b557f'
 $script:D32VendoredProtocPackageRoot = 'protoc-bin-vendored-win32-3.2.0'
 $script:D32VendoredProtocArchiveRelativePath = "registry\cache\$($script:D32VendoredProtocRegistryHash)\protoc-bin-vendored-win32-3.2.0.crate"
 $script:D32VendoredProtocSourceRelativePath = "registry\src\$($script:D32VendoredProtocRegistryHash)\$($script:D32VendoredProtocPackageRoot)"
+$script:D32TauriMacrosSourcePatchType = 'D32_TAURI_MACROS_SOURCE_PATCH_V1'
+$script:D32TauriMacrosArchiveSha256 = 'e8b394794f399a421811d06966343e7933fcae92d59f5180b9388d1174497a45'
+$script:D32TauriMacrosArchiveBytes = [Int64]34903
+$script:D32TauriMacrosSourceTreeSha256 = '68e44e75bf963a52b2fbda751c876c68ed4c8656dd6628e593478f47d18ea983'
+$script:D32TauriMacrosVendoredTreeSha256 = '52842cfa519dd31f59d684bcbd7fedc19bb709081ca16c9b9d0741b08594fb1b'
+$script:D32TauriMacrosPatchSha256 = 'a8d76c969d38c9525762906955a51b33fec360a174dc2ff3a6051be3db4021cd'
+$script:D32TauriMacrosPatchedSourceSha256 = '1bac6f2bdb822c890f7c645560dcb3c28737908c5aebaafd2c2e0742cb05593b'
+$script:D32TauriMacrosRootManifestSha256 = 'e05e2f819ae667eb7a738f8d54a0e45f210093fc4f4bee1ca849eca80ed250db'
+$script:D32TauriMacrosRootLockSha256 = '8818a24ee4ba8f7d628f443ce181b0686f6353f759d76e2e7305c47da603049c'
+$script:D32TauriMacrosVendorManifestSha256 = '359f36b12d366f379f46fb9b59d78678e2df4a1617e605c9c480301d3d57e4b3'
+$script:D32TauriMacrosVendorLockSha256 = '4d96652714b4cdb6494b7a7c957babbf5c704c5197f31043d180d8f43ec968f3'
 
 function Get-D32VendoredOrdinaryPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -62,6 +73,150 @@ function Get-D32VendoredFileReference {
         volume_serial_hex = [string]$snapshot.VolumeSerialHex
         file_id_hex = [string]$snapshot.FileIdHex
     }
+}
+
+function Get-D32TauriMacrosCanonicalFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: a source or metadata file is missing or reparse-backed' }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13) {
+            if (($i + 1) -ge $bytes.Length -or $bytes[$i + 1] -ne 10) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: lone CR is not canonical source text' }
+            $i++
+        }
+    }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    try { $text = $strictUtf8.GetString($bytes).Replace("`r`n", "`n") }
+    catch { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source file is not valid UTF-8' }
+    $canonical = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($canonical)).ToLowerInvariant()
+}
+
+function Get-D32TauriMacrosCanonicalTreeSha256 {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $fullRoot = [IO.Path]::GetFullPath($Root)
+    if (-not (Test-D32ProfileNoReparsePath -Path $fullRoot) -or -not (Test-Path -LiteralPath $fullRoot -PathType Container)) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: vendored source root is missing or reparse-backed' }
+    $expectedCount = 15
+    $files = @(Get-ChildItem -LiteralPath $fullRoot -File -Recurse -Force -ErrorAction Stop)
+    $directories = @(Get-ChildItem -LiteralPath $fullRoot -Directory -Recurse -Force -ErrorAction Stop)
+    foreach ($entry in @($files) + @($directories)) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: vendored source tree contains a reparse entry' }
+    }
+    if ($files.Count -ne $expectedCount) { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: vendored source tree must contain exactly $expectedCount regular archive members" }
+    $records = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in $files) {
+        $relative = [IO.Path]::GetRelativePath($fullRoot, $file.FullName).Replace('\', '/')
+        if ($relative.StartsWith('../', [StringComparison]::Ordinal) -or $relative.Contains(':') -or $relative -match '(^|/)\.\.?(/|$)') { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: vendored source member path is not canonical' }
+        $fileSha = Get-D32TauriMacrosCanonicalFileSha256 -Path $file.FullName
+        $records.Add($relative + [char]0 + $fileSha + "`n")
+    }
+    $records.Sort([StringComparer]::Ordinal)
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes(($records.ToArray() -join ''))
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payload)).ToLowerInvariant()
+}
+
+function Get-D32TauriMacrosSourcePatchFileReference {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return Get-D32VendoredFileReference -Path $Path
+}
+
+function Test-D32TauriMacrosSourcePatchAuthority {
+    param(
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedAuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+    )
+    if ($ExpectedAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not (Test-D32ProfileCanonicalPathString -Path $AuthorityPath) -or
+        -not (Test-D32ProfileNoReparsePath -Path $AuthorityPath) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $EvidenceRoot)) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source authority must be an independently SHA-pinned external regular file'
+    }
+    $authorityStream = [IO.File]::Open($AuthorityPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $before = Get-D32ProfileFileSnapshot -Path $AuthorityPath
+        if ($before.Sha256 -cne $ExpectedAuthoritySha256) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority bytes differ from the independent expected SHA-256' }
+        $authorityStream.Position = 0
+        $reader = [IO.StreamReader]::new($authorityStream, [Text.Encoding]::UTF8, $true, 4096, $true)
+        try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $after = Get-D32ProfileFileSnapshot -Path $AuthorityPath
+        if ($before.Bytes -ne $after.Bytes -or $before.Sha256 -cne $after.Sha256 -or $before.VolumeSerialHex -cne $after.VolumeSerialHex -or $before.FileIdHex -cne $after.FileIdHex) {
+            throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority changed during opened-handle validation'
+        }
+    }
+    finally { $authorityStream.Dispose() }
+    $json = [System.Text.Json.JsonDocument]::Parse($raw)
+    try { if (Test-D32ProfileJsonElementDuplicates -Element $json.RootElement) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority JSON contains duplicate keys' } }
+    finally { $json.Dispose() }
+    $doc = $raw | ConvertFrom-Json -DateKind String
+    $fields = @('schema_version', 'record_type', 'status', 'candidate_sha', 'toolchain_profile', 'package_name', 'package_version', 'registry_source', 'archive_path', 'archive_bytes', 'archive_sha256', 'source_tree_sha256', 'expected_source_tree_sha256', 'vendored_path', 'vendored_tree_sha256', 'changed_files', 'source_wrapper_sha256', 'patched_source_sha256', 'patch_sha256', 'manifest_sha256', 'lock_sha256', 'vendor_manifest_sha256', 'vendor_lock_sha256')
+    if (-not (Test-D32VendoredObjectExactProperties -Object $doc -Expected $fields) -or
+        -not (Test-D32VendoredInteger -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or
+        $doc.record_type -isnot [string] -or $doc.record_type -cne $script:D32TauriMacrosSourcePatchType -or
+        $doc.status -isnot [string] -or $doc.status -cne 'SOURCE_PATCH_VERIFIED' -or
+        $doc.candidate_sha -isnot [string] -or $doc.candidate_sha -cne $CandidateSha -or
+        -not (Test-D32VendoredObjectExactProperties -Object $doc.toolchain_profile -Expected @('path', 'sha256', 'bytes')) -or
+        $doc.toolchain_profile.path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $doc.toolchain_profile.path -Right $ValidatedProfile.ProfilePath) -or
+        $doc.toolchain_profile.sha256 -isnot [string] -or $doc.toolchain_profile.sha256 -cne $ValidatedProfile.Digest -or
+        -not (Test-D32VendoredInteger -Value $doc.toolchain_profile.bytes -Positive) -or [Int64]$doc.toolchain_profile.bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $doc.package_name -isnot [string] -or $doc.package_name -cne 'tauri-macros' -or
+        $doc.package_version -isnot [string] -or $doc.package_version -cne '2.6.3' -or
+        $doc.registry_source -isnot [string] -or $doc.registry_source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
+        $doc.archive_path -isnot [string] -or -not [IO.Path]::IsPathRooted($doc.archive_path) -or
+        -not (Test-D32VendoredInteger -Value $doc.archive_bytes -Positive) -or [Int64]$doc.archive_bytes -ne $script:D32TauriMacrosArchiveBytes -or
+        $doc.archive_sha256 -isnot [string] -or $doc.archive_sha256 -cne $script:D32TauriMacrosArchiveSha256 -or
+        $doc.source_tree_sha256 -isnot [string] -or $doc.source_tree_sha256 -cne $script:D32TauriMacrosSourceTreeSha256 -or
+        $doc.expected_source_tree_sha256 -isnot [string] -or $doc.expected_source_tree_sha256 -cne $script:D32TauriMacrosSourceTreeSha256 -or
+        $doc.vendored_path -isnot [string] -or $doc.vendored_path -cne 'src-tauri/vendor/tauri-macros-2.6.3' -or
+        $doc.vendored_tree_sha256 -isnot [string] -or $doc.vendored_tree_sha256 -cne $script:D32TauriMacrosVendoredTreeSha256 -or
+        $doc.changed_files -isnot [Array] -or $doc.changed_files.Count -ne 1 -or $doc.changed_files[0] -cne 'src/command/wrapper.rs') {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority is not the exact current source-patch schema/candidate/profile/locked package approval'
+    }
+    foreach ($field in @('source_wrapper_sha256', 'patched_source_sha256', 'patch_sha256', 'manifest_sha256', 'lock_sha256', 'vendor_manifest_sha256', 'vendor_lock_sha256')) {
+        if ($doc.$field -isnot [string] -or $doc.$field -cnotmatch '^[0-9a-f]{64}$') { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: $field is not a lowercase SHA-256" }
+    }
+    if (-not (Test-D32ProfileCanonicalPathString -Path ([string]$doc.archive_path)) -or
+        -not (Test-D32ProfileNoReparsePath -Path ([string]$doc.archive_path)) -or
+        (Test-D32ProfilePathWithin -Child ([string]$doc.archive_path) -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child ([string]$doc.archive_path) -Parent $EvidenceRoot)) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: original archive must be a regular canonical file outside repository and run EvidenceRoot'
+    }
+    $archiveSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$doc.archive_path)
+    if ($archiveSnapshot.Bytes -ne [Int64]$doc.archive_bytes -or $archiveSnapshot.Sha256 -cne $script:D32TauriMacrosArchiveSha256) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source archive content/size differs from the exact approved registry archive'
+    }
+    $repo = [IO.Path]::GetFullPath($Repository)
+    $vendor = [IO.Path]::GetFullPath((Join-Path $repo 'src-tauri\vendor\tauri-macros-2.6.3'))
+    if (-not (Test-D32ProfilePathEqual -Left (Join-Path $repo ([string]$doc.vendored_path.Replace('/', '\'))) -Right $vendor)) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: vendor root is not candidate-local at its fixed path' }
+    $treeSha = Get-D32TauriMacrosCanonicalTreeSha256 -Root $vendor
+    if ($treeSha -cne $doc.vendored_tree_sha256) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: current candidate-local source tree differs from the independently pinned exact patch tree' }
+    $fixedHashes = @{
+        patched_source_sha256 = $script:D32TauriMacrosPatchedSourceSha256
+        patch_sha256 = $script:D32TauriMacrosPatchSha256
+        manifest_sha256 = $script:D32TauriMacrosRootManifestSha256
+        lock_sha256 = $script:D32TauriMacrosRootLockSha256
+        vendor_manifest_sha256 = $script:D32TauriMacrosVendorManifestSha256
+        vendor_lock_sha256 = $script:D32TauriMacrosVendorLockSha256
+    }
+    if ([string]$doc.source_wrapper_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source wrapper SHA is malformed' }
+    foreach ($field in $fixedHashes.Keys) {
+        if ([string]$doc.$field -cne [string]$fixedHashes[$field]) { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority field $field differs from the approved exact source patch" }
+    }
+    $localFiles = @(
+        [PSCustomObject]@{ Path = (Join-Path $repo 'src-tauri\Cargo.toml'); Sha = $script:D32TauriMacrosRootManifestSha256 },
+        [PSCustomObject]@{ Path = (Join-Path $repo 'src-tauri\Cargo.lock'); Sha = $script:D32TauriMacrosRootLockSha256 },
+        [PSCustomObject]@{ Path = (Join-Path $vendor 'Cargo.toml'); Sha = $script:D32TauriMacrosVendorManifestSha256 },
+        [PSCustomObject]@{ Path = (Join-Path $vendor 'Cargo.lock'); Sha = $script:D32TauriMacrosVendorLockSha256 },
+        [PSCustomObject]@{ Path = (Join-Path $vendor 'src\command\wrapper.rs'); Sha = $script:D32TauriMacrosPatchedSourceSha256 }
+    )
+    foreach ($file in $localFiles) {
+        if ((Get-D32TauriMacrosCanonicalFileSha256 -Path $file.Path) -cne $file.Sha) { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: candidate-local file differs from the pinned patch authority: $($file.Path)" }
+    }
+    return [PSCustomObject]@{ Document = $doc; Reference = (Get-D32VendoredFileReference -Path $AuthorityPath); Archive = $archiveSnapshot; VendoredTreeSha256 = $treeSha }
 }
 
 function Assert-D32VendoredFileReference {

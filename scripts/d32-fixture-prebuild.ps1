@@ -50,6 +50,8 @@ param(
     [AllowNull()][object]$Phase0OwnerBinding,
     [string]$VendoredProtocAuthorityPath,
     [string]$ExpectedVendoredProtocAuthoritySha256,
+    [string]$TauriMacrosSourceAuthorityPath,
+    [string]$ExpectedTauriMacrosSourceAuthoritySha256,
     [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 14400)]
     [int]$TimeoutSeconds = 600,
@@ -1940,7 +1942,27 @@ internal sealed class D32DebugLaunchCoordinator
     public bool AllowPinnedVendoredProtoc;
     public string VendoredProtocCargoHomePath;
     public string VendoredProtocPin;
+    public string H7CGitNativePolicyText;
     public string FailureInjection;
+}
+
+public sealed class D32H7CGitChildObservationV1
+{
+    public string Slot { get; set; }
+    public string Operation { get; set; }
+    public uint ProcessId { get; set; }
+    public long CreationFileTime { get; set; }
+    public uint ParentProcessId { get; set; }
+    public long ParentCreationFileTime { get; set; }
+    public string ImagePath { get; set; }
+    public long Bytes { get; set; }
+    public string Sha256 { get; set; }
+    public string VolumeSerialHex { get; set; }
+    public string FileIdHex { get; set; }
+    public string CommandLine { get; set; }
+    public string[] Argv { get; set; }
+    public string WorkingDirectory { get; set; }
+    public Dictionary<string, string> Environment { get; set; }
 }
 
 public sealed class D32FixtureNativeProcessV2 : IDisposable
@@ -1983,7 +2005,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private const int ErrorSemTimeout = 121;
     private const uint DuplicateSameAccess = 0x00000002;
     private const uint ProcessQueryInformation = 0x00000400;
+    private const uint ProcessVmRead = 0x00000010;
     private const uint Synchronize = 0x00100000;
+    private const uint FileReadAttributes = 0x00000080;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileAttributeDirectory = 0x00000010;
+    private const uint FileAttributeReparsePoint = 0x00000400;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes
@@ -2108,6 +2140,55 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         public int BasePriority;
         public IntPtr UniqueProcessId;
         public IntPtr InheritedFromUniqueProcessId;
+    }
+
+    private sealed class H7CGitSlotPolicy
+    {
+        public string Name;
+        public string Path;
+        public string Volume;
+        public string FileId;
+        public string Repo;
+        public string RepoVolume;
+        public string RepoFileId;
+        public string GitHome;
+        public string GitHomeVolume;
+        public string GitHomeFileId;
+        public string EmptyConfig;
+        public string ConfigVolume;
+        public string ConfigFileId;
+        public int SetupNext;
+        public int StatusCount;
+    }
+
+    private sealed class H7CGitNativePolicy
+    {
+        public string Repository;
+        public string CargoPath;
+        public string EvidenceRoot;
+        public string EvidenceRootVolume;
+        public string EvidenceRootFileId;
+        public string TempRoot;
+        public string TempRootVolume;
+        public string TempRootFileId;
+        public string OwnerMarkerPath;
+        public long OwnerMarkerBytes;
+        public string OwnerMarkerSha256;
+        public string OwnerMarkerVolume;
+        public string OwnerMarkerFileId;
+        public string GitPath;
+        public long GitBytes;
+        public string GitSha256;
+        public string GitVolume;
+        public string GitFileId;
+        public Dictionary<string, H7CGitSlotPolicy> Slots = new Dictionary<string, H7CGitSlotPolicy>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class H7CGitDirectoryIdentity
+    {
+        public string Path;
+        public string Volume;
+        public string FileId;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -2286,11 +2367,32 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetFileInformationByHandleEx(IntPtr file, int informationClass, IntPtr buffer, uint size);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, UIntPtr size, out UIntPtr bytesRead);
+
+    [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetWindowsDirectoryW(StringBuilder buffer, uint size);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetSystemDirectoryW(StringBuilder buffer, uint size);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFinalPathNameByHandleW(IntPtr file, StringBuilder path, uint size, uint flags);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr sourceHandle, IntPtr targetProcess, out IntPtr targetHandle, uint desiredAccess, bool inheritHandle, uint options);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool IsWow64Process(IntPtr process, out bool wow64Process);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
@@ -2372,6 +2474,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private readonly List<IntPtr> _observedProcessHandles = new List<IntPtr>();
     private readonly List<uint> _observedProcessIds = new List<uint>();
     private readonly List<string> _observedHandleDuplicationAudit = new List<string>();
+    private readonly object _h7cGitChildLock = new object();
+    private readonly List<D32H7CGitChildObservationV1> _h7cGitChildren = new List<D32H7CGitChildObservationV1>();
     private D32DebugProcessTraceV2 _debugTrace;
 
     public int ProcessId { get; private set; }
@@ -2643,7 +2747,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     public void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection)
     {
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false, false, false, null, null);
+            injectFirstCreateInterruption, injectFirstCreateIdentityMismatch, failureInjection, false, false, false, null, null, null);
     }
 
     public static bool IsApprovedPinnedCargoVctipConfiguration(string expectedRootPin, string[] approvedImagePins)
@@ -2806,7 +2910,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
             throw new InvalidOperationException("D32_VCTIP_PROFILE_PIN_BLOCKED: only the exact approved caller-pinned Profile V2 VCTIP entry may be configured beneath a fixed Cargo root");
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            false, false, null, false, true, false, null, null);
+            false, false, null, false, true, false, null, null, null);
     }
 
     public void ConfigurePinnedCargoDebugCaptureWithVendoredProtoc(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, string expectedCargoHome, string vendoredProtocPin)
@@ -2816,7 +2920,24 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!IsApprovedPinnedCargoVendoredProtocConfiguration(expectedRootPin, approvedImagePins, expectedCargoHome, vendoredProtocPin))
             throw new InvalidOperationException("VENDORED_PROTOC_GRANT_BLOCKED: native CREATE continuation requires the unique exact per-run locked protoc image pin beneath the fixed Cargo root");
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
-            false, false, null, false, true, true, expectedCargoHome, vendoredProtocPin);
+            false, false, null, false, true, true, expectedCargoHome, vendoredProtocPin, null);
+    }
+
+    public void ConfigurePinnedCargoDebugCaptureWithVendoredProtocAndH7CGit(
+        string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds,
+        string expectedCargoHome, string vendoredProtocPin, string h7cGitNativePolicyText)
+    {
+        if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
+            throw new InvalidOperationException("D32_VCTIP_PROFILE_PIN_BLOCKED: only the exact approved caller-pinned Profile V2 VCTIP entry may be configured beneath a fixed Cargo root");
+        if (!IsApprovedPinnedCargoVendoredProtocConfiguration(expectedRootPin, approvedImagePins, expectedCargoHome, vendoredProtocPin))
+            throw new InvalidOperationException("VENDORED_PROTOC_GRANT_BLOCKED: native CREATE continuation requires the unique exact per-run locked protoc image pin beneath the fixed Cargo root");
+        H7CGitNativePolicy policy = ParseH7CGitNativePolicy(h7cGitNativePolicyText);
+        string[] root = ParseDebugPin(expectedRootPin);
+        if (!String.Equals(Path.GetFileName(root[0]), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(NormalizeDebugPath(policy.Repository), NormalizeDebugPath(Path.GetFullPath(policy.Repository)), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7C_GIT_GRANT_BLOCKED: Git child permission is limited to an exact Cargo-root policy and canonical candidate repository");
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+            false, false, null, false, true, true, expectedCargoHome, vendoredProtocPin, h7cGitNativePolicyText);
     }
 
     public void ConfigurePinnedGitDebugCapture(string expectedRootPin, string approvedWindowsImagePin, int timeoutMilliseconds)
@@ -2828,10 +2949,10 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (!String.Equals(Path.GetFileName(childPin[0]), "conhost.exe", StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("standalone pinned-Git capture requires the caller-pinned conhost.exe child image");
         ConfigureDebugCapture(expectedRootPin, new string[] { approvedWindowsImagePin }, new string[0], timeoutMilliseconds,
-            false, false, null, true, false, false, null, null);
+            false, false, null, true, false, false, null, null, null);
     }
 
-    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot, bool allowPinnedCargoVctip, bool allowPinnedVendoredProtoc, string vendoredProtocCargoHomePath, string vendoredProtocPin)
+    private void ConfigureDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, bool injectFirstCreateInterruption, bool injectFirstCreateIdentityMismatch, string failureInjection, bool allowPinnedGitRoot, bool allowPinnedCargoVctip, bool allowPinnedVendoredProtoc, string vendoredProtocCargoHomePath, string vendoredProtocPin, string h7cGitNativePolicyText)
     {
         if (!_debugEnabled || _debugCoordinator == null) throw new InvalidOperationException("dedicated debugger session is not initialized");
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
@@ -2851,6 +2972,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             _debugCoordinator.AllowPinnedVendoredProtoc = allowPinnedVendoredProtoc;
             _debugCoordinator.VendoredProtocCargoHomePath = vendoredProtocCargoHomePath;
             _debugCoordinator.VendoredProtocPin = vendoredProtocPin;
+            _debugCoordinator.H7CGitNativePolicyText = h7cGitNativePolicyText;
             _debugCoordinator.CapturePlanReady.Set();
         }
     }
@@ -2876,6 +2998,11 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         }
         PopulatePostJoinDebugEvidence(trace, joined);
         return trace;
+    }
+
+    public D32H7CGitChildObservationV1[] GetH7CGitChildObservations()
+    {
+        lock (_h7cGitChildLock) return _h7cGitChildren.ToArray();
     }
 
     private static D32DebugProcessTraceV2 CreateBlockedDebugTrace(string reason)
@@ -3454,6 +3581,411 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         return (uint)value;
     }
 
+    private static byte[] ReadRemoteBytes(IntPtr process, IntPtr address, int count, string label)
+    {
+        if (process == IntPtr.Zero || address == IntPtr.Zero || count <= 0 || count > 131072)
+            throw new InvalidOperationException("H7-C Git child has an invalid remote " + label + " address/length");
+        byte[] buffer = new byte[count];
+        UIntPtr read;
+        if (!ReadProcessMemory(process, address, buffer, new UIntPtr((uint)count), out read) || read.ToUInt64() != (ulong)count)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git child remote " + label + " read failed");
+        return buffer;
+    }
+
+    private static IntPtr ReadRemotePointer(IntPtr process, IntPtr address, string label)
+    {
+        if (IntPtr.Size != 8) throw new InvalidOperationException("H7-C Git CREATE requires the pinned x64 Windows process parameter layout");
+        byte[] bytes = ReadRemoteBytes(process, address, 8, label);
+        long value = BitConverter.ToInt64(bytes, 0);
+        if (value == 0) throw new InvalidOperationException("H7-C Git child remote " + label + " pointer is null");
+        return new IntPtr(value);
+    }
+
+    private static string ReadRemoteUnicodeString(IntPtr process, IntPtr structure, string label)
+    {
+        byte[] header = ReadRemoteBytes(process, structure, 16, label + " UNICODE_STRING");
+        ushort length = BitConverter.ToUInt16(header, 0);
+        ushort maximumLength = BitConverter.ToUInt16(header, 2);
+        long bufferAddress = BitConverter.ToInt64(header, 8);
+        if (length == 0 || (length & 1) != 0 || length > 32766 || maximumLength < length || bufferAddress == 0)
+            throw new InvalidOperationException("H7-C Git child remote " + label + " UNICODE_STRING bounds are invalid");
+        byte[] text = ReadRemoteBytes(process, new IntPtr(bufferAddress), length, label + " text");
+        return Encoding.Unicode.GetString(text);
+    }
+
+    private static Dictionary<string, string> ReadRemoteEnvironment(IntPtr process, IntPtr environment)
+    {
+        if (environment == IntPtr.Zero) throw new InvalidOperationException("H7-C Git child has no remote environment block");
+        List<byte> bytes = new List<byte>();
+        int offset = 0;
+        bool terminated = false;
+        while (offset < 131072)
+        {
+            int chunk = Math.Min(256, 131072 - offset);
+            byte[] part = null;
+            while (chunk >= 2 && part == null)
+            {
+                try { part = ReadRemoteBytes(process, IntPtr.Add(environment, offset), chunk, "environment block"); }
+                catch { chunk /= 2; }
+            }
+            if (part == null) throw new InvalidOperationException("H7-C Git child environment block cannot be read completely");
+            bytes.AddRange(part);
+            offset += part.Length;
+            for (int end = 0; end + 3 < bytes.Count; end += 2)
+            {
+                if (bytes[end] == 0 && bytes[end + 1] == 0 && bytes[end + 2] == 0 && bytes[end + 3] == 0)
+                {
+                    terminated = true;
+                    break;
+                }
+            }
+            if (terminated) break;
+        }
+        if (!terminated) throw new InvalidOperationException("H7-C Git child environment block is unterminated or exceeds its evidence bound");
+        int textBytes = bytes.Count - 4;
+        for (int end = 0; end + 3 < bytes.Count; end += 2)
+        {
+            if (bytes[end] == 0 && bytes[end + 1] == 0 && bytes[end + 2] == 0 && bytes[end + 3] == 0) { textBytes = end; break; }
+        }
+        if ((textBytes & 1) != 0) throw new InvalidOperationException("H7-C Git child environment block has odd UTF-16 byte length");
+        string block = Encoding.Unicode.GetString(bytes.ToArray(), 0, textBytes);
+        Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string item in block.Split(new char[] { '\0' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = item.IndexOf('=');
+            if (separator <= 0 || separator == item.Length - 1)
+                throw new InvalidOperationException("H7-C Git child environment contains an empty name/value or hidden drive variable");
+            string name = item.Substring(0, separator);
+            string value = item.Substring(separator + 1);
+            if (name.IndexOfAny(new char[] { '\t', '\r', '\n' }) >= 0 || value.IndexOfAny(new char[] { '\t', '\r', '\n' }) >= 0 || result.ContainsKey(name))
+                throw new InvalidOperationException("H7-C Git child environment contains a duplicate or non-canonical entry");
+            result.Add(name, value);
+        }
+        return result;
+    }
+
+    private static string[] ReadRemoteArgv(IntPtr process, string commandLine)
+    {
+        int count;
+        IntPtr vector = CommandLineToArgvW(commandLine, out count);
+        if (vector == IntPtr.Zero || count <= 0 || count > 64)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git child CommandLineToArgvW failed or returned an invalid count");
+        try
+        {
+            string[] args = new string[count];
+            for (int i = 0; i < count; i++)
+            {
+                IntPtr item = Marshal.ReadIntPtr(vector, i * IntPtr.Size);
+                args[i] = Marshal.PtrToStringUni(item);
+                if (String.IsNullOrEmpty(args[i])) throw new InvalidOperationException("H7-C Git child argv contains a null/empty argument");
+            }
+            return args;
+        }
+        finally { LocalFree(vector); }
+    }
+
+    private static H7CGitNativePolicy ParseH7CGitNativePolicy(string raw)
+    {
+        if (String.IsNullOrEmpty(raw) || raw.IndexOf('\r') >= 0) throw new InvalidOperationException("H7-C Git native policy text is empty or non-canonical");
+        string[] lines = raw.Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length != 36) throw new InvalidOperationException("H7-C Git native policy must contain exactly one header and 35 slots");
+        string[] header = lines[0].Split('\t');
+        if (header.Length != 19 || header[0] != "D32_H7C_NATIVE_POLICY_V1") throw new InvalidOperationException("H7-C Git native policy header schema differs");
+        H7CGitNativePolicy policy = new H7CGitNativePolicy();
+        policy.Repository = NormalizeDebugPath(header[1]);
+        policy.CargoPath = NormalizeDebugPath(header[2]);
+        policy.EvidenceRoot = NormalizeDebugPath(header[3]);
+        policy.EvidenceRootVolume = header[4];
+        policy.EvidenceRootFileId = header[5];
+        policy.TempRoot = NormalizeDebugPath(header[6]);
+        policy.TempRootVolume = header[7];
+        policy.TempRootFileId = header[8];
+        policy.OwnerMarkerPath = NormalizeDebugPath(header[9]);
+        if (!Int64.TryParse(header[10], NumberStyles.None, CultureInfo.InvariantCulture, out policy.OwnerMarkerBytes)) throw new InvalidOperationException("H7-C owner marker byte count is malformed");
+        policy.OwnerMarkerSha256 = header[11];
+        policy.OwnerMarkerVolume = header[12];
+        policy.OwnerMarkerFileId = header[13];
+        policy.GitPath = NormalizeDebugPath(header[14]);
+        if (!Int64.TryParse(header[15], NumberStyles.None, CultureInfo.InvariantCulture, out policy.GitBytes)) throw new InvalidOperationException("H7-C Git image byte count is malformed");
+        policy.GitSha256 = header[16];
+        policy.GitVolume = header[17];
+        policy.GitFileId = header[18];
+        if (policy.GitBytes <= 0 || policy.GitSha256.Length != 64 || policy.GitVolume.Length != 16 || policy.GitFileId.Length != 32 ||
+            policy.EvidenceRootVolume.Length != 16 || policy.EvidenceRootFileId.Length != 32 || policy.TempRootVolume.Length != 16 || policy.TempRootFileId.Length != 32 ||
+            policy.OwnerMarkerBytes <= 0 || policy.OwnerMarkerSha256.Length != 64 || policy.OwnerMarkerVolume.Length != 16 || policy.OwnerMarkerFileId.Length != 32 ||
+            !String.Equals(Path.GetFileName(policy.GitPath), "git.exe", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(policy.CargoPath), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
+            !Path.IsPathRooted(policy.Repository) || !String.Equals(policy.Repository, NormalizeDebugPath(Path.GetFullPath(policy.Repository)), StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(policy.OwnerMarkerPath), "D32-PHASE0-OWNER.json", StringComparison.Ordinal) ||
+            !String.Equals(Path.GetDirectoryName(policy.OwnerMarkerPath), policy.EvidenceRoot, StringComparison.OrdinalIgnoreCase) ||
+            !IsImageUnderRoot(policy.TempRoot, policy.EvidenceRoot) ||
+            !String.Equals(policy.TempRoot, Path.Combine(policy.EvidenceRoot, "r", "t"), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git native policy root, owner-marker, or pinned image identity is malformed");
+        for (int i = 1; i < lines.Length; i++)
+        {
+            string[] f = lines[i].Split('\t');
+            if (f.Length != 14 || f[0] != "SLOT") throw new InvalidOperationException("H7-C Git native slot schema differs at index " + (i - 1).ToString(CultureInfo.InvariantCulture));
+            H7CGitSlotPolicy slot = new H7CGitSlotPolicy();
+            slot.Name = f[1];
+            slot.Path = NormalizeDebugPath(f[2]);
+            slot.Volume = f[3];
+            slot.FileId = f[4];
+            slot.Repo = NormalizeDebugPath(f[5]);
+            slot.RepoVolume = f[6];
+            slot.RepoFileId = f[7];
+            slot.GitHome = NormalizeDebugPath(f[8]);
+            slot.GitHomeVolume = f[9];
+            slot.GitHomeFileId = f[10];
+            slot.EmptyConfig = NormalizeDebugPath(f[11]);
+            slot.ConfigVolume = f[12];
+            slot.ConfigFileId = f[13];
+            string expected = "d32-h7c-slot-" + (i).ToString("D2", CultureInfo.InvariantCulture);
+            if (!String.Equals(slot.Name, expected, StringComparison.Ordinal) ||
+                slot.Volume.Length != 16 || slot.FileId.Length != 32 || slot.RepoVolume.Length != 16 || slot.RepoFileId.Length != 32 ||
+                slot.GitHomeVolume.Length != 16 || slot.GitHomeFileId.Length != 32 || slot.ConfigVolume.Length != 16 || slot.ConfigFileId.Length != 32 ||
+                !String.Equals(Path.GetDirectoryName(slot.Path), policy.TempRoot, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(Path.GetDirectoryName(slot.Repo), slot.Path, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(Path.GetDirectoryName(slot.GitHome), slot.Path, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(slot.EmptyConfig, Path.Combine(slot.GitHome, "empty.gitconfig"), StringComparison.OrdinalIgnoreCase) ||
+                !policy.Slots.TryAdd(slot.Name, slot))
+                throw new InvalidOperationException("H7-C Git native slot paths/identities are invalid or duplicated at index " + (i - 1).ToString(CultureInfo.InvariantCulture));
+        }
+        return policy;
+    }
+
+    private static H7CGitDirectoryIdentity ReadH7CGitDirectoryHandle(IntPtr handle, string expectedPath)
+    {
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) throw new InvalidOperationException("H7-C Git working-directory handle is absent");
+        DebugFileInformation basic;
+        if (!GetFileInformationByHandle(handle, out basic)) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git directory GetFileInformationByHandle failed");
+        if ((basic.Attributes & FileAttributeDirectory) == 0 || (basic.Attributes & FileAttributeReparsePoint) != 0)
+            throw new InvalidOperationException("H7-C Git path is not a regular non-reparse directory");
+        IntPtr attrBuffer = Marshal.AllocHGlobal(8);
+        IntPtr idBuffer = Marshal.AllocHGlobal(24);
+        try
+        {
+            if (!GetFileInformationByHandleEx(handle, 9, attrBuffer, 8)) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git FileAttributeTagInfo failed");
+            uint attributes = unchecked((uint)Marshal.ReadInt32(attrBuffer, 0));
+            if ((attributes & FileAttributeDirectory) == 0 || (attributes & FileAttributeReparsePoint) != 0)
+                throw new InvalidOperationException("H7-C Git directory handle identifies a reparse/non-directory entry");
+            if (!GetFileInformationByHandleEx(handle, 18, idBuffer, 24)) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git FileIdInfo failed");
+            string volume = unchecked((ulong)Marshal.ReadInt64(idBuffer, 0)).ToString("x16", CultureInfo.InvariantCulture);
+            byte[] id = new byte[16];
+            Marshal.Copy(IntPtr.Add(idBuffer, 8), id, 0, 16);
+            string fileId = BitConverter.ToString(id).Replace("-", "").ToLowerInvariant();
+            StringBuilder finalPath = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandleW(handle, finalPath, (uint)finalPath.Capacity, 0);
+            if (length == 0 || length >= finalPath.Capacity) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git directory final path query failed");
+            string path = NormalizeDebugPath(finalPath.ToString());
+            if (!String.Equals(path, NormalizeDebugPath(expectedPath), StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("H7-C Git directory opened-handle path differs from the authorized slot path");
+            return new H7CGitDirectoryIdentity { Path = path, Volume = volume, FileId = fileId };
+        }
+        finally { Marshal.FreeHGlobal(attrBuffer); Marshal.FreeHGlobal(idBuffer); }
+    }
+
+    private static H7CGitDirectoryIdentity OpenH7CGitDirectory(string path)
+    {
+        using (SafeFileHandle handle = CreateFileW(path, FileReadAttributes, FileShareRead | FileShareWrite | FileShareDelete, IntPtr.Zero,
+            OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero))
+        {
+            if (handle == null || handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git authorized directory could not be opened without following reparse points: " + path);
+            return ReadH7CGitDirectoryHandle(handle.DangerousGetHandle(), path);
+        }
+    }
+
+    private static void RequireH7CGitDirectory(H7CGitNativePolicy policy, string path, string volume, string fileId)
+    {
+        H7CGitDirectoryIdentity identity = OpenH7CGitDirectory(path);
+        if (!String.Equals(identity.Volume, volume, StringComparison.OrdinalIgnoreCase) || !String.Equals(identity.FileId, fileId, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git authorized directory opened-handle volume/file identity changed: " + path);
+    }
+
+    private static DebugImageSnapshot OpenH7CGitFile(string path)
+    {
+        using (SafeFileHandle handle = CreateFileW(path, FileReadAttributes | 0x80000000, FileShareRead, IntPtr.Zero, OpenExisting,
+            FileFlagOpenReparsePoint, IntPtr.Zero))
+        {
+            if (handle == null || handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git authorized regular file could not be opened without following reparse points: " + path);
+            return ReadDebugImage(handle.DangerousGetHandle());
+        }
+    }
+
+    private static string GetWindowsDirectoryCanonical()
+    {
+        StringBuilder buffer = new StringBuilder(32768);
+        uint count = GetWindowsDirectoryW(buffer, (uint)buffer.Capacity);
+        if (count == 0 || count >= buffer.Capacity) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetWindowsDirectoryW failed for H7-C Git environment validation");
+        return NormalizeDebugPath(buffer.ToString());
+    }
+
+    private static string GetSystemDirectoryCanonical()
+    {
+        StringBuilder buffer = new StringBuilder(32768);
+        uint count = GetSystemDirectoryW(buffer, (uint)buffer.Capacity);
+        if (count == 0 || count >= buffer.Capacity) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetSystemDirectoryW failed for H7-C Git environment validation");
+        return NormalizeDebugPath(buffer.ToString());
+    }
+
+    private static bool H7CGitPathVariable(string name)
+    {
+        return name == "HOME" || name == "USERPROFILE" || name == "XDG_CONFIG_HOME" || name == "TEMP" || name == "TMP" ||
+            name == "GIT_CEILING_DIRECTORIES" || name == "GIT_CONFIG_GLOBAL" || name == "GIT_CONFIG_SYSTEM" || name == "SYSTEMROOT" ||
+            name == "WINDIR" || name == "SYSTEMDRIVE" || name == "COMSPEC";
+    }
+
+    private static void RequireH7CGitEnvironment(Dictionary<string, string> actual, H7CGitNativePolicy policy, H7CGitSlotPolicy slot, bool status)
+    {
+        Dictionary<string, string> expected = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string windows = GetWindowsDirectoryCanonical();
+        if (status)
+        {
+            expected.Add("COMSPEC", Path.Combine(GetSystemDirectoryCanonical(), "cmd.exe"));
+            expected.Add("GCM_INTERACTIVE", "Never");
+            expected.Add("GIT_CEILING_DIRECTORIES", slot.Path);
+            expected.Add("GIT_CONFIG_GLOBAL", slot.EmptyConfig);
+            expected.Add("GIT_CONFIG_NOSYSTEM", "1");
+            expected.Add("GIT_OPTIONAL_LOCKS", "0");
+            expected.Add("GIT_TERMINAL_PROMPT", "0");
+            expected.Add("HOME", slot.GitHome);
+            expected.Add("SystemDrive", Path.GetPathRoot(windows).TrimEnd('\\'));
+            expected.Add("SystemRoot", windows);
+            expected.Add("windir", windows);
+        }
+        else
+        {
+            expected.Add("GCM_INTERACTIVE", "Never");
+            expected.Add("GIT_CEILING_DIRECTORIES", slot.Path);
+            expected.Add("GIT_CONFIG_GLOBAL", slot.EmptyConfig);
+            expected.Add("GIT_CONFIG_NOSYSTEM", "1");
+            expected.Add("GIT_CONFIG_SYSTEM", slot.EmptyConfig);
+            expected.Add("GIT_NO_REPLACE_OBJECTS", "1");
+            expected.Add("GIT_OPTIONAL_LOCKS", "0");
+            expected.Add("GIT_PAGER", "cat");
+            expected.Add("GIT_TERMINAL_PROMPT", "0");
+            expected.Add("HOME", slot.GitHome);
+            expected.Add("TEMP", policy.TempRoot);
+            expected.Add("TMP", policy.TempRoot);
+            expected.Add("USERPROFILE", slot.GitHome);
+            expected.Add("WINDIR", windows);
+            expected.Add("SystemRoot", windows);
+            expected.Add("XDG_CONFIG_HOME", slot.GitHome);
+        }
+        if (actual.Count != expected.Count) throw new InvalidOperationException("H7-C Git child environment has missing or extra keys; PATH, config override, shell/helper, and ambient variables remain denied");
+        foreach (KeyValuePair<string, string> entry in expected)
+        {
+            string value;
+            if (!actual.TryGetValue(entry.Key, out value)) throw new InvalidOperationException("H7-C Git child environment omits required key " + entry.Key);
+            bool pathValue = H7CGitPathVariable(entry.Key);
+            if (!(pathValue ? String.Equals(NormalizeDebugPath(value), NormalizeDebugPath(entry.Value), StringComparison.OrdinalIgnoreCase) : String.Equals(value, entry.Value, StringComparison.Ordinal)))
+                throw new InvalidOperationException("H7-C Git child environment value differs for " + entry.Key);
+        }
+    }
+
+    private static string[][] H7CGitSetupArguments()
+    {
+        return new string[][] {
+            new string[] { "init", "--quiet" },
+            new string[] { "config", "user.name", "D29-H7-C" },
+            new string[] { "config", "user.email", "d29h7c@example.invalid" },
+            new string[] { "add", "--", "unchanged.txt", "modified.txt" },
+            new string[] { "commit", "--quiet", "-m", "initial" }
+        };
+    }
+
+    private static string[] H7CGitStatusArguments()
+    {
+        return new string[] { "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all" };
+    }
+
+    private D32H7CGitChildObservationV1 ValidateH7CGitCreate(
+        H7CGitNativePolicy policy, DebugImageSnapshot image, IntPtr processHandle, D32DebugProcessRecordV2 parent,
+        DebugActiveProcess rootProcess, uint processId, long creationFileTime, uint parentPid, long parentCreationFileTime)
+    {
+        if (policy == null || image == null || parent == null || rootProcess == null || processHandle == IntPtr.Zero)
+            throw new InvalidOperationException("H7-C Git direct-child grant/process evidence is incomplete");
+        if (!String.Equals(NormalizeDebugPath(image.Path), policy.GitPath, StringComparison.OrdinalIgnoreCase) || image.Bytes != policy.GitBytes ||
+            !String.Equals(image.Sha256, policy.GitSha256, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(image.VolumeSerialHex, policy.GitVolume, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(image.FileIdHex, policy.GitFileId, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git CREATE image differs from the exact authority-pinned path/bytes/SHA/volume/file identity");
+        if (!String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase) || parent.Record.ProcessId != parentPid ||
+            parent.Record.CreationFileTime != parentCreationFileTime || rootProcess.Record.ProcessId == parentPid ||
+            parent.Record.ParentProcessId != rootProcess.Record.ProcessId || parent.Record.ParentCreationFileTime != rootProcess.Record.CreationFileTime ||
+            !String.Equals(Path.GetFileName(rootProcess.Record.ImagePath), "cargo.exe", StringComparison.OrdinalIgnoreCase) ||
+            !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(parent.Record.ImagePath), @"^vita_agent-[0-9a-f]+\.exe$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant) ||
+            !String.Equals(Path.GetFileName(Path.GetDirectoryName(parent.Record.ImagePath)), "deps", StringComparison.OrdinalIgnoreCase) ||
+            !IsImageUnderRoot(parent.Record.ImagePath, Path.Combine(policy.Repository, "vita-agent", "target", "debug")))
+            throw new InvalidOperationException("H7-C Git CREATE must be a direct child of the exact candidate Vita libtest, which is itself a direct child of the fixed Cargo Job root");
+        bool wow64;
+        if (!IsWow64Process(processHandle, out wow64) || wow64 || IntPtr.Size != 8)
+            throw new InvalidOperationException("H7-C Git CREATE process is not a readable native x64 Windows image");
+        DebugProcessBasicInformation information = GetDebugProcessBasicInformation(processHandle);
+        IntPtr parameters = ReadRemotePointer(processHandle, IntPtr.Add(information.PebBaseAddress, 0x20), "ProcessParameters");
+        string commandLine = ReadRemoteUnicodeString(processHandle, IntPtr.Add(parameters, 0x70), "CommandLine");
+        string currentDirectory = NormalizeDebugPath(ReadRemoteUnicodeString(processHandle, IntPtr.Add(parameters, 0x38), "CurrentDirectory"));
+        IntPtr remoteCurrentDirectoryHandle = Marshal.ReadIntPtr(parameters, 0x48);
+        if (remoteCurrentDirectoryHandle == IntPtr.Zero || remoteCurrentDirectoryHandle == new IntPtr(-1)) throw new InvalidOperationException("H7-C Git CREATE has no child current-directory handle");
+        IntPtr duplicatedCurrentDirectory = IntPtr.Zero;
+        try
+        {
+            if (!DuplicateHandle(processHandle, remoteCurrentDirectoryHandle, GetCurrentProcess(), out duplicatedCurrentDirectory, 0, false, DuplicateSameAccess))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "H7-C Git CREATE current-directory handle could not be retained for identity validation");
+            H7CGitDirectoryIdentity cwdIdentity = ReadH7CGitDirectoryHandle(duplicatedCurrentDirectory, currentDirectory);
+            if (!String.Equals(cwdIdentity.Path, currentDirectory, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("H7-C Git CREATE cwd path differs from its opened current-directory handle");
+        }
+        finally { if (duplicatedCurrentDirectory != IntPtr.Zero) CloseHandle(duplicatedCurrentDirectory); }
+
+        Dictionary<string, string> environment = ReadRemoteEnvironment(processHandle, ReadRemotePointer(processHandle, IntPtr.Add(parameters, 0x80), "Environment"));
+        string[] argv = ReadRemoteArgv(processHandle, commandLine);
+        if (argv.Length < 2 || !String.Equals(NormalizeDebugPath(argv[0]), policy.GitPath, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git CREATE argv[0] differs from the exact pinned native image path");
+        H7CGitSlotPolicy slot = null;
+        foreach (H7CGitSlotPolicy candidate in policy.Slots.Values)
+        {
+            if (String.Equals(currentDirectory, candidate.Repo, StringComparison.OrdinalIgnoreCase)) { slot = candidate; break; }
+        }
+        if (slot == null) throw new InvalidOperationException("H7-C Git CREATE working directory is not one of the 35 owner-bound fresh workspace slots");
+        RequireH7CGitDirectory(policy, policy.EvidenceRoot, policy.EvidenceRootVolume, policy.EvidenceRootFileId);
+        RequireH7CGitDirectory(policy, policy.TempRoot, policy.TempRootVolume, policy.TempRootFileId);
+        RequireH7CGitDirectory(policy, slot.Path, slot.Volume, slot.FileId);
+        RequireH7CGitDirectory(policy, slot.Repo, slot.RepoVolume, slot.RepoFileId);
+        RequireH7CGitDirectory(policy, slot.GitHome, slot.GitHomeVolume, slot.GitHomeFileId);
+        DebugImageSnapshot owner = OpenH7CGitFile(policy.OwnerMarkerPath);
+        if (owner.Bytes != policy.OwnerMarkerBytes || !String.Equals(owner.Sha256, policy.OwnerMarkerSha256, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(owner.VolumeSerialHex, policy.OwnerMarkerVolume, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(owner.FileIdHex, policy.OwnerMarkerFileId, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git CREATE owner marker identity changed after per-run grant creation");
+        DebugImageSnapshot emptyConfig = OpenH7CGitFile(slot.EmptyConfig);
+        if (emptyConfig.Bytes != 0 || !String.Equals(emptyConfig.Sha256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", StringComparison.Ordinal) ||
+            !String.Equals(emptyConfig.VolumeSerialHex, slot.ConfigVolume, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(emptyConfig.FileIdHex, slot.ConfigFileId, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7-C Git CREATE empty global/system config is no longer the exact owner-bound zero-byte file");
+
+        string[] arguments = argv.Skip(1).ToArray();
+        string operation;
+        string[][] setup = H7CGitSetupArguments();
+        if (slot.SetupNext < setup.Length && arguments.SequenceEqual(setup[slot.SetupNext], StringComparer.Ordinal))
+        {
+            RequireH7CGitEnvironment(environment, policy, slot, false);
+            operation = "setup-" + (slot.SetupNext + 1).ToString("D2", CultureInfo.InvariantCulture);
+            slot.SetupNext++;
+        }
+        else if (slot.SetupNext == setup.Length && slot.StatusCount == 0 && arguments.SequenceEqual(H7CGitStatusArguments(), StringComparer.Ordinal))
+        {
+            RequireH7CGitEnvironment(environment, policy, slot, true);
+            operation = "status";
+            slot.StatusCount++;
+        }
+        else throw new InvalidOperationException("H7-C Git CREATE argv is not the next fixed setup action or the one allowed fixed status action for this slot");
+        return new D32H7CGitChildObservationV1 {
+            Slot = slot.Name, Operation = operation, ProcessId = processId, CreationFileTime = creationFileTime,
+            ParentProcessId = parentPid, ParentCreationFileTime = parentCreationFileTime, ImagePath = image.Path,
+            Bytes = image.Bytes, Sha256 = image.Sha256, VolumeSerialHex = image.VolumeSerialHex, FileIdHex = image.FileIdHex,
+            CommandLine = commandLine, Argv = argv, WorkingDirectory = currentDirectory, Environment = environment
+        };
+    }
+
     private static bool TryGetDebugJobAccounting(IntPtr job, out JobObjectBasicAccountingInformation accounting)
     {
         accounting = new JobObjectBasicAccountingInformation();
@@ -3511,6 +4043,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         if (String.IsNullOrWhiteSpace(expectedRootPin) || approvedImagePins == null || candidateImageRoots == null || timeoutMilliseconds <= 0)
             throw new ArgumentException("expected root pin, image inventories, and a positive deadline are mandatory");
         string[] expectedRoot = ParseDebugPin(expectedRootPin);
+        H7CGitNativePolicy h7cGitPolicy = String.IsNullOrEmpty(_debugCoordinator.H7CGitNativePolicyText) ? null : ParseH7CGitNativePolicy(_debugCoordinator.H7CGitNativePolicyText);
+        if (h7cGitPolicy != null && !String.Equals(NormalizeDebugPath(expectedRoot[0]), h7cGitPolicy.CargoPath, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("H7C_GIT_GRANT_BLOCKED: narrow Git child authority is not bound to the fixed caller-pinned Cargo root");
         string[][] pins = new string[approvedImagePins.Length][];
         for (int i = 0; i < approvedImagePins.Length; i++) pins[i] = ParseDebugPin(approvedImagePins[i]);
         string[] roots = new string[candidateImageRoots.Length];
@@ -3640,7 +4175,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                     DebugImageSnapshot image = null;
                     string reason = null;
                     bool verified = false;
-                    DebugActiveProcess parent;
+                    DebugActiveProcess parent = null;
                     DebugActiveProcess retained = null;
                     IntPtr retainedHandle = IntPtr.Zero;
                     try
@@ -3726,10 +4261,24 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 parentCreation = parent.Record.CreationFileTime;
                                 // Each retained parent was itself admitted from this root's verified CREATE chain.
                                 string denied = GetHardDeniedImageReason(image.Path);
-                                if (denied != null) throw new InvalidOperationException(denied + ": " + image.Path);
+                                bool exactH7GitName = String.Equals(Path.GetFileName(image.Path), "git.exe", StringComparison.OrdinalIgnoreCase);
+                                if (denied != null && !(exactH7GitName && h7cGitPolicy != null)) throw new InvalidOperationException(denied + ": " + image.Path);
                                 if (_debugCoordinator.AllowPinnedGitRoot &&
                                     (trace.ProcessCreateEventCount != 2 || trace.Processes.Count != 1 || parentPid != trace.Processes[0].ProcessId))
                                     throw new InvalidOperationException("standalone pinned Git permits only one direct caller-pinned Windows console-host child; observed " + image.Path + " parent=" + parent.Record.ImagePath);
+                                if (exactH7GitName && h7cGitPolicy != null)
+                                {
+                                    DebugActiveProcess rootActive;
+                                    if (trace.Processes.Count == 0 || !active.TryGetValue(trace.Processes[0].ProcessId, out rootActive))
+                                        throw new InvalidOperationException("H7-C Git CREATE has no unique active root Cargo identity");
+                                    D32H7CGitChildObservationV1 observation = ValidateH7CGitCreate(
+                                        h7cGitPolicy, image, created.Process, parent.Record, rootActive,
+                                        ev.ProcessId, creation, parentPid, parentCreation);
+                                    lock (_h7cGitChildLock) _h7cGitChildren.Add(observation);
+                                    reason = "narrow-caller-pinned-H7C-Git-child-v1";
+                                }
+                                else
+                                {
                                 bool protocName = String.Equals(Path.GetFileName(image.Path), "protoc.exe", StringComparison.OrdinalIgnoreCase);
                                 bool protocContent = IsPinnedVendoredProtocContentIdentity(image.Bytes.ToString(CultureInfo.InvariantCulture), image.Sha256);
                                 if (protocName || protocContent)
@@ -3768,6 +4317,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 }
                                 if (reason == null) throw new InvalidOperationException("unknown child/helper image outside pinned inventories and declared candidate target roots: " + image.Path);
                                 }
+                                }
                                 verified = true;
                             }
                         }
@@ -3794,7 +4344,17 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                     catch (Exception error)
                     {
                         trace.DebugApiErrorCount++;
-                        TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT verification failed: " + error.Message);
+                        string childIdentity = image == null
+                            ? "opened_child_path=UNAVAILABLE opened_child_bytes=UNVERIFIED opened_child_sha256=UNVERIFIED opened_child_volume=UNVERIFIED opened_child_file_id=UNVERIFIED"
+                            : "opened_child_path=" + image.Path + " opened_child_bytes=" + image.Bytes.ToString(CultureInfo.InvariantCulture) +
+                                " opened_child_sha256=" + image.Sha256 + " opened_child_volume=" + image.VolumeSerialHex + " opened_child_file_id=" + image.FileIdHex;
+                        string parentIdentity = parent == null
+                            ? "parent_image_path=UNAVAILABLE"
+                            : "parent_image_path=" + parent.Record.ImagePath;
+                        TraceBlock(trace, "CREATE_PROCESS_DEBUG_EVENT verification failed: child_process_id=" + ev.ProcessId.ToString(CultureInfo.InvariantCulture) +
+                            " child_creation_filetime=" + creation.ToString(CultureInfo.InvariantCulture) +
+                            " parent_process_id=" + parentPid.ToString(CultureInfo.InvariantCulture) +
+                            " parent_creation_filetime=" + parentCreation.ToString(CultureInfo.InvariantCulture) + " " + parentIdentity + " " + childIdentity + "; " + error.Message);
                     }
                     if (injectFirstCreateInterruption && trace.ProcessCreateEventCount == 1)
                     {
@@ -5536,12 +6096,12 @@ function Assert-D32FixtureBuildProvenanceShape {
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
-        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant')
+        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
     $actual = @($Document.Keys | ForEach-Object { [string]$_ })
     if ($actual.Count -ne $expected.Count -or
         @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
         @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
-        [int]$Document.schema_version -ne 4 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V4' -or
+        [int]$Document.schema_version -ne 5 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V5' -or
         [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [uint64]$Document.fixture_manifest_bytes -le 0 -or
@@ -5557,6 +6117,15 @@ function Assert-D32FixtureBuildProvenanceShape {
         $grant.volume_serial_hex -isnot [string] -or $grant.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $grant.file_id_hex -isnot [string] -or $grant.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: strict per-run vendored-protoc grant reference is malformed'
+    }
+    $sourcePatch = $Document.tauri_macros_source_patch
+    if (-not (Test-D32VendoredObjectExactProperties -Object $sourcePatch -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+        $sourcePatch.path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $sourcePatch.path) -or
+        [IO.Path]::GetFileName([string]$sourcePatch.path) -cne 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json' -or
+        $sourcePatch.bytes -isnot [int64] -or $sourcePatch.bytes -le 0 -or $sourcePatch.sha256 -isnot [string] -or $sourcePatch.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $sourcePatch.volume_serial_hex -isnot [string] -or $sourcePatch.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+        $sourcePatch.file_id_hex -isnot [string] -or $sourcePatch.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'FIXTURE_PROVENANCE_INVALID: strict candidate/Profile-bound source-patch authority reference is malformed'
     }
     Assert-D32FixtureDebugTraceShape -Traces $Document.process_traces
     $environmentFields = @('toolchain_profile_path', 'toolchain_profile_sha256', 'target_triple', 'env_policy',
@@ -5857,13 +6426,14 @@ function Invoke-D32SelfTest {
             process_result = [PSCustomObject]@{ process_trace = [PSCustomObject]@{ state = 'BLOCKED'; marker = 'terminal-fatal-trace' }; native_cleanup = [PSCustomObject]@{ cleanup_succeeded = $false; marker = 'terminal-fatal-cleanup' } }
             phase_log = 'fixture-5.log'; error = 'fixture-5 failed fatally'
         }
-        $terminalSelection = Get-D32FixtureFailurePayloadSelection -PendingFailures @($ordinaryFailures[0]) -TerminalFailure $terminalFailure
+        $terminalSelection = Get-D32FixtureFailurePayloadSelection -PendingFailures $ordinaryFailures -TerminalFailure $terminalFailure
         if ($ordinarySelection.Name -cne 'fixture-4' -or $ordinarySelection.PrimaryError -cne 'fixture-4 exited nonzero' -or
             $ordinarySelection.SecondaryErrors[0] -cne 'fixture-2 exited nonzero' -or $ordinarySelection.SecondaryErrors[1] -cne 'global cleanup verification failed' -or
             $terminalSelection.Name -cne 'fixture-5' -or $terminalSelection.ProcessResult.process_trace.marker -cne 'terminal-fatal-trace' -or
             $terminalSelection.ProcessResult.native_cleanup.marker -cne 'terminal-fatal-cleanup' -or
-            $terminalSelection.SecondaryErrors.Count -ne 1 -or $terminalSelection.SecondaryErrors[0] -cne 'fixture-2 exited nonzero') {
-            throw 'SELFTEST_FAILED: blocked payload selection did not prefer the terminal failing phase trace/cleanup while retaining earlier failures'
+            $terminalSelection.SecondaryErrors.Count -ne 2 -or $terminalSelection.SecondaryErrors[0] -cne 'fixture-2 exited nonzero' -or
+            $terminalSelection.SecondaryErrors[1] -cne 'fixture-4 exited nonzero') {
+            throw 'SELFTEST_FAILED: blocked payload selection did not prefer the terminal failing phase trace/cleanup while retaining every earlier ordinary failure in order'
         }
         $passed++
 
@@ -6454,6 +7024,12 @@ public static class D32DebugSelfTestLauncher
             using (Process child = Start(args[2], new string[] { "exit", args[3] }))
                 return child.WaitForExit(10000) ? 0 : 49;
         }
+        if (mode == "spawn-git")
+        {
+            if (args.Length < 4) return 50;
+            using (Process child = Start(args[2], new string[] { "exit", args[3] }))
+                return child.WaitForExit(10000) ? 0 : 51;
+        }
         if (mode == "spawn-cmd")
         {
             if (args.Length < 3) return 44;
@@ -6689,8 +7265,24 @@ public static class D32DebugSelfTestLauncher
             -Arguments @('spawn-protoc', $protocRootMarker, $protocUnapprovedPath, $protocChildMarker) `
             -WorkingDirectory $root -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
         $protocDeniedTrace = ConvertTo-D32DebugProcessTraceDocument -Trace $protocCreateDenied.Trace
+        $protocDeniedIdentityDetail = [string]$protocDeniedTrace.block_reason
+        $protocCreateIdentityBound = $protocDeniedIdentityDetail.Contains('child_process_id=') -and
+            $protocDeniedIdentityDetail.Contains('child_creation_filetime=') -and
+            $protocDeniedIdentityDetail.Contains('parent_process_id=') -and
+            $protocDeniedIdentityDetail.Contains('parent_creation_filetime=') -and
+            $protocDeniedIdentityDetail.Contains('parent_image_path=') -and
+            $protocDeniedIdentityDetail.Contains('opened_child_path=') -and
+            $protocDeniedIdentityDetail.Contains('opened_child_sha256=') -and
+            $protocDeniedIdentityDetail.Contains('opened_child_volume=') -and
+            $protocDeniedIdentityDetail.Contains('opened_child_file_id=')
+        $protocDeniedImageSnapshot = Get-D32ProfileFileSnapshot -Path $protocUnapprovedPath
+        $protocCreateIdentityBound = $protocCreateIdentityBound -and
+            $protocDeniedIdentityDetail.Contains('opened_child_path=' + $protocDeniedImageSnapshot.Path) -and
+            $protocDeniedIdentityDetail.Contains('opened_child_sha256=' + $protocDeniedImageSnapshot.Sha256) -and
+            $protocDeniedIdentityDetail.Contains('parent_image_path=' + $debugLauncherPin.Path)
         if ($protocDeniedTrace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or $protocDeniedTrace.schema_version -ne 2 -or
             $protocDeniedTrace.state -cne 'BLOCKED' -or $protocDeniedTrace.block_reason -notmatch 'vendored protoc descendant does not match the exact per-run locked Cargo source pin' -or
+            -not $protocCreateIdentityBound -or
             $protocDeniedTrace.uncontinued_create_process_id -le 0 -or $protocDeniedTrace.uncontinued_create_continue_call_count -ne 0 -or
             $protocDeniedTrace.process_create_event_count -lt 1 -or -not [bool]$protocDeniedTrace.job_accounting_verified -or
             -not (Test-Path -LiteralPath $protocRootMarker) -or
@@ -6703,6 +7295,30 @@ public static class D32DebugSelfTestLauncher
             throw "SELFTEST_FAILED: ungranted protoc CREATE did not remain uncontinued with no child marker and complete V2 debugger/Job cleanup: $($protocDeniedTrace.block_reason); $($protocCreateDenied.Cleanup.Detail)"
         }
         Write-Host 'D32_PROTOC_CREATE_NEGATIVE=PASS uncontinued_create_calls=0 child_marker=false V2_trace=BLOCKED debugger_joined=true handles_signaled=true debugger_absent=true job_active=0'
+        $passed++
+
+        $ungrantedGitPath = Join-Path $root 'git.exe'
+        [IO.File]::Copy($debugLauncherPath, $ungrantedGitPath)
+        $gitRootMarker = Join-Path $root 'd32-ungranted-git-root.marker'
+        $gitChildMarker = Join-Path $root 'd32-ungranted-git-child.marker'
+        $gitCreateDenied = Invoke-D32DebugSelfTestProcess -FilePath $debugLauncherPath `
+            -Arguments @('spawn-git', $gitRootMarker, $ungrantedGitPath, $gitChildMarker) `
+            -WorkingDirectory $root -ExpectedRootPin $debugLauncherPin -ApprovedImagePins @($consoleHostPin) -EnvironmentBlock $debugTestEnvironment
+        $gitDeniedTrace = ConvertTo-D32DebugProcessTraceDocument -Trace $gitCreateDenied.Trace
+        if ($gitDeniedTrace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or $gitDeniedTrace.state -cne 'BLOCKED' -or
+            $gitDeniedTrace.block_reason -notmatch 'Git/SSH/credential helper image is never launchable' -or
+            $gitDeniedTrace.uncontinued_create_process_id -le 0 -or $gitDeniedTrace.uncontinued_create_continue_call_count -ne 0 -or
+            -not $gitDeniedTrace.block_reason.Contains('opened_child_path=' + $ungrantedGitPath) -or
+            -not $gitDeniedTrace.block_reason.Contains('parent_process_id=') -or
+            -not (Test-Path -LiteralPath $gitRootMarker) -or (Test-Path -LiteralPath $gitChildMarker) -or $gitCreateDenied.ContinueCalls -le 0 -or
+            -not $gitCreateDenied.Cleanup.CleanupSucceeded -or -not $gitCreateDenied.Cleanup.ProcessWaitSignaled -or
+            -not $gitCreateDenied.Cleanup.DebuggerThreadExited -or -not $gitCreateDenied.Cleanup.DebuggerThreadJoined -or
+            -not $gitCreateDenied.Cleanup.DebuggerKillOnExitEnabled -or -not $gitCreateDenied.Cleanup.RetainedProcessHandlesSignaled -or
+            -not $gitCreateDenied.Cleanup.DebuggerAssociationQueryVerified -or -not $gitCreateDenied.Cleanup.DebuggerAssociationAbsent -or
+            -not $gitCreateDenied.Cleanup.JobActiveProcessCountVerified -or [uint32]$gitCreateDenied.Cleanup.JobActiveProcessCount -ne 0) {
+            throw "SELFTEST_FAILED: ungranted Git CREATE did not remain uncontinued with no child marker and complete V2 debugger/Job cleanup: $($gitDeniedTrace.block_reason); $($gitCreateDenied.Cleanup.Detail)"
+        }
+        Write-Host 'D32_GIT_CREATE_NEGATIVE=PASS ungranted_direct_child_uncontinued=true user_marker=false V2_trace=BLOCKED debugger_joined=true handles_signaled=true debugger_absent=true job_active=0'
         $passed++
 
         foreach ($commandTarget in @([PSCustomObject]@{ Name = 'absolute-cmd'; Command = $cmdScriptPath }, [PSCustomObject]@{ Name = 'PATH-cmd'; Command = 'd32-debug-no-launch.cmd' })) {
@@ -7521,8 +8137,8 @@ public static class D32DebugSelfTestLauncher
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
         $provenanceDocument = [ordered]@{
-            schema_version = 4
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
+            schema_version = 5
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
             candidate_sha = '0123456789abcdef0123456789abcdef01234567'
             source_repo = $fakeRepo
             fixture_manifest_path = $sample
@@ -7546,6 +8162,13 @@ public static class D32DebugSelfTestLauncher
                 sha256 = ('a' * 64)
                 volume_serial_hex = ('0' * 16)
                 file_id_hex = ('0' * 32)
+            }
+            tauri_macros_source_patch = [ordered]@{
+                path = 'E:\\D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
+                bytes = [Int64]1
+                sha256 = ('b' * 64)
+                volume_serial_hex = ('0' * 16)
+                file_id_hex = ('1' * 32)
             }
         }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
@@ -8278,6 +8901,13 @@ if (-not [bool]$validatedToolchainProfile.IsValid) {
 }
 $script:ValidatedToolchainProfile = $validatedToolchainProfile
 if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: operational fixture builds require the fixed Phase0 runner owner binding' }
+$script:D32TauriMacrosSourcePatchAuthority = Test-D32TauriMacrosSourcePatchAuthority `
+    -AuthorityPath $TauriMacrosSourceAuthorityPath `
+    -ExpectedAuthoritySha256 $ExpectedTauriMacrosSourceAuthoritySha256 `
+    -Repository $RepoRoot `
+    -CandidateSha $candidateSha `
+    -ValidatedProfile $validatedToolchainProfile `
+    -EvidenceRoot $OutputRoot
 $cargo = [string]$validatedToolchainProfile.Profile.toolchain.cargo.path
 $cargo = Assert-D32NoReparsePath -Path $cargo
 $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
@@ -8701,8 +9331,8 @@ $processTraceRecords = @($phaseEvidence | ForEach-Object {
     }
 })
 $fixtureBuildProvenance = [ordered]@{
-    schema_version = 4
-    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
+    schema_version = 5
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
     candidate_sha = $candidateSha
     source_repo = $RepoRoot
     fixture_manifest_path = $ManifestPath
@@ -8714,6 +9344,7 @@ $fixtureBuildProvenance = [ordered]@{
     storage = $script:D32Phase0StorageContext
     process_traces = $processTraceRecords
     vendored_protoc_run_grant = $script:D32VendoredProtocRunGrant.Reference
+    tauri_macros_source_patch = $script:D32TauriMacrosSourcePatchAuthority.Reference
 }
 Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance
 $fixtureBuildProvenanceArtifact = Write-D32NewFixtureBuildProvenance -Path $fixtureProvenancePath -Document $fixtureBuildProvenance

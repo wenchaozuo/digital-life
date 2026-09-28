@@ -11,6 +11,10 @@ param(
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
     [string]$Phase0VendoredProtocAuthorityPath,
     [string]$Phase0ExpectedVendoredProtocAuthoritySha256,
+    [string]$Phase0TauriMacrosSourceAuthorityPath,
+    [string]$Phase0ExpectedTauriMacrosSourceAuthoritySha256,
+    [string]$Phase0H7CGitAuthorityPath,
+    [string]$Phase0ExpectedH7CGitAuthoritySha256,
     # Keep the original 1800-second default; owner-bound Phase0 callers may explicitly pin a bounded four-hour per-command limit.
     [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800
 )
@@ -22,9 +26,10 @@ $script:D32Phase0ScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
 $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1')
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-vendored-protoc-authority.ps1')
+. (Join-Path $script:D32Phase0ScriptRoot 'd32-h7c-git-child-authority.ps1')
 
-$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V4'
-$script:D32Phase0SchemaVersion = 4
+$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V5'
+$script:D32Phase0SchemaVersion = 5
 $script:D32Phase0FixtureOwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:D32Phase0FixtureOwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:D32Phase0OwnerBindingName = 'D32-PHASE0-OWNER.json'
@@ -33,6 +38,8 @@ $script:D32Phase0BlockedDiagnosticName = 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
 $script:D32Phase0BlockedDiagnosticType = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1'
 $script:D32Phase0FailureContext = $null
 $script:D32Phase0LastProcessFailure = $null
+$script:D32Phase0SelfTestSourcePatchAuthorityPath = $null
+$script:D32Phase0SelfTestSourcePatchAuthoritySha256 = $null
 $script:D32Phase0FixtureBuildSpecs = @(
     [PSCustomObject]@{ name = 'd29h1-authority-fixture'; manifest = 'src-tauri/Cargo.toml'; binary = 'd29h1-authority-fixture'; features = @('d29-h1-host-fixture') },
     [PSCustomObject]@{ name = 'd29h7-authority-fixture'; manifest = 'src-tauri/Cargo.toml'; binary = 'd29h7-authority-fixture'; features = @('d29-h7-host-fixture') },
@@ -193,7 +200,8 @@ function ConvertTo-D32Phase0ProcessRecord {
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
-        [AllowNull()][object]$VendoredProtocGrant
+        [AllowNull()][object]$VendoredProtocGrant,
+        [AllowNull()][object]$H7CGitRunGrant
     )
     if ($Process.process_id -le 0 -or $null -eq $Process.parent_process_id -or
         [String]::IsNullOrWhiteSpace([string]$Process.name) -or
@@ -204,7 +212,7 @@ function ConvertTo-D32Phase0ProcessRecord {
     }
     $imagePath = [IO.Path]::GetFullPath([string]$Process.image_path)
     $snapshot = Get-D32ProfileFileSnapshot -Path $imagePath
-    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $snapshot -VendoredProtocGrant $VendoredProtocGrant
+    $allowReason = Get-D32Phase0AllowedChildImageReason -ImagePath $imagePath -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $snapshot -VendoredProtocGrant $VendoredProtocGrant -H7CGitRunGrant $H7CGitRunGrant
     if ([String]::IsNullOrWhiteSpace($allowReason)) { throw 'PHASE0_PROCESS_TREE_BLOCKED: unknown child image is outside the pinned toolchain/native inventory and candidate debug targets' }
     $matching = @($ValidatedProfile.ExecutableInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $imagePath })
     if ($matching.Count -gt 1) { throw "PHASE0_PROCESS_TREE_BLOCKED: duplicate pinned process image identity: $imagePath" }
@@ -238,13 +246,26 @@ function Get-D32Phase0AllowedChildImageReason {
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
         [AllowNull()][object]$ImageIdentity,
-        [AllowNull()][object]$VendoredProtocGrant
+        [AllowNull()][object]$VendoredProtocGrant,
+        [AllowNull()][object]$H7CGitRunGrant
     )
     $imageName = [IO.Path]::GetFileName($ImagePath).ToLowerInvariant()
     $imageBytes = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('bytes', 'Bytes')
     $imageSha256 = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
     $knownVctipContent = Test-D32ProfilePinnedVctipContentIdentity -Bytes $imageBytes -Sha256 $imageSha256
     $knownVendoredProtocContent = ([Int64]$imageBytes -eq $script:D32VendoredProtocImageBytes -and [string]$imageSha256 -ceq $script:D32VendoredProtocImageSha256)
+    if ($imageName -ceq 'git.exe') {
+        if ($null -eq $H7CGitRunGrant -or $null -eq $H7CGitRunGrant.GitImage -or
+            -not (Test-D32ProfilePathEqual -Left $ImagePath -Right $H7CGitRunGrant.GitImage.Path) -or
+            [Int64]$imageBytes -ne [Int64]$H7CGitRunGrant.GitImage.Bytes -or $imageSha256 -cne [string]$H7CGitRunGrant.GitImage.Sha256) { return $null }
+        $openedPath = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('path', 'Path', 'image_path', 'ImagePath')
+        $openedVolume = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('volume_serial_hex', 'VolumeSerialHex')
+        $openedFileId = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('file_id_hex', 'FileIdHex')
+        if ($openedPath -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $openedPath -Right $H7CGitRunGrant.GitImage.Path) -or
+            $openedVolume -cne [string]$H7CGitRunGrant.GitImage.VolumeSerialHex -or $openedFileId -cne [string]$H7CGitRunGrant.GitImage.FileIdHex -or
+            -not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right ([string]$ValidatedProfile.Profile.toolchain.cargo.path))) { return $null }
+        return 'narrow-caller-pinned-H7C-Git-child-v1'
+    }
     if ($imageName -ceq 'vctip.exe' -or $knownVctipContent) {
         if ($imageName -cne 'vctip.exe') { return $null }
         $profileCargoPath = $null
@@ -426,7 +447,9 @@ function Test-D32Phase0DebugProcessTrace {
         [Parameter(Mandatory = $true)][int]$ExpectedParentProcessId,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
         [Parameter(Mandatory = $true)][string]$Repository,
-        [AllowNull()][object]$VendoredProtocGrant
+        [AllowNull()][object]$VendoredProtocGrant,
+        [AllowNull()][object]$H7CGitAuthority,
+        [AllowNull()][object]$H7CGitRunGrant
     )
 
     $fields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id',
@@ -569,12 +592,28 @@ function Test-D32Phase0DebugProcessTrace {
     foreach ($record in $Trace.processes) {
         $identity = "$($record.process_id)|$($record.creation_filetime)"
         if ($identity -eq $rootKey) { continue }
-        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $record -VendoredProtocGrant $VendoredProtocGrant
+        $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $record.image_path -ValidatedProfile $ValidatedProfile -Repository $Repository -ExpectedRootPath $ExpectedRootPath -ImageIdentity $record -VendoredProtocGrant $VendoredProtocGrant -H7CGitRunGrant $H7CGitRunGrant
         if ([String]::IsNullOrWhiteSpace($actualReason) -or $record.allowed_image_reason -cne $actualReason) { throw "PROCESS_TRACE_BLOCKED: child/helper image is outside exact pinned inventory and candidate target roots: $($record.image_path)" }
         $pinned = @($ValidatedProfile.ExecutableInventory + $ValidatedProfile.WindowsImageInventory | Where-Object { Test-D32ProfilePathEqual -Left $_.Path -Right $record.image_path })
         if ($pinned.Count -gt 1) { throw 'PROCESS_TRACE_BLOCKED: pinned process image identity is ambiguous' }
         if ($pinned.Count -eq 1 -and ($record.sha256 -cne $pinned[0].Sha256 -or [Int64]$record.bytes -ne [Int64]$pinned[0].Bytes -or
             $record.volume_serial_hex -cne $pinned[0].VolumeSerialHex -or $record.file_id_hex -cne $pinned[0].FileIdHex)) { throw 'PROCESS_TRACE_BLOCKED: caller-pinned child image changed' }
+    }
+    $h7GitPath = if ($null -ne $H7CGitRunGrant) { [string]$H7CGitRunGrant.GitImage.Path } else { '__D32_NO_H7C_GIT_AUTHORITY__' }
+    $gitChildren = @($Trace.processes | Where-Object { Test-D32ProfilePathEqual -Left $_.image_path -Right $h7GitPath })
+    if ($gitChildren.Count -gt 0) {
+        if ($null -eq $H7CGitRunGrant -or $null -eq $H7CGitAuthority -or
+            -not (Test-D32ProfilePathEqual -Left $ExpectedRootPath -Right ([string]$ValidatedProfile.Profile.toolchain.cargo.path))) { throw 'PROCESS_TRACE_BLOCKED: a Git process appears without the exact H7-C fixed-suite run grant' }
+        if ((ConvertTo-Json -InputObject $H7CGitRunGrant.Document.authority -Depth 6 -Compress) -cne
+            (ConvertTo-Json -InputObject $H7CGitAuthority.Reference -Depth 6 -Compress)) { throw 'PROCESS_TRACE_BLOCKED: H7-C run grant authority differs from the independently caller-pinned external authority' }
+        $rootRecord = @($Trace.processes | Where-Object { $_.create_sequence -eq 1 })
+        if ($rootRecord.Count -ne 1) { throw 'PROCESS_TRACE_BLOCKED: H7-C Git trace has no unique fixed Cargo root' }
+        foreach ($gitChild in $gitChildren) {
+            $parent = @($Trace.processes | Where-Object { $_.process_id -eq $gitChild.parent_process_id -and $_.creation_filetime -eq $gitChild.parent_creation_filetime })
+            if ($parent.Count -ne 1 -or $parent[0].parent_process_id -ne $rootRecord[0].process_id -or
+                $parent[0].parent_creation_filetime -ne $rootRecord[0].creation_filetime -or
+                $parent[0].image_path -notmatch '\\vita-agent\\target\\debug\\deps\\vita_agent-[0-9a-f]+\.exe$') { throw 'PROCESS_TRACE_BLOCKED: pinned Git is not a direct child of the exact candidate Vita libtest directly below the fixed Cargo root' }
+        }
     }
     return $Trace
 }
@@ -725,7 +764,9 @@ function Invoke-D32Phase0PinnedProcess {
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$GitSha256,
-        [AllowNull()][object]$VendoredProtocRunGrant
+        [AllowNull()][object]$VendoredProtocRunGrant,
+        [AllowNull()][object]$H7CGitAuthority,
+        [AllowNull()][object]$H7CGitRunGrant
     )
     $script:D32Phase0LastProcessFailure = [ordered]@{
         PrimaryError = $null
@@ -797,6 +838,28 @@ function Invoke-D32Phase0PinnedProcess {
         elseif ($launchEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: Vita code-mode uses its locked vendored path and must not receive PROTOC' }
     }
     elseif ($launchEnvironment.Contains('PROTOC')) { throw 'VENDORED_PROTOC_ENV_BLOCKED: PROTOC is outside the exact fixed src-tauri build/test command scope' }
+    $h7cNativePolicyText = $null
+    if ($null -ne $H7CGitAuthority -or $null -ne $H7CGitRunGrant) {
+        $fixedVitaSuiteArgs = @(Get-D32Phase0TestCommand -Package 'vita' -Kind suite)
+        if ($Name -cne 'vita-full-local-suite' -or -not $isCargoRoot -or -not $isBuildOrTest -or
+            -not (Test-D32ProfilePathEqual -Left $manifestPath -Right (Join-Path $Repository 'vita-agent\Cargo.toml')) -or
+            ($Arguments -join "`0") -cne ($fixedVitaSuiteArgs -join "`0") -or $null -eq $H7CGitAuthority -or $null -eq $H7CGitRunGrant) {
+            throw 'H7C_GIT_GRANT_BLOCKED: direct Git child authority is restricted to the one exact fixed Vita full-local-suite command'
+        }
+        if (-not (Test-D32ProfilePathEqual -Left $H7CGitRunGrant.Document.fixed_suite.executable -Right $Executable) -or
+            ($H7CGitRunGrant.Document.fixed_suite.arguments -join "`0") -cne ($Arguments -join "`0") -or
+            -not (Test-D32ProfilePathEqual -Left $H7CGitRunGrant.Document.fixed_suite.working_directory -Right $WorkingDirectory) -or
+            [Int64]$H7CGitRunGrant.Document.fixed_suite.timeout_seconds -ne $TimeoutSeconds -or
+            -not (Test-D32Phase0ExactProperties -Object $H7CGitRunGrant.Document.fixed_suite.policy.suite.environment -Expected @('D32_EXPECTED_CANDIDATE_SHA')) -or
+            $H7CGitRunGrant.Document.fixed_suite.policy.suite.environment.D32_EXPECTED_CANDIDATE_SHA -cne $ExpectedCandidateSha -or
+            (ConvertTo-Json -InputObject $H7CGitRunGrant.Document.authority -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $H7CGitAuthority.Reference -Depth 6 -Compress)) {
+            throw 'H7C_GIT_GRANT_BLOCKED: per-run grant differs from the exact current authority, Vita suite executable/argv/cwd/timeout'
+        }
+        if ($launchEnvironment.Contains('D32_EXPECTED_CANDIDATE_SHA')) { throw 'H7C_GIT_GRANT_BLOCKED: candidate SHA environment is already present before the exact suite grant injection' }
+        $launchEnvironment['D32_EXPECTED_CANDIDATE_SHA'] = $ExpectedCandidateSha
+        $h7cNativePolicyText = Get-D32H7CGitNativePolicyText -RunGrant $H7CGitRunGrant -Repository $Repository -GitImage $H7CGitRunGrant.GitImage
+        $script:D32Phase0ObservedH7CGitChildren = @()
+    }
     $environmentBlock = ConvertTo-D32Phase0EnvironmentBlock -Environment $launchEnvironment
     $started = [DateTimeOffset]::UtcNow
     $native = $null
@@ -842,7 +905,13 @@ function Invoke-D32Phase0PinnedProcess {
         $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
         if (Test-D32ProfilePathEqual -Left $image.Path -Right ([string]$currentProfile.Profile.toolchain.cargo.path)) {
             $null = Get-D32ProfileExactVctipImageRecord -ValidatedProfile $currentProfile
-            if ($null -ne $grantForProcess) {
+            if ($null -ne $grantForProcess -and $null -ne $H7CGitRunGrant) {
+                $protocPinText = @([string]$grantForProcess.Image.Path, [string]$grantForProcess.Image.Bytes, [string]$grantForProcess.Image.Sha256,
+                    [string]$grantForProcess.Image.VolumeSerialHex, [string]$grantForProcess.Image.FileIdHex) -join "`t"
+                $native.ConfigurePinnedCargoDebugCaptureWithVendoredProtocAndH7CGit($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout,
+                    [string]$grantForProcess.Document.cargo_home.path, $protocPinText, $h7cNativePolicyText)
+            }
+            elseif ($null -ne $grantForProcess) {
                 $protocPinText = @([string]$grantForProcess.Image.Path, [string]$grantForProcess.Image.Bytes, [string]$grantForProcess.Image.Sha256,
                     [string]$grantForProcess.Image.VolumeSerialHex, [string]$grantForProcess.Image.FileIdHex) -join "`t"
                 $native.ConfigurePinnedCargoDebugCaptureWithVendoredProtoc($rootPinText, [string[]]$approvedPinText, [string[]]$candidateRoots, $traceTimeout,
@@ -857,13 +926,14 @@ function Invoke-D32Phase0PinnedProcess {
         }
         $traceJoinTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000 + 20000))
         $traceNative = $native.WaitForDebugTrace($traceJoinTimeout)
+        if ($null -ne $H7CGitRunGrant) { $script:D32Phase0ObservedH7CGitChildren = @($native.GetH7CGitChildObservations() | ForEach-Object { ConvertTo-D32H7CGitObservationDocument -Observation $_ }) }
         $processTrace = ConvertTo-D32Phase0DebugProcessTraceDocument -Trace $traceNative
-        $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository -VendoredProtocGrant $grantForProcess
+        $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository -VendoredProtocGrant $grantForProcess -H7CGitAuthority $H7CGitAuthority -H7CGitRunGrant $H7CGitRunGrant
         if ($traceNative.State -cne 'COMPLETED' -or -not $traceNative.AccountingConsistent) { throw "PHASE0_PROCESS_TRACE_BLOCKED: $($traceNative.BlockReason)" }
         if ($traceNative.Processes.Count -eq 0) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: root CREATE_PROCESS_DEBUG_EVENT is absent' }
         $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -CommandLine $commandLine
         if ($rootSnapshot.parent_process_id -ne $PID) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: fixed command parent is not the exact runner identity' }
-        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess
+        $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess -H7CGitRunGrant $H7CGitRunGrant
         if (-not (Test-D32ProfilePathEqual -Left $rootRecord.image_path -Right $image.Path) -or $rootRecord.sha256 -cne $image.Sha256 -or
             $rootRecord.volume_serial_hex -cne $image.VolumeSerialHex -or $rootRecord.file_id_hex -cne $image.FileIdHex -or $rootRecord.command_line -cne $commandLine) {
             throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: root executable path/hash/file ID/argv mismatch'
@@ -872,7 +942,7 @@ function Invoke-D32Phase0PinnedProcess {
             $childSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $child
             $key = "$($childSnapshot.process_id)|$($childSnapshot.creation_date)"
             if ($descendants.Contains($key)) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: duplicate child PID/creation identity' }
-            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess
+            $descendants[$key] = ConvertTo-D32Phase0ProcessRecord -Process $childSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess -H7CGitRunGrant $H7CGitRunGrant
         }
         $exitCode = [int]$native.ExitCode
         $cleanup = $native.CloseJobAndWait(15000)
@@ -970,7 +1040,9 @@ function Invoke-D32Phase0LoggedCommand {
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$GitSha256,
-        [AllowNull()][object]$VendoredProtocRunGrant
+        [AllowNull()][object]$VendoredProtocRunGrant,
+        [AllowNull()][object]$H7CGitAuthority,
+        [AllowNull()][object]$H7CGitRunGrant
     )
     $Ordinal.Value++
     $safeName = $Name -replace '[^A-Za-z0-9._-]', '_'
@@ -980,7 +1052,8 @@ function Invoke-D32Phase0LoggedCommand {
         -LogPath (Join-Path $LogRoot ('phase0-{0:D2}-{1}' -f $Ordinal.Value, $safeName)) `
         -Environment $Environment -TimeoutSeconds $TimeoutSeconds `
         -ValidatedProfile $ValidatedProfile -Repository $Repository `
-        -ExpectedCandidateSha $ExpectedCandidateSha -GitPath $GitPath -GitSha256 $GitSha256 -VendoredProtocRunGrant $VendoredProtocRunGrant
+        -ExpectedCandidateSha $ExpectedCandidateSha -GitPath $GitPath -GitSha256 $GitSha256 -VendoredProtocRunGrant $VendoredProtocRunGrant `
+        -H7CGitAuthority $H7CGitAuthority -H7CGitRunGrant $H7CGitRunGrant
     $Records.Add($record)
     return $record
 }
@@ -1313,7 +1386,9 @@ function Test-D32Phase0FixtureBuildProvenance {
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
         [AllowNull()][string]$VendoredAuthorityPath,
         [AllowNull()][string]$ExpectedVendoredAuthoritySha256,
-        [AllowNull()][object]$ValidatedVendoredGrant
+        [AllowNull()][object]$ValidatedVendoredGrant,
+        [AllowNull()][string]$TauriMacrosSourceAuthorityPath,
+        [AllowNull()][string]$ExpectedTauriMacrosSourceAuthoritySha256
     )
     $expectedSidecar = [IO.Path]::GetFullPath((Join-Path $OutputRoot 'fixture-build-provenance.json'))
     if (-not (Test-D32ProfilePathEqual -Left $SidecarPath -Right $expectedSidecar) -or -not (Test-D32ProfileNoReparsePath -Path $expectedSidecar)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar path is not the fixed external regular file' }
@@ -1321,9 +1396,9 @@ function Test-D32Phase0FixtureBuildProvenance {
     $raw = [IO.File]::ReadAllText($expectedSidecar, [Text.Encoding]::UTF8)
     if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar has duplicate or invalid JSON keys' }
     $document = $raw | ConvertFrom-D32Phase0Json
-    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant')
-    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 4 -or
-        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V4' -or
+    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
+    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 5 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V5' -or
         $document.candidate_sha -isnot [string] -or $document.candidate_sha -cne $ExpectedCandidateSha -or
         $document.source_repo -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.source_repo -Right $Repository) -or
         $document.fixture_manifest_path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.fixture_manifest_path -Right $ManifestPath) -or
@@ -1331,6 +1406,18 @@ function Test-D32Phase0FixtureBuildProvenance {
         $document.fixture_manifest_volume_serial_hex -isnot [string] -or $document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $document.fixture_manifest_file_id_hex -isnot [string] -or $document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         -not (Test-D32Phase0Integer -Value $document.fixture_manifest_bytes -Positive)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar schema/candidate/source/manifest binding is invalid' }
+    if ([String]::IsNullOrWhiteSpace($TauriMacrosSourceAuthorityPath) -and -not [String]::IsNullOrWhiteSpace([string]$script:D32Phase0SelfTestSourcePatchAuthorityPath)) {
+        $TauriMacrosSourceAuthorityPath = [string]$script:D32Phase0SelfTestSourcePatchAuthorityPath
+        $ExpectedTauriMacrosSourceAuthoritySha256 = [string]$script:D32Phase0SelfTestSourcePatchAuthoritySha256
+    }
+    if ([String]::IsNullOrWhiteSpace($TauriMacrosSourceAuthorityPath) -or $ExpectedTauriMacrosSourceAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: fixture provenance validation requires the independently pinned external source-patch authority' }
+    $sourcePatchAuthority = Test-D32TauriMacrosSourcePatchAuthority `
+        -AuthorityPath $TauriMacrosSourceAuthorityPath -ExpectedAuthoritySha256 $ExpectedTauriMacrosSourceAuthoritySha256 `
+        -Repository $Repository -CandidateSha $ExpectedCandidateSha -ValidatedProfile $ValidatedProfile -EvidenceRoot $OutputRoot
+    if (-not (Test-D32VendoredObjectExactProperties -Object $document.tauri_macros_source_patch -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+        (ConvertTo-Json -InputObject $document.tauri_macros_source_patch -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $sourcePatchAuthority.Reference -Depth 5 -Compress)) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: fixture provenance source-patch reference differs from current opened external authority bytes/identity'
+    }
     $grantPath = Join-Path $OutputRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json'
     if (-not (Test-D32VendoredObjectExactProperties -Object $document.vendored_protoc_run_grant -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
         $document.vendored_protoc_run_grant.path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.vendored_protoc_run_grant.path -Right $grantPath) -or
@@ -1453,7 +1540,7 @@ function Test-D32Phase0FixtureBuildProvenance {
                 $entry.command_line -cne $fetchIdentity.command_line) { throw "PHASE0_FETCH_BLOCKED: legacy fetch identity disagrees with synchronized process trace at index $i" }
         }
     }
-    return [PSCustomObject]@{ Document = $document; Reference = $sidecarReference; ManifestReference = (Get-D32Phase0FileReference -Path $ManifestPath); VendoredGrant = $vendoredGrant }
+    return [PSCustomObject]@{ Document = $document; Reference = $sidecarReference; ManifestReference = (Get-D32Phase0FileReference -Path $ManifestPath); VendoredGrant = $vendoredGrant; TauriMacrosSourcePatchAuthority = $sourcePatchAuthority }
 }
 
 function Get-D32Phase0ExpectedCommandPlan {
@@ -1508,9 +1595,9 @@ function Test-D32Phase0MatrixRecord {
         $raw = [IO.File]::ReadAllText($recordFull, [Text.Encoding]::UTF8)
         if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'Phase0 record has duplicate object keys or invalid JSON structure' }
         $document = $raw | ConvertFrom-D32Phase0Json
-        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
-        if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw 'Phase0 record schema_version must be the supported JSON integer version 4' }
+        if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw "Phase0 record schema_version must be the supported JSON integer version $($script:D32Phase0SchemaVersion)" }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
         if (-not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive)) { throw 'Phase0 runner_process_id must be a positive JSON integer' }
         foreach ($name in @('candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'phase0_scope')) { if ($document.$name -isnot [string]) { throw "Phase0 $name must be a JSON string" } }
@@ -1591,6 +1678,24 @@ function Test-D32Phase0MatrixRecord {
             -ValidatedProfile $profile -EvidenceRoot $outputRoot -ExpectedRunId ([string]$document.cargo_home.run_id) `
             -CargoHome ([string]$document.cargo_home.path) -AuthorityPath $authorityPath -AuthoritySha256 $authoritySha `
             -OwnerMarkerReference $document.owner_marker
+        if (-not (Test-D32Phase0ExactProperties -Object $document.tauri_macros_source_patch -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) { throw 'Phase0 tauri-macros source authority reference is malformed' }
+        $tauriMacrosAuthority = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath ([string]$document.tauri_macros_source_patch.path) `
+            -ExpectedAuthoritySha256 ([string]$document.tauri_macros_source_patch.sha256) -Repository $repo -CandidateSha $ExpectedCandidateSha -ValidatedProfile $profile -EvidenceRoot $outputRoot
+        if ((ConvertTo-Json -InputObject $tauriMacrosAuthority.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.tauri_macros_source_patch -Depth 5 -Compress)) { throw 'Phase0 external tauri-macros source authority reference bytes/identity changed' }
+        if (-not (Test-D32Phase0ExactProperties -Object $document.h7c_git_child_authority -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32Phase0ExactProperties -Object $document.h7c_git_child_attestation -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) { throw 'Phase0 H7-C Git authority/companion reference is malformed' }
+        $h7Inputs = Get-D32H7CGitChildAttestationInputs -Reference $document.h7c_git_child_attestation -EvidenceRoot $outputRoot
+        if ((ConvertTo-Json -InputObject $h7Inputs.AuthorityReference -Depth 6 -Compress) -cne
+            (ConvertTo-Json -InputObject $document.h7c_git_child_authority -Depth 6 -Compress)) { throw 'Phase0 independently pinned H7-C Git authority differs from the companion authority reference' }
+        $h7GitImage = Get-D32ProfileFileSnapshot -Path $h7Inputs.GitImage.Path
+        if ($h7GitImage.Bytes -ne $h7Inputs.GitImage.Bytes -or $h7GitImage.Sha256 -cne $h7Inputs.GitImage.Sha256 -or $h7GitImage.VolumeSerialHex -cne $h7Inputs.GitImage.VolumeSerialHex -or $h7GitImage.FileIdHex -cne $h7Inputs.GitImage.FileIdHex) { throw 'H7C_GIT_ATTESTATION_BLOCKED: Git image opened identity differs from the companion header' }
+        $h7Authority = Test-D32H7CGitAuthority -AuthorityPath ([string]$document.h7c_git_child_authority.path) -ExpectedAuthoritySha256 ([string]$document.h7c_git_child_authority.sha256) `
+            -Repository $repo -CandidateSha $ExpectedCandidateSha -ValidatedProfile $profile -EvidenceRoot $outputRoot -TempRoot ([string]$document.cargo_home.temp_root) `
+            -GitImage $h7GitImage -TimeoutSeconds $h7Inputs.TimeoutSeconds
+        if ((ConvertTo-Json -InputObject $h7Authority.Reference -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $document.h7c_git_child_authority -Depth 6 -Compress)) { throw 'Phase0 external H7-C Git authority bytes/opened identity changed' }
+        $h7RunGrant = Test-D32H7CGitRunGrant -Reference $h7Inputs.Document.run_grant -Authority $h7Authority -Repository $repo -CandidateSha $ExpectedCandidateSha `
+            -ValidatedProfile $profile -EvidenceRoot $outputRoot -TempRoot ([string]$document.cargo_home.temp_root) -RunId ([string]$document.cargo_home.run_id) `
+            -OwnerMarker $ownerBinding.MarkerReference -GitImage $h7GitImage
         $expectedFetches = @($profile.LockInputs)
         if ($document.fetches -isnot [Array] -or $document.fetches.Count -ne $expectedFetches.Count) { throw 'Phase0 locked fetch array/count mismatch' }
         for ($i = 0; $i -lt $expectedFetches.Count; $i++) {
@@ -1621,8 +1726,9 @@ function Test-D32Phase0MatrixRecord {
         Test-D32FixtureManifest -FixtureManifest $fixtureDocument -FixtureManifestPath $fixturePath -Head $ExpectedCandidateSha -Repository $repo -Findings $fixtureFindings
         if (@($fixtureFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'Phase0 fixture schema/artifact validation failed' }
         if ([IO.Path]::GetFileName($fixtureProvenanceRef.Path) -cne 'fixture-build-provenance.json') { throw 'Phase0 fixture build provenance path is not fixed' }
-        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant
+        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant -TauriMacrosSourceAuthorityPath ([string]$document.tauri_macros_source_patch.path) -ExpectedTauriMacrosSourceAuthoritySha256 ([string]$document.tauri_macros_source_patch.sha256)
         if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.vendored_protoc_run_grant -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.vendored_protoc.run_grant -Depth 5 -Compress)) { throw 'Phase0 fixture provenance grant reference differs from matrix run grant reference' }
+        if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.tauri_macros_source_patch -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.tauri_macros_source_patch -Depth 5 -Compress)) { throw 'Phase0 fixture provenance tauri-macros source reference differs from matrix source authority reference' }
         if (($fixtureProvenance.Reference | ConvertTo-Json -Depth 5 -Compress) -cne ($document.fixture.build_provenance | ConvertTo-Json -Depth 5 -Compress)) { throw 'Phase0 fixture provenance sidecar reference does not match current opened-handle bytes/identity' }
         if (($document.fixture.fixture_names -join '|') -cne 'd29h1-authority-fixture|d29h7-authority-fixture|d29h7-process-fixture|d29h7-git-helper-fixture|d32a-sandbox-fixture' -or
             ($fixtureDocument.fixtures | ConvertTo-Json -Depth 20 -Compress) -cne ($document.fixture.fixture_records | ConvertTo-Json -Depth 20 -Compress)) { throw 'Phase0 fixture records do not match the independently validated fixture manifest' }
@@ -1714,7 +1820,11 @@ function Test-D32Phase0MatrixRecord {
                 $rootProcess.parent_process_id -ne [int]$document.runner_process_id -or -not (Test-D32ProfilePathEqual -Left $rootProcess.image_path -Right $plan.executable) -or $rootProcess.command_line -cne $expectedLine -or
                 $rootProcess.sha256 -cne $command.executable_sha256 -or [Int64]$rootProcess.bytes -ne [Int64]$command.executable_bytes -or
                 $rootProcess.volume_serial_hex -cne $command.executable_volume_serial_hex -or $rootProcess.file_id_hex -cne $command.executable_file_id_hex) { throw "Phase0 command[$i] root process identity mismatch" }
-            $null = Test-D32Phase0DebugProcessTrace -Trace $command.process_trace -ExpectedRootPath $plan.executable -ExpectedRootIdentity $toolRecord -ExpectedParentProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -Repository $repo -VendoredProtocGrant $vendoredGrant
+            $commandH7Authority = if ($command.name -ceq 'vita-full-local-suite') { $h7Authority } else { $null }
+            $commandH7RunGrant = if ($command.name -ceq 'vita-full-local-suite') { $h7RunGrant } else { $null }
+            $null = Test-D32Phase0DebugProcessTrace -Trace $command.process_trace -ExpectedRootPath $plan.executable -ExpectedRootIdentity $toolRecord `
+                -ExpectedParentProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -Repository $repo -VendoredProtocGrant $vendoredGrant `
+                -H7CGitAuthority $commandH7Authority -H7CGitRunGrant $commandH7RunGrant
             $traceRoot = @($command.process_trace.processes | Where-Object { $_.create_sequence -eq 1 })
             $rootFileTime = [DateTime]::Parse([string]$rootProcess.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
             if ($traceRoot.Count -ne 1 -or $traceRoot[0].process_id -ne $rootProcess.process_id -or $traceRoot[0].creation_filetime -ne $rootFileTime -or
@@ -1735,10 +1845,17 @@ function Test-D32Phase0MatrixRecord {
                     $traceChild[0].sha256 -cne $child.sha256 -or $traceChild[0].bytes -ne $child.bytes -or
                     $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex -or
                     $traceChild[0].parent_process_id -ne $child.parent_process_id) { throw "Phase0 command[$i] child record differs from synchronized debug CREATE evidence" }
-                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo -ExpectedRootPath ([string]$plan.executable) -ImageIdentity $child -VendoredProtocGrant $vendoredGrant
+                $actualReason = Get-D32Phase0AllowedChildImageReason -ImagePath $child.image_path -ValidatedProfile $profile -Repository $repo -ExpectedRootPath ([string]$plan.executable) -ImageIdentity $child -VendoredProtocGrant $vendoredGrant -H7CGitRunGrant $commandH7RunGrant
                 if ([String]::IsNullOrWhiteSpace($actualReason) -or $child.allowed_image_reason -cne $actualReason) { throw "Phase0 command[$i] contains unknown child image" }
             }
         }
+
+        $vitaSuiteCommand = @($document.commands | Where-Object { $_.name -ceq 'vita-full-local-suite' })
+        if ($vitaSuiteCommand.Count -ne 1) { throw 'Phase0 H7-C companion requires exactly one fixed Vita full-local-suite command' }
+        $h7Attestation = Test-D32H7CGitChildAttestation -Reference $document.h7c_git_child_attestation -Authority $h7Authority -RunGrant $h7RunGrant `
+            -OwnerBinding $ownerBinding -Phase0Command $vitaSuiteCommand[0] -Repository $repo -CandidateSha $ExpectedCandidateSha `
+            -ValidatedProfile $profile -EvidenceRoot $outputRoot -TempRoot ([string]$document.cargo_home.temp_root) -GitImage $h7GitImage
+        if ((ConvertTo-Json -InputObject $h7Attestation.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.h7c_git_child_attestation -Depth 5 -Compress)) { throw 'Phase0 H7-C companion reference bytes/identity changed' }
 
         $null = Test-D32Phase0ExecutedCommandEvidence -Document $document
 
@@ -2123,6 +2240,10 @@ function Invoke-D32Phase0Matrix {
         [Parameter(Mandatory = $true)][string]$GitSha256,
         [Parameter(Mandatory = $true)][string]$VendoredProtocAuthorityPath,
         [Parameter(Mandatory = $true)][string]$ExpectedVendoredProtocAuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$TauriMacrosSourceAuthorityPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedTauriMacrosSourceAuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$H7CGitAuthorityPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedH7CGitAuthoritySha256,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
     if ($PSVersionTable.PSVersion -lt [Version]'7.5') { throw 'PHASE0_BLOCKED: PowerShell 7.5 or newer is required' }
@@ -2138,6 +2259,15 @@ function Invoke-D32Phase0Matrix {
     $vendoredAuthority = Test-D32VendoredProtocAuthority `
         -AuthorityPath $VendoredProtocAuthorityPath -ExpectedAuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 `
         -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile -EvidenceRoot $output
+    $tauriMacrosAuthority = Test-D32TauriMacrosSourcePatchAuthority `
+        -AuthorityPath $TauriMacrosSourceAuthorityPath -ExpectedAuthoritySha256 $ExpectedTauriMacrosSourceAuthoritySha256 `
+        -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile -EvidenceRoot $output
+    $gitImage = Get-D32ProfileFileSnapshot -Path $GitPath
+    $expectedTempRoot = Join-Path (Join-Path $output 'r') 't'
+    $h7cAuthority = Test-D32H7CGitAuthority `
+        -AuthorityPath $H7CGitAuthorityPath -ExpectedAuthoritySha256 $ExpectedH7CGitAuthoritySha256 `
+        -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
+        -EvidenceRoot $output -TempRoot $expectedTempRoot -GitImage $gitImage -TimeoutSeconds $TimeoutSeconds
     Set-D32GitCaptureContext -ValidatedProfile $profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
     $pre = Get-D32Phase0GitState -Repository $repo -GitPath $GitPath -GitSha256 $GitSha256
     if ($pre.Head -cne $ExpectedSha) { throw 'PHASE0_CANDIDATE_BLOCKED: current HEAD does not equal caller-pinned candidate SHA' }
@@ -2176,6 +2306,8 @@ function Invoke-D32Phase0Matrix {
         Phase0OwnerBinding = $outputBinding
         VendoredProtocAuthorityPath = $VendoredProtocAuthorityPath
         ExpectedVendoredProtocAuthoritySha256 = $ExpectedVendoredProtocAuthoritySha256
+        TauriMacrosSourceAuthorityPath = $TauriMacrosSourceAuthorityPath
+        ExpectedTauriMacrosSourceAuthoritySha256 = $ExpectedTauriMacrosSourceAuthoritySha256
         TimeoutSeconds = $TimeoutSeconds
     }
     $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
@@ -2265,12 +2397,18 @@ function Invoke-D32Phase0Matrix {
     $fixtureProvenanceEvidence = Test-D32Phase0FixtureBuildProvenance `
         -SidecarPath $fixtureProvenancePath -ManifestPath $fixtureManifestPath -Repository $repo -OutputRoot $output `
         -ExpectedCandidateSha $ExpectedSha -ExpectedRunnerProcessId $PID -ValidatedProfile $profile `
-        -VendoredAuthorityPath $VendoredProtocAuthorityPath -ExpectedVendoredAuthoritySha256 $ExpectedVendoredProtocAuthoritySha256
+        -VendoredAuthorityPath $VendoredProtocAuthorityPath -ExpectedVendoredAuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 `
+        -TauriMacrosSourceAuthorityPath $TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $ExpectedTauriMacrosSourceAuthoritySha256
     $fixtureEnvironment = $fixtureProvenanceEvidence.Document.environment
     $cargoHome = [string]$fixtureEnvironment.cargo_home
     $tempRoot = [string]$fixtureEnvironment.temp_root
     $runId = [string]$fixtureEnvironment.run_id
     if ([String]::IsNullOrWhiteSpace($runId) -or -not (Test-D32ProfilePathWithin -Child $cargoHome -Parent $output) -or -not (Test-D32ProfilePathWithin -Child $tempRoot -Parent $output)) { throw 'PHASE0_CARGO_HOME_BLOCKED: fixture Cargo home/temp are not bound beneath the external evidence root' }
+    $h7cOwnerBinding = Test-D32Phase0OwnerBinding -EvidenceRoot $output -ExpectedCandidateSha $ExpectedSha -ValidatedProfile $profile -ExpectedRunId $runId -ExpectedRootIdentity $outputBinding.RootIdentity -ExpectedMarkerReference $outputBinding.OwnerMarker
+    $h7cRunGrantCreated = New-D32H7CGitRunGrant -Authority $h7cAuthority -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
+        -EvidenceRoot $output -TempRoot $tempRoot -RunId $runId -OwnerMarker $h7cOwnerBinding.MarkerReference -GitImage $gitImage
+    $h7cRunGrant = Test-D32H7CGitRunGrant -Reference $h7cRunGrantCreated.Reference -Authority $h7cAuthority -Repository $repo -CandidateSha $ExpectedSha `
+        -ValidatedProfile $profile -EvidenceRoot $output -TempRoot $tempRoot -RunId $runId -OwnerMarker $h7cOwnerBinding.MarkerReference -GitImage $gitImage
     $cargoHomeCheck = Test-D32CargoHome -Path $cargoHome -Repository $repo
     $lockInputs = @(Get-D32BuildToolchainLockInputs -Repository $repo)
     if (@($fixtureEnvironment.fetch_manifests).Count -ne $lockInputs.Count) { throw 'PHASE0_FETCH_BLOCKED: fixture did not fetch each exact profile-bound manifest' }
@@ -2337,8 +2475,20 @@ function Invoke-D32Phase0Matrix {
     }
 
     $suites = [System.Collections.Generic.List[object]]::new()
+    $h7cAttestation = $null
     foreach ($package in @('protocol', 'vita', 'host')) {
-        $suite = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-full-local-suite" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind suite)
+        if ($package -eq 'vita') {
+            $suite = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-full-local-suite" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind suite) `
+                -H7CGitAuthority $h7cAuthority -H7CGitRunGrant $h7cRunGrant
+            $h7cAttestationCreated = New-D32H7CGitChildAttestation -Authority $h7cAuthority -RunGrant $h7cRunGrant -OwnerBinding $h7cOwnerBinding `
+                -Phase0Command $suite -SuiteLines @(Get-D32Phase0TextFromLogs -CommandRecord $suite) -GitChildren @($script:D32Phase0ObservedH7CGitChildren) `
+                -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile -EvidenceRoot $output -TempRoot $tempRoot -GitImage $gitImage
+            $h7cAttestation = Test-D32H7CGitChildAttestation -Reference $h7cAttestationCreated.Reference -Authority $h7cAuthority -RunGrant $h7cRunGrant `
+                -OwnerBinding $h7cOwnerBinding -Phase0Command $suite -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
+                -EvidenceRoot $output -TempRoot $tempRoot -GitImage $gitImage
+        } else {
+            $suite = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-full-local-suite" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind suite)
+        }
         $summaries = @(Get-D32Phase0Summaries -Lines @(Get-D32Phase0TextFromLogs -CommandRecord $suite))
         if ($summaries.Count -eq 0) { throw "PHASE0_TEST_BLOCKED: test result summary missing for $package suite" }
         $counts = [ordered]@{
@@ -2414,6 +2564,9 @@ function Invoke-D32Phase0Matrix {
             authority = $vendoredAuthority.Reference
             run_grant = $fixtureProvenanceEvidence.VendoredGrant.Reference
         }
+        tauri_macros_source_patch = $fixtureProvenanceEvidence.TauriMacrosSourcePatchAuthority.Reference
+        h7c_git_child_authority = $h7cAuthority.Reference
+        h7c_git_child_attestation = if ($null -eq $h7cAttestation) { $null } else { $h7cAttestation.Reference }
         status = $script:D32Phase0Status
         bundle_hashes = $script:D32Phase0BundleHashes
         started_at_utc = $started.ToString('o')
@@ -3021,7 +3174,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)
-    & $add 'Phase0 record constants label local-only V4 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V4' -and $script:D32Phase0SchemaVersion -eq 4 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+    & $add 'Phase0 record constants label local-only V5 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V5' -and $script:D32Phase0SchemaVersion -eq 5 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
 
     $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $selfTestRoot = Join-Path $tempBase ('d32-phase0-sidecar-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -3503,9 +3656,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $compactDirectoryCollisionRejected = $true }
         & $add 'fixed compact Cargo-home child refuses an existing-directory collision' $compactDirectoryCollisionRejected
         $schemaRejectPath = Join-Path $selfTestRoot 'D32-PHASE0-MATRIX.json'
-        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         foreach ($phase0SchemaCase in @(
-                [PSCustomObject]@{ Version = 3; Type = 'D32_PHASE0_MATRIX_RECORD_V3'; Name = 'prior V3' },
+                [PSCustomObject]@{ Version = 4; Type = 'D32_PHASE0_MATRIX_RECORD_V4'; Name = 'prior V4' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
             )) {
             $phase0SchemaDocument = [ordered]@{}
@@ -3515,7 +3668,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             [IO.File]::WriteAllText($schemaRejectPath, (ConvertTo-Json -InputObject $phase0SchemaDocument -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
             $phase0SchemaDigest = Get-D32ProfileFileSnapshot -Path $schemaRejectPath
             $phase0SchemaResult = Test-D32Phase0MatrixRecord -RecordPath $schemaRejectPath -ExpectedRecordSha256 $phase0SchemaDigest.Sha256 -Repository $testRepository -ExpectedCandidateSha $candidate -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest -GitPath 'C:\d32-phase0-selftest\git.exe' -GitSha256 ('b' * 64)
-            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 4*')
+            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 5*')
         }
         [IO.File]::Delete($schemaRejectPath)
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
@@ -3721,6 +3874,44 @@ function Test-D32Phase0MatrixRecordSelfTest {
         $profilePath = [string]$fakeProfile.ProfilePath
         $fakeCargoPath = [string]$fakeProfile.Profile.toolchain.cargo.path
         $fakeLockInputs = @($fakeProfile.LockInputs)
+        $tauriArchivePath = $null
+        if (-not [String]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+            $tauriArchiveCandidate = Join-Path (Join-Path $env:USERPROFILE '.cargo\registry\cache\index.crates.io-1949cf8c6b5b557f') 'tauri-macros-2.6.3.crate'
+            if (Test-D32ProfileNoReparsePath -Path $tauriArchiveCandidate) { $tauriArchivePath = [IO.Path]::GetFullPath($tauriArchiveCandidate) }
+        }
+        if ([String]::IsNullOrWhiteSpace($tauriArchivePath)) { throw 'PHASE0_SELFTEST_BLOCKED: read-only local source cache lacks the exact locked tauri-macros 2.6.3 archive' }
+        $tauriSourceAttesterPath = Join-Path $script:D32Phase0ScriptRoot 'd32-tauri-macros-source-attestation.ps1'
+        if (-not (Test-D32ProfileNoReparsePath -Path $tauriSourceAttesterPath)) { throw 'PHASE0_SELFTEST_BLOCKED: exact source-patch facts generator is missing or reparse-backed' }
+        $tauriSourceAuthorityPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
+        $tauriSourceFactsLines = @(& $tauriSourceAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $candidate `
+            -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest)
+        if ($tauriSourceFactsLines.Count -ne 1 -or $tauriSourceFactsLines[0] -isnot [string]) { throw 'PHASE0_SELFTEST_BLOCKED: source-patch facts generator did not emit exactly one JSON document' }
+        $tauriSourceFacts = ConvertFrom-D32Phase0Json -Json ([string]$tauriSourceFactsLines[0])
+        $tauriSourceAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts
+        $tauriSourceAuthority = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath `
+            -ExpectedAuthoritySha256 $tauriSourceAuthorityReference.sha256 -Repository $testRepository -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
+        $script:D32Phase0SelfTestSourcePatchAuthorityPath = [string]$tauriSourceAuthorityReference.path
+        $script:D32Phase0SelfTestSourcePatchAuthoritySha256 = [string]$tauriSourceAuthorityReference.sha256
+        & $add 'source-patch V1 authority binds exact locked archive, sole candidate-local wrapper patch, current profile, candidate, and opened external identity' `
+            ($tauriSourceAuthority.Reference.sha256 -ceq $tauriSourceAuthorityReference.sha256 -and
+                $tauriSourceFacts.record_type -ceq 'D32_TAURI_MACROS_SOURCE_PATCH_V1' -and
+                $tauriSourceFacts.changed_files.Count -eq 1 -and $tauriSourceFacts.changed_files[0] -ceq 'src/command/wrapper.rs')
+        $wrongSourceAuthorityShaRejected = $false
+        try {
+            $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath -ExpectedAuthoritySha256 ('0' * 64) `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
+        }
+        catch { $wrongSourceAuthorityShaRejected = $_.Exception.Message -like '*independent expected SHA-256*' }
+        & $add 'source-patch reader rejects an authority whose bytes differ from its caller-pinned SHA' $wrongSourceAuthorityShaRejected
+        $wrongSourceCandidateRejected = $false
+        try {
+            $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath -ExpectedAuthoritySha256 $tauriSourceAuthorityReference.sha256 `
+                -Repository $testRepository -CandidateSha ('b' * 40) -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
+        }
+        catch { $wrongSourceCandidateRejected = $_.Exception.Message -like '*exact source-patch schema/candidate/profile*' }
+        & $add 'source-patch reader rejects a stale/wrong candidate binding' $wrongSourceCandidateRejected
+
         $expectedSelfTestLocks = @(Get-D32BuildToolchainLockInputs -Repository $testRepository)
         $lockProjectionExact = $fakeLockInputs.Count -eq 3 -and $expectedSelfTestLocks.Count -eq 3
         for ($lockIndex = 0; $lockIndex -lt [Math]::Min($fakeLockInputs.Count, $expectedSelfTestLocks.Count); $lockIndex++) {
@@ -3780,8 +3971,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
             }
         }
         $sidecar = [ordered]@{
-            schema_version = 4
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
+            schema_version = 5
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
             candidate_sha = $candidate
             source_repo = $testRepository
             fixture_manifest_path = $manifestSnapshot.Path
@@ -3817,14 +4008,135 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 volume_serial_hex = ('0' * 16)
                 file_id_hex = ('0' * 32)
             }
+            tauri_macros_source_patch = $tauriSourceAuthority.Reference
         }
         $writeSidecar = { param($value) [IO.File]::WriteAllText($sidecarPath, (ConvertTo-Json -InputObject $value -Depth 12), [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
         & $writeSidecar $sidecar
         try {
             $validSidecar = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $fixtureOutputRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile
-            & $add 'fixture build provenance v4 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V4')
+            & $add 'fixture build provenance v5 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V5')
         }
-        catch { & $add 'fixture build provenance v4 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
+        catch { & $add 'fixture build provenance v5 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
+
+        $h7GitPath = 'E:\Program Files\Git\mingw64\bin\git.exe'
+        $h7GitSnapshot = Get-D32ProfileFileSnapshot -Path $h7GitPath
+        if ($h7GitSnapshot.Sha256 -cne '1f2ee2de971b6d0a7a13f053014998b66c22df47f30f1907a767346392eb8d78') { throw 'PHASE0_SELFTEST_BLOCKED: direct Git self-test image no longer matches its project pin' }
+        $h7GitImage = [PSCustomObject]@{ Path = $h7GitSnapshot.Path; Bytes = [Int64]$h7GitSnapshot.Bytes; Sha256 = $h7GitSnapshot.Sha256; VolumeSerialHex = $h7GitSnapshot.VolumeSerialHex; FileIdHex = $h7GitSnapshot.FileIdHex }
+        $h7AuthorityPath = Join-Path $profileSelfTestRoot 'D32-H7C-GIT-CHILD-AUTHORITY.json'
+        $h7AuthorityDocument = Get-D32H7CGitAuthorityTemplate -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile `
+            -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage -TimeoutSeconds 1800
+        $h7AuthorityReference = Write-D32H7CGitJsonCreateNew -Path $h7AuthorityPath -Document $h7AuthorityDocument
+        $h7Authority = Test-D32H7CGitAuthority -AuthorityPath $h7AuthorityPath -ExpectedAuthoritySha256 $h7AuthorityReference.sha256 `
+            -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot `
+            -GitImage $h7GitImage -TimeoutSeconds 1800
+        & $add 'H7-C external authority V1 pins only direct Git identity, exact Vita suite, fixed operations, slots, environment, and Job policy' `
+            ($h7Authority.Reference.sha256 -ceq $h7AuthorityReference.sha256 -and $h7Authority.PolicySha256 -ceq $h7AuthorityDocument.policy_sha256)
+        $h7WrongAuthorityShaRejected = $false
+        try {
+            $null = Test-D32H7CGitAuthority -AuthorityPath $h7AuthorityPath -ExpectedAuthoritySha256 ('0' * 64) -Repository $testRepository `
+                -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage -TimeoutSeconds 1800
+        }
+        catch { $h7WrongAuthorityShaRejected = $_.Exception.Message -like '*caller-pinned SHA-256*' }
+        $h7WrongAuthorityCandidateRejected = $false
+        try {
+            $null = Test-D32H7CGitAuthority -AuthorityPath $h7AuthorityPath -ExpectedAuthoritySha256 $h7AuthorityReference.sha256 -Repository $testRepository `
+                -CandidateSha ('f' * 40) -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage -TimeoutSeconds 1800
+        }
+        catch { $h7WrongAuthorityCandidateRejected = $_.Exception.Message -like '*strict authority schema/candidate/profile/fresh path binding differs*' }
+        $h7WrongAuthorityImageRejected = $false
+        try {
+            $wrongGitImage = [PSCustomObject]@{ Path = $h7GitImage.Path; Bytes = $h7GitImage.Bytes; Sha256 = ('0' * 64); VolumeSerialHex = $h7GitImage.VolumeSerialHex; FileIdHex = $h7GitImage.FileIdHex }
+            $null = Test-D32H7CGitAuthority -AuthorityPath $h7AuthorityPath -ExpectedAuthoritySha256 $h7AuthorityReference.sha256 -Repository $testRepository `
+                -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $wrongGitImage -TimeoutSeconds 1800
+        }
+        catch { $h7WrongAuthorityImageRejected = $_.Exception.Message -like '*exact caller-pinned direct Git image identity differs*' }
+        & $add 'H7-C authority rejects wrong SHA, stale candidate, and mismatched Git image identity' `
+            ($h7WrongAuthorityShaRejected -and $h7WrongAuthorityCandidateRejected -and $h7WrongAuthorityImageRejected)
+        $h7OwnerBinding = Test-D32Phase0OwnerBinding -EvidenceRoot $selfTestRoot -ExpectedCandidateSha $candidate -ValidatedProfile $fakeProfile `
+            -ExpectedRunId $runId -ExpectedRootIdentity $ownerBinding.RootIdentity -ExpectedMarkerReference $ownerBinding.OwnerMarker
+        $h7RunGrant = New-D32H7CGitRunGrant -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile `
+            -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -RunId $runId -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+        $h7RunGrantValidated = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository `
+            -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -RunId $runId `
+            -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+        & $add 'H7-C per-run grant creates exactly 35 fresh owner-bound slots with opened directory and empty-config identities' `
+            ($h7RunGrantValidated.Slots.Count -eq 35 -and $h7RunGrantValidated.Document.status -ceq 'BOUND' -and
+                $h7RunGrantValidated.Slots[0].slot -ceq 'd32-h7c-slot-01' -and $h7RunGrantValidated.Slots[34].slot -ceq 'd32-h7c-slot-35')
+        $h7WrongRunRejected = $false
+        try {
+            $null = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -RunId ('f' * 32) -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+        }
+        catch { $h7WrongRunRejected = $_.Exception.Message -like '*per-run grant candidate/profile/owner/root/temp/image/policy binding is invalid*' }
+        $h7WrongTempRootRejected = $false
+        try {
+            $null = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot (Join-Path $profileSelfTestRoot 'wrong-temp-root') -RunId $runId `
+                -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+        }
+        catch { $h7WrongTempRootRejected = $_.Exception.Message -like '*grant file reference/path is not fixed*' }
+        $wrongH7Owner = [ordered]@{}
+        foreach ($field in $ownerBinding.OwnerMarker.Keys) { $wrongH7Owner[$field] = $ownerBinding.OwnerMarker[$field] }
+        $wrongH7Owner.file_id_hex = 'f' * 32
+        $h7WrongOwnerRejected = $false
+        try {
+            $null = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -RunId $runId -OwnerMarker $wrongH7Owner -GitImage $h7GitImage
+        }
+        catch { $h7WrongOwnerRejected = $_.Exception.Message -like '*per-run grant candidate/profile/owner/root/temp/image/policy binding is invalid*' }
+        $h7WrongRootRejected = $false
+        try {
+            $null = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
+                -ValidatedProfile $fakeProfile -EvidenceRoot (Join-Path $profileSelfTestRoot 'wrong-root') -TempRoot $tempRoot -RunId $runId `
+                -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+        }
+        catch { $h7WrongRootRejected = $_.Exception.Message -like '*grant file reference/path is not fixed*' }
+        & $add 'H7-C run-grant reader rejects stale/wrong run ID, EvidenceRoot, TempRoot, and owner identity' `
+            ($h7WrongRunRejected -and $h7WrongRootRejected -and $h7WrongTempRootRejected -and $h7WrongOwnerRejected)
+        $h7SuiteLogRoot = Join-Path $selfTestRoot 'h7c-suite-logs'
+        [void][IO.Directory]::CreateDirectory($h7SuiteLogRoot)
+        $h7SuiteStdout = Join-Path $h7SuiteLogRoot 'vita-full-local-suite.stdout.log'
+        $h7SuiteStderr = Join-Path $h7SuiteLogRoot 'vita-full-local-suite.stderr.log'
+        $h7SuiteLines = [System.Collections.Generic.List[string]]::new()
+        foreach ($h7Name in $script:D32H7CGitTestInventory) { $h7SuiteLines.Add("test d29h7::tests::$h7Name ... ok") }
+        $h7SuiteLines.Add('test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+        [IO.File]::WriteAllLines($h7SuiteStdout, $h7SuiteLines.ToArray(), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($h7SuiteStderr, '', [Text.UTF8Encoding]::new($false))
+        $h7SuiteArgs = @(Get-D32Phase0TestCommand -Package 'vita' -Kind 'suite')
+        $h7SuiteTrace = New-D32Phase0SelfTestDebugTrace -Profile $fakeProfile -RunnerProcessId $PID -RootProcessId 2000001234
+        $h7SuiteCommand = [PSCustomObject][ordered]@{
+            name = 'vita-full-local-suite'
+            executable = [string]$fakeProfile.Profile.toolchain.cargo.path
+            executable_sha256 = [string]$fakeProfile.Profile.toolchain.cargo.sha256
+            executable_bytes = [Int64]$fakeProfile.Profile.toolchain.cargo.bytes
+            executable_volume_serial_hex = [string]$fakeProfile.Profile.toolchain.cargo.volume_serial_hex
+            executable_file_id_hex = [string]$fakeProfile.Profile.toolchain.cargo.file_id_hex
+            arguments = $h7SuiteArgs
+            command_line = ConvertTo-D32Phase0CommandLine -Arguments (@([string]$fakeProfile.Profile.toolchain.cargo.path) + $h7SuiteArgs)
+            working_directory = $testRepository
+            exit_code = 0
+            process_trace = $h7SuiteTrace
+            stdout = Get-D32Phase0FileReference -Path $h7SuiteStdout
+            stderr = Get-D32Phase0FileReference -Path $h7SuiteStderr
+        }
+        $h7Attestation = New-D32H7CGitChildAttestation -Authority $h7Authority -RunGrant $h7RunGrant -OwnerBinding $h7OwnerBinding `
+            -Phase0Command $h7SuiteCommand -SuiteLines $h7SuiteLines.ToArray() -GitChildren @() -Repository $testRepository -CandidateSha $candidate `
+            -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage
+        $h7AttestationValidated = Test-D32H7CGitChildAttestation -Reference $h7Attestation.Reference -Authority $h7Authority -RunGrant $h7RunGrant `
+            -OwnerBinding $h7OwnerBinding -Phase0Command $h7SuiteCommand -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile `
+            -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage
+        & $add 'H7-C companion validates the fixed full-suite command, all 46 H7-C results, Trace V2 link, and zero unobserved Git children' `
+            ($h7AttestationValidated.Reference.sha256 -ceq $h7Attestation.Reference.sha256 -and $h7AttestationValidated.Document.git_child_count -eq 0 -and $h7AttestationValidated.Document.test_inventory.Count -eq 46)
+        $h7MissingTestRejected = $false
+        try { $null = Get-D32H7CGitTestResults -Lines @($h7SuiteLines.ToArray() | Where-Object { $_ -notmatch 'h7c_git_status_schema_is_fixed' }) }
+        catch { $h7MissingTestRejected = $_.Exception.Message -like '*required H7-C test result is absent*' }
+        $h7DuplicateTestRejected = $false
+        try { $null = Get-D32H7CGitTestResults -Lines (@($h7SuiteLines.ToArray()) + 'test d29h7::tests::h7c_git_status_schema_is_fixed ... ok') }
+        catch { $h7DuplicateTestRejected = $_.Exception.Message -like '*duplicate H7-C test result row*' }
+        $h7FailedTestRejected = $false
+        try { $null = Get-D32H7CGitTestResults -Lines @($h7SuiteLines.ToArray() | ForEach-Object { $_ -replace 'h7c_git_status_schema_is_fixed \.\.\. ok$', 'h7c_git_status_schema_is_fixed ... FAILED' }) }
+        catch { $h7FailedTestRejected = $_.Exception.Message -like '*required H7-C test did not pass*' }
+        & $add 'H7-C result parser rejects missing, duplicate, and failed required inventory rows' ($h7MissingTestRejected -and $h7DuplicateTestRejected -and $h7FailedTestRejected)
 
         $vctipTraceProfile = [PSCustomObject]@{
             Profile = $fakeProfile.Profile
@@ -4083,17 +4395,17 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'fixture provenance rejects prior V2 compact-layout schema even with a fresh exact file' $oldV2ProvenanceRejected
 
         $oldV3Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
-        $oldV3Provenance.schema_version = 3
-        $oldV3Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V3'
+        $oldV3Provenance.schema_version = 4
+        $oldV3Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
         & $writeSidecar $oldV3Provenance
-        $oldV3ProvenanceRejected = $false
+        $oldV4ProvenanceRejected = $false
         try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
-        catch { $oldV3ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
-        & $add 'fixture provenance rejects prior V3 after the vendored-authority migration' $oldV3ProvenanceRejected
+        catch { $oldV4ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
+        & $add 'fixture provenance rejects prior V4 after the source-patch authority migration' $oldV4ProvenanceRejected
 
         $unknownV4Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
-        $unknownV4Provenance.schema_version = 5
-        $unknownV4Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
+        $unknownV4Provenance.schema_version = 99
+        $unknownV4Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V99'
         & $writeSidecar $unknownV4Provenance
         $unknownV4ProvenanceRejected = $false
         try { $null = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $selfTestRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile }
@@ -4250,11 +4562,11 @@ if ($Phase0SelfTest) {
 }
 
 if ([String]::IsNullOrWhiteSpace($Phase0RepoRoot)) { $Phase0RepoRoot = Split-Path -Parent $script:D32Phase0ScriptRoot }
-foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256), @('VendoredProtocAuthorityPath', $Phase0VendoredProtocAuthorityPath), @('ExpectedVendoredProtocAuthoritySha256', $Phase0ExpectedVendoredProtocAuthoritySha256))) {
+foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256), @('VendoredProtocAuthorityPath', $Phase0VendoredProtocAuthorityPath), @('ExpectedVendoredProtocAuthoritySha256', $Phase0ExpectedVendoredProtocAuthoritySha256), @('TauriMacrosSourceAuthorityPath', $Phase0TauriMacrosSourceAuthorityPath), @('ExpectedTauriMacrosSourceAuthoritySha256', $Phase0ExpectedTauriMacrosSourceAuthoritySha256), @('H7CGitAuthorityPath', $Phase0H7CGitAuthorityPath), @('ExpectedH7CGitAuthoritySha256', $Phase0ExpectedH7CGitAuthoritySha256))) {
     if ([String]::IsNullOrWhiteSpace([string]$required[1])) { Write-Output "D32 Phase0: BLOCKED — -$($required[0]) is required"; exit 2 }
 }
 try {
-    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds
+    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TauriMacrosSourceAuthorityPath $Phase0TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $Phase0ExpectedTauriMacrosSourceAuthoritySha256 -H7CGitAuthorityPath $Phase0H7CGitAuthorityPath -ExpectedH7CGitAuthoritySha256 $Phase0ExpectedH7CGitAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds
     if ($result.Success) { exit 0 }
     exit 1
 }

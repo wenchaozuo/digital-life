@@ -3829,9 +3829,18 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
     private static bool H7CGitPathVariable(string name)
     {
-        return name == "HOME" || name == "USERPROFILE" || name == "XDG_CONFIG_HOME" || name == "TEMP" || name == "TMP" ||
-            name == "GIT_CEILING_DIRECTORIES" || name == "GIT_CONFIG_GLOBAL" || name == "GIT_CONFIG_SYSTEM" || name == "SYSTEMROOT" ||
-            name == "WINDIR" || name == "SYSTEMDRIVE" || name == "COMSPEC";
+        return String.Equals(name, "HOME", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "USERPROFILE", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "XDG_CONFIG_HOME", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "TEMP", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "TMP", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "GIT_CEILING_DIRECTORIES", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "GIT_CONFIG_GLOBAL", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "GIT_CONFIG_SYSTEM", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "SystemRoot", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "WINDIR", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "SystemDrive", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(name, "ComSpec", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void RequireH7CGitEnvironment(Dictionary<string, string> actual, H7CGitNativePolicy policy, H7CGitSlotPolicy slot, bool status)
@@ -3840,7 +3849,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         string windows = GetWindowsDirectoryCanonical();
         if (status)
         {
-            expected.Add("COMSPEC", Path.Combine(GetSystemDirectoryCanonical(), "cmd.exe"));
+            expected.Add("ComSpec", Path.Combine(GetSystemDirectoryCanonical(), "cmd.exe"));
             expected.Add("GCM_INTERACTIVE", "Never");
             expected.Add("GIT_CEILING_DIRECTORIES", slot.Path);
             expected.Add("GIT_CONFIG_GLOBAL", slot.EmptyConfig);
@@ -7170,6 +7179,53 @@ public static class D32DebugSelfTestLauncher
             throw "SELFTEST_FAILED: locked protoc native admission was not unique, exact-home, exact-image, and fail-closed (config=$exactProtocConfigAccepted child=$exactProtocChildAccepted negatives=$(@($protocPolicyNegatives | Where-Object { -not $_ }).Count))"
         }
         Write-Host 'D32_VENDORED_PROTOC_POLICY=PASS exact_per_run_CargoHome_and_opened_identity_only; stale_home_duplicate_alias_drift_wrong_root_and_unpermitted_denied'
+        $passed++
+        $h7NativeType = [D32FixtureNativeProcessV2]
+        $h7SlotType = $h7NativeType.GetNestedType('H7CGitSlotPolicy', [System.Reflection.BindingFlags]::NonPublic)
+        $h7Slot = [Activator]::CreateInstance($h7SlotType, $true)
+        $h7TempPath = Join-Path $root 'h7-environment-temp'
+        $h7SlotPath = Join-Path $h7TempPath 'd32-h7c-slot-01'
+        $h7HomePath = Join-Path $h7SlotPath 'git-home'
+        $h7ConfigPath = Join-Path $h7HomePath 'empty.gitconfig'
+        $setH7PrivateField = {
+            param([object]$Target, [string]$Name, [object]$Value)
+            $field = $Target.GetType().GetField($Name, [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::NonPublic)
+            if ($null -eq $field) { throw "SELFTEST_FAILED: H7-C private native policy field is absent: $Name" }
+            $field.SetValue($Target, $Value)
+        }.GetNewClosure()
+        & $setH7PrivateField $h7Slot 'Path' $h7SlotPath
+        & $setH7PrivateField $h7Slot 'EmptyConfig' $h7ConfigPath
+        & $setH7PrivateField $h7Slot 'GitHome' $h7HomePath
+        $h7StatusMap = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $h7WindowsRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+        $h7StatusMap.Add('ComSpec', (Join-Path (Join-Path $h7WindowsRoot 'System32') 'cmd.exe'))
+        $h7StatusMap.Add('GCM_INTERACTIVE', 'Never')
+        $h7StatusMap.Add('GIT_CEILING_DIRECTORIES', $h7SlotPath)
+        $h7StatusMap.Add('GIT_CONFIG_GLOBAL', $h7ConfigPath)
+        $h7StatusMap.Add('GIT_CONFIG_NOSYSTEM', '1')
+        $h7StatusMap.Add('GIT_OPTIONAL_LOCKS', '0')
+        $h7StatusMap.Add('GIT_TERMINAL_PROMPT', '0')
+        $h7StatusMap.Add('HOME', $h7HomePath)
+        $h7StatusMap.Add('SystemDrive', ([IO.Path]::GetPathRoot($h7WindowsRoot)).TrimEnd('\'))
+        $h7StatusMap.Add('SystemRoot', $h7WindowsRoot)
+        $h7StatusMap.Add('windir', $h7WindowsRoot)
+        $h7EnvironmentMethod = $h7NativeType.GetMethod('RequireH7CGitEnvironment', [System.Reflection.BindingFlags]::Static -bor [System.Reflection.BindingFlags]::NonPublic)
+        if ($null -eq $h7EnvironmentMethod) { throw 'SELFTEST_FAILED: H7-C native environment validator is absent' }
+        $h7EnvironmentMethod.Invoke($null, [object[]]@($h7StatusMap, $null, $h7Slot, $true))
+        $h7MissingMap = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in $h7StatusMap.Keys) { $h7MissingMap.Add([string]$key, [string]$h7StatusMap[$key]) }
+        $null = $h7MissingMap.Remove('GIT_CONFIG_GLOBAL')
+        $h7MissingMapRejected = $false
+        try { $h7EnvironmentMethod.Invoke($null, [object[]]@($h7MissingMap, $null, $h7Slot, $true)) }
+        catch { $h7MissingMapRejected = $_.Exception.GetBaseException().Message -like '*missing or extra keys*' }
+        $h7ExtraMap = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in $h7StatusMap.Keys) { $h7ExtraMap.Add([string]$key, [string]$h7StatusMap[$key]) }
+        $h7ExtraMap.Add('PATH', 'C:\unexpected')
+        $h7ExtraMapRejected = $false
+        try { $h7EnvironmentMethod.Invoke($null, [object[]]@($h7ExtraMap, $null, $h7Slot, $true)) }
+        catch { $h7ExtraMapRejected = $_.Exception.GetBaseException().Message -like '*missing or extra keys*' }
+        if (-not $h7MissingMapRejected -or -not $h7ExtraMapRejected) { throw 'SELFTEST_FAILED: H7-C native status environment did not reject missing/extra keys' }
+        Write-Host 'D32_H7C_NATIVE_ENVIRONMENT=PASS actual ComSpec casing and case-insensitive canonical path are accepted; missing/extra keys remain denied'
         $passed++
         $jobFlagsPolicyValid = [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002000) -and
             -not [D32FixtureNativeProcessV2]::HasRequiredNonBreakawayJobFlags(0x00002800) -and

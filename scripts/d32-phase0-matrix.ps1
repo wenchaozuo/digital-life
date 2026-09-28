@@ -4109,6 +4109,114 @@ function Test-D32Phase0MatrixRecordSelfTest {
         [IO.File]::WriteAllText($h7SuiteStderr, '', [Text.UTF8Encoding]::new($false))
         $h7SuiteArgs = @(Get-D32Phase0TestCommand -Package 'vita' -Kind 'suite')
         $h7SuiteTrace = New-D32Phase0SelfTestDebugTrace -Profile $fakeProfile -RunnerProcessId $PID -RootProcessId 2000001234
+        $h7Slot = $h7RunGrant.Document.slots[0]
+        $h7SystemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+        if ([String]::IsNullOrWhiteSpace($h7SystemRoot)) { throw 'PHASE0_SELFTEST_BLOCKED: Windows system root is unavailable for H7-C environment observation' }
+        $h7SetupEnvironment = [ordered]@{
+            GCM_INTERACTIVE = 'Never'
+            GIT_CEILING_DIRECTORIES = [string]$h7Slot.path.path
+            GIT_CONFIG_GLOBAL = [string]$h7Slot.empty_git_config.path
+            GIT_CONFIG_NOSYSTEM = '1'
+            GIT_CONFIG_SYSTEM = [string]$h7Slot.empty_git_config.path
+            GIT_NO_REPLACE_OBJECTS = '1'
+            GIT_OPTIONAL_LOCKS = '0'
+            GIT_PAGER = 'cat'
+            GIT_TERMINAL_PROMPT = '0'
+            HOME = [string]$h7Slot.git_home.path
+            TEMP = $tempRoot
+            TMP = $tempRoot
+            USERPROFILE = [string]$h7Slot.git_home.path
+            WINDIR = $h7SystemRoot
+            SystemRoot = $h7SystemRoot
+            XDG_CONFIG_HOME = [string]$h7Slot.git_home.path
+        }
+        $h7StatusEnvironment = [ordered]@{
+            ComSpec = Join-Path (Join-Path $h7SystemRoot 'System32') 'cmd.exe'
+            GCM_INTERACTIVE = 'Never'
+            GIT_CEILING_DIRECTORIES = [string]$h7Slot.path.path
+            GIT_CONFIG_GLOBAL = [string]$h7Slot.empty_git_config.path
+            GIT_CONFIG_NOSYSTEM = '1'
+            GIT_OPTIONAL_LOCKS = '0'
+            GIT_TERMINAL_PROMPT = '0'
+            HOME = [string]$h7Slot.git_home.path
+            SystemDrive = ([IO.Path]::GetPathRoot($h7SystemRoot)).TrimEnd('\')
+            SystemRoot = $h7SystemRoot
+            windir = $h7SystemRoot
+        }
+        $h7FixedArgv = Get-D32H7CGitFixedArgv
+        $h7SyntheticChildren = [System.Collections.Generic.List[object]]::new()
+        for ($h7OperationIndex = 0; $h7OperationIndex -lt 6; $h7OperationIndex++) {
+            $h7IsStatus = $h7OperationIndex -eq 5
+            $h7Operation = if ($h7IsStatus) { 'status' } else { 'setup-{0:D2}' -f ($h7OperationIndex + 1) }
+            $h7Arguments = if ($h7IsStatus) { @($h7FixedArgv.status) } else { @($h7FixedArgv.setup[$h7OperationIndex]) }
+            $h7Environment = if ($h7IsStatus) { $h7StatusEnvironment } else { $h7SetupEnvironment }
+            $h7GitPid = [uint32](2100001300 + $h7OperationIndex)
+            $h7GitCreation = [Int64]$h7SuiteTrace.processes[0].creation_filetime + 10 + $h7OperationIndex
+            $h7SyntheticChildren.Add((ConvertTo-D32H7CGitObservationDocument -Observation ([PSCustomObject]@{
+                Slot = [string]$h7Slot.slot
+                Operation = $h7Operation
+                ProcessId = $h7GitPid
+                CreationFileTime = $h7GitCreation
+                ParentProcessId = [uint32]2000001235
+                ParentCreationFileTime = [Int64]$h7SuiteTrace.processes[0].creation_filetime + 1
+                ImagePath = [string]$h7GitImage.Path
+                Bytes = [Int64]$h7GitImage.Bytes
+                Sha256 = [string]$h7GitImage.Sha256
+                VolumeSerialHex = [string]$h7GitImage.VolumeSerialHex
+                FileIdHex = [string]$h7GitImage.FileIdHex
+                CommandLine = ConvertTo-D32Phase0CommandLine -Arguments (@([string]$h7GitImage.Path) + $h7Arguments)
+                Argv = @([string]$h7GitImage.Path) + $h7Arguments
+                WorkingDirectory = [string]$h7Slot.repo.path
+                Environment = $h7Environment
+            })))
+        }
+
+        # Build a synthetic but internally reconciled Trace V2 process ledger:
+        # fixed Cargo root -> candidate Vita libtest -> five setup Git children -> one status Git child.
+        $h7RootRecord = $h7SuiteTrace.processes[0]
+        $h7RootPid = [uint32]$h7RootRecord.process_id
+        $h7RootCreation = [Int64]$h7RootRecord.creation_filetime
+        $h7VitaPid = [uint32]2000001235
+        $h7VitaCreation = $h7RootCreation + 1
+        $h7VitaPath = [IO.Path]::GetFullPath((Join-Path $testRepository 'vita-agent\target\debug\deps\vita_agent-0123456789abcdef.exe'))
+        $h7SyntheticProcesses = [System.Collections.Generic.List[object]]::new()
+        $h7SyntheticEvents = [System.Collections.Generic.List[object]]::new()
+        $h7SyntheticProcesses.Add($h7RootRecord)
+        $h7RootRecord.exit_sequence = 16
+        $h7RootRecord.exited_at_utc = [DateTime]::FromFileTimeUtc($h7RootCreation + 1000).ToString('o')
+        $h7SyntheticEvents.Add([ordered]@{ sequence = 1; kind = 'CREATE'; process_id = $h7RootPid; parent_process_id = [uint32]$PID; creation_filetime = $h7RootCreation; parent_creation_filetime = [Int64]$h7SuiteTrace.debugger_creation_filetime; exit_code = 0 })
+        $h7SyntheticEvents.Add([ordered]@{ sequence = 2; kind = 'CREATE'; process_id = $h7VitaPid; parent_process_id = $h7RootPid; creation_filetime = $h7VitaCreation; parent_creation_filetime = $h7RootCreation; exit_code = 0 })
+        $h7SyntheticProcesses.Add([ordered]@{
+            process_id = $h7VitaPid; parent_process_id = $h7RootPid; creation_filetime = $h7VitaCreation; parent_creation_filetime = $h7RootCreation
+            image_path = $h7VitaPath; bytes = [Int64]123456; sha256 = 'a' * 64; volume_serial_hex = '0000000000000001'; file_id_hex = '00000000000000010000000000000001'
+            allowed_image_reason = 'candidate-owned-target-image-observed-by-opened-handle'; image_verified = $true; exited = $true; exit_code = 0
+            create_sequence = 2; exit_sequence = 15; created_at_utc = [DateTime]::FromFileTimeUtc($h7VitaCreation).ToString('o'); exited_at_utc = [DateTime]::FromFileTimeUtc($h7RootCreation + 999).ToString('o')
+        })
+        for ($h7OperationIndex = 0; $h7OperationIndex -lt $h7SyntheticChildren.Count; $h7OperationIndex++) {
+            $h7Child = $h7SyntheticChildren[$h7OperationIndex]
+            $h7CreateSequence = 3 + (2 * $h7OperationIndex)
+            $h7ExitSequence = $h7CreateSequence + 1
+            $h7CreatedAt = [DateTime]::FromFileTimeUtc([Int64]$h7Child.creation_filetime).ToString('o')
+            $h7ExitedAt = [DateTime]::FromFileTimeUtc([Int64]$h7Child.creation_filetime + 1).ToString('o')
+            $h7SyntheticEvents.Add([ordered]@{ sequence = $h7CreateSequence; kind = 'CREATE'; process_id = [uint32]$h7Child.process_id; parent_process_id = $h7VitaPid; creation_filetime = [Int64]$h7Child.creation_filetime; parent_creation_filetime = $h7VitaCreation; exit_code = 0 })
+            $h7SyntheticEvents.Add([ordered]@{ sequence = $h7ExitSequence; kind = 'EXIT'; process_id = [uint32]$h7Child.process_id; parent_process_id = $h7VitaPid; creation_filetime = [Int64]$h7Child.creation_filetime; parent_creation_filetime = $h7VitaCreation; exit_code = 0 })
+            $h7SyntheticProcesses.Add([ordered]@{
+                process_id = [uint32]$h7Child.process_id; parent_process_id = $h7VitaPid; creation_filetime = [Int64]$h7Child.creation_filetime; parent_creation_filetime = $h7VitaCreation
+                image_path = [string]$h7Child.image_path; bytes = [Int64]$h7Child.bytes; sha256 = [string]$h7Child.sha256; volume_serial_hex = [string]$h7Child.volume_serial_hex; file_id_hex = [string]$h7Child.file_id_hex
+                allowed_image_reason = 'narrow-caller-pinned-H7C-Git-child-v1'; image_verified = $true; exited = $true; exit_code = 0
+                create_sequence = $h7CreateSequence; exit_sequence = $h7ExitSequence; created_at_utc = $h7CreatedAt; exited_at_utc = $h7ExitedAt
+            })
+        }
+        $h7SyntheticEvents.Add([ordered]@{ sequence = 15; kind = 'EXIT'; process_id = $h7VitaPid; parent_process_id = $h7RootPid; creation_filetime = $h7VitaCreation; parent_creation_filetime = $h7RootCreation; exit_code = 0 })
+        $h7SyntheticEvents.Add([ordered]@{ sequence = 16; kind = 'EXIT'; process_id = $h7RootPid; parent_process_id = [uint32]$PID; creation_filetime = $h7RootCreation; parent_creation_filetime = [Int64]$h7SuiteTrace.debugger_creation_filetime; exit_code = 0 })
+        $h7SuiteTrace.processes = @($h7SyntheticProcesses.ToArray())
+        $h7SuiteTrace.process_events = @($h7SyntheticEvents.ToArray())
+        $h7SuiteTrace.process_create_event_count = 8
+        $h7SuiteTrace.process_exit_event_count = 8
+        $h7SuiteTrace.process_event_count = 16
+        $h7SuiteTrace.debug_event_count = 16
+        $h7SuiteTrace.job_total_processes = 8
+        $h7SuiteTrace.retained_process_handle_count = 9
         $h7SuiteCommand = [PSCustomObject][ordered]@{
             name = 'vita-full-local-suite'
             executable = [string]$fakeProfile.Profile.toolchain.cargo.path
@@ -4124,14 +4232,66 @@ function Test-D32Phase0MatrixRecordSelfTest {
             stdout = Get-D32Phase0FileReference -Path $h7SuiteStdout
             stderr = Get-D32Phase0FileReference -Path $h7SuiteStderr
         }
+        $null = Test-D32Phase0DebugProcessTrace -Trace $h7SuiteTrace -ExpectedRootPath ([string]$fakeProfile.Profile.toolchain.cargo.path) `
+            -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID -ValidatedProfile $fakeProfile -Repository $testRepository `
+            -VendoredProtocGrant $null -H7CGitAuthority $h7Authority -H7CGitRunGrant $h7RunGrant
         $h7Attestation = New-D32H7CGitChildAttestation -Authority $h7Authority -RunGrant $h7RunGrant -OwnerBinding $h7OwnerBinding `
-            -Phase0Command $h7SuiteCommand -SuiteLines $h7SuiteLines.ToArray() -GitChildren @() -Repository $testRepository -CandidateSha $candidate `
+            -Phase0Command $h7SuiteCommand -SuiteLines $h7SuiteLines.ToArray() -GitChildren @($h7SyntheticChildren.ToArray()) -Repository $testRepository -CandidateSha $candidate `
             -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage
         $h7AttestationValidated = Test-D32H7CGitChildAttestation -Reference $h7Attestation.Reference -Authority $h7Authority -RunGrant $h7RunGrant `
             -OwnerBinding $h7OwnerBinding -Phase0Command $h7SuiteCommand -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile `
             -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage
-        & $add 'H7-C companion validates the fixed full-suite command, all 46 H7-C results, Trace V2 link, and zero unobserved Git children' `
-            ($h7AttestationValidated.Reference.sha256 -ceq $h7Attestation.Reference.sha256 -and $h7AttestationValidated.Document.git_child_count -eq 0 -and $h7AttestationValidated.Document.test_inventory.Count -eq 46)
+        $h7ObservedStatusEnvironment = $h7AttestationValidated.Document.git_children[5].environment
+        $h7ObservedEnvironmentKeys = @($h7ObservedStatusEnvironment.PSObject.Properties | ForEach-Object { [string]$_.Name })
+        $h7ObservedComSpec = @($h7ObservedEnvironmentKeys | Where-Object { [String]::Equals([string]$_, 'ComSpec', [StringComparison]::Ordinal) })
+        $h7ObservedUpperComSpec = @($h7ObservedEnvironmentKeys | Where-Object { [String]::Equals([string]$_, 'COMSPEC', [StringComparison]::Ordinal) })
+        & $add 'H7-C companion validates 46 H7-C results plus five setup and one status child through a reconciled Trace V2; actual ComSpec spelling is preserved' `
+            ($h7AttestationValidated.Reference.sha256 -ceq $h7Attestation.Reference.sha256 -and $h7AttestationValidated.Document.git_child_count -eq 6 -and
+                $h7AttestationValidated.Document.test_inventory.Count -eq 46 -and $h7ObservedComSpec.Count -eq 1 -and $h7ObservedUpperComSpec.Count -eq 0)
+
+        $cloneH7GitChild = {
+            param([System.Collections.IDictionary]$Source, [System.Collections.IDictionary]$Environment)
+            $copy = [ordered]@{}
+            foreach ($key in $Source.Keys) { $copy[[string]$key] = if ([string]$key -ceq 'environment') { $Environment } else { $Source[$key] } }
+            return $copy
+        }.GetNewClosure()
+        $newH7Environment = {
+            param([System.Collections.IDictionary]$Source, [string]$RemoveKey, [string]$AddKey, [string]$AddValue, [string]$RenameFrom, [string]$RenameTo)
+            $copy = [ordered]@{}
+            foreach ($key in $Source.Keys) {
+                if ([string]$key -ceq $RemoveKey) { continue }
+                $targetKey = if ([string]$key -ceq $RenameFrom) { $RenameTo } else { [string]$key }
+                $copy[$targetKey] = [string]$Source[$key]
+            }
+            if (-not [String]::IsNullOrEmpty($AddKey)) { $copy[$AddKey] = $AddValue }
+            return $copy
+        }.GetNewClosure()
+        $h7StatusMissingComSpec = & $newH7Environment $h7SyntheticChildren[5].environment 'ComSpec' '' '' '' ''
+        $h7StatusWrongComSpecCase = & $newH7Environment $h7SyntheticChildren[5].environment '' '' '' 'ComSpec' 'COMSPEC'
+        $h7StatusExtraPath = & $newH7Environment $h7SyntheticChildren[5].environment '' 'PATH' 'C:\unexpected' '' ''
+        $h7SetupMissingPager = & $newH7Environment $h7SyntheticChildren[0].environment 'GIT_PAGER' '' '' '' ''
+        $h7SetupExtraPath = & $newH7Environment $h7SyntheticChildren[0].environment '' 'PATH' 'C:\unexpected' '' ''
+        $h7EnvNegatives = [ordered]@{
+            status_missing_ComSpec = @($h7SyntheticChildren.ToArray())
+            status_wrong_ComSpec_case = @($h7SyntheticChildren.ToArray())
+            status_extra_PATH = @($h7SyntheticChildren.ToArray())
+            setup_missing_GIT_PAGER = @($h7SyntheticChildren.ToArray())
+            setup_extra_PATH = @($h7SyntheticChildren.ToArray())
+        }
+        $h7EnvNegatives.status_missing_ComSpec[5] = & $cloneH7GitChild $h7SyntheticChildren[5] $h7StatusMissingComSpec
+        $h7EnvNegatives.status_wrong_ComSpec_case[5] = & $cloneH7GitChild $h7SyntheticChildren[5] $h7StatusWrongComSpecCase
+        $h7EnvNegatives.status_extra_PATH[5] = & $cloneH7GitChild $h7SyntheticChildren[5] $h7StatusExtraPath
+        $h7EnvNegatives.setup_missing_GIT_PAGER[0] = & $cloneH7GitChild $h7SyntheticChildren[0] $h7SetupMissingPager
+        $h7EnvNegatives.setup_extra_PATH[0] = & $cloneH7GitChild $h7SyntheticChildren[0] $h7SetupExtraPath
+        $h7EnvNegativeResults = [System.Collections.Generic.List[bool]]::new()
+        foreach ($negativeCase in $h7EnvNegatives.GetEnumerator()) {
+            $rejected = $false
+            try { $null = Assert-D32H7CGitObservationSet -GitChildren $negativeCase.Value -RunGrant $h7RunGrant -Trace $h7SuiteTrace -GitImage $h7GitImage -Repository $testRepository }
+            catch { $rejected = $_.Exception.Message -like '*Git environment key set differs*' }
+            $h7EnvNegativeResults.Add($rejected)
+        }
+        & $add 'H7-C observation rejects missing or case-mismatched ComSpec, missing setup key, and extra PATH in setup/status maps' `
+            ($h7EnvNegativeResults.Count -eq 5 -and @($h7EnvNegativeResults | Where-Object { -not $_ }).Count -eq 0)
         $h7MissingTestRejected = $false
         try { $null = Get-D32H7CGitTestResults -Lines @($h7SuiteLines.ToArray() | Where-Object { $_ -notmatch 'h7c_git_status_schema_is_fixed' }) }
         catch { $h7MissingTestRejected = $_.Exception.Message -like '*required H7-C test result is absent*' }

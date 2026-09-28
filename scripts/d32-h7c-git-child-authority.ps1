@@ -90,12 +90,12 @@ function Get-D32H7CGitPolicyDocument {
             fixed_values = [ordered]@{ GCM_INTERACTIVE = 'Never'; GIT_NO_REPLACE_OBJECTS = '1'; GIT_OPTIONAL_LOCKS = '0'; GIT_PAGER = 'cat'; GIT_TERMINAL_PROMPT = '0' }
         }
         status_environment = [ordered]@{
-            required_keys = @('COMSPEC', 'GCM_INTERACTIVE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'HOME', 'SystemDrive', 'SystemRoot', 'windir')
+            required_keys = @('ComSpec', 'GCM_INTERACTIVE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'HOME', 'SystemDrive', 'SystemRoot', 'windir')
             git_config_rule = 'GIT_CONFIG_NOSYSTEM=1; GIT_CONFIG_GLOBAL equals this slot git-home\\empty.gitconfig'
             fixed_values = [ordered]@{ GCM_INTERACTIVE = 'Never'; GIT_OPTIONAL_LOCKS = '0'; GIT_TERMINAL_PROMPT = '0' }
         }
         native_environment = [ordered]@{
-            required_keys = @('COMSPEC', 'SystemDrive', 'SystemRoot', 'windir')
+            required_keys = @('ComSpec', 'SystemDrive', 'SystemRoot', 'windir')
             rule = 'only Windows CreateProcess OS plumbing: host-root SystemRoot/windir, SystemDrive, and canonical OS ComSpec string; these do not authorize process creation'
         }
         forbidden_environment = @('PATH', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_NOSYSTEM=false', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GCM_INTERACTIVE_PROMPT', 'GIT_CONFIG_KEY_*', 'GIT_CONFIG_VALUE_*')
@@ -497,7 +497,7 @@ function Assert-D32H7CGitObservationSet {
         if ($child.operation -cnotin @('setup-01', 'setup-02', 'setup-03', 'setup-04', 'setup-05', 'status') -or $child.operation -cne $operationKey -or
             $child.command_line -cne (ConvertTo-D32Phase0CommandLine -Arguments (@($GitImage.Path) + $arguments))) { throw "H7C_GIT_ATTESTATION_BLOCKED: Git argv/operation pair is outside the finite setup/status policy: $key" }
         $expectedEnvironmentKeys = if ($child.operation -ceq 'status') {
-            @('COMSPEC', 'GCM_INTERACTIVE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'HOME', 'SystemDrive', 'SystemRoot', 'windir')
+            @('ComSpec', 'GCM_INTERACTIVE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'HOME', 'SystemDrive', 'SystemRoot', 'windir')
         } else {
             @('GCM_INTERACTIVE', 'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_SYSTEM', 'GIT_NO_REPLACE_OBJECTS', 'GIT_OPTIONAL_LOCKS', 'GIT_PAGER', 'GIT_TERMINAL_PROMPT', 'HOME', 'TEMP', 'TMP', 'USERPROFILE', 'WINDIR', 'SystemRoot', 'XDG_CONFIG_HOME')
         }
@@ -514,7 +514,7 @@ function Assert-D32H7CGitObservationSet {
         }
         if ($child.operation -ceq 'status') {
             $envExpected.SystemDrive = ([IO.Path]::GetPathRoot($systemRoot)).TrimEnd('\')
-            $envExpected.COMSPEC = Join-Path (Join-Path $systemRoot 'System32') 'cmd.exe'
+            $envExpected.ComSpec = Join-Path (Join-Path $systemRoot 'System32') 'cmd.exe'
         } else {
             $envExpected.GIT_CONFIG_SYSTEM = [string]$slot.empty_git_config.path; $envExpected.GIT_NO_REPLACE_OBJECTS = '1'; $envExpected.GIT_PAGER = 'cat'
             $envExpected.TEMP = [string]$RunGrant.Document.temp_root.path; $envExpected.TMP = [string]$RunGrant.Document.temp_root.path
@@ -523,7 +523,7 @@ function Assert-D32H7CGitObservationSet {
         if (-not $windowsRootOk) { throw "H7C_GIT_ATTESTATION_BLOCKED: Git child Windows root environment is not canonical/equal: $key" }
         foreach ($envKey in $envExpected.Keys) {
             $actualValue = [string]$environmentMap[$envKey]
-            if ($envKey -in @('GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'HOME', 'TEMP', 'TMP', 'USERPROFILE', 'XDG_CONFIG_HOME', 'COMSPEC')) {
+            if ($envKey -in @('GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'HOME', 'TEMP', 'TMP', 'USERPROFILE', 'XDG_CONFIG_HOME', 'ComSpec')) {
                 if (-not (Test-D32ProfilePathEqual -Left $actualValue -Right ([string]$envExpected[$envKey]))) { throw "H7C_GIT_ATTESTATION_BLOCKED: Git child environment path $envKey differs: $key" }
             } elseif ($actualValue -cne [string]$envExpected[$envKey]) { throw "H7C_GIT_ATTESTATION_BLOCKED: Git child environment value $envKey differs: $key" }
         }

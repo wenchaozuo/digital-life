@@ -1718,6 +1718,13 @@ function Get-D32Phase0ExpectedCommandPlan {
     return @($plan.ToArray())
 }
 
+function Assert-D32Phase0FixtureSummarySchemaVersion {
+    param([Parameter(Mandatory = $true)][object]$Fixture)
+    if (-not (Test-D32Phase0Integer -Value $Fixture.schema_version) -or [Int64]$Fixture.schema_version -ne 3) {
+        throw 'Phase0 fixture summary schema_version must be the JSON integer 3'
+    }
+}
+
 function Test-D32Phase0MatrixRecord {
     param(
         [Parameter(Mandatory = $true)][string]$RecordPath,
@@ -1862,7 +1869,9 @@ function Test-D32Phase0MatrixRecord {
                 $fetchIdentity.identity_verified -isnot [bool] -or -not $fetchIdentity.identity_verified -or -not (Test-D32ProfilePathEqual -Left $fetchIdentity.image_path -Right $profile.Profile.toolchain.cargo.path)) { throw 'Phase0 Cargo fetch process identity is invalid' }
         }
 
-        if (-not (Test-D32Phase0ExactProperties -Object $document.fixture -Expected @('manifest', 'build_provenance', 'transcript', 'schema_version', 'process_tree_check', 'fixture_names', 'fixture_records', 'log_references', 'per_phase_git_states')) -or $document.fixture.schema_version -ne 3 -or $document.fixture.process_tree_check -cne 'succeeded') { throw 'Phase0 fixture summary schema/cleanup is invalid' }
+        if (-not (Test-D32Phase0ExactProperties -Object $document.fixture -Expected @('manifest', 'build_provenance', 'transcript', 'schema_version', 'process_tree_check', 'fixture_names', 'fixture_records', 'log_references', 'per_phase_git_states'))) { throw 'Phase0 fixture summary schema/cleanup is invalid' }
+        Assert-D32Phase0FixtureSummarySchemaVersion -Fixture $document.fixture
+        if ($document.fixture.process_tree_check -cne 'succeeded') { throw 'Phase0 fixture summary schema/cleanup is invalid' }
         $fixtureRef = Test-D32Phase0FileReference -Reference $document.fixture.manifest -AllowedRoot $outputRoot
         $fixtureProvenanceRef = Test-D32Phase0FileReference -Reference $document.fixture.build_provenance -AllowedRoot $outputRoot
         $transcriptRef = Test-D32Phase0FileReference -Reference $document.fixture.transcript -AllowedRoot $outputRoot
@@ -2924,6 +2933,19 @@ function Test-D32Phase0MatrixRecordSelfTest {
     }
     Assert-D32Phase0FixtureBuildBudgetRecord -Document $validFixtureBuildBudget
     & $add 'Phase0 fixture-build budget V1 accepts only the approved fixed timeout/jobs and capacity floor' $true
+    $fixtureSummarySchemaCasesPassed = $true
+    foreach ($schemaCase in @(
+            [PSCustomObject]@{ Value = [int]3; Expected = $true },
+            [PSCustomObject]@{ Value = '3'; Expected = $false },
+            [PSCustomObject]@{ Value = [int]2; Expected = $false },
+            [PSCustomObject]@{ Value = [int]99; Expected = $false }
+        )) {
+        $fixtureSummaryAccepted = $true
+        try { Assert-D32Phase0FixtureSummarySchemaVersion -Fixture ([PSCustomObject]@{ schema_version = $schemaCase.Value }) }
+        catch { $fixtureSummaryAccepted = $false }
+        if ($fixtureSummaryAccepted -ne [bool]$schemaCase.Expected) { $fixtureSummarySchemaCasesPassed = $false }
+    }
+    & $add 'Phase0 nested fixture summary requires the current JSON integer and rejects string, prior, and unknown versions' $fixtureSummarySchemaCasesPassed
     foreach ($invalidBudget in @(
             [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 14400 },
             [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 28801 },
@@ -4200,6 +4222,28 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         catch { $wrongSourceCandidateRejected = $_.Exception.Message -like '*source-patch schema/candidate/profile*' }
         & $add 'source-patch reader rejects a stale/wrong candidate binding' $wrongSourceCandidateRejected
+        $wrongSourceWrapperFacts = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($tauriSourceFacts))
+        $wrongSourceWrapperFacts.source_wrapper_sha256 = '0' * 64
+        $wrongSourceWrapperPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY-WRONG-WRAPPER.json'
+        $wrongSourceWrapperReference = Write-D32VendoredProtocAuthorityCreateNew -Path $wrongSourceWrapperPath -Document $wrongSourceWrapperFacts
+        $wrongSourceWrapperRejected = $false
+        try {
+            $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $wrongSourceWrapperPath -ExpectedAuthoritySha256 $wrongSourceWrapperReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
+        }
+        catch { $wrongSourceWrapperRejected = $_.Exception.Message -like '*source_wrapper_sha256 is not the exact wrapper extracted*' }
+        & $add 'source-patch authority rejects a mutated archived-wrapper SHA even with a freshly pinned authority file' $wrongSourceWrapperRejected
+        $wrongPatchDescriptorFacts = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($tauriSourceFacts))
+        $wrongPatchDescriptorFacts.patch_sha256 = '0' * 64
+        $wrongPatchDescriptorPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY-WRONG-DESCRIPTOR.json'
+        $wrongPatchDescriptorReference = Write-D32VendoredProtocAuthorityCreateNew -Path $wrongPatchDescriptorPath -Document $wrongPatchDescriptorFacts
+        $wrongPatchDescriptorRejected = $false
+        try {
+            $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $wrongPatchDescriptorPath -ExpectedAuthoritySha256 $wrongPatchDescriptorReference.sha256 `
+                -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot
+        }
+        catch { $wrongPatchDescriptorRejected = $_.Exception.Message -like '*descriptor does not recompute*' }
+        & $add 'source-patch authority rejects a mutated descriptor after recomputing the exact archived-to-patched wrapper transformation' $wrongPatchDescriptorRejected
 
         $expectedSelfTestLocks = @(Get-D32BuildToolchainLockInputs -Repository $testRepository)
         $lockProjectionExact = $fakeLockInputs.Count -eq 3 -and $expectedSelfTestLocks.Count -eq 3
@@ -4342,6 +4386,29 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $h7WrongAuthorityImageRejected = $_.Exception.Message -like '*exact caller-pinned direct Git image identity differs*' }
         & $add 'H7-C authority rejects wrong SHA, stale candidate, and mismatched Git image identity' `
             ($h7WrongAuthorityShaRejected -and $h7WrongAuthorityCandidateRejected -and $h7WrongAuthorityImageRejected)
+        $h7AuthoritySchemaOriginal = [IO.File]::ReadAllText($h7AuthorityPath, [Text.Encoding]::UTF8)
+        $h7AuthoritySchemaCasesPassed = $true
+        try {
+            foreach ($schemaCase in @(
+                    [PSCustomObject]@{ Value = '1'; Name = 'JSON string' },
+                    [PSCustomObject]@{ Value = [int]0; Name = 'prior integer' },
+                    [PSCustomObject]@{ Value = [int]99; Name = 'unknown integer' }
+                )) {
+                $authorityVariant = ConvertFrom-D32Phase0Json -Json $h7AuthoritySchemaOriginal
+                $authorityVariant.schema_version = $schemaCase.Value
+                [IO.File]::WriteAllText($h7AuthorityPath, (ConvertTo-Json -InputObject $authorityVariant -Depth 24 -Compress) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+                $authorityVariantReference = Get-D32H7CGitExternalFileReference -Path $h7AuthorityPath
+                $authorityVariantRejected = $false
+                try {
+                    $null = Test-D32H7CGitAuthority -AuthorityPath $h7AuthorityPath -ExpectedAuthoritySha256 $authorityVariantReference.sha256 -Repository $testRepository `
+                        -CandidateSha $candidate -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage -TimeoutSeconds 1800
+                }
+                catch { $authorityVariantRejected = $true }
+                if (-not $authorityVariantRejected) { $h7AuthoritySchemaCasesPassed = $false }
+            }
+        }
+        finally { [IO.File]::WriteAllText($h7AuthorityPath, $h7AuthoritySchemaOriginal, [Text.UTF8Encoding]::new($false)) }
+        & $add 'H7-C authority reader rejects string, prior, and unknown schema versions' $h7AuthoritySchemaCasesPassed
         $h7OwnerBinding = Test-D32Phase0OwnerBinding -EvidenceRoot $selfTestRoot -ExpectedCandidateSha $candidate -ValidatedProfile $fakeProfile `
             -ExpectedRunId $runId -ExpectedRootIdentity $ownerBinding.RootIdentity -ExpectedMarkerReference $ownerBinding.OwnerMarker
         $h7RunGrant = New-D32H7CGitRunGrant -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate -ValidatedProfile $fakeProfile `
@@ -4352,6 +4419,30 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'H7-C per-run grant creates exactly 35 fresh owner-bound slots with opened directory and empty-config identities' `
             ($h7RunGrantValidated.Slots.Count -eq 35 -and $h7RunGrantValidated.Document.status -ceq 'BOUND' -and
                 $h7RunGrantValidated.Slots[0].slot -ceq 'd32-h7c-slot-01' -and $h7RunGrantValidated.Slots[34].slot -ceq 'd32-h7c-slot-35')
+        $h7RunGrantSchemaPath = [string]$h7RunGrant.Reference.path
+        $h7RunGrantSchemaOriginal = [IO.File]::ReadAllText($h7RunGrantSchemaPath, [Text.Encoding]::UTF8)
+        $h7RunGrantSchemaCasesPassed = $true
+        try {
+            foreach ($schemaCase in @(
+                    [PSCustomObject]@{ Value = '1'; Name = 'JSON string' },
+                    [PSCustomObject]@{ Value = [int]0; Name = 'prior integer' },
+                    [PSCustomObject]@{ Value = [int]99; Name = 'unknown integer' }
+                )) {
+                $grantVariant = ConvertFrom-D32Phase0Json -Json $h7RunGrantSchemaOriginal
+                $grantVariant.schema_version = $schemaCase.Value
+                [IO.File]::WriteAllText($h7RunGrantSchemaPath, (ConvertTo-Json -InputObject $grantVariant -Depth 32 -Compress) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+                $grantVariantReference = Get-D32H7CGitExternalFileReference -Path $h7RunGrantSchemaPath
+                $grantVariantRejected = $false
+                try {
+                    $null = Test-D32H7CGitRunGrant -Reference $grantVariantReference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
+                        -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -RunId $runId -OwnerMarker $ownerBinding.OwnerMarker -GitImage $h7GitImage
+                }
+                catch { $grantVariantRejected = $true }
+                if (-not $grantVariantRejected) { $h7RunGrantSchemaCasesPassed = $false }
+            }
+        }
+        finally { [IO.File]::WriteAllText($h7RunGrantSchemaPath, $h7RunGrantSchemaOriginal, [Text.UTF8Encoding]::new($false)) }
+        & $add 'H7-C per-run grant reader rejects string, prior, and unknown schema versions' $h7RunGrantSchemaCasesPassed
         $h7WrongRunRejected = $false
         try {
             $null = Test-D32H7CGitRunGrant -Reference $h7RunGrant.Reference -Authority $h7Authority -Repository $testRepository -CandidateSha $candidate `
@@ -4533,6 +4624,34 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'H7-C companion validates 46 H7-C results plus five setup and one status child through a reconciled Trace V2; actual ComSpec spelling is preserved' `
             ($h7AttestationValidated.Reference.sha256 -ceq $h7Attestation.Reference.sha256 -and $h7AttestationValidated.Document.git_child_count -eq 6 -and
                 $h7AttestationValidated.Document.test_inventory.Count -eq 46 -and $h7ObservedComSpec.Count -eq 1 -and $h7ObservedUpperComSpec.Count -eq 0)
+        $h7AttestationSchemaPath = [string]$h7Attestation.Reference.path
+        $h7AttestationSchemaOriginal = [IO.File]::ReadAllText($h7AttestationSchemaPath, [Text.Encoding]::UTF8)
+        $h7AttestationSchemaCasesPassed = $true
+        try {
+            foreach ($schemaCase in @(
+                    [PSCustomObject]@{ Value = '1'; Name = 'JSON string' },
+                    [PSCustomObject]@{ Value = [int]0; Name = 'prior integer' },
+                    [PSCustomObject]@{ Value = [int]99; Name = 'unknown integer' }
+                )) {
+                $attestationVariant = ConvertFrom-D32Phase0Json -Json $h7AttestationSchemaOriginal
+                $attestationVariant.schema_version = $schemaCase.Value
+                [IO.File]::WriteAllText($h7AttestationSchemaPath, (ConvertTo-Json -InputObject $attestationVariant -Depth 40 -Compress) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+                $attestationVariantReference = Get-D32H7CGitExternalFileReference -Path $h7AttestationSchemaPath
+                $headerRejected = $false
+                try { $null = Get-D32H7CGitChildAttestationInputs -Reference $attestationVariantReference -EvidenceRoot $selfTestRoot }
+                catch { $headerRejected = $true }
+                $companionRejected = $false
+                try {
+                    $null = Test-D32H7CGitChildAttestation -Reference $attestationVariantReference -Authority $h7Authority -RunGrant $h7RunGrant `
+                        -OwnerBinding $h7OwnerBinding -Phase0Command $h7SuiteCommand -Repository $testRepository -CandidateSha $candidate `
+                        -ValidatedProfile $fakeProfile -EvidenceRoot $selfTestRoot -TempRoot $tempRoot -GitImage $h7GitImage
+                }
+                catch { $companionRejected = $true }
+                if (-not $headerRejected -or -not $companionRejected) { $h7AttestationSchemaCasesPassed = $false }
+            }
+        }
+        finally { [IO.File]::WriteAllText($h7AttestationSchemaPath, $h7AttestationSchemaOriginal, [Text.UTF8Encoding]::new($false)) }
+        & $add 'H7-C companion prevalidation and full readers reject string, prior, and unknown schema versions' $h7AttestationSchemaCasesPassed
 
         $cloneH7GitChild = {
             param([System.Collections.IDictionary]$Source, [System.Collections.IDictionary]$Environment)

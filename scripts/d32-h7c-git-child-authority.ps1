@@ -206,7 +206,7 @@ function Get-D32H7CGitChildAttestationInputs {
     $null = Assert-D32H7CGitFileReferenceIdentity -Reference $Reference -Snapshot $read.Snapshot -Name 'H7-C child attestation'
     $doc = $read.Document
     if (-not (Test-D32Phase0ExactProperties -Object $doc -Expected @('schema_version', 'record_type', 'status', 'candidate_sha', 'toolchain_profile', 'authority', 'run_grant', 'owner_marker', 'run_id', 'evidence_root', 'temp_root', 'git_image', 'fixed_suite', 'test_attribution', 'test_inventory', 'git_child_count', 'git_children', 'policy_sha256', 'generated_at_utc')) -or
-        $doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitChildAttestationType -or $doc.status -cne 'PASS' -or
+        -not (Test-D32Phase0Integer -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitChildAttestationType -or $doc.status -cne 'PASS' -or
         -not (Test-D32Phase0ExactProperties -Object $doc.authority -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
         -not (Test-D32Phase0ExactProperties -Object $doc.run_grant -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
         -not (Test-D32Phase0ExactProperties -Object $doc.fixed_suite -Expected @('name', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex', 'executable_file_id_hex', 'arguments', 'command_line', 'working_directory', 'timeout_seconds', 'candidate_sha_environment', 'exit_code', 'stdout', 'stderr', 'process_trace_sha256')) -or
@@ -367,7 +367,8 @@ function Test-D32H7CGitRunGrant {
     $null = Assert-D32H7CGitFileReferenceIdentity -Reference $Reference -Snapshot $read.Snapshot -Name 'H7-C per-run grant'
     $doc = $read.Document
     $fields = @('schema_version', 'record_type', 'status', 'authority', 'policy_sha256', 'candidate_sha', 'toolchain_profile', 'owner_marker', 'run_id', 'evidence_root', 'temp_root', 'git_image', 'fixed_suite', 'slots', 'parent_policy', 'job_policy', 'process_test_attribution', 'test_inventory', 'test_result_policy', 'created_at_utc')
-    if (-not (Test-D32Phase0ExactProperties -Object $doc -Expected $fields) -or $doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitRunGrantType -or
+    if (-not (Test-D32Phase0ExactProperties -Object $doc -Expected $fields) -or
+        -not (Test-D32Phase0Integer -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitRunGrantType -or
         $doc.status -cne 'BOUND' -or $doc.policy_sha256 -cne $Authority.PolicySha256 -or $doc.candidate_sha -cne $CandidateSha -or $doc.run_id -cne $RunId -or
         (ConvertTo-Json -InputObject $doc.authority -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Authority.Reference -Depth 6 -Compress) -or
         (ConvertTo-Json -InputObject $doc.toolchain_profile -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject ([ordered]@{ path = $ValidatedProfile.ProfilePath; sha256 = $ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes; volume_serial_hex = $ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = $ValidatedProfile.Identity.FileIdHex }) -Depth 6 -Compress) -or
@@ -607,7 +608,8 @@ function Test-D32H7CGitChildAttestation {
     $null = Assert-D32H7CGitFileReferenceIdentity -Reference $Reference -Snapshot $read.Snapshot -Name 'H7-C child attestation'
     $doc = $read.Document
     $fields = @('schema_version', 'record_type', 'status', 'candidate_sha', 'toolchain_profile', 'authority', 'run_grant', 'owner_marker', 'run_id', 'evidence_root', 'temp_root', 'git_image', 'fixed_suite', 'test_attribution', 'test_inventory', 'git_child_count', 'git_children', 'policy_sha256', 'generated_at_utc')
-    if (-not (Test-D32Phase0ExactProperties -Object $doc -Expected $fields) -or $doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitChildAttestationType -or $doc.status -cne 'PASS' -or
+    if (-not (Test-D32Phase0ExactProperties -Object $doc -Expected $fields) -or
+        -not (Test-D32Phase0Integer -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32H7CGitChildAttestationType -or $doc.status -cne 'PASS' -or
         $doc.candidate_sha -cne $CandidateSha -or $doc.run_id -cne $OwnerBinding.RunId -or $doc.policy_sha256 -cne $Authority.PolicySha256 -or $doc.test_attribution -cne 'NONE' -or
         (ConvertTo-Json -InputObject $doc.authority -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Authority.Reference -Depth 6 -Compress) -or
         (ConvertTo-Json -InputObject $doc.run_grant -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $RunGrant.Reference -Depth 6 -Compress) -or

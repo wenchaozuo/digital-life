@@ -16,6 +16,7 @@ $script:D32TauriMacrosSourcePatchType = 'D32_TAURI_MACROS_SOURCE_PATCH_V1'
 $script:D32TauriMacrosArchiveSha256 = 'e8b394794f399a421811d06966343e7933fcae92d59f5180b9388d1174497a45'
 $script:D32TauriMacrosArchiveBytes = [Int64]34903
 $script:D32TauriMacrosSourceTreeSha256 = '68e44e75bf963a52b2fbda751c876c68ed4c8656dd6628e593478f47d18ea983'
+$script:D32TauriMacrosSourceWrapperSha256 = '1ff1fbc6f18e0eeed00b8d33eda8e5111b0b203f5ff77e1a0cfd5929975b21e3'
 $script:D32TauriMacrosVendoredTreeSha256 = '52842cfa519dd31f59d684bcbd7fedc19bb709081ca16c9b9d0741b08594fb1b'
 $script:D32TauriMacrosPatchSha256 = 'a8d76c969d38c9525762906955a51b33fec360a174dc2ff3a6051be3db4021cd'
 $script:D32TauriMacrosPatchedSourceSha256 = '1bac6f2bdb822c890f7c645560dcb3c28737908c5aebaafd2c2e0742cb05593b'
@@ -23,6 +24,90 @@ $script:D32TauriMacrosRootManifestSha256 = 'e05e2f819ae667eb7a738f8d54a0e45f2100
 $script:D32TauriMacrosRootLockSha256 = '8818a24ee4ba8f7d628f443ce181b0686f6353f759d76e2e7305c47da603049c'
 $script:D32TauriMacrosVendorManifestSha256 = '359f36b12d366f379f46fb9b59d78678e2df4a1617e605c9c480301d3d57e4b3'
 $script:D32TauriMacrosVendorLockSha256 = '4d96652714b4cdb6494b7a7c957babbf5c704c5197f31043d180d8f43ec968f3'
+
+function Get-D32TauriMacrosArchiveWrapperSha256 {
+    param([Parameter(Mandatory = $true)][byte[]]$ArchiveBytes)
+
+    $memory = [IO.MemoryStream]::new($ArchiveBytes, $false)
+    $gzip = $null
+    $reader = $null
+    try {
+        $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Decompress, $true)
+        $reader = [System.Formats.Tar.TarReader]::new($gzip, $true)
+        $wrapperBytes = $null
+        $wrapperCount = 0
+        while ($null -ne ($entry = $reader.GetNextEntry($false))) {
+            if ($entry.EntryType.ToString() -cne 'RegularFile') { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: pinned source archive contains a non-regular member' }
+            $name = [string]$entry.Name
+            $prefix = 'tauri-macros-2.6.3/'
+            if (-not $name.StartsWith($prefix, [StringComparison]::Ordinal) -or $name.Contains('\') -or $name.Contains(':') -or $name.StartsWith('/')) {
+                throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: pinned source archive contains a non-canonical member path'
+            }
+            $relative = $name.Substring($prefix.Length)
+            if ($relative.Length -eq 0 -or @($relative.Split('/') | Where-Object { $_.Length -eq 0 -or $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) {
+                throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: pinned source archive contains an unsafe member path'
+            }
+            if ($relative -ceq 'src/command/wrapper.rs') {
+                $wrapperCount++
+                $content = [IO.MemoryStream]::new()
+                try {
+                    if ($null -ne $entry.DataStream) { $entry.DataStream.CopyTo($content) }
+                    $wrapperBytes = $content.ToArray()
+                }
+                finally { $content.Dispose() }
+            }
+        }
+        if ($wrapperCount -ne 1 -or $null -eq $wrapperBytes) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: exact archive must contain one regular command wrapper source' }
+        return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($wrapperBytes)).ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $gzip) { $gzip.Dispose() }
+        $memory.Dispose()
+    }
+}
+
+function Get-D32TauriMacrosPatchDescriptorSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceWrapperSha256,
+        [Parameter(Mandatory = $true)][string]$PatchedSourceSha256
+    )
+
+    $oldWrapperBlock = @(
+        'fn cross_command(bin: &str) -> std::process::Command {',
+        '  #[cfg(target_os = "windows")]',
+        '  let cmd = {',
+        '    let mut cmd = std::process::Command::new("cmd");',
+        '    cmd.arg("/c").arg(bin);',
+        '    cmd',
+        '  };',
+        '  #[cfg(not(target_os = "windows"))]',
+        '  let cmd = std::process::Command::new(bin);',
+        '  cmd',
+        '}'
+    ) -join "`n"
+    $newWrapperBlock = @(
+        'fn cross_command(bin: &str) -> std::process::Command {',
+        '  #[cfg(target_os = "windows")]',
+        '  let cmd = {',
+        '    // D32 provides the caller-pinned absolute RUSTC path; reject missing or relative input.',
+        '    let _ = bin;',
+        '    let rustc = std::env::var_os("RUSTC")',
+        '      .filter(|path| std::path::Path::new(path).is_absolute())',
+        '      .expect("D32 requires the caller-pinned absolute RUSTC path");',
+        '    std::process::Command::new(rustc)',
+        '  };',
+        '  #[cfg(not(target_os = "windows"))]',
+        '  let cmd = std::process::Command::new(bin);',
+        '  cmd',
+        '}'
+    ) -join "`n"
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $oldSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($oldWrapperBlock))).ToLowerInvariant()
+    $newSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($newWrapperBlock))).ToLowerInvariant()
+    $descriptor = @('D32_TAURI_MACROS_SOURCE_PATCH_V1', 'src/command/wrapper.rs', $SourceWrapperSha256, $PatchedSourceSha256, $oldSha, $newSha) -join "`n"
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($descriptor))).ToLowerInvariant()
+}
 
 function Get-D32VendoredOrdinaryPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -186,8 +271,15 @@ function Test-D32TauriMacrosSourcePatchAuthority {
         throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: original archive must be a regular canonical file outside repository and run EvidenceRoot'
     }
     $archiveSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$doc.archive_path)
-    if ($archiveSnapshot.Bytes -ne [Int64]$doc.archive_bytes -or $archiveSnapshot.Sha256 -cne $script:D32TauriMacrosArchiveSha256) {
+    $archiveBytes = [IO.File]::ReadAllBytes([string]$doc.archive_path)
+    $archiveBytesSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($archiveBytes)).ToLowerInvariant()
+    if ($archiveSnapshot.Bytes -ne [Int64]$doc.archive_bytes -or $archiveSnapshot.Sha256 -cne $script:D32TauriMacrosArchiveSha256 -or
+        $archiveBytes.LongLength -ne $script:D32TauriMacrosArchiveBytes -or $archiveBytesSha256 -cne $script:D32TauriMacrosArchiveSha256) {
         throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source archive content/size differs from the exact approved registry archive'
+    }
+    $archivedWrapperSha256 = Get-D32TauriMacrosArchiveWrapperSha256 -ArchiveBytes $archiveBytes
+    if ($archivedWrapperSha256 -cne $script:D32TauriMacrosSourceWrapperSha256 -or $doc.source_wrapper_sha256 -cne $archivedWrapperSha256) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source_wrapper_sha256 is not the exact wrapper extracted from the pinned registry archive'
     }
     $repo = [IO.Path]::GetFullPath($Repository)
     $vendor = [IO.Path]::GetFullPath((Join-Path $repo 'src-tauri\vendor\tauri-macros-2.6.3'))
@@ -202,7 +294,11 @@ function Test-D32TauriMacrosSourcePatchAuthority {
         vendor_manifest_sha256 = $script:D32TauriMacrosVendorManifestSha256
         vendor_lock_sha256 = $script:D32TauriMacrosVendorLockSha256
     }
-    if ([string]$doc.source_wrapper_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source wrapper SHA is malformed' }
+    $recomputedPatchSha256 = Get-D32TauriMacrosPatchDescriptorSha256 -SourceWrapperSha256 $archivedWrapperSha256 -PatchedSourceSha256 $script:D32TauriMacrosPatchedSourceSha256
+    if ([string]$doc.source_wrapper_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $recomputedPatchSha256 -cne $script:D32TauriMacrosPatchSha256 -or $doc.patch_sha256 -cne $recomputedPatchSha256) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: source-patch descriptor does not recompute from the exact archived and patched wrapper hashes'
+    }
     foreach ($field in $fixedHashes.Keys) {
         if ([string]$doc.$field -cne [string]$fixedHashes[$field]) { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: authority field $field differs from the approved exact source patch" }
     }

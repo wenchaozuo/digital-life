@@ -13,6 +13,7 @@
 |---|---|---|---|---|
 | ADR-TEMPLATE | TEMPLATE | 示例占位 | - | - |
 | ADR-D32-PHASE0-FIXTURE-BUDGET-V1 | APPROVED WITH CONDITIONS | Bounded four-job D32 Phase0 fixture-build budget | GPT-6 Sol Max | Five owner-bound Phase0 fixture builds only |
+| ADR-D32-PHASE0-TEST-INVENTORY-AUTHORITY-V1 | APPROVED WITH CONDITIONS | Independently discovered and coordinator-pinned D32 test inventories | GPT-6 Sol Max | Six list-only commands before each formal Phase0 |
 | ADR-D32-EVIDENCE-BUNDLE-V1 | APPROVED | D32-A gate evidence bundle 与 clean-source release attestation | GPT-6 Sol | D32-A preflight/evidence only |
 | ADR-D32-FIXTURE-TRUST-D31-SEEDER | APPROVED | D32 fixture Git trust 与 D31 recovery seeder evidence | GPT-6 Sol | D32 fixture tooling 与 D31 test-helper evidence only |
 | ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP | APPROVED WITH CONDITIONS | D32-A release evidence bundle 两阶段 bootstrap | GPT-6 Sol | D32-A bundle bootstrap ordering only |
@@ -739,6 +740,43 @@ Repeated cold Phase0 attempts showed that the first fixture build can exceed sev
 ### Supersedes / Superseded by
 
 - Supersedes only the prospective jobs=1 / 600-second fixture-build budget for the exact five owner-bound Phase0 fixtures. It does not supersede the fixed five-phase scope, test parallelism, any fixed fetch/test/release command, toolchain, trace, authority, security rule, or gate. Any further budget or concurrency change requires a separate architecture decision.
+
+---
+
+## ADR-D32-PHASE0-TEST-INVENTORY-AUTHORITY-V1 — Independent test-inventory discovery and pin
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-29, prospective
+**Related milestone:** D32 final-gate readiness (D32-A-R2)
+**Related baseline:** `756acd388620f7511034e7f3e8886fefb9ff6ea3`
+
+### Context
+
+Repeated source/manifest changes make a code-authored fixed `cargo test -- --list` name table an unsafe authority for the current exact candidate. Conversely, a formal Phase0 runner must not accept its own first observation as the test baseline. Inventory must be observed in a separate, monitored, candidate/Profile/lock-bound preparation run, reviewed independently, and pinned by the Coordinator before the expensive formal Phase0 attempt.
+
+### Decision
+
+1. Before any formal Phase0 root is claimed, run a separate list-only inventory discovery against the exact clean candidate. The discovery uses a new exclusive external canonical non-reparse EvidenceRoot with a create-new owner marker, compact `r\c` CargoHome and `r\t` TempRoot, both fresh and owner-bound. It binds the caller-pinned Profile V2, exact candidate SHA, all three Cargo.lock inputs, source-patch authority, and a separate discovery-only protoc authority/grant for that fresh CargoHome. The discovery performs exactly the three existing fixed locked fetch commands at 14,400 seconds, then exactly six ordered Cargo list commands: protocol all/ignored, Vita all/ignored, Host all/ignored. Each list command adds only `--jobs 4` before the `--` test-harness separator and has the explicit 28,800-second `Phase0InventoryListTimeoutSeconds` deadline. No test bodies execute in discovery. It uses the existing V2 process Job/debug/CREATE/EXIT/retained-handle/accounting/cleanup policy. H7-C Git authority is not used.
+
+2. Discovery writes create-new `D32_TEST_INVENTORY_DISCOVERY_V1`, with `gate_authority = NONE`, exact clean SHA before/after, owner/root/CargoHome/TempRoot opened identities, current profile/lock/source/protoc references, all fetch/list argv/process identities and ordered stdout/stderr references, and complete parsed list rows, summaries and digests. The parser accepts only complete libtest list grammar with one reconciled summary, unique well-formed full names/kinds, no unknown/truncated/duplicate rows, nonempty `all` inventory, and the `ignored` list as a unique subset of `all`; a valid empty ignored list is permitted.
+
+3. A separate create-new `D32_TEST_INVENTORY_BASELINE_V1` is produced in an external path from the validated discovery. It is explicitly `AWAITING_COORDINATOR_PIN` and `gate_authority = NONE`; producing or validating it never authorizes itself. It binds candidate, Profile V2 path/hash/bytes/opened identity, target, three locks, source/protoc references, discovery file/root/run/CargoHome/TempRoot identities, all six exact list commands, their raw captures/process traces, and the sorted UTF-8 package/kind/full-name/category rows. It carries per-package and combined counts/digests and classifies entries as ordinary, ignored, deferred, or focused. The Coordinator independently reviews the exact candidate's source/manifest/config and discovery evidence, then separately pins the baseline's path and SHA-256 for the one formal run.
+
+4. Formal Phase0 requires the externally supplied baseline path and independently pinned SHA-256 before it creates or claims its own EvidenceRoot. It reopens and validates the pinned baseline and its linked discovery through stable opened-file snapshots, then performs the same six ordered list commands in the formal root with exact jobs/timeout/tool/feature/target/lock policy. All six formal output sets, categories, counts and digests must exactly equal the pinned baseline before full suites start. Full-suite per-test results and focused-test results must reconcile by exact full name and expected category/status against that baseline; counts alone are insufficient. Missing, added, removed, renamed, duplicate, malformed, ignored-subset, summary, digest, command, feature, target, toolchain, candidate, root, owner, grant or profile mismatches are BLOCKED.
+
+5. Release attestation, aggregate, and independent-gate readers must independently validate and bind the baseline and discovery references to the same exact Phase0 record/candidate/profile, including their external file hashes and opened identities; stale, missing, tampered, self-generated-but-unpinned, or cross-run references are rejected. New strict schemas are discovery V1 and baseline V1, Phase0 V7, release attestation V8, and aggregate V7. Fixture provenance V6, fixture manifest v3 and its six fields, Profile V2, Trace V2, source/protoc/H7 authority V1, bundle manifest v1, and D31 seeder provenance V2 remain unchanged. Every migrated reader rejects prior and unknown versions. No fixed fixture, suite, focused check, negative evidence, release command or downstream gate is removed or weakened.
+
+### Frozen constraints and stop conditions
+
+- Keep the three locked fetch argv, five fixture builds and their approved jobs=4/28,800 budget, all Phase0 suites/focused checks and their existing timeouts, default test parallelism, toolchain, normal target paths, fresh owner-bound CargoHome, V2 trace/Job policy, child-image authority and cleanup unchanged.
+- The six inventory listing commands alone use jobs=4 and 28,800 seconds; do not add a global jobs environment variable or change suite/focused/release/D31 command arguments.
+- Discovery is separate from the formal attempt and cannot create or infer the Coordinator baseline pin. It grants no H7 Git exception, PASS, Phase1, aggregate, release, canary or gate authority.
+- This decision authorizes implementation and no-Cargo validation only. No inventory discovery/Cargo/fetch/formal Phase0/root/authority creation is authorized by this ADR alone.
+
+### Supersedes
+
+For newly produced Phase0 evidence only, supersedes the earlier requirement that `--list` output equal an immutable code-authored inventory table. The requirement for an exact, complete, independently validated inventory is preserved and is now supplied by the Coordinator-pinned discovery/baseline pair. All other Stage Contract, security, authority, fixture, test, and gate requirements remain in force.
 
 ---
 

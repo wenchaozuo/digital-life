@@ -390,7 +390,8 @@ function New-D32VendoredProtocAuthorityDocument {
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$CandidateSha,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
-        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [ValidateSet('D32_PHASE0_PHASE1_ONLY', 'D32_TEST_INVENTORY_DISCOVERY_ONLY')][string]$Scope = 'D32_PHASE0_PHASE1_ONLY'
     )
     $repo = [IO.Path]::GetFullPath($Repository)
     $root = [IO.Path]::GetFullPath($EvidenceRoot)
@@ -406,7 +407,7 @@ function New-D32VendoredProtocAuthorityDocument {
     return [ordered]@{
         schema_version = 1
         record_type = $script:D32VendoredProtocAuthorityType
-        scope = 'D32_PHASE0_PHASE1_ONLY'
+        scope = $Scope
         candidate_sha = $CandidateSha
         toolchain_profile = [ordered]@{
             path = [string]$ValidatedProfile.ProfilePath
@@ -448,7 +449,8 @@ function Test-D32VendoredProtocAuthority {
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$CandidateSha,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
-        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [ValidateSet('D32_PHASE0_PHASE1_ONLY', 'D32_TEST_INVENTORY_DISCOVERY_ONLY')][string]$ExpectedScope = 'D32_PHASE0_PHASE1_ONLY'
     )
     if ($ExpectedAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-D32ProfileCanonicalPathString -Path $AuthorityPath) -or
         -not (Test-D32ProfileNoReparsePath -Path $AuthorityPath) -or (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $Repository) -or
@@ -476,7 +478,7 @@ function Test-D32VendoredProtocAuthority {
     $expectedFields = @('schema_version', 'record_type', 'scope', 'candidate_sha', 'toolchain_profile', 'evidence_root_path', 'cargo_home_path', 'temp_root_path', 'vita_cargo_lock', 'packages', 'cargo_archive', 'image')
     if (-not (Test-D32VendoredObjectExactProperties -Object $document -Expected $expectedFields) -or
         -not (Test-D32VendoredInteger -Value $document.schema_version) -or [Int64]$document.schema_version -ne 1 -or $document.record_type -cne $script:D32VendoredProtocAuthorityType -or
-        $document.record_type -isnot [string] -or $document.scope -isnot [string] -or $document.scope -cne 'D32_PHASE0_PHASE1_ONLY' -or
+        $document.record_type -isnot [string] -or $document.scope -isnot [string] -or $document.scope -cne $ExpectedScope -or
         $document.candidate_sha -isnot [string] -or $document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or $document.candidate_sha -cne $CandidateSha -or
         -not (Test-D32VendoredObjectExactProperties -Object $document.toolchain_profile -Expected @('path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex')) -or
         $document.toolchain_profile.path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.toolchain_profile.path -Right $ValidatedProfile.ProfilePath) -or
@@ -697,9 +699,10 @@ function New-D32VendoredProtocRunGrant {
         [Parameter(Mandatory = $true)][string]$EvidenceRoot,
         [Parameter(Mandatory = $true)][object]$OwnerMarkerReference,
         [Parameter(Mandatory = $true)][string]$RunId,
-        [Parameter(Mandatory = $true)][string]$CargoHome
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [ValidateSet('D32_PHASE0_PHASE1_ONLY', 'D32_TEST_INVENTORY_DISCOVERY_ONLY')][string]$Scope = 'D32_PHASE0_PHASE1_ONLY'
     )
-    $authority = Test-D32VendoredProtocAuthority -AuthorityPath $AuthorityPath -ExpectedAuthoritySha256 $AuthoritySha256 -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -EvidenceRoot $EvidenceRoot
+    $authority = Test-D32VendoredProtocAuthority -AuthorityPath $AuthorityPath -ExpectedAuthoritySha256 $AuthoritySha256 -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -EvidenceRoot $EvidenceRoot -ExpectedScope $Scope
     if ($RunId -cnotmatch '^[0-9a-f]{32}$' -or -not (Test-D32ProfilePathEqual -Left $CargoHome -Right $authority.Document.cargo_home_path)) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: run id or fresh CargoHome differs from authority template' }
     $rootIdentity = Get-D32ProfileDirectoryIdentity -Path $EvidenceRoot
     $homeIdentity = Get-D32ProfileDirectoryIdentity -Path $CargoHome
@@ -711,7 +714,7 @@ function New-D32VendoredProtocRunGrant {
     $document = [ordered]@{
         schema_version = 1
         record_type = $script:D32VendoredProtocRunGrantType
-        scope = 'D32_PHASE0_PHASE1_ONLY'
+        scope = $Scope
         authority = $authority.Reference
         candidate_sha = $CandidateSha
         toolchain_profile = [ordered]@{ path = $ValidatedProfile.ProfilePath; sha256 = $ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes; volume_serial_hex = $ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = $ValidatedProfile.Identity.FileIdHex }
@@ -724,7 +727,8 @@ function New-D32VendoredProtocRunGrant {
         source_directory = [ordered]@{ path = $materialized.SourceIdentity.Path; volume_serial_hex = $materialized.SourceIdentity.VolumeSerialHex; file_id_hex = $materialized.SourceIdentity.FileIdHex }
         protoc_image = [ordered]@{ path = $materialized.Image.Path; bytes = [Int64]$materialized.Image.Bytes; sha256 = [string]$materialized.Image.Sha256; volume_serial_hex = [string]$materialized.Image.VolumeSerialHex; file_id_hex = [string]$materialized.Image.FileIdHex }
     }
-    $grantPath = Join-Path $EvidenceRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json'
+    $grantName = if ($Scope -ceq 'D32_TEST_INVENTORY_DISCOVERY_ONLY') { 'D32-TEST-INVENTORY-VENDORED-PROTOC-RUN-GRANT.json' } else { 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json' }
+    $grantPath = Join-Path $EvidenceRoot $grantName
     $grantRef = Write-D32VendoredProtocAuthorityCreateNew -Path $grantPath -Document $document
     return [PSCustomObject]@{ Document = $document; Reference = $grantRef; Authority = $authority; Image = $materialized.Image; Archive = $materialized.Archive; SourcePath = $materialized.SourcePath }
 }
@@ -740,10 +744,12 @@ function Test-D32VendoredProtocRunGrant {
         [Parameter(Mandatory = $true)][string]$CargoHome,
         [Parameter(Mandatory = $true)][string]$AuthorityPath,
         [Parameter(Mandatory = $true)][string]$AuthoritySha256,
-        [Parameter(Mandatory = $true)][object]$OwnerMarkerReference
+        [Parameter(Mandatory = $true)][object]$OwnerMarkerReference,
+        [ValidateSet('D32_PHASE0_PHASE1_ONLY', 'D32_TEST_INVENTORY_DISCOVERY_ONLY')][string]$Scope = 'D32_PHASE0_PHASE1_ONLY'
     )
     $grantPath = [string](Get-D32VendoredProperty $Reference 'path')
-    $grantSnapshot = Assert-D32VendoredFileReference -Reference $Reference -AllowedRoot $EvidenceRoot -ExpectedPath (Join-Path $EvidenceRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json')
+    $grantName = if ($Scope -ceq 'D32_TEST_INVENTORY_DISCOVERY_ONLY') { 'D32-TEST-INVENTORY-VENDORED-PROTOC-RUN-GRANT.json' } else { 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json' }
+    $grantSnapshot = Assert-D32VendoredFileReference -Reference $Reference -AllowedRoot $EvidenceRoot -ExpectedPath (Join-Path $EvidenceRoot $grantName)
     $grantStream = [IO.File]::Open($grantPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $grantBeforeRead = Get-D32ProfileFileSnapshot -Path $grantPath
@@ -768,7 +774,7 @@ function Test-D32VendoredProtocRunGrant {
     $doc = $raw | ConvertFrom-Json -DateKind String
     $fields = @('schema_version', 'record_type', 'scope', 'authority', 'candidate_sha', 'toolchain_profile', 'evidence_root', 'owner_marker', 'run_id', 'cargo_home', 'vita_cargo_lock', 'cargo_archive', 'source_directory', 'protoc_image')
     if (-not (Test-D32VendoredObjectExactProperties -Object $doc -Expected $fields) -or
-        -not (Test-D32VendoredInteger -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32VendoredProtocRunGrantType -or $doc.scope -cne 'D32_PHASE0_PHASE1_ONLY' -or
+        -not (Test-D32VendoredInteger -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or $doc.record_type -cne $script:D32VendoredProtocRunGrantType -or $doc.scope -cne $Scope -or
         $doc.candidate_sha -isnot [string] -or $doc.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or $doc.candidate_sha -cne $CandidateSha -or
         $doc.run_id -isnot [string] -or $doc.run_id -cnotmatch '^[0-9a-f]{32}$' -or $doc.run_id -cne $ExpectedRunId -or
         -not (Test-D32VendoredObjectExactProperties -Object $doc.toolchain_profile -Expected @('path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex')) -or
@@ -796,7 +802,7 @@ function Test-D32VendoredProtocRunGrant {
         (ConvertTo-Json -InputObject $actualOwnerReference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $doc.owner_marker -Depth 5 -Compress)) {
         throw 'VENDORED_PROTOC_GRANT_BLOCKED: current owner marker bytes/opened identity do not match the independently validated owner binding'
     }
-    $authority = Test-D32VendoredProtocAuthority -AuthorityPath $AuthorityPath -ExpectedAuthoritySha256 $AuthoritySha256 -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -EvidenceRoot $EvidenceRoot
+    $authority = Test-D32VendoredProtocAuthority -AuthorityPath $AuthorityPath -ExpectedAuthoritySha256 $AuthoritySha256 -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -EvidenceRoot $EvidenceRoot -ExpectedScope $Scope
     $null = Assert-D32VendoredFileReference -Reference $doc.authority -AllowedRoot ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($AuthorityPath))) -ExpectedPath $AuthorityPath
     if ((ConvertTo-Json -InputObject $doc.authority -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $authority.Reference -Depth 5 -Compress)) { throw 'VENDORED_PROTOC_GRANT_BLOCKED: external authority file identity/hash differs' }
     $lock = Get-D32VendoredLockPackageRecords -Repository $Repository

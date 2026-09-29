@@ -15,7 +15,7 @@ SC-D32-V1 的建立日期不声称存在先前 ratification；它以列明的 e9
 
 **Base / merge-base:** 4c727ec5ba42e0288400d5847b43b08a1c96bc54
 
-**Current fixture-budget batch base:** 06c300d94792e2a9aed4c47cb1db7b1a69551861
+**Current inventory-authority batch base:** 756acd388620f7511034e7f3e8886fefb9ff6ea3
 
 **Earlier D32 integration baseline (before the compact-evidence repair batch):** e902a05bf3193212c131c78ec7dfe6b72e2c292f
 
@@ -24,11 +24,12 @@ SC-D32-V1 的建立日期不声称存在先前 ratification；它以列明的 e9
 ## 3. 本批次范围和状态
 
 - Earlier governance/raw-stream repair synchronized protocol v1.2 and SC-D32-V1, then repaired fixture child stdout/stderr raw capture. Its evidence remains bound to its old exact SHA.
-- The current prospective repair batch implements ADR-D32-PHASE0-COMPACT-EVIDENCE-V1 and the approved exact locked vendored-protoc, tauri-macros source-patch, and H7-C direct-Git exceptions. The candidate-local tauri-macros 2.6.3 patch is source/archive/lock-bound; only the exact direct pinned Git.exe child of the accepted Vita libtest may be continued under a Coordinator-pinned external suite authority and fresh owner/run/root/temp-bound grant. Current strict schemas are fixture provenance V6, Phase0 matrix V6, release attestation V7, and aggregate V6; blocked-diagnostic V1 remains failure-only. Profile V2, debug/Job trace V2, fixture manifest v3, and D31 recovery-seeder provenance V2 remain unchanged. The separate D31 seeder grant/companion attestation is approved in principle but remains an explicit deferred implementation batch; Phase0/Phase1 authority is not reusable for it.
+- The current prospective repair batch implements ADR-D32-PHASE0-COMPACT-EVIDENCE-V1, the bounded fixture-build budget, and ADR-D32-PHASE0-TEST-INVENTORY-AUTHORITY-V1, alongside the approved exact locked vendored-protoc, tauri-macros source-patch, and H7-C direct-Git exceptions. The candidate-local tauri-macros 2.6.3 patch is source/archive/lock-bound; only the exact direct pinned Git.exe child of the accepted Vita libtest may be continued under a Coordinator-pinned external suite authority and fresh owner/run/root/temp-bound grant. Current strict schemas are fixture provenance V6, Phase0 matrix V7, release attestation V8, and aggregate V7; inventory discovery and baseline use separate V1 records; blocked-diagnostic V1 remains failure-only. Profile V2, debug/Job trace V2, fixture manifest v3, and D31 recovery-seeder provenance V2 remain unchanged. The separate D31 seeder grant/companion attestation is approved in principle but remains an explicit deferred implementation batch; Phase0/Phase1 authority is not reusable for it.
 - The latest authorized formal Phase0 attempt before the present prospective budget migration was the one-shot `E:\p0r12` attempt on candidate `06c300d94792e2a9aed4c47cb1db7b1a69551861`; it was BLOCKED at the first fixture after the fixed 14,400-second command limit. Its evidence remains immutable and bound to that attempt. ADR-D32-PHASE0-FIXTURE-BUDGET-V1 now prospectively authorizes exactly the five owner-bound fixture builds to use `--jobs 4` and 28,800 seconds each, after strict capacity preflight; all fetch/test/non-build commands remain 14,400 seconds. This implementation batch itself runs no Cargo or formal Phase0 and does not rebind earlier evidence.
 - Historical path-budget correction (the `E:\p0r3` proposal has since been consumed and is not a current root): 286 characters is the failing `.snap` path's **full** length, not a suffix length. The old Cargo-home prefix is 74 characters, leaving a 212-character suffix; replacing that prefix with compact `E:\p0r3\r\c` (11 characters) yields 223 characters. The Coordinator's read-only pinned-tree census reported 6,800 files / 878 directories and a longest projected compact path of 230 characters, 17 below the 247-character successful directory-path probe. This arithmetic/census is not Phase 0 evidence.
 - Old-SHA quarantine ledger/leaves and prior `E:\p0r3`–`E:\p0r12` evidence remain immutable and bound only to their original attempts; none is rebound by this batch. Any future Phase 0 must use a separately authorized fresh root and prove all five fixture source paths absent before creation. No Phase 0, Cargo, network, release, move, canary, or gate has been run for this bounded-budget implementation batch.
 - The exact candidate remains NOT FROZEN. New Phase 0 and downstream evidence must be regenerated for the committed exact SHA; prior SHA evidence and PASS never transfer.
+- Before any next formal Phase0, the exact clean candidate needs a separate monitored six-command list-only discovery using a fresh root/home/temp, followed by independent Coordinator review and a pinned `D32_TEST_INVENTORY_BASELINE_V1` path/SHA. Formal Phase0 must re-run and match those list sets before suite execution. This implementation batch does not run discovery, Cargo, or formal Phase0.
 - 当前没有因此关闭任何 D32 final gate，候选状态仍为 NOT FROZEN。
 
 ## 4. 尚未关闭的门禁
@@ -53,7 +54,7 @@ Phase 0、Phase 1、full aggregate、D31 real-process、适用 D29G2 provider、
 ## 6. 后续 gate 顺序
 
 1. 读取实际 Git 状态，记录当前 clean Integration Candidate exact SHA 和适用 profile/toolchain inputs。
-2. 按 ADR-D32-PHASE0-TOOLCHAIN-PROFILE 完成 Phase 0 五个 fixture phases、full local suites 和 named checks。Phase 0 不运行 release build、D31 real-process/seeder、provider request、physical capture 或 Host real canary。
+2. 先按 ADR-D32-PHASE0-TEST-INVENTORY-AUTHORITY-V1 对该 exact candidate 运行单独六命令 list-only discovery，由 Coordinator 审查并 pin 外部 baseline path/SHA；再按 ADR-D32-PHASE0-TOOLCHAIN-PROFILE 完成 Phase 0 五个 fixture phases、formal list 比对、full local suites 和 named checks。Phase 0 不运行 release build、D31 real-process/seeder、provider request、physical capture 或 Host real canary。
 3. Phase 0 通过后，只运行 ADR-D32-EVIDENCE-BUNDLE-V1 指定的两条 fixed locked release Cargo argv，生成 fresh 三件 flat artifacts、manifest 和 sibling attestation。
 4. 立即验证 schema、SHA、commands、hashes/bytes/file identities、flat layout、runtime_resources = []、Tauri resource map 与 clean state；随后完成 full §16.1.5 aggregate，bundle hashes = VERIFIED。
 5. Aggregate 通过后，先完成独立 D31 recovery-seeder grant/companion-attestation 批次并由 Coordinator/Luna High 验证，方可运行依赖该 seeder 的 D31 real-process case；它必须使用 fresh seeder run/home、create-new owner marker 和独立 per-run grant，绝不复用 Phase0/Phase1 grant。随后完成十个 D31 real-process cases，以及适用且用户已授权的四个 D29G2 provider cases。三个 interactive/physical capture cases 继续标为 N/A — NOT RUN。

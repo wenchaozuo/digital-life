@@ -423,6 +423,10 @@ function Get-D32H7CGitTestResults {
     return @($results.ToArray())
 }
 
+function Get-D32H7CGitCodeOwnedTestInventory {
+    return @($script:D32H7CGitTestInventory)
+}
+
 function Get-D32H7CGitEnvironmentMap {
     param([Parameter(Mandatory = $true)][object]$Environment)
     $map = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -622,7 +626,7 @@ function Test-D32H7CGitChildAttestation {
         $doc.test_inventory -isnot [Array] -or $doc.test_inventory.Count -ne 46 -or $doc.git_children -isnot [Array] -or $doc.git_child_count -ne $doc.git_children.Count) { throw 'H7C_GIT_ATTESTATION_BLOCKED: companion strict schema/candidate/profile/owner/root/grant binding differs' }
     $expectedTraceJson = ConvertTo-Json -InputObject $Phase0Command.process_trace -Depth 40 -Compress
     $expectedTraceSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($expectedTraceJson))).ToLowerInvariant()
-    $suiteLines = @(Get-D32Phase0TextFromLogs -CommandRecord $Phase0Command)
+    $suiteLines = @(Get-D32Phase0TextFromLogs -CommandRecord $Phase0Command -AllowedRoot $EvidenceRoot)
     $expectedTestResults = @(Get-D32H7CGitTestResults -Lines $suiteLines)
     if (-not (Test-D32Phase0ExactProperties -Object $doc.fixed_suite -Expected @('name', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex', 'executable_file_id_hex', 'arguments', 'command_line', 'working_directory', 'timeout_seconds', 'candidate_sha_environment', 'exit_code', 'stdout', 'stderr', 'process_trace_sha256')) -or
         -not (Test-D32Phase0ExactProperties -Object $doc.fixed_suite.candidate_sha_environment -Expected @('name', 'value')) -or

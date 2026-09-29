@@ -15,6 +15,9 @@ param(
     [string]$Phase0ExpectedTauriMacrosSourceAuthoritySha256,
     [string]$Phase0H7CGitAuthorityPath,
     [string]$Phase0ExpectedH7CGitAuthoritySha256,
+    [string]$Phase0TestInventoryBaselinePath,
+    [string]$Phase0ExpectedTestInventoryBaselineSha256,
+    [ValidateRange(1, 28800)][int]$Phase0InventoryListTimeoutSeconds = 28800,
     # Keep the original 1800-second default; owner-bound Phase0 callers may explicitly pin a bounded four-hour per-command limit.
     [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800,
     [ValidateRange(1, 28800)][int]$Phase0FixtureBuildTimeoutSeconds = 28800
@@ -28,9 +31,10 @@ $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-build-toolchain-profile.ps1')
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-vendored-protoc-authority.ps1')
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-h7c-git-child-authority.ps1')
+. (Join-Path $script:D32Phase0ScriptRoot 'd32-test-inventory-authority.ps1')
 
-$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V6'
-$script:D32Phase0SchemaVersion = 6
+$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V7'
+$script:D32Phase0SchemaVersion = 7
 $script:D32Phase0FixtureBuildJobs = 4
 $script:D32Phase0FixtureBuildTimeoutSeconds = 28800
 $script:D32Phase0RequiredCommandTimeoutSeconds = 14400
@@ -837,7 +841,10 @@ function Get-D32Phase0FixtureLogPaths {
 }
 
 function Test-D32Phase0ExecutedCommandEvidence {
-    param([Parameter(Mandatory = $true)][object]$Document)
+    param(
+        [Parameter(Mandatory = $true)][object]$Document,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$BaselineEntries
+    )
     $inventory = $Document.test_inventory
     $commandByName = @{}
     foreach ($command in $Document.commands) {
@@ -845,27 +852,45 @@ function Test-D32Phase0ExecutedCommandEvidence {
         $commandByName[[string]$command.name] = $command
     }
     foreach ($package in @('protocol', 'vita', 'host')) {
+        $baselinePackageEntries = @($BaselineEntries | Where-Object { $_.package -ceq $package })
+        $baselineAllRows = @($baselinePackageEntries | ForEach-Object { [PSCustomObject][ordered]@{ package = $_.package; kind = $_.kind; full_name = $_.full_name } })
+        $declaredInventory = $inventory.$package
+        if (-not (Test-D32TestInventoryRowsEqual -Left $declaredInventory.entries -Right $baselinePackageEntries -IncludeCategory) -or
+            -not (Test-D32TestInventoryRowsEqual -Left $declaredInventory.all_rows -Right $baselineAllRows) -or
+            [string]$declaredInventory.all_list_digest -cne (Get-D32TestInventoryDigest -Rows $declaredInventory.all_rows) -or
+            [string]$declaredInventory.ignored_list_digest -cne (Get-D32TestInventoryDigest -Rows $declaredInventory.ignored_rows)) {
+            throw "Phase0 $package structured list inventory differs from the pinned baseline or its canonical digest"
+        }
         foreach ($kind in @('test-list', 'ignored-list')) {
             $name = "$package-$kind"
             if (-not $commandByName.ContainsKey($name)) { throw "Phase0 actual command evidence is missing $name" }
-            $lines = @(Get-D32Phase0TextFromLogs -CommandRecord $commandByName[$name])
-            $declared = if ($kind -eq 'test-list') { @($inventory.$package.test_names) } else { @($inventory.$package.ignored_names) }
-            $isIgnoredList = $kind -eq 'ignored-list'
-            if (-not (Test-D32Phase0ExactTestListOutput -Lines $lines -Expected $declared -Ignored:$isIgnoredList)) { throw "Phase0 $package $kind names do not match the captured command logs" }
+            $listingKind = if ($kind -eq 'test-list') { 'all' } else { 'ignored' }
+            $lines = @(Read-D32TestInventoryLogReference -Reference $commandByName[$name].stdout -AllowedRoot ([string]$Document.output_root))
+            $parsed = Get-D32TestInventoryListOutput -Lines $lines -Package $package -ListingKind $listingKind
+            $declaredRows = if ($listingKind -eq 'all') { @($inventory.$package.all_rows) } else { @($inventory.$package.ignored_rows) }
+            $pinnedRows = if ($listingKind -eq 'all') { $baselineAllRows } else { @($baselinePackageEntries | Where-Object { $_.category -ceq 'ignored' } | ForEach-Object { [PSCustomObject][ordered]@{ package = $_.package; kind = $_.kind; full_name = $_.full_name } }) }
+            $parsedRows = @($parsed.rows | ForEach-Object { [PSCustomObject][ordered]@{ package = $package; kind = $_.kind; full_name = $_.full_name } })
+            if (-not (Test-D32TestInventoryRowsEqual -Left $declaredRows -Right $parsedRows) -or
+                -not (Test-D32TestInventoryRowsEqual -Left $pinnedRows -Right $parsedRows) -or
+                $parsed.row_count -ne $(if ($listingKind -eq 'all') { $inventory.$package.all_rows.Count } else { $inventory.$package.ignored_rows.Count })) {
+                throw "Phase0 $package $kind complete rows differ from pinned baseline/raw output"
+            }
         }
         $suiteName = "$package-full-local-suite"
         if (-not $commandByName.ContainsKey($suiteName)) { throw "Phase0 actual command evidence is missing $suiteName" }
         $suite = @($Document.local_suites | Where-Object { $_.package -ceq $package })
         if ($suite.Count -ne 1) { throw "Phase0 suite result is missing/duplicated for $package" }
-        $suiteLines = @(Get-D32Phase0TextFromLogs -CommandRecord $commandByName[$suiteName])
-        $summaries = @(Get-D32Phase0Summaries -Lines $suiteLines)
+        $suiteLines = @(Read-D32TestInventoryLogReference -Reference $commandByName[$suiteName].stdout -AllowedRoot ([string]$Document.output_root))
+        $suiteEvidence = Assert-D32TestInventorySuiteRows -Package $package -BaselineEntries $BaselineEntries -Lines $suiteLines `
+            -ExpectedIgnored ([Int64]$inventory.$package.ignored_count) -ExpectedDeferred ([Int64]$suite[0].exact_deferred_skip_count)
+        $summaries = @($suiteEvidence.Summaries)
         if ($summaries.Count -eq 0 -or $summaries.Count -ne $suite[0].summary_count -or @($summaries | Where-Object { $_.status -cne 'ok' }).Count -ne 0) { throw "Phase0 $package suite summaries do not match its captured logs" }
         $actualCounts = [ordered]@{
-            passed = [Int64](($summaries | Measure-Object -Property passed -Sum).Sum)
-            failed = [Int64](($summaries | Measure-Object -Property failed -Sum).Sum)
-            ignored = [Int64](($summaries | Measure-Object -Property ignored -Sum).Sum)
-            measured = [Int64](($summaries | Measure-Object -Property measured -Sum).Sum)
-            filtered_out = [Int64](($summaries | Measure-Object -Property filtered_out -Sum).Sum)
+            passed = [Int64]$suiteEvidence.Counts.passed
+            failed = [Int64]$suiteEvidence.Counts.failed
+            ignored = [Int64]$suiteEvidence.Counts.ignored
+            measured = [Int64]$suiteEvidence.Counts.measured
+            filtered_out = [Int64]$suiteEvidence.Counts.filtered_out
         }
         if (-not (Test-D32Phase0SuiteCounts -Counts $suite[0].counts -TestCount ([Int64]$inventory.$package.test_count) -ExpectedIgnored ([Int64]$inventory.$package.ignored_count) -ExpectedFiltered ([Int64]$suite[0].exact_deferred_skip_count))) { throw "Phase0 $package suite count record is invalid" }
         foreach ($field in @('passed', 'failed', 'ignored', 'measured', 'filtered_out')) { if ([Int64]$suite[0].counts.$field -ne [Int64]$actualCounts[$field]) { throw "Phase0 $package suite $field count differs from actual test-result logs" } }
@@ -880,8 +905,10 @@ function Test-D32Phase0ExecutedCommandEvidence {
             if (-not $commandByName.ContainsKey($commandName)) { throw "Phase0 focused command log is missing: $commandName" }
             $records = @($Document.focused_tests | Where-Object { $_.package -ceq $package -and $_.full_name -ceq $fullName })
             if ($records.Count -ne 1 -or -not (Test-D32Phase0ExactProperties -Object $records[0] -Expected @('package', 'full_name', 'command', 'status', 'passed', 'failed')) -or $records[0].status -cne 'PASS' -or $records[0].command -cne $commandName -or -not (Test-D32Phase0Integer -Value $records[0].passed) -or -not (Test-D32Phase0Integer -Value $records[0].failed)) { throw "Phase0 focused result record is malformed: $fullName" }
-            $focusedLines = @(Get-D32Phase0TextFromLogs -CommandRecord $commandByName[$commandName])
-            $focusedSummaries = @(Get-D32Phase0Summaries -Lines $focusedLines)
+            $focusedLines = @(Read-D32TestInventoryLogReference -Reference $commandByName[$commandName].stdout -AllowedRoot ([string]$Document.output_root))
+            $focusedResult = Get-D32Phase0SuiteTestResultRows -Lines $focusedLines
+            $focusedSummaries = @($focusedResult.summaries)
+            if ($focusedResult.rows.Count -ne 1 -or $focusedResult.rows[0].full_name -cne $fullName -or $focusedResult.rows[0].status -cne 'ok') { throw "Phase0 focused test log names a different or non-passing test: $fullName" }
             $passed = [Int64](($focusedSummaries | Measure-Object -Property passed -Sum).Sum)
             $failed = [Int64](($focusedSummaries | Measure-Object -Property failed -Sum).Sum)
             $ignored = [Int64](($focusedSummaries | Measure-Object -Property ignored -Sum).Sum)
@@ -1125,6 +1152,7 @@ function Invoke-D32Phase0PinnedProcess {
     $script:D32Phase0LastProcessFailure = $null
     return [ordered]@{
         name = $Name
+        timeout_seconds = [Int64]$TimeoutSeconds
         executable = $image.Path
         executable_sha256 = $image.Sha256
         executable_bytes = [Int64]$image.Bytes
@@ -1699,23 +1727,336 @@ function Get-D32Phase0ExpectedCommandPlan {
     $cargo = [string]$Profile.toolchain.cargo.path
     $rustc = [string]$Profile.toolchain.rustc.path
     $plan = [System.Collections.Generic.List[object]]::new()
-    $plan.Add([PSCustomObject]@{ name = 'rustc-target-probe'; executable = $rustc; arguments = @('--print', 'cfg', '--target', 'x86_64-pc-windows-msvc') })
+    $plan.Add([PSCustomObject]@{ name = 'rustc-target-probe'; executable = $rustc; arguments = @('--print', 'cfg', '--target', 'x86_64-pc-windows-msvc'); timeout_seconds = $script:D32Phase0RequiredCommandTimeoutSeconds })
     foreach ($package in @('protocol', 'vita', 'host')) {
-        $plan.Add([PSCustomObject]@{ name = "$package-test-list"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind list) })
-        $plan.Add([PSCustomObject]@{ name = "$package-ignored-list"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind ignored-list) })
+        $plan.Add([PSCustomObject]@{ name = "$package-test-list"; package = $package; listing_kind = 'all'; features = @(Get-D32TestInventoryPackages | Where-Object { $_.package -ceq $package } | ForEach-Object { $_.features }); executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind list); timeout_seconds = 28800 })
+        $plan.Add([PSCustomObject]@{ name = "$package-ignored-list"; package = $package; listing_kind = 'ignored'; features = @(Get-D32TestInventoryPackages | Where-Object { $_.package -ceq $package } | ForEach-Object { $_.features }); executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind ignored-list); timeout_seconds = 28800 })
     }
     foreach ($package in @('protocol', 'vita', 'host')) {
-        $plan.Add([PSCustomObject]@{ name = "$package-full-local-suite"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind suite) })
+        $plan.Add([PSCustomObject]@{ name = "$package-full-local-suite"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind suite); timeout_seconds = $script:D32Phase0RequiredCommandTimeoutSeconds })
     }
     foreach ($package in @('vita', 'host')) {
         $suffixes = if ($package -eq 'vita') { $script:D32Phase0FocusedVita } else { $script:D32Phase0FocusedHost }
         foreach ($suffix in $suffixes) {
             $matches = @($Inventory.$package.test_names | Where-Object { $_.EndsWith($suffix, [StringComparison]::Ordinal) })
             if ($matches.Count -ne 1) { throw "Phase0 fixed focused name is absent/ambiguous: $suffix" }
-            $plan.Add([PSCustomObject]@{ name = "$package-focused-$($suffix.Split('::')[-1])"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind focused -ExactName $matches[0]) })
+            $plan.Add([PSCustomObject]@{ name = "$package-focused-$($suffix.Split('::')[-1])"; executable = $cargo; arguments = @(Get-D32Phase0TestCommand -Package $package -Kind focused -ExactName $matches[0]); timeout_seconds = $script:D32Phase0RequiredCommandTimeoutSeconds })
         }
     }
     return @($plan.ToArray())
+}
+
+function Get-D32TestInventoryExpectedCommands {
+    param([Parameter(Mandatory = $true)][object]$Profile)
+    $commands = [System.Collections.Generic.List[object]]::new()
+    $cargo = [string]$Profile.toolchain.cargo.path
+    foreach ($packageInfo in Get-D32TestInventoryPackages) {
+        foreach ($listingKind in @('all', 'ignored')) {
+            $kind = if ($listingKind -ceq 'all') { 'list' } else { 'ignored-list' }
+            $commands.Add([PSCustomObject]@{
+                package = [string]$packageInfo.package
+                listing_kind = [string]$listingKind
+                name = if ($listingKind -ceq 'all') { "$($packageInfo.package)-test-list" } else { "$($packageInfo.package)-ignored-list" }
+                executable = $cargo
+                arguments = @(Get-D32Phase0TestCommand -Package $packageInfo.package -Kind $kind)
+                features = @($packageInfo.features)
+                target_triple = [string]$Profile.target_triple
+                timeout_seconds = [Int64]28800
+            })
+        }
+    }
+    return @($commands.ToArray())
+}
+
+function Get-D32Phase0TestInventoryClassificationPolicy {
+    return [PSCustomObject]@{
+        deferred_vita = @($script:D32Phase0DeferredVita)
+        deferred_host = @($script:D32Phase0DeferredHost)
+        ignored_vita = @($script:D32Phase0IgnoredVita)
+        ignored_host = @($script:D32Phase0IgnoredHost)
+        focused_vita = @($script:D32Phase0FocusedVita)
+        focused_host = @($script:D32Phase0FocusedHost)
+    }
+}
+
+function Test-D32Phase0InventoryProcessRecord {
+    param(
+        [Parameter(Mandatory = $true)][object]$Command,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][int]$RunnerProcessId,
+        [Parameter(Mandatory = $true)][object]$Profile,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [AllowNull()][object]$VendoredProtocGrant
+    )
+    $fields = @('name', 'timeout_seconds', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex', 'executable_file_id_hex',
+        'argv', 'arguments', 'command_line', 'working_directory', 'candidate_sha_before', 'clean_before', 'started_at_utc', 'completed_at_utc', 'exit_code',
+        'root_process', 'descendant_processes', 'process_trace', 'process_tree_cleanup', 'stdout', 'stderr', 'candidate_sha_after', 'clean_after')
+    if (-not (Test-D32Phase0ExactProperties -Object $Command -Expected $fields) -or $Command.name -cne $Name -or
+        -not (Test-D32Phase0Integer -Value $Command.timeout_seconds) -or [Int64]$Command.timeout_seconds -ne $TimeoutSeconds -or
+        -not (Test-D32ProfilePathEqual -Left $Command.executable -Right $Executable) -or
+        $Command.executable_sha256 -cne $Profile.Profile.toolchain.cargo.sha256 -or [Int64]$Command.executable_bytes -ne [Int64]$Profile.Profile.toolchain.cargo.bytes -or
+        $Command.executable_volume_serial_hex -cne $Profile.Profile.toolchain.cargo.volume_serial_hex -or $Command.executable_file_id_hex -cne $Profile.Profile.toolchain.cargo.file_id_hex -or
+        ($Command.arguments -join "`0") -cne ($Arguments -join "`0") -or
+        ($Command.argv -join "`0") -cne ((@($Executable) + @($Arguments)) -join "`0") -or
+        $Command.command_line -cne (ConvertTo-D32Phase0CommandLine -Arguments (@($Executable) + @($Arguments))) -or
+        -not (Test-D32ProfilePathEqual -Left $Command.working_directory -Right $Repository) -or
+        $Command.candidate_sha_before -cne $CandidateSha -or $Command.candidate_sha_after -cne $CandidateSha -or
+        $Command.clean_before -isnot [bool] -or -not $Command.clean_before -or $Command.clean_after -isnot [bool] -or -not $Command.clean_after -or
+        -not (Test-D32Phase0Integer -Value $Command.exit_code) -or $Command.exit_code -ne 0 -or
+        $Command.descendant_processes -isnot [Array]) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name command argv/status/process identity scalars are invalid" }
+    foreach ($timestamp in @('started_at_utc', 'completed_at_utc')) {
+        $parsed = [DateTimeOffset]::MinValue
+        if ($Command.$timestamp -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$Command.$timestamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name $timestamp is malformed"
+        }
+    }
+    if ([DateTimeOffset]::Parse([string]$Command.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) -lt
+        [DateTimeOffset]::Parse([string]$Command.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name completion precedes start" }
+    $null = Test-D32Phase0FileReference -Reference $Command.stdout -AllowedRoot $EvidenceRoot
+    $null = Test-D32Phase0FileReference -Reference $Command.stderr -AllowedRoot $EvidenceRoot
+    if (-not (Test-D32Phase0ExactProperties -Object $Command.process_tree_cleanup -Expected @('launch_mode', 'job_close_succeeded', 'process_wait_signaled', 'active_process_count_verified', 'active_process_count', 'debugger_thread_id', 'debugger_thread_exited', 'debugger_thread_joined', 'debugger_kill_on_exit_enabled', 'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'cleanup_succeeded', 'detail')) -or
+        $Command.process_tree_cleanup.launch_mode -cne 'DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)' -or
+        $Command.process_tree_cleanup.job_close_succeeded -isnot [bool] -or -not $Command.process_tree_cleanup.job_close_succeeded -or
+        $Command.process_tree_cleanup.process_wait_signaled -isnot [bool] -or -not $Command.process_tree_cleanup.process_wait_signaled -or
+        $Command.process_tree_cleanup.active_process_count_verified -isnot [bool] -or -not $Command.process_tree_cleanup.active_process_count_verified -or
+        [uint32]$Command.process_tree_cleanup.active_process_count -ne 0 -or
+        $Command.process_tree_cleanup.debugger_thread_id -ne $Command.process_trace.debugger_thread_id -or
+        $Command.process_tree_cleanup.debugger_thread_exited -isnot [bool] -or -not $Command.process_tree_cleanup.debugger_thread_exited -or
+        $Command.process_tree_cleanup.debugger_thread_joined -isnot [bool] -or -not $Command.process_tree_cleanup.debugger_thread_joined -or
+        $Command.process_tree_cleanup.debugger_kill_on_exit_enabled -isnot [bool] -or -not $Command.process_tree_cleanup.debugger_kill_on_exit_enabled -or
+        $Command.process_tree_cleanup.retained_process_handle_count -ne $Command.process_trace.retained_process_handle_count -or
+        $Command.process_tree_cleanup.retained_process_handles_signaled -isnot [bool] -or -not $Command.process_tree_cleanup.retained_process_handles_signaled -or
+        $Command.process_tree_cleanup.debugger_association_query_verified -isnot [bool] -or -not $Command.process_tree_cleanup.debugger_association_query_verified -or
+        $Command.process_tree_cleanup.debugger_association_absent -isnot [bool] -or -not $Command.process_tree_cleanup.debugger_association_absent -or
+        $Command.process_tree_cleanup.cleanup_succeeded -isnot [bool] -or -not $Command.process_tree_cleanup.cleanup_succeeded) {
+        throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name command lacks complete zero-active Job/debug cleanup"
+    }
+    $root = $Command.root_process
+    if (-not (Test-D32Phase0ExactProperties -Object $root -Expected @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'identity_verified')) -or
+        -not (Test-D32Phase0Integer -Value $root.process_id -Positive) -or $root.parent_process_id -ne $RunnerProcessId -or
+        $root.identity_verified -isnot [bool] -or -not $root.identity_verified -or
+        -not (Test-D32ProfilePathEqual -Left $root.image_path -Right $Executable) -or $root.command_line -cne $Command.command_line -or
+        $root.sha256 -cne $Command.executable_sha256 -or [Int64]$root.bytes -ne [Int64]$Command.executable_bytes -or
+        $root.volume_serial_hex -cne $Command.executable_volume_serial_hex -or $root.file_id_hex -cne $Command.executable_file_id_hex) {
+        throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name root process identity is not the exact caller-pinned direct Cargo process"
+    }
+    $null = Test-D32Phase0DebugProcessTrace -Trace $Command.process_trace -ExpectedRootPath $Executable -ExpectedRootIdentity $Profile.Profile.toolchain.cargo `
+        -ExpectedParentProcessId $RunnerProcessId -ValidatedProfile $Profile -Repository $Repository -VendoredProtocGrant $VendoredProtocGrant
+    $rootTime = [DateTime]::Parse([string]$root.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
+    $traceRoot = @($Command.process_trace.processes | Where-Object { $_.create_sequence -eq 1 })
+    if ($traceRoot.Count -ne 1 -or $traceRoot[0].process_id -ne $root.process_id -or $traceRoot[0].creation_filetime -ne $rootTime -or
+        $traceRoot[0].parent_process_id -ne $root.parent_process_id -or $traceRoot[0].exit_code -ne $Command.exit_code -or
+        $Command.descendant_processes.Count -ne ($Command.process_trace.processes.Count - 1)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name CREATE/EXIT/descendant inventory differs from V2 trace" }
+    foreach ($child in $Command.descendant_processes) {
+        $childTime = [DateTime]::Parse([string]$child.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
+        $traceChild = @($Command.process_trace.processes | Where-Object { $_.process_id -eq $child.process_id -and $_.creation_filetime -eq $childTime })
+        if ($traceChild.Count -ne 1 -or $traceChild[0].parent_process_id -ne $child.parent_process_id -or
+            $traceChild[0].sha256 -cne $child.sha256 -or [Int64]$traceChild[0].bytes -ne [Int64]$child.bytes -or
+            $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name child identity differs from V2 CREATE evidence" }
+    }
+    return $true
+}
+
+function Test-D32Phase0TestInventoryDiscoveryRecord {
+    param(
+        [Parameter(Mandatory = $true)][object]$Reference,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$Profile,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter(Mandatory = $true)][string]$GitSha256,
+        [object[]]$LockInputs = @(Get-D32BuildToolchainLockInputs -Repository $Repository)
+    )
+    $path = [string]$Reference.path
+    if ([IO.Path]::GetFileName($path) -cne 'D32-TEST-INVENTORY-DISCOVERY.json' -or
+        -not (Test-D32Phase0FileReference -Reference $Reference -AllowedRoot ([IO.Path]::GetDirectoryName($path)))) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery reference must name the fixed record under its own external root' }
+    $read = Read-D32TestInventoryJsonReference -Reference $Reference -ExpectedPath $path -ExpectedSha256 $ExpectedSha256 -Repository $Repository
+    $document = $read.Document
+    $root = [IO.Path]::GetDirectoryName($path)
+    if (-not (Test-D32ProfileNoReparsePath -Path $root) -or (Test-D32ProfilePathWithin -Child $root -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child $Repository -Parent $root)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery EvidenceRoot must be external, canonical, and non-reparse' }
+    $fields = @('schema_version', 'record_type', 'status', 'gate_authority', 'runner_process_id', 'candidate_sha', 'source_repo', 'evidence_root_identity', 'owner_marker',
+        'run_id', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc', 'storage', 'fetches', 'inventory_commands', 'test_inventory',
+        'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean')
+    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $fields) -or
+        -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 1 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_TEST_INVENTORY_DISCOVERY_V1' -or
+        $document.status -isnot [string] -or $document.status -cne 'COMPLETE_FOR_COORDINATOR_REVIEW' -or
+        $document.gate_authority -isnot [string] -or $document.gate_authority -cne 'NONE' -or
+        -not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive) -or
+        $document.candidate_sha -isnot [string] -or $document.candidate_sha -cne $CandidateSha -or
+        $document.final_candidate_sha -isnot [string] -or $document.final_candidate_sha -cne $CandidateSha -or
+        $document.final_clean -isnot [bool] -or -not $document.final_clean -or
+        $document.source_repo -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.source_repo -Right $Repository) -or
+        $document.run_id -isnot [string] -or $document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
+        $document.fetches -isnot [Array] -or $document.fetches.Count -ne 3 -or
+        $document.inventory_commands -isnot [Array] -or $document.inventory_commands.Count -ne 6) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: strict V1 schema/status/candidate/process/list inventory mismatch' }
+    foreach ($stamp in @('started_at_utc', 'completed_at_utc')) {
+        $parsed = [DateTimeOffset]::MinValue
+        if ($document.$stamp -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$document.$stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $stamp malformed" }
+    }
+    if (-not (Test-D32Phase0ExactProperties -Object $document.evidence_root_identity -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32ProfilePathEqual -Left $document.evidence_root_identity.path -Right $root)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery EvidenceRoot identity path malformed' }
+    $rootIdentity = Test-D32ProfileDirectoryIdentity -Path $root -VolumeSerialHex ([string]$document.evidence_root_identity.volume_serial_hex) -FileIdHex ([string]$document.evidence_root_identity.file_id_hex)
+    $owner = Test-D32Phase0OwnerBinding -EvidenceRoot $root -ExpectedCandidateSha $CandidateSha -ValidatedProfile $Profile -ExpectedRunId $document.run_id `
+        -ExpectedRootIdentity $rootIdentity -ExpectedMarkerReference $document.owner_marker
+    $expectedProfileRecord = Get-D32TestInventoryProfileRecord -ValidatedProfile $Profile
+    if ((ConvertTo-Json -InputObject $document.toolchain_profile -Depth 20 -Compress) -cne
+        (ConvertTo-Json -InputObject $expectedProfileRecord -Depth 20 -Compress)) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: complete discovery toolchain/profile/image/lock inventory differs from current caller-pinned Profile V2'
+    }
+    if (-not (Test-D32Phase0ExactProperties -Object $document.storage -Expected @('run_root', 'cargo_home', 'temp_root')) -or
+        -not (Test-D32Phase0ExactProperties -Object $document.storage.run_root -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32Phase0ExactProperties -Object $document.storage.cargo_home -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32Phase0ExactProperties -Object $document.storage.temp_root -Expected @('path', 'volume_serial_hex', 'file_id_hex'))) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: storage identity schema is invalid' }
+    $expectedRunRoot = Join-Path $root 'r'
+    $expectedCargoHome = Join-Path $expectedRunRoot 'c'
+    $expectedTempRoot = Join-Path $expectedRunRoot 't'
+    if (-not (Test-D32ProfilePathEqual -Left $document.storage.run_root.path -Right $expectedRunRoot) -or
+        -not (Test-D32ProfilePathEqual -Left $document.storage.cargo_home.path -Right $expectedCargoHome) -or
+        -not (Test-D32ProfilePathEqual -Left $document.storage.temp_root.path -Right $expectedTempRoot)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: compact run/CargoHome/TempRoot layout mismatch' }
+    foreach ($dir in @($document.storage.run_root, $document.storage.cargo_home, $document.storage.temp_root)) {
+        $null = Test-D32ProfileDirectoryIdentity -Path $dir.path -VolumeSerialHex $dir.volume_serial_hex -FileIdHex $dir.file_id_hex
+    }
+    if (-not (Test-D32ProfilePathWithin -Child $expectedCargoHome -Parent $root) -or -not (Test-D32ProfilePathWithin -Child $expectedTempRoot -Parent $root)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: compact storage escaped EvidenceRoot' }
+    if ($document.lock_inputs -isnot [Array] -or $document.lock_inputs.Count -ne $LockInputs.Count) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: lock input inventory count mismatch' }
+    for ($index = 0; $index -lt $LockInputs.Count; $index++) {
+        if (-not (Test-D32Phase0ExactProperties -Object $document.lock_inputs[$index] -Expected @('manifest_path', 'lock_sha256', 'lock_bytes')) -or
+            $document.lock_inputs[$index].manifest_path -cne $LockInputs[$index].ManifestPath -or $document.lock_inputs[$index].lock_sha256 -cne $LockInputs[$index].LockSha256 -or
+            [Int64]$document.lock_inputs[$index].lock_bytes -ne [Int64]$LockInputs[$index].LockBytes) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: current three Cargo.lock inputs differ' }
+    }
+    $sourceRef = $document.source_patch_authority
+    $sourceAuth = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath ([string]$sourceRef.path) -ExpectedAuthoritySha256 ([string]$sourceRef.sha256) `
+        -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $Profile -EvidenceRoot $root
+    $protocFields = @('authority', 'run_grant')
+    if (-not (Test-D32Phase0ExactProperties -Object $document.protoc -Expected $protocFields)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: separate discovery protoc authority/grant is required' }
+    $discoveryProtocAuthority = Test-D32VendoredProtocAuthority -AuthorityPath ([string]$document.protoc.authority.path) `
+        -ExpectedAuthoritySha256 ([string]$document.protoc.authority.sha256) -Repository $Repository -CandidateSha $CandidateSha `
+        -ValidatedProfile $Profile -EvidenceRoot $root -ExpectedScope 'D32_TEST_INVENTORY_DISCOVERY_ONLY'
+    $discoveryGrant = Test-D32VendoredProtocRunGrant -Reference $document.protoc.run_grant -Repository $Repository -CandidateSha $CandidateSha `
+        -ValidatedProfile $Profile -EvidenceRoot $root -ExpectedRunId $document.run_id -CargoHome $expectedCargoHome `
+        -AuthorityPath ([string]$document.protoc.authority.path) -AuthoritySha256 ([string]$document.protoc.authority.sha256) `
+        -OwnerMarkerReference $owner.MarkerReference -Scope 'D32_TEST_INVENTORY_DISCOVERY_ONLY'
+    if ((ConvertTo-Json -InputObject $discoveryProtocAuthority.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.protoc.authority -Depth 5 -Compress) -or
+        (ConvertTo-Json -InputObject $discoveryGrant.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.protoc.run_grant -Depth 5 -Compress)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery-only protoc authority/grant ref changed' }
+    Set-D32GitCaptureContext -ValidatedProfile $Profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
+    $git = Get-D32Phase0GitState -Repository $Repository -GitPath $GitPath -GitSha256 $GitSha256
+    if ($git.Head -cne $CandidateSha) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: current candidate differs from pinned discovery SHA' }
+    $cargo = [string]$Profile.Profile.toolchain.cargo.path
+    for ($index = 0; $index -lt 3; $index++) {
+        $lock = $LockInputs[$index]
+        $fetch = $document.fetches[$index]
+        $args = @('fetch', '--locked', '--manifest-path', $lock.ManifestFullPath, '--target', [string]$Profile.Profile.target_triple)
+        $name = 'inventory-fetch-{0:D2}' -f ($index + 1)
+        $null = Test-D32Phase0InventoryProcessRecord -Command $fetch -Name $name -Executable $cargo -Arguments $args -TimeoutSeconds 14400 `
+            -RunnerProcessId ([int]$document.runner_process_id) -Profile $Profile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $root -VendoredProtocGrant $null
+    }
+    $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $Profile.Profile)
+    $packageRows = @{}
+    for ($index = 0; $index -lt 6; $index++) {
+        $expected = $expectedCommands[$index]
+        $actual = $document.inventory_commands[$index]
+        if (-not (Test-D32Phase0ExactProperties -Object $actual -Expected @('package', 'listing_kind', 'features', 'target_triple', 'digest', 'row_count', 'test_count', 'benchmark_count', 'rows', 'command')) -or
+            $actual.package -cne $expected.package -or $actual.listing_kind -cne $expected.listing_kind -or
+            ($actual.features -join "`0") -cne ($expected.features -join "`0") -or $actual.target_triple -cne $Profile.Profile.target_triple -or
+            $actual.rows -isnot [Array] -or $actual.digest -isnot [string] -or $actual.digest -cnotmatch '^[0-9a-f]{64}$' -or
+            -not $(if ($expected.listing_kind -ceq 'all') { Test-D32Phase0Integer -Value $actual.row_count -Positive } else { Test-D32Phase0Integer -Value $actual.row_count }) -or
+            -not (Test-D32Phase0Integer -Value $actual.test_count) -or
+            -not (Test-D32Phase0Integer -Value $actual.benchmark_count)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: inventory command record[$index] schema/order mismatch" }
+        $null = Test-D32Phase0InventoryProcessRecord -Command $actual.command -Name $expected.name -Executable $expected.executable -Arguments $expected.arguments `
+            -TimeoutSeconds 28800 -RunnerProcessId ([int]$document.runner_process_id) -Profile $Profile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $root -VendoredProtocGrant $discoveryGrant
+        $lines = Read-D32TestInventoryLogReference -Reference $actual.command.stdout -AllowedRoot $root
+        $parsed = Get-D32TestInventoryListOutput -Lines $lines -Package $expected.package -ListingKind $expected.listing_kind
+        if (@($actual.rows | Where-Object { $_.package -isnot [string] -or $_.package -cne $expected.package -or $_.kind -isnot [string] -or $_.full_name -isnot [string] }).Count -gt 0 -or
+            -not (Test-D32TestInventoryRowsEqual -Left $parsed.rows -Right $actual.rows) -or
+            $actual.row_count -ne $parsed.row_count -or $actual.test_count -ne $parsed.test_count -or $actual.benchmark_count -ne $parsed.benchmark_count -or
+            $actual.digest -cne (Get-D32TestInventoryDigest -Rows $parsed.rows)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: captured raw list output differs from structured $($expected.name) rows/digest" }
+        $packageRows[($expected.package + '|' + $expected.listing_kind)] = @($parsed.rows)
+    }
+    $packageInventories = [System.Collections.Generic.List[object]]::new()
+    foreach ($package in @('protocol', 'vita', 'host')) {
+        [string[]]$deferred = @()
+        [string[]]$focused = @()
+        if ($package -eq 'vita') { $deferred = @($script:D32Phase0DeferredVita); $focused = @($script:D32Phase0FocusedVita) }
+        elseif ($package -eq 'host') { $deferred = @($script:D32Phase0DeferredHost); $focused = @($script:D32Phase0FocusedHost) }
+        $assignment = Get-D32TestInventoryCategoryAssignments -Package $package -AllRows $packageRows[($package + '|all')] `
+            -IgnoredRows $packageRows[($package + '|ignored')] -DeferredNames $deferred -FocusedSuffixes $focused
+        $packageInventories.Add($assignment)
+    }
+    $entries = @($packageInventories | ForEach-Object { $_.entries })
+    if (-not (Test-D32Phase0ExactProperties -Object $document.test_inventory -Expected @('entries', 'combined_digest', 'package_digests', 'category_counts')) -or
+        -not (Test-D32TestInventoryRowsEqual -Left $document.test_inventory.entries -Right $entries -IncludeCategory) -or
+        $document.test_inventory.combined_digest -cne (Get-D32TestInventoryBaselineDigest -Entries $entries) -or
+        $document.test_inventory.package_digests -isnot [Array] -or $document.test_inventory.package_digests.Count -ne 3 -or
+        -not (Test-D32Phase0ExactProperties -Object $document.test_inventory.category_counts -Expected @('protocol', 'vita', 'host'))) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: complete categorized inventory or combined digest schema mismatch'
+    }
+    for ($packageIndex = 0; $packageIndex -lt 3; $packageIndex++) {
+        $package = @('protocol', 'vita', 'host')[$packageIndex]
+        $digestRecord = $document.test_inventory.package_digests[$packageIndex]
+        $assignment = @($packageInventories | Where-Object { $_.package -ceq $package })[0]
+        if (-not (Test-D32Phase0ExactProperties -Object $digestRecord -Expected @('package', 'entry_count', 'sha256')) -or
+            $digestRecord.package -cne $package -or $digestRecord.entry_count -ne $assignment.entry_count -or
+            $digestRecord.sha256 -cne (Get-D32TestInventoryBaselineDigest -Entries $assignment.entries) -or
+            (ConvertTo-Json -InputObject $document.test_inventory.category_counts.$package -Depth 5 -Compress) -cne
+            (ConvertTo-Json -InputObject $assignment.category_counts -Depth 5 -Compress)) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: package/category digest and counts mismatch for $package"
+        }
+    }
+    $post = Get-D32Phase0GitState -Repository $Repository -GitPath $GitPath -GitSha256 $GitSha256
+    if ($post.Head -cne $CandidateSha) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: candidate changed after inventory discovery' }
+    return [PSCustomObject]@{
+        Document = $document
+        Reference = $Reference
+        Snapshot = $read.Snapshot
+        Root = $root
+        OwnerBinding = $owner
+        Profile = $Profile
+        LockInputs = $LockInputs
+        PackageInventories = @($packageInventories.ToArray())
+        SourcePatchAuthority = $sourceAuth
+        ProtocAuthority = $discoveryProtocAuthority
+        ProtocGrant = $discoveryGrant
+    }
+}
+
+function Test-D32Phase0TestInventoryAuthority {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaselinePath,
+        [Parameter(Mandatory = $true)][string]$BaselineSha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$Profile,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter(Mandatory = $true)][string]$GitSha256,
+        [AllowNull()][object]$ExpectedBaselineReference
+    )
+    if ([IO.Path]::GetFileName($BaselinePath) -cne 'D32-TEST-INVENTORY-BASELINE.json' -or
+        $BaselineSha256 -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-D32ProfileCanonicalPathString -Path $BaselinePath) -or
+        -not (Test-D32ProfileNoReparsePath -Path $BaselinePath) -or (Test-D32ProfilePathWithin -Child $BaselinePath -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child $BaselinePath -Parent $EvidenceRoot)) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: caller must pin an external canonical baseline before root claim' }
+    $baselineReference = if ($null -ne $ExpectedBaselineReference) { $ExpectedBaselineReference } else { Get-D32Phase0FileReference -Path $BaselinePath }
+    $baselineRead = Read-D32TestInventoryJsonReference -Reference $baselineReference -ExpectedPath $BaselinePath -ExpectedSha256 $BaselineSha256 -Repository $Repository
+    if (-not (Test-D32Phase0ExactProperties -Object $baselineRead.Document -Expected @('schema_version', 'record_type', 'status', 'gate_authority', 'candidate_sha', 'source_repo', 'target_triple', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc_discovery_authority', 'discovery', 'commands', 'entries', 'package_digests', 'combined_digest', 'category_counts', 'generated_at_utc'))) {
+        throw 'TEST_INVENTORY_BASELINE_BLOCKED: missing/legacy/unknown baseline schema'
+    }
+    $discoveryReference = $baselineRead.Document.discovery.reference
+    $discovery = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $discoveryReference -ExpectedSha256 ([string]$discoveryReference.sha256) `
+        -Repository $Repository -CandidateSha $CandidateSha -Profile $Profile -GitPath $GitPath -GitSha256 $GitSha256
+    if (Test-D32ProfilePathEqual -Left $discovery.Root -Right $EvidenceRoot) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: discovery and formal Phase0 must use distinct fresh owner-bound roots' }
+    $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $Profile.Profile)
+    $null = Test-D32TestInventoryBaselineDocument -Document $baselineRead.Document -Discovery $discovery.Document -DiscoveryReference $discovery.Reference `
+        -ExpectedCandidateSha $CandidateSha -Repository $Repository -Profile $Profile -LockInputs $discovery.LockInputs `
+        -SourcePatchAuthorityReference $discovery.Document.source_patch_authority -ProtocAuthorityReference $discovery.Document.protoc.authority `
+        -ExpectedCommands $expectedCommands
+    return [PSCustomObject]@{ Baseline = $baselineRead.Document; BaselineReference = $baselineReference; Discovery = $discovery }
 }
 
 function Assert-D32Phase0FixtureSummarySchemaVersion {
@@ -1753,7 +2094,7 @@ function Test-D32Phase0MatrixRecord {
         $raw = [IO.File]::ReadAllText($recordFull, [Text.Encoding]::UTF8)
         if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'Phase0 record has duplicate object keys or invalid JSON structure' }
         $document = $raw | ConvertFrom-D32Phase0Json
-        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
         if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw "Phase0 record schema_version must be the supported JSON integer version $($script:D32Phase0SchemaVersion)" }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
@@ -1922,23 +2263,50 @@ function Test-D32Phase0MatrixRecord {
         }
         foreach ($reference in @($fixtureRef, $fixtureProvenanceRef, $transcriptRef)) { $null = $reference }
 
+        if (-not (Test-D32Phase0ExactProperties -Object $document.test_inventory_authority -Expected @('baseline', 'discovery')) -or
+            -not (Test-D32Phase0ExactProperties -Object $document.test_inventory_authority.baseline -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32Phase0ExactProperties -Object $document.test_inventory_authority.discovery -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) { throw 'Phase0 external test-inventory baseline/discovery references are malformed' }
+        $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath ([string]$document.test_inventory_authority.baseline.path) `
+            -BaselineSha256 ([string]$document.test_inventory_authority.baseline.sha256) -Repository $repo -EvidenceRoot $outputRoot `
+            -CandidateSha $ExpectedCandidateSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 `
+            -ExpectedBaselineReference $document.test_inventory_authority.baseline
+        if ((ConvertTo-Json -InputObject $inventoryAuthority.Discovery.Reference -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $document.test_inventory_authority.discovery -Depth 6 -Compress)) {
+            throw 'Phase0 discovery reference does not match the external Coordinator-pinned baseline source'
+        }
         $inventory = $document.test_inventory
         if (-not (Test-D32Phase0ExactProperties -Object $inventory -Expected @('protocol', 'vita', 'host'))) { throw 'Phase0 test_inventory must contain exactly protocol/Vita/Host' }
         $testInventories = @{}
         foreach ($package in @('protocol', 'vita', 'host')) {
             $record = $inventory.$package
-            if (-not (Test-D32Phase0ExactProperties -Object $record -Expected @('test_names', 'ignored_names', 'test_count', 'ignored_count')) -or
+            $inventoryFields = @('all_rows', 'ignored_rows', 'entries', 'all_list_digest', 'ignored_list_digest', 'test_names', 'ignored_names', 'test_count', 'ignored_count', 'benchmark_count')
+            if (-not (Test-D32Phase0ExactProperties -Object $record -Expected $inventoryFields) -or
+                $record.all_rows -isnot [Array] -or $record.ignored_rows -isnot [Array] -or $record.entries -isnot [Array] -or
                 $record.test_names -isnot [Array] -or $record.ignored_names -isnot [Array] -or
                 -not (Test-D32Phase0Integer -Value $record.test_count) -or -not (Test-D32Phase0Integer -Value $record.ignored_count) -or
-                $record.test_count -ne $record.test_names.Count -or $record.ignored_count -ne $record.ignored_names.Count) { throw "Phase0 $package inventory schema/count mismatch" }
+                -not (Test-D32Phase0Integer -Value $record.benchmark_count) -or
+                $record.test_count -ne $record.test_names.Count -or $record.ignored_count -ne $record.ignored_names.Count -or
+                $record.all_list_digest -isnot [string] -or $record.all_list_digest -cnotmatch '^[0-9a-f]{64}$' -or
+                $record.ignored_list_digest -isnot [string] -or $record.ignored_list_digest -cnotmatch '^[0-9a-f]{64}$') { throw "Phase0 $package inventory schema/count mismatch" }
             if (@($record.test_names | Where-Object { $_ -isnot [string] }).Count -ne 0 -or @($record.ignored_names | Where-Object { $_ -isnot [string] }).Count -ne 0) { throw "Phase0 $package test names must be strings" }
+            $actualTestNames = @($record.all_rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
+            $actualIgnoredNames = @($record.ignored_rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
+            if (($actualTestNames -join "`0") -cne ($record.test_names -join "`0") -or ($actualIgnoredNames -join "`0") -cne ($record.ignored_names -join "`0") -or
+                [Int64]@($record.all_rows | Where-Object { $_.kind -ceq 'benchmark' }).Count -ne [Int64]$record.benchmark_count -or
+                [Int64]@($record.all_rows | Where-Object { $_.kind -ceq 'test' }).Count -ne [Int64]$record.test_count -or
+                [Int64]@($record.ignored_rows | Where-Object { $_.kind -ceq 'test' }).Count -ne [Int64]$record.ignored_count) { throw "Phase0 $package row/type/test-count fields disagree" }
+            $baselinePackageEntries = @($inventoryAuthority.Baseline.entries | Where-Object { $_.package -ceq $package })
+            if (-not (Test-D32TestInventoryRowsEqual -Left $record.entries -Right $baselinePackageEntries -IncludeCategory) -or
+                -not (Test-D32TestInventoryRowsEqual -Left $record.all_rows -Right @($baselinePackageEntries | ForEach-Object { [PSCustomObject][ordered]@{ package = $_.package; kind = $_.kind; full_name = $_.full_name } })) -or
+                -not (Test-D32TestInventoryRowsEqual -Left $record.ignored_rows -Right @($baselinePackageEntries | Where-Object { $_.category -ceq 'ignored' } | ForEach-Object { [PSCustomObject][ordered]@{ package = $_.package; kind = $_.kind; full_name = $_.full_name } }))) {
+                throw "Phase0 $package full inventory differs from external pinned baseline"
+            }
             $testInventories[$package] = [PSCustomObject]@{ all = @($record.test_names); ignored = @($record.ignored_names) }
         }
         $null = Test-D32Phase0FixedInventory -Inventories $testInventories
 
         $expectedPlan = @(Get-D32Phase0ExpectedCommandPlan -Profile $profile.Profile -Inventory $inventory)
         if ($document.commands -isnot [Array] -or $document.commands.Count -ne $expectedPlan.Count) { throw 'Phase0 command inventory is missing/extra fixed commands' }
-        $commandFields = @('name', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex', 'executable_file_id_hex', 'argv', 'arguments', 'command_line', 'working_directory', 'candidate_sha_before', 'clean_before', 'started_at_utc', 'completed_at_utc', 'exit_code', 'root_process', 'descendant_processes', 'process_trace', 'process_tree_cleanup', 'stdout', 'stderr', 'candidate_sha_after', 'clean_after')
+        $commandFields = @('name', 'timeout_seconds', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex', 'executable_file_id_hex', 'argv', 'arguments', 'command_line', 'working_directory', 'candidate_sha_before', 'clean_before', 'started_at_utc', 'completed_at_utc', 'exit_code', 'root_process', 'descendant_processes', 'process_trace', 'process_tree_cleanup', 'stdout', 'stderr', 'candidate_sha_after', 'clean_after')
         for ($i = 0; $i -lt $expectedPlan.Count; $i++) {
             $command = $document.commands[$i]
             $plan = $expectedPlan[$i]
@@ -1955,6 +2323,7 @@ function Test-D32Phase0MatrixRecord {
             }
             if ([DateTimeOffset]::Parse([string]$command.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) -lt [DateTimeOffset]::Parse([string]$command.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)) { throw "Phase0 command[$i] completion precedes start" }
             if ($command.name -cne $plan.name -or -not (Test-D32ProfilePathEqual -Left $command.executable -Right $plan.executable) -or
+                -not (Test-D32Phase0Integer -Value $command.timeout_seconds) -or [Int64]$command.timeout_seconds -ne [Int64]$plan.timeout_seconds -or
                 $command.arguments -isnot [Array] -or ($command.arguments -join "`0") -cne ($plan.arguments -join "`0") -or
                 $command.argv -isnot [Array] -or (@($command.argv) -join "`0") -cne ((@($plan.executable) + @($plan.arguments)) -join "`0")) { throw "Phase0 command[$i] does not match the code-owned argv/name/executable" }
             $expectedLine = ConvertTo-D32Phase0CommandLine -Arguments (@($plan.executable) + @($plan.arguments))
@@ -2025,7 +2394,7 @@ function Test-D32Phase0MatrixRecord {
             -ValidatedProfile $profile -EvidenceRoot $outputRoot -TempRoot ([string]$document.cargo_home.temp_root) -GitImage $h7GitImage
         if ((ConvertTo-Json -InputObject $h7Attestation.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.h7c_git_child_attestation -Depth 5 -Compress)) { throw 'Phase0 H7-C companion reference bytes/identity changed' }
 
-        $null = Test-D32Phase0ExecutedCommandEvidence -Document $document
+        $null = Test-D32Phase0ExecutedCommandEvidence -Document $document -BaselineEntries @($inventoryAuthority.Baseline.entries)
 
         if ($document.local_suites -isnot [Array] -or $document.local_suites.Count -ne 3) { throw 'Phase0 full local suite inventory must contain exactly three package results' }
         foreach ($package in @('protocol', 'vita', 'host')) {
@@ -2097,8 +2466,8 @@ function Get-D32Phase0TestCommand {
     foreach ($part in @('test', '--manifest-path', $manifest, '--all-targets', '--locked', '--offline')) { $arguments.Add($part) }
     if ($Package -eq 'vita') { $arguments.Add('--features'); $arguments.Add('d32-a-test-helper') }
     if ($Package -eq 'host') { $arguments.Add('--features'); $arguments.Add('d32-a-host-canary') }
-    if ($Kind -eq 'list') { $arguments.Add('--'); $arguments.Add('--list') }
-    elseif ($Kind -eq 'ignored-list') { $arguments.Add('--'); $arguments.Add('--ignored'); $arguments.Add('--list') }
+    if ($Kind -eq 'list') { $arguments.Add('--jobs'); $arguments.Add('4'); $arguments.Add('--'); $arguments.Add('--list') }
+    elseif ($Kind -eq 'ignored-list') { $arguments.Add('--jobs'); $arguments.Add('4'); $arguments.Add('--'); $arguments.Add('--ignored'); $arguments.Add('--list') }
     elseif ($Kind -eq 'suite') {
         if ($Package -ne 'protocol') {
             $arguments.Add('--')
@@ -2155,10 +2524,11 @@ function Get-D32Phase0Summaries {
 }
 
 function Get-D32Phase0TextFromLogs {
-    param([Parameter(Mandatory = $true)][object]$CommandRecord)
+    param([Parameter(Mandatory = $true)][object]$CommandRecord, [Parameter(Mandatory = $true)][string]$AllowedRoot)
     $text = [System.Collections.Generic.List[string]]::new()
     foreach ($reference in @($CommandRecord.stdout, $CommandRecord.stderr)) {
-        $text.AddRange([IO.File]::ReadAllLines([string]$reference.path))
+        $referenceLines = @(Read-D32TestInventoryLogReference -Reference $reference -AllowedRoot $AllowedRoot)
+        if ($referenceLines.Count -gt 0) { $text.AddRange([string[]]$referenceLines) }
     }
     return @($text.ToArray())
 }
@@ -2412,13 +2782,17 @@ function Invoke-D32Phase0Matrix {
         [Parameter(Mandatory = $true)][string]$ExpectedTauriMacrosSourceAuthoritySha256,
         [Parameter(Mandatory = $true)][string]$H7CGitAuthorityPath,
         [Parameter(Mandatory = $true)][string]$ExpectedH7CGitAuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$TestInventoryBaselinePath,
+        [Parameter(Mandatory = $true)][string]$ExpectedTestInventoryBaselineSha256,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
-        [Parameter(Mandatory = $true)][int]$FixtureBuildTimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$FixtureBuildTimeoutSeconds,
+        [Parameter(Mandatory = $true)][int]$InventoryListTimeoutSeconds
     )
     if ($PSVersionTable.PSVersion -lt [Version]'7.5') { throw 'PHASE0_BLOCKED: PowerShell 7.5 or newer is required' }
     if ($TimeoutSeconds -ne $script:D32Phase0RequiredCommandTimeoutSeconds -or
+        $InventoryListTimeoutSeconds -ne 28800 -or
         $FixtureBuildTimeoutSeconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds) {
-        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: formal Phase0 requires exact 14400-second command and 28800-second fixture-build limits'
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: formal Phase0 requires exact 14400-second standard commands and 28800-second fixture-build/inventory-list limits'
     }
     $repo = [IO.Path]::GetFullPath($Repository)
     if (-not (Test-D32ProfileNoReparsePath -Path $repo) -or -not (Test-Path -LiteralPath $repo -PathType Container)) { throw 'PHASE0_BLOCKED: repository must be an existing non-reparse directory' }
@@ -2441,6 +2815,8 @@ function Invoke-D32Phase0Matrix {
         -AuthorityPath $H7CGitAuthorityPath -ExpectedAuthoritySha256 $ExpectedH7CGitAuthoritySha256 `
         -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
         -EvidenceRoot $output -TempRoot $expectedTempRoot -GitImage $gitImage -TimeoutSeconds $TimeoutSeconds
+    $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $TestInventoryBaselinePath -BaselineSha256 $ExpectedTestInventoryBaselineSha256 `
+        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 -ExpectedBaselineReference $null
     Set-D32GitCaptureContext -ValidatedProfile $profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
     $pre = Get-D32Phase0GitState -Repository $repo -GitPath $GitPath -GitSha256 $GitSha256
     if ($pre.Head -cne $ExpectedSha) { throw 'PHASE0_CANDIDATE_BLOCKED: current HEAD does not equal caller-pinned candidate SHA' }
@@ -2632,29 +3008,56 @@ function Invoke-D32Phase0Matrix {
     }
 
     $rustcProbe = Invoke-D32Phase0LoggedCommand @commandArgs -Name 'rustc-target-probe' -Executable $rustc -Arguments @('--print', 'cfg', '--target', 'x86_64-pc-windows-msvc')
-    $rustcProbeText = Get-D32Phase0TextFromLogs -CommandRecord $rustcProbe
+        $rustcProbeText = Get-D32Phase0TextFromLogs -CommandRecord $rustcProbe -AllowedRoot $output
     if (($rustcProbeText -join "`n") -notmatch 'target_arch="x86_64"' -or ($rustcProbeText -join "`n") -notmatch 'target_os="windows"' -or ($rustcProbeText -join "`n") -notmatch 'target_env="msvc"') { throw 'PHASE0_TOOLCHAIN_BLOCKED: pinned rustc target probe did not confirm x86_64-pc-windows-msvc' }
 
     $listCommands = @{}
     foreach ($package in @('protocol', 'vita', 'host')) {
-        $list = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-test-list" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind list)
-        $ignoredList = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-ignored-list" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind ignored-list)
+        $list = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-test-list" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind list) -TimeoutSeconds $InventoryListTimeoutSeconds
+        $ignoredList = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-ignored-list" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind ignored-list) -TimeoutSeconds $InventoryListTimeoutSeconds
+        $allListEvidence = Get-D32TestInventoryListOutput -Lines @(Read-D32TestInventoryLogReference -Reference $list.stdout -AllowedRoot $output) -Package $package -ListingKind all
+        $ignoredListEvidence = Get-D32TestInventoryListOutput -Lines @(Read-D32TestInventoryLogReference -Reference $ignoredList.stdout -AllowedRoot $output) -Package $package -ListingKind ignored
         $listCommands[$package] = [PSCustomObject]@{
-            all = @(Get-D32Phase0ListedTests -Lines @(Get-D32Phase0TextFromLogs -CommandRecord $list))
-            ignored = @(Get-D32Phase0IgnoredTests -Lines @(Get-D32Phase0TextFromLogs -CommandRecord $ignoredList))
+            all = @($allListEvidence.rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
+            ignored = @($ignoredListEvidence.rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
+            all_rows = @($allListEvidence.rows)
+            ignored_rows = @($ignoredListEvidence.rows)
+            all_list_digest = Get-D32TestInventoryDigest -Rows $allListEvidence.rows
+            ignored_list_digest = Get-D32TestInventoryDigest -Rows $ignoredListEvidence.rows
+            benchmark_count = [Int64]$allListEvidence.benchmark_count
             list_command = $list.name
+            list_record = $list
             ignored_command = $ignoredList.name
+            ignored_record = $ignoredList
         }
     }
     $inventoryHashtable = @{}
     foreach ($package in @('protocol', 'vita', 'host')) { $inventoryHashtable[$package] = $listCommands[$package] }
     $null = Test-D32Phase0FixedInventory -Inventories $inventoryHashtable
+    $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $TestInventoryBaselinePath -BaselineSha256 $ExpectedTestInventoryBaselineSha256 `
+        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 -ExpectedBaselineReference $inventoryAuthority.BaselineReference
     foreach ($package in @('protocol', 'vita', 'host')) {
+        [string[]]$deferredNames = @()
+        [string[]]$focusedNames = @()
+        if ($package -ceq 'vita') { $deferredNames = @($script:D32Phase0DeferredVita); $focusedNames = @($script:D32Phase0FocusedVita) }
+        elseif ($package -ceq 'host') { $deferredNames = @($script:D32Phase0DeferredHost); $focusedNames = @($script:D32Phase0FocusedHost) }
+        $actualPackageInventory = Get-D32TestInventoryCategoryAssignments -Package $package -AllRows $listCommands[$package].all_rows `
+            -IgnoredRows $listCommands[$package].ignored_rows -DeferredNames $deferredNames -FocusedSuffixes $focusedNames
+        $pinnedEntries = @($inventoryAuthority.Baseline.entries | Where-Object { $_.package -ceq $package })
+        if (-not (Test-D32TestInventoryRowsEqual -Left $actualPackageInventory.entries -Right $pinnedEntries -IncludeCategory)) {
+            throw "PHASE0_TEST_INVENTORY_BLOCKED: $package exact list set/category differs from independently pinned discovery baseline before suites"
+        }
         $inventory[$package] = [ordered]@{
+            all_rows = @($listCommands[$package].all_rows)
+            ignored_rows = @($listCommands[$package].ignored_rows)
+            entries = @($actualPackageInventory.entries)
+            all_list_digest = [string]$listCommands[$package].all_list_digest
+            ignored_list_digest = [string]$listCommands[$package].ignored_list_digest
             test_names = @($listCommands[$package].all)
             ignored_names = @($listCommands[$package].ignored)
             test_count = [Int64]$listCommands[$package].all.Count
             ignored_count = [Int64]$listCommands[$package].ignored.Count
+            benchmark_count = [Int64]$listCommands[$package].benchmark_count
         }
     }
 
@@ -2665,7 +3068,7 @@ function Invoke-D32Phase0Matrix {
             $suite = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-full-local-suite" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind suite) `
                 -H7CGitAuthority $h7cAuthority -H7CGitRunGrant $h7cRunGrant
             $h7cAttestationCreated = New-D32H7CGitChildAttestation -Authority $h7cAuthority -RunGrant $h7cRunGrant -OwnerBinding $h7cOwnerBinding `
-                -Phase0Command $suite -SuiteLines @(Get-D32Phase0TextFromLogs -CommandRecord $suite) -GitChildren @($script:D32Phase0ObservedH7CGitChildren) `
+                -Phase0Command $suite -SuiteLines @(Get-D32Phase0TextFromLogs -CommandRecord $suite -AllowedRoot $output) -GitChildren @($script:D32Phase0ObservedH7CGitChildren) `
                 -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile -EvidenceRoot $output -TempRoot $tempRoot -GitImage $gitImage
             $h7cAttestation = Test-D32H7CGitChildAttestation -Reference $h7cAttestationCreated.Reference -Authority $h7cAuthority -RunGrant $h7cRunGrant `
                 -OwnerBinding $h7cOwnerBinding -Phase0Command $suite -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
@@ -2673,7 +3076,11 @@ function Invoke-D32Phase0Matrix {
         } else {
             $suite = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-full-local-suite" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind suite)
         }
-        $summaries = @(Get-D32Phase0Summaries -Lines @(Get-D32Phase0TextFromLogs -CommandRecord $suite))
+        $suiteLines = @(Get-D32Phase0TextFromLogs -CommandRecord $suite -AllowedRoot $output)
+        $pinnedSuiteEvidence = Assert-D32TestInventorySuiteRows -Package $package -BaselineEntries @($inventoryAuthority.Baseline.entries) `
+            -Lines $suiteLines -ExpectedIgnored ([Int64]$inventoryAuthority.Baseline.category_counts.$package.ignored) `
+            -ExpectedDeferred ([Int64]$inventoryAuthority.Baseline.category_counts.$package.deferred)
+        $summaries = @($pinnedSuiteEvidence.Summaries)
         if ($summaries.Count -eq 0) { throw "PHASE0_TEST_BLOCKED: test result summary missing for $package suite" }
         $counts = [ordered]@{
             passed = [Int64](($summaries | Measure-Object -Property passed -Sum).Sum)
@@ -2697,7 +3104,12 @@ function Invoke-D32Phase0Matrix {
             $matches = @($listCommands[$package].all | Where-Object { $_.EndsWith($suffix, [StringComparison]::Ordinal) })
             if ($matches.Count -ne 1) { throw "PHASE0_TEST_BLOCKED: focused name no longer resolves uniquely: $suffix" }
             $focusedRecord = Invoke-D32Phase0LoggedCommand @commandArgs -Name "$package-focused-$($suffix.Split('::')[-1])" -Executable $cargo -Arguments (Get-D32Phase0TestCommand -Package $package -Kind focused -ExactName $matches[0])
-            $focusedSummaries = @(Get-D32Phase0Summaries -Lines @(Get-D32Phase0TextFromLogs -CommandRecord $focusedRecord))
+            $focusedLines = @(Get-D32Phase0TextFromLogs -CommandRecord $focusedRecord -AllowedRoot $output)
+            $focusedParsed = Get-D32Phase0SuiteTestResultRows -Lines $focusedLines
+            if ($focusedParsed.rows.Count -ne 1 -or $focusedParsed.rows[0].full_name -cne $matches[0] -or $focusedParsed.rows[0].status -cne 'ok') {
+                throw "PHASE0_TEST_INVENTORY_BLOCKED: focused command result name/status differs from the baseline-selected full name: $($matches[0])"
+            }
+            $focusedSummaries = @(Get-D32Phase0Summaries -Lines $focusedLines)
             $passed = [Int64](($focusedSummaries | Measure-Object -Property passed -Sum).Sum)
             $failed = [Int64](($focusedSummaries | Measure-Object -Property failed -Sum).Sum)
             if (@($focusedSummaries | Where-Object { $_.status -cne 'ok' }).Count -ne 0 -or $passed -ne 1 -or $failed -ne 0 -or [Int64](($focusedSummaries | Measure-Object -Property ignored -Sum).Sum) -ne 0) { throw "PHASE0_TEST_BLOCKED: focused test did not pass exactly once: $($matches[0])" }
@@ -2751,6 +3163,7 @@ function Invoke-D32Phase0Matrix {
         tauri_macros_source_patch = $fixtureProvenanceEvidence.TauriMacrosSourcePatchAuthority.Reference
         h7c_git_child_authority = $h7cAuthority.Reference
         h7c_git_child_attestation = if ($null -eq $h7cAttestation) { $null } else { $h7cAttestation.Reference }
+        test_inventory_authority = [ordered]@{ baseline = $inventoryAuthority.BaselineReference; discovery = $inventoryAuthority.Discovery.Reference }
         status = $script:D32Phase0Status
         bundle_hashes = $script:D32Phase0BundleHashes
         started_at_utc = $started.ToString('o')
@@ -3032,12 +3445,26 @@ function Test-D32Phase0MatrixRecordSelfTest {
         ($writerAdmissionFailures.Count -eq $targetWriterNames.Count -and $writerAdmissionFailuresValid) "writer_classes=$($targetWriterNames -join ',')"
 
     $phase0SourceForAdmission = [IO.File]::ReadAllText($script:D32Phase0ScriptPath)
-    $admissionCallOffset = $phase0SourceForAdmission.IndexOf('$fixtureAdmission = Invoke-D32Phase0FixtureBuildAdmission', [StringComparison]::Ordinal)
-    $rootClaimCallbackOffset = $phase0SourceForAdmission.IndexOf('-ClaimOutputRoot { New-D32Phase0FixtureOutputRoot', [StringComparison]::Ordinal)
-    $producerBoundaryOffset = $phase0SourceForAdmission.IndexOf('$fixtureProducer = { & $fixtureScript @fixtureArguments }', [StringComparison]::Ordinal)
+    $phase0FunctionStart = $phase0SourceForAdmission.IndexOf('function Invoke-D32Phase0Matrix', [StringComparison]::Ordinal)
+    $phase0FunctionEnd = if ($phase0FunctionStart -ge 0) {
+        $phase0SourceForAdmission.IndexOf('function New-D32Phase0SelfTestInventory', $phase0FunctionStart, [StringComparison]::Ordinal)
+    }
+    else { -1 }
+    $phase0ProductionBody = if ($phase0FunctionStart -ge 0 -and $phase0FunctionEnd -gt $phase0FunctionStart) {
+        $phase0SourceForAdmission.Substring($phase0FunctionStart, $phase0FunctionEnd - $phase0FunctionStart)
+    }
+    else { '' }
+    $inventoryAuthorityOffset = $phase0ProductionBody.IndexOf('$inventoryAuthority = Test-D32Phase0TestInventoryAuthority', [StringComparison]::Ordinal)
+    $admissionCallOffset = $phase0ProductionBody.IndexOf('$fixtureAdmission = Invoke-D32Phase0FixtureBuildAdmission', [StringComparison]::Ordinal)
+    $rootClaimCallbackOffset = $phase0ProductionBody.IndexOf('-ClaimOutputRoot { New-D32Phase0FixtureOutputRoot', [StringComparison]::Ordinal)
+    $producerBoundaryOffset = $phase0ProductionBody.IndexOf('$fixtureProducer = { & $fixtureScript @fixtureArguments }', [StringComparison]::Ordinal)
     & $add 'production capacity admission claims the EvidenceRoot only after measurement and precedes the fixture/Cargo producer' `
         ($admissionCallOffset -ge 0 -and $rootClaimCallbackOffset -gt $admissionCallOffset -and $producerBoundaryOffset -gt $rootClaimCallbackOffset) `
-        "admission=$admissionCallOffset root_claim=$rootClaimCallbackOffset producer=$producerBoundaryOffset"
+        "production_body=$($phase0ProductionBody.Length) admission=$admissionCallOffset root_claim=$rootClaimCallbackOffset producer=$producerBoundaryOffset"
+    & $add 'formal caller-pinned baseline and linked discovery are validated in the production entry before capacity/root claim and Cargo' `
+        ($phase0FunctionStart -ge 0 -and $phase0FunctionEnd -gt $phase0FunctionStart -and $inventoryAuthorityOffset -ge 0 -and
+            $inventoryAuthorityOffset -lt $admissionCallOffset -and $admissionCallOffset -lt $rootClaimCallbackOffset -and $rootClaimCallbackOffset -lt $producerBoundaryOffset) `
+        "production_body=$($phase0ProductionBody.Length) inventory=$inventoryAuthorityOffset admission=$admissionCallOffset root_claim=$rootClaimCallbackOffset producer=$producerBoundaryOffset"
 
     $timeoutContractFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($timeoutContract in @(
@@ -3485,7 +3912,132 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)
-    & $add 'Phase0 record constants label local-only V6 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V6' -and $script:D32Phase0SchemaVersion -eq 6 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+    & $add 'Phase0 record constants label local-only V7 evidence with independently pinned inventory and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V7' -and $script:D32Phase0SchemaVersion -eq 7 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+
+    $inventoryPackages = @(Get-D32TestInventoryExpectedCommands -Profile ([PSCustomObject]@{
+        target_triple = 'x86_64-pc-windows-msvc'
+        toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]@{ path = 'C:\\pinned\\cargo.exe'; sha256 = ('a' * 64) } }
+    }))
+    $inventoryPlanValid = $inventoryPackages.Count -eq 6
+    foreach ($inventoryIndex in 0..([Math]::Max(0, $inventoryPackages.Count - 1))) {
+        if ($inventoryPackages.Count -ne 6) { break }
+        $inventoryPlanValid = $inventoryPlanValid -and $inventoryPackages[$inventoryIndex].timeout_seconds -eq 28800 -and
+            $inventoryPackages[$inventoryIndex].arguments -contains '--jobs' -and
+            [Array]::IndexOf([string[]]$inventoryPackages[$inventoryIndex].arguments, '--jobs') -lt [Array]::IndexOf([string[]]$inventoryPackages[$inventoryIndex].arguments, '--') -and
+            $inventoryPackages[$inventoryIndex].arguments[[Array]::IndexOf([string[]]$inventoryPackages[$inventoryIndex].arguments, '--jobs') + 1] -ceq '4' -and
+            $inventoryPackages[$inventoryIndex].package -ceq (@('protocol', 'vita', 'host')[[int][Math]::Floor($inventoryIndex / 2)]) -and
+            $inventoryPackages[$inventoryIndex].listing_kind -ceq @('all', 'ignored')[$inventoryIndex % 2]
+    }
+    & $add 'six ordered package/list-kind inventory commands use jobs=4 before -- and only the 28,800-second listing budget' $inventoryPlanValid
+
+    $listFixture = Get-D32TestInventoryListOutput -Lines @('protocol::ordinary: test', 'protocol::ignored: test', '2 tests, 0 benchmarks') -Package protocol -ListingKind all
+    $ignoredFixture = Get-D32TestInventoryListOutput -Lines @('protocol::ignored: test', '1 test, 0 benchmarks') -Package protocol -ListingKind ignored
+    $categoryFixture = Get-D32TestInventoryCategoryAssignments -Package protocol -AllRows $listFixture.rows -IgnoredRows $ignoredFixture.rows -DeferredNames @() -FocusedSuffixes @()
+    & $add 'inventory parser reconciles full libtest grammar and classifies ignored subset separately from ordinary tests' `
+        ($categoryFixture.entry_count -eq 2 -and $categoryFixture.category_counts.ordinary -eq 1 -and $categoryFixture.category_counts.ignored -eq 1)
+    $emptyIgnoredInventory = Get-D32TestInventoryListOutput -Lines @('0 tests, 0 benchmarks') -Package protocol -ListingKind ignored
+    $emptyAllInventoryRejected = $false
+    try { $null = Get-D32TestInventoryListOutput -Lines @('0 tests, 0 benchmarks') -Package protocol -ListingKind all }
+    catch { $emptyAllInventoryRejected = $true }
+    & $add 'an empty ignored-list is valid while an empty complete package list remains blocked' `
+        ($emptyIgnoredInventory.row_count -eq 0 -and $emptyIgnoredInventory.test_count -eq 0 -and $emptyAllInventoryRejected)
+    $malformedInventoryRejected = $true
+    foreach ($badLines in @(
+        ,@('protocol::ordinary: test', 'protocol::ordinary: test', '2 tests, 0 benchmarks'),
+        ,@('protocol::ordinary: test', '2 tests, 0 benchmarks'),
+        ,@('unknown libtest banner'),
+        ,@('protocol::ordinary: test', '1 tests, 1 benchmarks')
+    )) {
+        $rejected = $false
+        try { $null = Get-D32TestInventoryListOutput -Lines $badLines -Package protocol -ListingKind all }
+        catch { $rejected = $true }
+        if (-not $rejected) { $malformedInventoryRejected = $false }
+    }
+    & $add 'inventory parser rejects duplicate, missing-summary, unknown, and count-mismatched rows' $malformedInventoryRejected
+    $ignoredOutsideAllRejected = $false
+    try { $null = Get-D32TestInventoryCategoryAssignments -Package protocol -AllRows $listFixture.rows -IgnoredRows @([ordered]@{ package = 'protocol'; kind = 'test'; full_name = 'protocol::not-listed' }) -DeferredNames @() -FocusedSuffixes @() }
+    catch { $ignoredOutsideAllRejected = $true }
+    & $add 'ignored inventory must be a unique subset of the complete --list result' $ignoredOutsideAllRejected
+    $goodSuiteLines = @('running 2 tests', 'test protocol::ordinary ... ok', 'test protocol::ignored ... ignored', 'test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+    $suiteInventoryMatches = $false
+    try { $null = Assert-D32TestInventorySuiteRows -Package protocol -BaselineEntries $categoryFixture.entries -Lines $goodSuiteLines -ExpectedIgnored 1 -ExpectedDeferred 0; $suiteInventoryMatches = $true }
+    catch { $suiteInventoryMatches = $false }
+    $addedSuiteRowRejected = $false
+    try { $null = Assert-D32TestInventorySuiteRows -Package protocol -BaselineEntries $categoryFixture.entries -Lines @('running 3 tests', 'test protocol::ordinary ... ok', 'test protocol::ignored ... ignored', 'test protocol::added ... ok', 'test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s') -ExpectedIgnored 1 -ExpectedDeferred 0 }
+    catch { $addedSuiteRowRejected = $true }
+    $removedSuiteBaselineRejected = $false
+    try { $null = Assert-D32TestInventorySuiteRows -Package protocol -BaselineEntries @($categoryFixture.entries | Where-Object { $_.full_name -cne 'protocol::ordinary' }) -Lines $goodSuiteLines -ExpectedIgnored 1 -ExpectedDeferred 0 }
+    catch { $removedSuiteBaselineRejected = $true }
+    $renamedSuiteRowRejected = $false
+    try { $null = Assert-D32TestInventorySuiteRows -Package protocol -BaselineEntries $categoryFixture.entries -Lines @('running 2 tests', 'test protocol::renamed ... ok', 'test protocol::ignored ... ignored', 'test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s') -ExpectedIgnored 1 -ExpectedDeferred 0 }
+    catch { $renamedSuiteRowRejected = $true }
+    & $add 'suite result names reconcile against baseline and reject added, removed, or renamed ordinary tests' `
+        ($suiteInventoryMatches -and $addedSuiteRowRejected -and $removedSuiteBaselineRejected -and $renamedSuiteRowRejected)
+
+    $planProfile = [PSCustomObject]@{ Profile = [PSCustomObject]@{ target_triple = 'x86_64-pc-windows-msvc'; toolchain = [PSCustomObject]@{ cargo = [PSCustomObject]@{ path = 'C:\pinned\cargo.exe'; sha256 = ('a' * 64) } } } }
+    $firstExpectedList = $inventoryPackages[0]
+    $syntheticRef = [ordered]@{ path = 'C:\inventory\stdout.log'; bytes = [Int64]1; sha256 = ('b' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = '00000000000000000000000000000001' }
+    $syntheticTrace = [ordered]@{ schema_version = 2; processes = @() }
+    $syntheticDiscoveryCommand = [ordered]@{
+        root_process = [ordered]@{ process_id = [Int64]123; creation_date = '2026-09-29T00:00:00.0000000Z' }
+        process_trace = $syntheticTrace; stdout = $syntheticRef; stderr = $syntheticRef
+    }
+    $syntheticListRecord = [ordered]@{
+        command_index = [Int64]0; package = $firstExpectedList.package; listing_kind = $firstExpectedList.listing_kind; name = $firstExpectedList.name
+        candidate_sha = ('c' * 40); clean_before = $true; clean_after = $true; exit_code = [Int64]0; root_process_id = [Int64]123
+        root_process_creation_date = $syntheticDiscoveryCommand.root_process.creation_date; process_trace_sha256 = Get-D32TestInventoryJsonDigest -Value $syntheticTrace
+        executable = 'C:\pinned\cargo.exe'; executable_sha256 = ('a' * 64); argv = @($firstExpectedList.executable) + @($firstExpectedList.arguments)
+        working_directory = 'C:\candidate'; timeout_seconds = [Int64]28800; feature_set = @(); target_triple = 'x86_64-pc-windows-msvc'
+        output_digest = ('d' * 64); output_count = [Int64]1; output_test_count = [Int64]1; output_benchmark_count = [Int64]0
+        stdout = $syntheticRef; stderr = $syntheticRef
+    }
+    $syntheticListAccepted = $false
+    $syntheticListError = ''
+    try { Assert-D32TestInventoryExpectedCommand -Actual $syntheticListRecord -Expected $firstExpectedList -DiscoveryCommand $syntheticDiscoveryCommand -Index 0 -CandidateSha ('c' * 40) -Repository 'C:\candidate' -Profile $planProfile; $syntheticListAccepted = $true }
+    catch {
+        $syntheticListAccepted = $false
+        $syntheticListError = $_.Exception.Message + '; actual_argv=' + (@($syntheticListRecord.argv) -join '|') + '; expected_argv=' + (@($firstExpectedList.executable) + @($firstExpectedList.arguments) -join '|') + '; expected_features=' + (@($firstExpectedList.features) -join '|') + '; actual_features=' + (@($syntheticListRecord.feature_set) -join '|')
+    }
+    $inventoryCommandMutantsRejected = @()
+    foreach ($mutation in @(
+        [PSCustomObject]@{ Field = 'argv'; Value = @($syntheticListRecord.argv | ForEach-Object { if ($_ -ceq '4') { '1' } else { $_ } }) },
+        [PSCustomObject]@{ Field = 'timeout_seconds'; Value = [Int64]14400 },
+        [PSCustomObject]@{ Field = 'feature_set'; Value = @('wrong-feature') },
+        [PSCustomObject]@{ Field = 'target_triple'; Value = 'wrong-target' },
+        [PSCustomObject]@{ Field = 'candidate_sha'; Value = ('e' * 40) },
+        [PSCustomObject]@{ Field = 'package'; Value = 'vita' },
+        [PSCustomObject]@{ Field = 'executable_sha256'; Value = ('f' * 64) }
+    )) {
+        $variant = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($syntheticListRecord))
+        $variant.([string]$mutation.Field) = $mutation.Value
+        $rejected = $false
+        try { Assert-D32TestInventoryExpectedCommand -Actual $variant -Expected $firstExpectedList -DiscoveryCommand $syntheticDiscoveryCommand -Index 0 -CandidateSha ('c' * 40) -Repository 'C:\candidate' -Profile $planProfile }
+        catch { $rejected = $true }
+        $inventoryCommandMutantsRejected += $rejected
+    }
+    & $add "pinned baseline command validator rejects wrong jobs argv, timeout, features, target, candidate, package, and toolchain identity ($syntheticListError)" `
+        ($syntheticListAccepted -and $inventoryCommandMutantsRejected.Count -eq 7 -and @($inventoryCommandMutantsRejected | Where-Object { -not $_ }).Count -eq 0)
+    $emptyIgnoredExpected = $inventoryPackages[1]
+    $emptyIgnoredCommand = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($syntheticListRecord))
+    $emptyIgnoredCommand.command_index = [Int64]1
+    $emptyIgnoredCommand.package = $emptyIgnoredExpected.package
+    $emptyIgnoredCommand.listing_kind = $emptyIgnoredExpected.listing_kind
+    $emptyIgnoredCommand.name = $emptyIgnoredExpected.name
+    $emptyIgnoredCommand.argv = @($emptyIgnoredExpected.executable) + @($emptyIgnoredExpected.arguments)
+    $emptyIgnoredCommand.feature_set = @($emptyIgnoredExpected.features)
+    $emptyIgnoredCommand.output_count = [Int64]0
+    $emptyIgnoredCommand.output_test_count = [Int64]0
+    $emptyIgnoredCommand.output_benchmark_count = [Int64]0
+    $emptyIgnoredCommand.output_digest = Get-D32TestInventoryDigest -Rows @()
+    $emptyIgnoredAccepted = $false
+    $emptyIgnoredError = ''
+    try {
+        Assert-D32TestInventoryExpectedCommand -Actual $emptyIgnoredCommand -Expected $emptyIgnoredExpected -DiscoveryCommand $syntheticDiscoveryCommand `
+            -Index 1 -CandidateSha ('c' * 40) -Repository 'C:\candidate' -Profile $planProfile
+        $emptyIgnoredAccepted = $true
+    }
+    catch { $emptyIgnoredAccepted = $false; $emptyIgnoredError = $_.Exception.Message }
+    & $add "baseline list-command validator accepts the valid zero-row ignored listing with its libtest summary ($emptyIgnoredError)" $emptyIgnoredAccepted
 
     $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $selfTestRoot = Join-Path $tempBase ('d32-phase0-sidecar-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -3967,9 +4519,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $compactDirectoryCollisionRejected = $true }
         & $add 'fixed compact Cargo-home child refuses an existing-directory collision' $compactDirectoryCollisionRejected
         $schemaRejectPath = Join-Path $selfTestRoot 'D32-PHASE0-MATRIX.json'
-        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         foreach ($phase0SchemaCase in @(
-                [PSCustomObject]@{ Version = 5; Type = 'D32_PHASE0_MATRIX_RECORD_V5'; Name = 'prior V5' },
+                [PSCustomObject]@{ Version = 6; Type = 'D32_PHASE0_MATRIX_RECORD_V6'; Name = 'prior V6' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
             )) {
             $phase0SchemaDocument = [ordered]@{}
@@ -3979,7 +4531,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             [IO.File]::WriteAllText($schemaRejectPath, (ConvertTo-Json -InputObject $phase0SchemaDocument -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
             $phase0SchemaDigest = Get-D32ProfileFileSnapshot -Path $schemaRejectPath
             $phase0SchemaResult = Test-D32Phase0MatrixRecord -RecordPath $schemaRejectPath -ExpectedRecordSha256 $phase0SchemaDigest.Sha256 -Repository $testRepository -ExpectedCandidateSha $candidate -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest -GitPath 'C:\d32-phase0-selftest\git.exe' -GitSha256 ('b' * 64)
-            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 6*')
+            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 7*')
         }
         [IO.File]::Delete($schemaRejectPath)
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
@@ -5238,8 +5790,16 @@ if (-not $PSBoundParameters.ContainsKey('Phase0FixtureBuildTimeoutSeconds') -or 
     Write-Output 'D32 Phase0: BLOCKED — formal caller must explicitly pin -Phase0FixtureBuildTimeoutSeconds 28800 for each of the five fixture builds'
     exit 2
 }
+if (-not $PSBoundParameters.ContainsKey('Phase0InventoryListTimeoutSeconds') -or $Phase0InventoryListTimeoutSeconds -ne 28800) {
+    Write-Output 'D32 Phase0: BLOCKED — formal caller must explicitly pin -Phase0InventoryListTimeoutSeconds 28800 for the six inventory listing commands'
+    exit 2
+}
+if ([String]::IsNullOrWhiteSpace($Phase0TestInventoryBaselinePath) -or $Phase0ExpectedTestInventoryBaselineSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    Write-Output 'D32 Phase0: BLOCKED — formal caller must independently pin the external D32_TEST_INVENTORY_BASELINE_V1 path and SHA before EvidenceRoot claim'
+    exit 2
+}
 try {
-    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TauriMacrosSourceAuthorityPath $Phase0TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $Phase0ExpectedTauriMacrosSourceAuthoritySha256 -H7CGitAuthorityPath $Phase0H7CGitAuthorityPath -ExpectedH7CGitAuthoritySha256 $Phase0ExpectedH7CGitAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds -FixtureBuildTimeoutSeconds $Phase0FixtureBuildTimeoutSeconds
+    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TauriMacrosSourceAuthorityPath $Phase0TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $Phase0ExpectedTauriMacrosSourceAuthoritySha256 -H7CGitAuthorityPath $Phase0H7CGitAuthorityPath -ExpectedH7CGitAuthoritySha256 $Phase0ExpectedH7CGitAuthoritySha256 -TestInventoryBaselinePath $Phase0TestInventoryBaselinePath -ExpectedTestInventoryBaselineSha256 $Phase0ExpectedTestInventoryBaselineSha256 -TimeoutSeconds $Phase0TimeoutSeconds -FixtureBuildTimeoutSeconds $Phase0FixtureBuildTimeoutSeconds -InventoryListTimeoutSeconds $Phase0InventoryListTimeoutSeconds
     if ($result.Success) { exit 0 }
     exit 1
 }

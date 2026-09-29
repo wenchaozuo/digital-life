@@ -12,6 +12,7 @@
 | ID | 状态 | 主题 | 决策来源 | 生效范围 |
 |---|---|---|---|---|
 | ADR-TEMPLATE | TEMPLATE | 示例占位 | - | - |
+| ADR-D32-PHASE0-FIXTURE-BUDGET-V1 | APPROVED WITH CONDITIONS | Bounded four-job D32 Phase0 fixture-build budget | GPT-6 Sol Max | Five owner-bound Phase0 fixture builds only |
 | ADR-D32-EVIDENCE-BUNDLE-V1 | APPROVED | D32-A gate evidence bundle 与 clean-source release attestation | GPT-6 Sol | D32-A preflight/evidence only |
 | ADR-D32-FIXTURE-TRUST-D31-SEEDER | APPROVED | D32 fixture Git trust 与 D31 recovery seeder evidence | GPT-6 Sol | D32 fixture tooling 与 D31 test-helper evidence only |
 | ADR-D32-RELEASE-EVIDENCE-BOOTSTRAP | APPROVED WITH CONDITIONS | D32-A release evidence bundle 两阶段 bootstrap | GPT-6 Sol | D32-A bundle bootstrap ordering only |
@@ -698,6 +699,46 @@ The full fixed Vita Phase0 suite includes H7-C tests that create deterministic G
 ### Supersedes / Superseded by
 
 - Supersedes only the prior blanket denial of the exact-source tauri-macros local patch and exact granted Git.exe child described above. All other process denials, fixed suites and gates remain unchanged. Any future expansion requires a separate explicit architecture decision.
+
+---
+
+## ADR-D32-PHASE0-FIXTURE-BUDGET-V1 — Bounded four-job Phase0 fixture builds
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6 Sol Max
+**Decision date:** 2026-09-29
+**Effective:** prospective only
+**Related milestone:** D32-A-R2 / Phase0 and Phase1
+**Related baseline:** `06c300d94792e2a9aed4c47cb1db7b1a69551861`
+
+### Context
+
+Repeated cold Phase0 attempts showed that the first fixture build can exceed several hours. The existing Phase0 contract has a fixed one-job build path and a bounded command deadline. This decision permits a narrowly scoped, resource-gated concurrency and timeout change for the five local fixture builds only; it does not change which evidence those builds establish or authorize a broader Cargo invocation.
+
+### Decision
+
+1. Keep all three ordered locked fetch commands and their command timeout at exactly 14,400 seconds. Keep the Phase0 command timeout at 14,400 seconds for tool probes, test listing, the H7 authority suite, all local suites, focused checks, and every other non-fixture command. The default Phase0 timeout remains 1,800 seconds for non-formal callers; formal Phase0 must explicitly supply `-Phase0TimeoutSeconds 14400`.
+2. For the exact five ordered owner-bound Phase0 fixture builds only—H1 authority Host, H7 authority Host, H7 process, H7 Git helper, and D32-A sandbox—permit only the otherwise fixed `cargo build` argv with `--jobs 4` and an explicit per-build `-Phase0FixtureBuildTimeoutSeconds 28800`. No other argv token, package, manifest, feature, target, target directory, toolchain, or ordering changes. Formal Phase0 must explicitly pin that parameter to 28,800. Standalone/default fixture invocations remain 600 seconds and jobs=1 and cannot attest a Phase0 fixture budget. Phase1 release commands and the D31 recovery seeder remain unchanged.
+3. The Phase0 runner must measure and record, before creating the fresh owner-bound build environment, at least eight logical processors, at least 12 GiB available physical memory, at least 200 GiB free on the evidence volume, and zero competing cargo/rustc/cl/link/build-script writers for the candidate's target trees. Because the Windows process census does not provide a reliable working directory, fail closed if any process in those build classes is active; do not infer that it is unrelated from a command line lacking a candidate path. Failure or inability to measure any threshold is BLOCKED before Cargo. Record the exact observed capacity in strict `D32_PHASE0_FIXTURE_BUILD_BUDGET_V1` fields in fixture provenance V6 and Phase0 matrix V6; consumers require exact jobs/timeouts and enforce the recorded capacity minima.
+4. Retain a new, empty, owner-bound `r\c` CargoHome and `r\t` TempRoot, the current locked fetches, normal repository target directories, and the existing V2 debug/Job policy and pre-Continue image checks. Four concurrent Rust compiler processes may be active within the same verified nonbreakaway Job. Do not copy an old Cargo cache, set a target-dir override, change native process/accounting rules, clear caches, or enlarge the five-output quarantine scope.
+5. Strictly migrate fixture provenance V5→V6, Phase0 matrix V5→V6, release attestation V6→V7, and aggregate V5→V6. Every producer, reader, validator, and test rejects the prior and unknown versions and rejects wrong argv/budget. Preserve fixture manifest v3 and its six original `environment` fields, Profile V2, debug/Job Trace V2, protoc/source/H7 authorities V1, D31 recovery-seeder provenance V2, and bundle manifest v1. A BLOCKED run has no PASS or gate authority.
+
+### Frozen invariants and forbidden implementation
+
+- The full five-build Phase0 fixture inventory, three fetches, complete local suites, focused checks, H7-C negative evidence, and all existing downstream gates remain mandatory.
+- The only Cargo concurrency change is `--jobs 4` on those five fixture build commands; the only longer deadline is their explicit, individually bounded 28,800-second timeout. The 14,400-second Phase0 non-build command ceiling remains exact.
+- Fresh CargoHome, no cache copy, no target override, fixed toolchain/environment, V2 process-event verification, Job accounting, identity checks, and cleanup conditions remain unchanged.
+- Do not apply this budget to test commands, Phase1 release builds, D31 seeder builds, standalone fixture runs, other candidates, or any other stage.
+
+### Required tests and negative evidence
+
+- Accept only the exact five jobs=4 fixture argv records and 28,800-second build limit; reject jobs 1, 2, or 5 and timeout 14,400 or 28,801. Reject changed fetch/test/release argv, a missing or extra fixture, wrong order, budget drift, and old/unknown schema versions.
+- Reject insufficient or unverifiable CPU/RAM/evidence-volume capacity, any competing target writer, wrong candidate/profile/root/owner/home, stale artifacts/grants, or non-fresh CargoHome.
+- Preserve V2 trace identity/accounting under concurrent process events; reject partial, duplicate, out-of-order CREATE/EXIT sequences, missing EXIT, unknown child images, denied cmd/Git CREATE with zero Continue and no marker, breakaway Job, and residual Job members. Require full existing debugger/Job cleanup evidence.
+
+### Supersedes / Superseded by
+
+- Supersedes only the prospective jobs=1 / 600-second fixture-build budget for the exact five owner-bound Phase0 fixtures. It does not supersede the fixed five-phase scope, test parallelism, any fixed fetch/test/release command, toolchain, trace, authority, security rule, or gate. Any further budget or concurrency change requires a separate architecture decision.
 
 ---
 

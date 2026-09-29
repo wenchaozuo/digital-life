@@ -16,7 +16,8 @@ param(
     [string]$Phase0H7CGitAuthorityPath,
     [string]$Phase0ExpectedH7CGitAuthoritySha256,
     # Keep the original 1800-second default; owner-bound Phase0 callers may explicitly pin a bounded four-hour per-command limit.
-    [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800
+    [Alias('TimeoutSeconds')][ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800,
+    [ValidateRange(1, 28800)][int]$Phase0FixtureBuildTimeoutSeconds = 28800
 )
 
 Set-StrictMode -Version Latest
@@ -28,8 +29,12 @@ $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-vendored-protoc-authority.ps1')
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-h7c-git-child-authority.ps1')
 
-$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V5'
-$script:D32Phase0SchemaVersion = 5
+$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V6'
+$script:D32Phase0SchemaVersion = 6
+$script:D32Phase0FixtureBuildJobs = 4
+$script:D32Phase0FixtureBuildTimeoutSeconds = 28800
+$script:D32Phase0RequiredCommandTimeoutSeconds = 14400
+$script:D32Phase0FixtureBuildCapacity = $null
 $script:D32Phase0FixtureOwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:D32Phase0FixtureOwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:D32Phase0OwnerBindingName = 'D32-PHASE0-OWNER.json'
@@ -47,6 +52,87 @@ $script:D32Phase0FixtureBuildSpecs = @(
     [PSCustomObject]@{ name = 'd29h7-git-helper-fixture'; manifest = 'vita-agent/Cargo.toml'; binary = 'd29h7-git-helper-fixture'; features = @('d29-h7-test-helper') },
     [PSCustomObject]@{ name = 'd32a-sandbox-fixture'; manifest = 'vita-agent/Cargo.toml'; binary = 'd32a-sandbox-fixture'; features = @('d32-a-test-helper') }
 )
+
+function Assert-D32Phase0FixtureBuildBudgetRecord {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Document,
+        [int]$ExpectedPhase0TimeoutSeconds = 14400
+    )
+
+    $expectedFields = @('schema_version', 'record_type', 'phase0_command_timeout_seconds', 'fixture_build_timeout_seconds',
+        'cargo_build_jobs', 'logical_processor_count', 'available_physical_memory_bytes', 'evidence_volume_free_bytes',
+        'competing_target_writer_count', 'target_writer_check', 'checked_at_utc')
+    if (-not (Test-D32Phase0ExactProperties -Object $Document -Expected $expectedFields) -or
+        -not (Test-D32Phase0Integer -Value $Document.schema_version) -or [Int64]$Document.schema_version -ne 1 -or
+        $Document.record_type -isnot [string] -or $Document.record_type -cne 'D32_PHASE0_FIXTURE_BUILD_BUDGET_V1' -or
+        -not (Test-D32Phase0Integer -Value $Document.phase0_command_timeout_seconds) -or [Int64]$Document.phase0_command_timeout_seconds -ne $ExpectedPhase0TimeoutSeconds -or
+        -not (Test-D32Phase0Integer -Value $Document.fixture_build_timeout_seconds) -or [Int64]$Document.fixture_build_timeout_seconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds -or
+        -not (Test-D32Phase0Integer -Value $Document.cargo_build_jobs) -or [Int64]$Document.cargo_build_jobs -ne $script:D32Phase0FixtureBuildJobs -or
+        -not (Test-D32Phase0Integer -Value $Document.logical_processor_count -Positive) -or [Int64]$Document.logical_processor_count -lt 8 -or
+        -not (Test-D32Phase0Integer -Value $Document.available_physical_memory_bytes -Positive) -or [Int64]$Document.available_physical_memory_bytes -lt (12L * 1024L * 1024L * 1024L) -or
+        -not (Test-D32Phase0Integer -Value $Document.evidence_volume_free_bytes -Positive) -or [Int64]$Document.evidence_volume_free_bytes -lt (200L * 1024L * 1024L * 1024L) -or
+        -not (Test-D32Phase0Integer -Value $Document.competing_target_writer_count) -or [Int64]$Document.competing_target_writer_count -ne 0 -or
+        $Document.target_writer_check -isnot [string] -or $Document.target_writer_check -cne 'Win32-CIM-active-build-process-census' -or
+        $Document.checked_at_utc -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Document.checked_at_utc)) {
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: record must match exact V1 jobs/timeouts and minimum resource/no-writer preflight'
+    }
+    $checkedAt = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$Document.checked_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$checkedAt)) {
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: checked_at_utc must be a round-trip timestamp'
+    }
+}
+
+function Get-D32Phase0FixtureBuildCapacity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [Parameter(Mandatory = $true)][int]$Phase0TimeoutSeconds
+    )
+
+    if ($Phase0TimeoutSeconds -ne $script:D32Phase0RequiredCommandTimeoutSeconds) {
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: fixed fetch/list/test/focused/H7 command timeout must remain exactly 14400 seconds'
+    }
+    $cpuCount = [int][Environment]::ProcessorCount
+    $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    if ($null -eq $operatingSystem -or $null -eq $operatingSystem.FreePhysicalMemory) {
+        throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: available physical memory could not be verified'
+    }
+    $availableMemoryBytes = [Int64]$operatingSystem.FreePhysicalMemory * 1024L
+    $driveRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($EvidenceRoot))
+    $drive = [IO.DriveInfo]::new($driveRoot)
+    if (-not $drive.IsReady) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence volume is not ready' }
+    $freeBytes = [Int64]$drive.AvailableFreeSpace
+
+    $targetWriters = [System.Collections.Generic.List[string]]::new()
+    $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    foreach ($process in $processes) {
+        $processName = [string]$process.Name
+        if ($processName -notin @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'build-script-build.exe')) { continue }
+        $targetWriters.Add("$processName PID=$($process.ProcessId): active build-class process cannot be excluded from candidate target trees")
+    }
+    if ($targetWriters.Count -gt 0) {
+        throw "PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: competing target writer exists: $($targetWriters -join '; ')"
+    }
+    $capacity = [ordered]@{
+        schema_version = 1
+        record_type = 'D32_PHASE0_FIXTURE_BUILD_BUDGET_V1'
+        phase0_command_timeout_seconds = $Phase0TimeoutSeconds
+        fixture_build_timeout_seconds = $script:D32Phase0FixtureBuildTimeoutSeconds
+        cargo_build_jobs = $script:D32Phase0FixtureBuildJobs
+        logical_processor_count = $cpuCount
+        available_physical_memory_bytes = $availableMemoryBytes
+        evidence_volume_free_bytes = $freeBytes
+        competing_target_writer_count = 0
+        target_writer_check = 'Win32-CIM-active-build-process-census'
+        checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    $script:D32Phase0FixtureBuildCapacity = $capacity
+    if ($cpuCount -lt 8 -or $availableMemoryBytes -lt (12L * 1024L * 1024L * 1024L) -or $freeBytes -lt (200L * 1024L * 1024L * 1024L)) {
+        throw "PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: require >=8 logical CPUs, >=12 GiB available RAM and >=200 GiB evidence-volume free space (cpu=$cpuCount ram=$availableMemoryBytes free=$freeBytes)"
+    }
+    Assert-D32Phase0FixtureBuildBudgetRecord -Document $capacity -ExpectedPhase0TimeoutSeconds $Phase0TimeoutSeconds
+    return $capacity
+}
 $script:D32Phase0Status = 'PASS'
 $script:D32Phase0BundleHashes = 'PENDING'
 $script:D32Phase0Scope = 'local-fixture-and-test-matrix-only; no release build; no D31 real-process/seeder; no real provider; no physical capture; no host real canary'
@@ -1401,9 +1487,9 @@ function Test-D32Phase0FixtureBuildProvenance {
     $raw = [IO.File]::ReadAllText($expectedSidecar, [Text.Encoding]::UTF8)
     if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar has duplicate or invalid JSON keys' }
     $document = $raw | ConvertFrom-D32Phase0Json
-    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
-    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 5 -or
-        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V5' -or
+    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
+    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 6 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V6' -or
         $document.candidate_sha -isnot [string] -or $document.candidate_sha -cne $ExpectedCandidateSha -or
         $document.source_repo -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.source_repo -Right $Repository) -or
         $document.fixture_manifest_path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.fixture_manifest_path -Right $ManifestPath) -or
@@ -1411,6 +1497,11 @@ function Test-D32Phase0FixtureBuildProvenance {
         $document.fixture_manifest_volume_serial_hex -isnot [string] -or $document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $document.fixture_manifest_file_id_hex -isnot [string] -or $document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         -not (Test-D32Phase0Integer -Value $document.fixture_manifest_bytes -Positive)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar schema/candidate/source/manifest binding is invalid' }
+    Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
+    if ($null -ne $script:D32Phase0FixtureBuildCapacity -and
+        (ConvertTo-Json -InputObject $document.fixture_build_budget -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $script:D32Phase0FixtureBuildCapacity -Depth 5 -Compress)) {
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: fixture provenance capacity snapshot differs from the Phase0 preflight measurement'
+    }
     if ([String]::IsNullOrWhiteSpace($TauriMacrosSourceAuthorityPath) -and -not [String]::IsNullOrWhiteSpace([string]$script:D32Phase0SelfTestSourcePatchAuthorityPath)) {
         $TauriMacrosSourceAuthorityPath = [string]$script:D32Phase0SelfTestSourcePatchAuthorityPath
         $ExpectedTauriMacrosSourceAuthoritySha256 = [string]$script:D32Phase0SelfTestSourcePatchAuthoritySha256
@@ -1528,7 +1619,7 @@ function Test-D32Phase0FixtureBuildProvenance {
             $manifest = [IO.Path]::GetFullPath((Join-Path $Repository $spec.manifest))
             $expectedArgs = @('build', '--quiet', '--locked', '--manifest-path', $manifest, '--bin', [string]$spec.binary)
             if ($spec.features.Count -gt 0) { $expectedArgs += @('--features', ($spec.features -join ' ')) }
-            $expectedArgs += @('--jobs', '1')
+            $expectedArgs += @('--jobs', '4')
         }
         if (($entry.arguments -join "`0") -cne ($expectedArgs -join "`0") -or
             $entry.command_line -cne (ConvertTo-D32Phase0CommandLine -Arguments (@([string]$cargoIdentity.path) + $expectedArgs))) { throw "PHASE0_FIXTURE_BLOCKED: fixed process trace command/cwd mismatch at index $i" }
@@ -1600,10 +1691,11 @@ function Test-D32Phase0MatrixRecord {
         $raw = [IO.File]::ReadAllText($recordFull, [Text.Encoding]::UTF8)
         if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'Phase0 record has duplicate object keys or invalid JSON structure' }
         $document = $raw | ConvertFrom-D32Phase0Json
-        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
         if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw "Phase0 record schema_version must be the supported JSON integer version $($script:D32Phase0SchemaVersion)" }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
+        Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
         if (-not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive)) { throw 'Phase0 runner_process_id must be a positive JSON integer' }
         foreach ($name in @('candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'phase0_scope')) { if ($document.$name -isnot [string]) { throw "Phase0 $name must be a JSON string" } }
         if ($document.candidate_sha -cne $ExpectedCandidateSha -or $document.final_candidate_sha -cne $ExpectedCandidateSha) { throw 'Phase0 record candidate SHA binding mismatch' }
@@ -1730,8 +1822,15 @@ function Test-D32Phase0MatrixRecord {
         $fixtureFindings = New-D32FindingList
         Test-D32FixtureManifest -FixtureManifest $fixtureDocument -FixtureManifestPath $fixturePath -Head $ExpectedCandidateSha -Repository $repo -Findings $fixtureFindings
         if (@($fixtureFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'Phase0 fixture schema/artifact validation failed' }
+        if (-not (Test-D32Phase0ExactProperties -Object $fixtureDocument.build_policy -Expected @('timeout_seconds', 'cargo_build_jobs', 'nested_builds', 'process_tree_timeout_action')) -or
+            -not (Test-D32Phase0Integer -Value $fixtureDocument.build_policy.timeout_seconds) -or [Int64]$fixtureDocument.build_policy.timeout_seconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds -or
+            -not (Test-D32Phase0Integer -Value $fixtureDocument.build_policy.cargo_build_jobs) -or [Int64]$fixtureDocument.build_policy.cargo_build_jobs -ne $script:D32Phase0FixtureBuildJobs) {
+            throw 'Phase0 fixture manifest does not carry the exact owner-bound five-build jobs-4/28800-second policy'
+        }
         if ([IO.Path]::GetFileName($fixtureProvenanceRef.Path) -cne 'fixture-build-provenance.json') { throw 'Phase0 fixture build provenance path is not fixed' }
         $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant -TauriMacrosSourceAuthorityPath ([string]$document.tauri_macros_source_patch.path) -ExpectedTauriMacrosSourceAuthoritySha256 ([string]$document.tauri_macros_source_patch.sha256)
+        if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.fixture_build_budget -Depth 5 -Compress) -cne
+            (ConvertTo-Json -InputObject $document.fixture_build_budget -Depth 5 -Compress)) { throw 'Phase0 matrix build budget differs from the exact fixture provenance budget snapshot' }
         if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.vendored_protoc_run_grant -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.vendored_protoc.run_grant -Depth 5 -Compress)) { throw 'Phase0 fixture provenance grant reference differs from matrix run grant reference' }
         if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.tauri_macros_source_patch -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.tauri_macros_source_patch -Depth 5 -Compress)) { throw 'Phase0 fixture provenance tauri-macros source reference differs from matrix source authority reference' }
         if (($fixtureProvenance.Reference | ConvertTo-Json -Depth 5 -Compress) -cne ($document.fixture.build_provenance | ConvertTo-Json -Depth 5 -Compress)) { throw 'Phase0 fixture provenance sidecar reference does not match current opened-handle bytes/identity' }
@@ -2249,9 +2348,14 @@ function Invoke-D32Phase0Matrix {
         [Parameter(Mandatory = $true)][string]$ExpectedTauriMacrosSourceAuthoritySha256,
         [Parameter(Mandatory = $true)][string]$H7CGitAuthorityPath,
         [Parameter(Mandatory = $true)][string]$ExpectedH7CGitAuthoritySha256,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][int]$FixtureBuildTimeoutSeconds
     )
     if ($PSVersionTable.PSVersion -lt [Version]'7.5') { throw 'PHASE0_BLOCKED: PowerShell 7.5 or newer is required' }
+    if ($TimeoutSeconds -ne $script:D32Phase0RequiredCommandTimeoutSeconds -or
+        $FixtureBuildTimeoutSeconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds) {
+        throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: formal Phase0 requires exact 14400-second command and 28800-second fixture-build limits'
+    }
     $repo = [IO.Path]::GetFullPath($Repository)
     if (-not (Test-D32ProfileNoReparsePath -Path $repo) -or -not (Test-Path -LiteralPath $repo -PathType Container)) { throw 'PHASE0_BLOCKED: repository must be an existing non-reparse directory' }
     if ($ExpectedSha -cnotmatch '^[0-9a-f]{40}$') { throw 'PHASE0_BLOCKED: exact candidate SHA must be lowercase 40-hex' }
@@ -2279,6 +2383,8 @@ function Invoke-D32Phase0Matrix {
     $findings = [System.Collections.ArrayList]::new()
     Test-D32Governance -Repository $repo -Findings $findings
     if (@($findings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'PHASE0_GOVERNANCE_BLOCKED: current governance inputs failed preflight' }
+    $fixtureBuildCapacity = Get-D32Phase0FixtureBuildCapacity -Repository $repo -EvidenceRoot $output -Phase0TimeoutSeconds $TimeoutSeconds
+    $script:D32Phase0FixtureBuildCapacity = $fixtureBuildCapacity
 
     # Claim the already caller-pinned, previously absent evidence root before
     # invoking the fixture producer. This lets the runner preserve the exact
@@ -2313,7 +2419,10 @@ function Invoke-D32Phase0Matrix {
         ExpectedVendoredProtocAuthoritySha256 = $ExpectedVendoredProtocAuthoritySha256
         TauriMacrosSourceAuthorityPath = $TauriMacrosSourceAuthorityPath
         ExpectedTauriMacrosSourceAuthoritySha256 = $ExpectedTauriMacrosSourceAuthoritySha256
+        Phase0FixtureBuildCapacity = $fixtureBuildCapacity
         TimeoutSeconds = $TimeoutSeconds
+        Phase0FixtureBuildTimeoutSeconds = $FixtureBuildTimeoutSeconds
+        BuildJobs = $script:D32Phase0FixtureBuildJobs
     }
     $fixtureProducer = { & $fixtureScript @fixtureArguments }.GetNewClosure()
     $fixtureCapture = Invoke-D32Phase0FixtureProducerCapture -Producer $fixtureProducer
@@ -2397,7 +2506,11 @@ function Invoke-D32Phase0Matrix {
     $fixtureNames = @($fixtureDoc.fixtures | ForEach-Object { [string]$_.name })
     $expectedFixtureNames = @('d29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
     if (($fixtureNames -join '|') -cne ($expectedFixtureNames -join '|') -or @($fixtureDoc.fixtures | Where-Object { $_.status -cne 'succeeded' -or $_.exit_code -ne 0 }).Count -ne 0) { throw 'PHASE0_FIXTURE_BLOCKED: fixture phase inventory/result differs from the exact five-phase contract' }
-    if ($fixtureDoc.build_policy.cargo_build_jobs -ne 1 -or $fixtureDoc.process_tree_check -cne 'succeeded' -or $null -ne $fixtureDoc.process_tree_error) { throw 'PHASE0_FIXTURE_BLOCKED: fixture process cleanup/build policy did not pass' }
+    if ($fixtureDoc.build_policy.cargo_build_jobs -ne $script:D32Phase0FixtureBuildJobs -or
+        $fixtureDoc.build_policy.timeout_seconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds -or
+        $fixtureDoc.process_tree_check -cne 'succeeded' -or $null -ne $fixtureDoc.process_tree_error) {
+        throw 'PHASE0_FIXTURE_BLOCKED: exact jobs-4/build-timeout budget or fixture process cleanup policy did not pass'
+    }
     $fixtureProvenancePath = Join-Path $output 'fixture-build-provenance.json'
     $fixtureProvenanceEvidence = Test-D32Phase0FixtureBuildProvenance `
         -SidecarPath $fixtureProvenancePath -ManifestPath $fixtureManifestPath -Repository $repo -OutputRoot $output `
@@ -2601,6 +2714,7 @@ function Invoke-D32Phase0Matrix {
             cargo_home_identity = [ordered]@{ volume_serial_hex = [string]$fixtureProvenanceEvidence.Document.storage.cargo_home.volume_serial_hex; file_id_hex = [string]$fixtureProvenanceEvidence.Document.storage.cargo_home.file_id_hex }
             temp_root_identity = [ordered]@{ volume_serial_hex = [string]$fixtureProvenanceEvidence.Document.storage.temp_root.volume_serial_hex; file_id_hex = [string]$fixtureProvenanceEvidence.Document.storage.temp_root.file_id_hex }
         }
+        fixture_build_budget = $fixtureProvenanceEvidence.Document.fixture_build_budget
         fetches = @($fixtureEnvironment.fetch_manifests)
         fixture = [ordered]@{
             manifest = $fixtureRef
@@ -2738,11 +2852,63 @@ function New-D32Phase0SelfTestDebugTrace {
 function Test-D32Phase0MatrixRecordSelfTest {
     $cases = [System.Collections.Generic.List[object]]::new()
     $add = { param([string]$Name, [bool]$Passed, [AllowNull()][string]$Detail = $null) $cases.Add([PSCustomObject]@{ name = $Name; passed = $Passed; detail = $Detail }) }.GetNewClosure()
+    $validFixtureBuildBudget = [ordered]@{
+        schema_version = 1
+        record_type = 'D32_PHASE0_FIXTURE_BUILD_BUDGET_V1'
+        phase0_command_timeout_seconds = 14400
+        fixture_build_timeout_seconds = 28800
+        cargo_build_jobs = 4
+        logical_processor_count = 8
+        available_physical_memory_bytes = 12L * 1024L * 1024L * 1024L
+        evidence_volume_free_bytes = 200L * 1024L * 1024L * 1024L
+        competing_target_writer_count = 0
+        target_writer_check = 'Win32-CIM-active-build-process-census'
+        checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    Assert-D32Phase0FixtureBuildBudgetRecord -Document $validFixtureBuildBudget
+    & $add 'Phase0 fixture-build budget V1 accepts only the approved fixed timeout/jobs and capacity floor' $true
+    foreach ($invalidBudget in @(
+            [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 14400 },
+            [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 28801 },
+            [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 1 },
+            [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 2 },
+            [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 5 },
+            [PSCustomObject]@{ Field = 'phase0_command_timeout_seconds'; Value = 14399 },
+            [PSCustomObject]@{ Field = 'phase0_command_timeout_seconds'; Value = 28800 }
+        )) {
+        $invalidCapacity = [ordered]@{}
+        foreach ($field in $validFixtureBuildBudget.Keys) { $invalidCapacity[$field] = $validFixtureBuildBudget[$field] }
+        $invalidCapacity[$invalidBudget.Field] = $invalidBudget.Value
+        $budgetRejected = $false
+        try { Assert-D32Phase0FixtureBuildBudgetRecord -Document $invalidCapacity }
+        catch { $budgetRejected = $_.Exception.Message -like 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED:*' }
+        if (-not $budgetRejected) { throw "PHASE0_SELFTEST_FAILED: invalid budget $($invalidBudget.Field)=$($invalidBudget.Value) was accepted" }
+    }
+    $capacityFloorResults = [System.Collections.Generic.List[bool]]::new()
+    foreach ($capacityMutation in @(
+            [PSCustomObject]@{ Field = 'logical_processor_count'; Value = 7 },
+            [PSCustomObject]@{ Field = 'available_physical_memory_bytes'; Value = (12L * 1024L * 1024L * 1024L) - 1 },
+            [PSCustomObject]@{ Field = 'evidence_volume_free_bytes'; Value = (200L * 1024L * 1024L * 1024L) - 1 },
+            [PSCustomObject]@{ Field = 'competing_target_writer_count'; Value = 1 },
+            [PSCustomObject]@{ Field = 'target_writer_check'; Value = 'unverified' }
+        )) {
+        $badCapacity = [ordered]@{}
+        foreach ($field in $validFixtureBuildBudget.Keys) { $badCapacity[$field] = $validFixtureBuildBudget[$field] }
+        $badCapacity[$capacityMutation.Field] = $capacityMutation.Value
+        $rejected = $false
+        try { Assert-D32Phase0FixtureBuildBudgetRecord -Document $badCapacity }
+        catch { $rejected = $_.Exception.Message -like 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED:*' }
+        $capacityFloorResults.Add($rejected)
+    }
+    & $add 'Phase0 fixture-build budget rejects CPU, RAM, evidence-volume, competing-writer, and measurement-source drift' `
+        ($capacityFloorResults.Count -eq 5 -and @($capacityFloorResults | Where-Object { -not $_ }).Count -eq 0)
 
     $timeoutContractFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($timeoutContract in @(
         [PSCustomObject]@{ Path = $script:D32Phase0ScriptPath; Name = 'Phase0TimeoutSeconds'; Minimum = 60; Maximum = 14400; Default = 1800 },
-        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'TimeoutSeconds'; Minimum = 1; Maximum = 14400; Default = 600 }
+        [PSCustomObject]@{ Path = $script:D32Phase0ScriptPath; Name = 'Phase0FixtureBuildTimeoutSeconds'; Minimum = 1; Maximum = 28800; Default = 28800 },
+        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'TimeoutSeconds'; Minimum = 1; Maximum = 14400; Default = 600 },
+        [PSCustomObject]@{ Path = (Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'); Name = 'Phase0FixtureBuildTimeoutSeconds'; Minimum = 1; Maximum = 28800; Default = 600 }
     )) {
         $tokens = $null
         $parseErrors = $null
@@ -2767,9 +2933,13 @@ function Test-D32Phase0MatrixRecordSelfTest {
     }
     $phase0SourceText = [IO.File]::ReadAllText($script:D32Phase0ScriptPath)
     $timeoutForwardingValid = $phase0SourceText -match 'TimeoutSeconds\s*=\s*\$TimeoutSeconds' -and
-        $phase0SourceText -notmatch 'TimeoutSeconds\s*=\s*\[Math\]::Min\s*\(\s*\$TimeoutSeconds\s*,\s*3600\s*\)'
+        $phase0SourceText -notmatch 'TimeoutSeconds\s*=\s*\[Math\]::Min\s*\(\s*\$TimeoutSeconds\s*,\s*3600\s*\)' -and
+        $phase0SourceText -match 'Phase0FixtureBuildTimeoutSeconds\s*=\s*\$FixtureBuildTimeoutSeconds' -and
+        $phase0SourceText -match 'BuildJobs\s*=\s*\$script:D32Phase0FixtureBuildJobs' -and
+        $phase0SourceText -match 'ContainsKey\(''Phase0FixtureBuildTimeoutSeconds''\)' -and
+        $phase0SourceText -match '\$Phase0FixtureBuildTimeoutSeconds\s*-ne\s*\$script:D32Phase0FixtureBuildTimeoutSeconds'
     if (-not $timeoutForwardingValid) { $timeoutContractFailures.Add('Phase0TimeoutSeconds:unclamped-forwarding') }
-    & $add 'Phase0 and fixture timeouts retain defaults and enforce the 14400-second Phase0 ceiling' `
+    & $add 'Phase0 and fixture-build parameters retain exact defaults, ceilings, explicit formal pins, and bounded forwarding' `
         ($timeoutContractFailures.Count -eq 0) ($timeoutContractFailures -join ', ')
 
     $preflightLibraryPath = Join-Path $script:D32Phase0ScriptRoot 'd32-preflight.ps1'
@@ -3179,7 +3349,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)
-    & $add 'Phase0 record constants label local-only V5 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V5' -and $script:D32Phase0SchemaVersion -eq 5 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+    & $add 'Phase0 record constants label local-only V6 evidence and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V6' -and $script:D32Phase0SchemaVersion -eq 6 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
 
     $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $selfTestRoot = Join-Path $tempBase ('d32-phase0-sidecar-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -3661,9 +3831,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $compactDirectoryCollisionRejected = $true }
         & $add 'fixed compact Cargo-home child refuses an existing-directory collision' $compactDirectoryCollisionRejected
         $schemaRejectPath = Join-Path $selfTestRoot 'D32-PHASE0-MATRIX.json'
-        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         foreach ($phase0SchemaCase in @(
-                [PSCustomObject]@{ Version = 4; Type = 'D32_PHASE0_MATRIX_RECORD_V4'; Name = 'prior V4' },
+                [PSCustomObject]@{ Version = 5; Type = 'D32_PHASE0_MATRIX_RECORD_V5'; Name = 'prior V5' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
             )) {
             $phase0SchemaDocument = [ordered]@{}
@@ -3673,7 +3843,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             [IO.File]::WriteAllText($schemaRejectPath, (ConvertTo-Json -InputObject $phase0SchemaDocument -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
             $phase0SchemaDigest = Get-D32ProfileFileSnapshot -Path $schemaRejectPath
             $phase0SchemaResult = Test-D32Phase0MatrixRecord -RecordPath $schemaRejectPath -ExpectedRecordSha256 $phase0SchemaDigest.Sha256 -Repository $testRepository -ExpectedCandidateSha $candidate -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest -GitPath 'C:\d32-phase0-selftest\git.exe' -GitSha256 ('b' * 64)
-            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 5*')
+            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 6*')
         }
         [IO.File]::Delete($schemaRejectPath)
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
@@ -3692,7 +3862,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             RootIdentity = $ownerBinding.RootIdentity
             OwnerMarker = $ownerBinding.OwnerMarker
         }
-        $payloadArguments = @('build', '--quiet', '--locked', '--manifest-path', (Join-Path $testRepository 'vita-agent/Cargo.toml'), '--bin', 'd32a-sandbox-fixture', '--jobs', '1')
+        $payloadArguments = @('build', '--quiet', '--locked', '--manifest-path', (Join-Path $testRepository 'vita-agent/Cargo.toml'), '--bin', 'd32a-sandbox-fixture', '--jobs', '4')
         $payloadCargo = $fakeProfile.Profile.toolchain.cargo
         $capturedFailurePayload = [ordered]@{
             schema_version = 1
@@ -3942,7 +4112,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 $spec = $script:D32Phase0FixtureBuildSpecs[$traceIndex - $fakeLockInputs.Count]
                 $traceArguments = @('build', '--quiet', '--locked', '--manifest-path', [IO.Path]::GetFullPath((Join-Path $testRepository $spec.manifest)), '--bin', [string]$spec.binary)
                 if ($spec.features.Count -gt 0) { $traceArguments += @('--features', ($spec.features -join ' ')) }
-                $traceArguments += @('--jobs', '1')
+                $traceArguments += @('--jobs', '4')
             }
             $rootPid = 2000000000 + $traceIndex
             $trace = New-D32Phase0SelfTestDebugTrace -Profile $fakeProfile -RunnerProcessId $PID -RootProcessId $rootPid
@@ -3976,8 +4146,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
             }
         }
         $sidecar = [ordered]@{
-            schema_version = 5
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
+            schema_version = 6
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
             candidate_sha = $candidate
             source_repo = $testRepository
             fixture_manifest_path = $manifestSnapshot.Path
@@ -4006,6 +4176,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 run_id = $runId
             }
             process_traces = @($traceRecords.ToArray())
+            fixture_build_budget = $validFixtureBuildBudget
             vendored_protoc_run_grant = [ordered]@{
                 path = (Join-Path $fixtureOutputRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json')
                 bytes = [Int64]1
@@ -4019,9 +4190,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $writeSidecar $sidecar
         try {
             $validSidecar = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $fixtureOutputRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile
-            & $add 'fixture build provenance v5 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V5')
+            & $add 'fixture build provenance v6 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V6')
         }
-        catch { & $add 'fixture build provenance v5 accepts exact owner-bound compact storage and manifest/profile/command/event evidence' $false $_.Exception.Message }
+        catch { & $add 'fixture build provenance v6 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' $false $_.Exception.Message }
 
         $h7GitPath = 'E:\Program Files\Git\mingw64\bin\git.exe'
         $h7GitSnapshot = Get-D32ProfileFileSnapshot -Path $h7GitPath
@@ -4354,6 +4525,102 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         catch { $vctipTraceFailure = $_.Exception.Message }
         & $add 'V2 process-trace validator accepts only an exact VCTIP image with the fixed Cargo root and retained parent chain' $vctipTraceAccepted ([string]$vctipTraceFailure)
+
+        $concurrentRustcTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
+        $concurrentRoot = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $concurrentRustcTrace.processes[0] -Depth 8 -Compress)
+        $concurrentRootPid = [uint32]$concurrentRoot.process_id
+        $concurrentRootCreation = [Int64]$concurrentRoot.creation_filetime
+        $rustcPin = $fakeProfile.Profile.toolchain.rustc
+        $rustcIdentity = [PSCustomObject]@{
+            Path = [string]$rustcPin.path
+            Bytes = [Int64]$rustcPin.bytes
+            Sha256 = [string]$rustcPin.sha256
+            VolumeSerialHex = [string]$rustcPin.volume_serial_hex
+            FileIdHex = [string]$rustcPin.file_id_hex
+        }
+        $rustcReason = Get-D32Phase0AllowedChildImageReason -ImagePath $rustcIdentity.Path -ValidatedProfile $vctipTraceProfile `
+            -Repository $testRepository -ExpectedRootPath $fakeCargoPath -ImageIdentity $rustcIdentity
+        if ([String]::IsNullOrWhiteSpace($rustcReason)) { throw 'PHASE0_SELFTEST_BLOCKED: exact profile-pinned rustc image is unavailable for the concurrent trace fixture' }
+        $concurrentEvents = [System.Collections.Generic.List[object]]::new()
+        $concurrentEvents.Add($concurrentRustcTrace.process_events[0])
+        $concurrentProcesses = [System.Collections.Generic.List[object]]::new()
+        $concurrentRoot.exit_sequence = 10
+        $concurrentRoot.exited_at_utc = [DateTime]::FromFileTimeUtc($concurrentRootCreation + 90000000).ToString('o')
+        $concurrentProcesses.Add($concurrentRoot)
+        $rustcRecords = [System.Collections.Generic.List[object]]::new()
+        for ($rustcIndex = 0; $rustcIndex -lt 4; $rustcIndex++) {
+            $rustcPid = [uint32]($concurrentRootPid + 5000 + $rustcIndex)
+            $rustcCreation = $concurrentRootCreation + (10000000L * ($rustcIndex + 1))
+            $createdAt = [DateTime]::FromFileTimeUtc($rustcCreation).ToString('o')
+            $rustcRecords.Add([PSCustomObject][ordered]@{
+                process_id = $rustcPid; parent_process_id = $concurrentRootPid
+                creation_filetime = $rustcCreation; parent_creation_filetime = $concurrentRootCreation
+                image_path = $rustcIdentity.Path; bytes = $rustcIdentity.Bytes; sha256 = $rustcIdentity.Sha256
+                volume_serial_hex = $rustcIdentity.VolumeSerialHex; file_id_hex = $rustcIdentity.FileIdHex
+                allowed_image_reason = $rustcReason; image_verified = $true; exited = $true; exit_code = 0
+                create_sequence = 2 + $rustcIndex; exit_sequence = 6 + $rustcIndex
+                created_at_utc = $createdAt
+                exited_at_utc = [DateTime]::FromFileTimeUtc($concurrentRootCreation + (10000000L * (5 + $rustcIndex))).ToString('o')
+            })
+            $concurrentEvents.Add([PSCustomObject][ordered]@{
+                sequence = 2 + $rustcIndex; kind = 'CREATE'; process_id = $rustcPid; parent_process_id = $concurrentRootPid
+                creation_filetime = $rustcCreation; parent_creation_filetime = $concurrentRootCreation; exit_code = 0
+            })
+        }
+        for ($rustcIndex = 0; $rustcIndex -lt 4; $rustcIndex++) {
+            $record = $rustcRecords[$rustcIndex]
+            $concurrentEvents.Add([PSCustomObject][ordered]@{
+                sequence = 6 + $rustcIndex; kind = 'EXIT'; process_id = $record.process_id; parent_process_id = $concurrentRootPid
+                creation_filetime = $record.creation_filetime; parent_creation_filetime = $concurrentRootCreation; exit_code = 0
+            })
+        }
+        $concurrentEvents.Add([PSCustomObject][ordered]@{
+            sequence = 10; kind = 'EXIT'; process_id = $concurrentRootPid; parent_process_id = [uint32]$concurrentRoot.parent_process_id
+            creation_filetime = $concurrentRootCreation; parent_creation_filetime = [Int64]$concurrentRoot.parent_creation_filetime; exit_code = 0
+        })
+        $concurrentProcesses.AddRange($rustcRecords.ToArray())
+        $concurrentRustcTrace.process_events = @($concurrentEvents.ToArray())
+        $concurrentRustcTrace.processes = @($concurrentProcesses.ToArray())
+        $concurrentRustcTrace.process_create_event_count = 5; $concurrentRustcTrace.process_exit_event_count = 5
+        $concurrentRustcTrace.process_event_count = 10; $concurrentRustcTrace.job_total_processes = 5
+        $concurrentRustcTrace.retained_process_handle_count = 6; $concurrentRustcTrace.job_active_processes = 0
+        $concurrentRustcTrace.debug_event_count = 10 + [Int64]$concurrentRustcTrace.thread_create_event_count +
+            [Int64]$concurrentRustcTrace.thread_exit_event_count + [Int64]$concurrentRustcTrace.image_load_event_count +
+            [Int64]$concurrentRustcTrace.image_unload_event_count + [Int64]$concurrentRustcTrace.exception_event_count +
+            [Int64]$concurrentRustcTrace.debug_string_event_count
+        $concurrentRustcTrace.completed_at_utc = [DateTime]::FromFileTimeUtc($concurrentRootCreation + 100000000).ToString('o')
+        $concurrentRustcAccepted = $false
+        $concurrentRustcFailure = $null
+        try {
+            $null = Test-D32Phase0DebugProcessTrace -Trace $concurrentRustcTrace -ExpectedRootPath $fakeCargoPath `
+                -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+            $concurrentRustcAccepted = $true
+        }
+        catch { $concurrentRustcFailure = $_.Exception.Message }
+        & $add 'V2 trace accepts four overlapping exact-profile rustc identities under one fixed Cargo Job' $concurrentRustcAccepted ([string]$concurrentRustcFailure)
+        foreach ($eventOrderCase in @(
+                [PSCustomObject]@{ Name = 'duplicate'; First = 1; Second = 2; Duplicate = $true },
+                [PSCustomObject]@{ Name = 'out-of-order'; First = 1; Second = 2; Duplicate = $false }
+            )) {
+            $invalidConcurrentTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $concurrentRustcTrace -Depth 14 -Compress)
+            if ($eventOrderCase.Duplicate) {
+                $invalidConcurrentTrace.process_events[$eventOrderCase.Second].sequence = $invalidConcurrentTrace.process_events[$eventOrderCase.First].sequence
+            }
+            else {
+                $temporaryEvent = $invalidConcurrentTrace.process_events[$eventOrderCase.First]
+                $invalidConcurrentTrace.process_events[$eventOrderCase.First] = $invalidConcurrentTrace.process_events[$eventOrderCase.Second]
+                $invalidConcurrentTrace.process_events[$eventOrderCase.Second] = $temporaryEvent
+            }
+            $eventOrderRejected = $false
+            try {
+                $null = Test-D32Phase0DebugProcessTrace -Trace $invalidConcurrentTrace -ExpectedRootPath $fakeCargoPath `
+                    -ExpectedRootIdentity $fakeProfile.Profile.toolchain.cargo -ExpectedParentProcessId $PID `
+                    -ValidatedProfile $vctipTraceProfile -Repository $testRepository
+            }
+            catch { $eventOrderRejected = $_.Exception.Message -like 'PROCESS_TRACE_BLOCKED:*' }
+            & $add "V2 trace rejects $($eventOrderCase.Name) CREATE/EXIT event ordering with four concurrent children" $eventOrderRejected
+        }
 
         $protocTrace = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $vctipTrace -Depth 12 -Compress)
         $protocTraceImagePath = Join-Path $cargoHome 'registry\src\index.crates.io-1949cf8c6b5b557f\protoc-bin-vendored-win32-3.2.0\bin\protoc.exe'
@@ -4730,8 +4997,16 @@ if ([String]::IsNullOrWhiteSpace($Phase0RepoRoot)) { $Phase0RepoRoot = Split-Pat
 foreach ($required in @(@('OutputRoot', $Phase0OutputRoot), @('ExpectedCandidateSha', $Phase0ExpectedCandidateSha), @('ToolchainProfilePath', $Phase0ToolchainProfilePath), @('ExpectedToolchainProfileSha256', $Phase0ExpectedToolchainProfileSha256), @('PinnedGitPath', $Phase0PinnedGitPath), @('PinnedGitSha256', $Phase0PinnedGitSha256), @('VendoredProtocAuthorityPath', $Phase0VendoredProtocAuthorityPath), @('ExpectedVendoredProtocAuthoritySha256', $Phase0ExpectedVendoredProtocAuthoritySha256), @('TauriMacrosSourceAuthorityPath', $Phase0TauriMacrosSourceAuthorityPath), @('ExpectedTauriMacrosSourceAuthoritySha256', $Phase0ExpectedTauriMacrosSourceAuthoritySha256), @('H7CGitAuthorityPath', $Phase0H7CGitAuthorityPath), @('ExpectedH7CGitAuthoritySha256', $Phase0ExpectedH7CGitAuthoritySha256))) {
     if ([String]::IsNullOrWhiteSpace([string]$required[1])) { Write-Output "D32 Phase0: BLOCKED — -$($required[0]) is required"; exit 2 }
 }
+if (-not $PSBoundParameters.ContainsKey('Phase0TimeoutSeconds') -or $Phase0TimeoutSeconds -ne $script:D32Phase0RequiredCommandTimeoutSeconds) {
+    Write-Output 'D32 Phase0: BLOCKED — formal caller must explicitly pin -Phase0TimeoutSeconds 14400 for fixed fetch/list/test/focused/H7 commands'
+    exit 2
+}
+if (-not $PSBoundParameters.ContainsKey('Phase0FixtureBuildTimeoutSeconds') -or $Phase0FixtureBuildTimeoutSeconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds) {
+    Write-Output 'D32 Phase0: BLOCKED — formal caller must explicitly pin -Phase0FixtureBuildTimeoutSeconds 28800 for each of the five fixture builds'
+    exit 2
+}
 try {
-    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TauriMacrosSourceAuthorityPath $Phase0TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $Phase0ExpectedTauriMacrosSourceAuthoritySha256 -H7CGitAuthorityPath $Phase0H7CGitAuthorityPath -ExpectedH7CGitAuthoritySha256 $Phase0ExpectedH7CGitAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds
+    $result = Invoke-D32Phase0Matrix -Repository $Phase0RepoRoot -EvidenceRoot $Phase0OutputRoot -ExpectedSha $Phase0ExpectedCandidateSha -ProfilePath $Phase0ToolchainProfilePath -ProfileSha256 $Phase0ExpectedToolchainProfileSha256 -GitPath $Phase0PinnedGitPath -GitSha256 $Phase0PinnedGitSha256 -VendoredProtocAuthorityPath $Phase0VendoredProtocAuthorityPath -ExpectedVendoredProtocAuthoritySha256 $Phase0ExpectedVendoredProtocAuthoritySha256 -TauriMacrosSourceAuthorityPath $Phase0TauriMacrosSourceAuthorityPath -ExpectedTauriMacrosSourceAuthoritySha256 $Phase0ExpectedTauriMacrosSourceAuthoritySha256 -H7CGitAuthorityPath $Phase0H7CGitAuthorityPath -ExpectedH7CGitAuthoritySha256 $Phase0ExpectedH7CGitAuthoritySha256 -TimeoutSeconds $Phase0TimeoutSeconds -FixtureBuildTimeoutSeconds $Phase0FixtureBuildTimeoutSeconds
     if ($result.Success) { exit 0 }
     exit 1
 }

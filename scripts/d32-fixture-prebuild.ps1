@@ -52,9 +52,12 @@ param(
     [string]$ExpectedVendoredProtocAuthoritySha256,
     [string]$TauriMacrosSourceAuthorityPath,
     [string]$ExpectedTauriMacrosSourceAuthoritySha256,
+    [AllowNull()][object]$Phase0FixtureBuildCapacity,
     [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 14400)]
     [int]$TimeoutSeconds = 600,
+    [ValidateRange(1, 28800)]
+    [int]$Phase0FixtureBuildTimeoutSeconds = 600,
     [ValidateRange(1, 16)]
     [int]$BuildJobs = 1,
     [switch]$D32LauncherLibraryOnly,
@@ -73,6 +76,66 @@ function Assert-D32FixtureTimeoutScope {
 
     if ($TimeoutSeconds -gt 3600 -and ($null -eq $OwnerBinding -or $BuildD31RecoverySeeder)) {
         throw 'PHASE0_TIMEOUT_SCOPE_BLOCKED: timeouts above 3600 seconds require the fixed Phase0 owner binding and cannot include the D31 recovery seeder'
+    }
+}
+
+function Test-D32FixtureBuildBudgetInteger {
+    param([AllowNull()][object]$Value)
+    return ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64])
+}
+
+function Assert-D32FixtureBuildBudgetRecord {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Document,
+        [Parameter(Mandatory = $true)][int]$ExpectedPhase0TimeoutSeconds
+    )
+
+    $expected = @('schema_version', 'record_type', 'phase0_command_timeout_seconds', 'fixture_build_timeout_seconds',
+        'cargo_build_jobs', 'logical_processor_count', 'available_physical_memory_bytes', 'evidence_volume_free_bytes',
+        'competing_target_writer_count', 'target_writer_check', 'checked_at_utc')
+    $actual = @(Get-D32ObjectFieldNames -Object $Document)
+    if ($actual.Count -ne $expected.Count -or
+        @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
+        @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.schema_version) -or [int]$Document.schema_version -ne 1 -or
+        $Document.record_type -isnot [string] -or $Document.record_type -cne 'D32_PHASE0_FIXTURE_BUILD_BUDGET_V1' -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.phase0_command_timeout_seconds) -or [int64]$Document.phase0_command_timeout_seconds -ne $ExpectedPhase0TimeoutSeconds -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.fixture_build_timeout_seconds) -or [int64]$Document.fixture_build_timeout_seconds -ne 28800 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.cargo_build_jobs) -or [int64]$Document.cargo_build_jobs -ne 4 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.logical_processor_count) -or [int64]$Document.logical_processor_count -lt 8 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.available_physical_memory_bytes) -or [int64]$Document.available_physical_memory_bytes -lt (12L * 1024L * 1024L * 1024L) -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.evidence_volume_free_bytes) -or [int64]$Document.evidence_volume_free_bytes -lt (200L * 1024L * 1024L * 1024L) -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.competing_target_writer_count) -or [int64]$Document.competing_target_writer_count -ne 0 -or
+        $Document.target_writer_check -isnot [string] -or $Document.target_writer_check -cne 'Win32-CIM-active-build-process-census' -or
+        $Document.checked_at_utc -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Document.checked_at_utc)) {
+        throw 'FIXTURE_BUILD_BUDGET_INVALID: strict V1 budget, fixed timeout/jobs, or resource-preflight capacity is invalid'
+    }
+    $parsedAt = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$Document.checked_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedAt)) {
+        throw 'FIXTURE_BUILD_BUDGET_INVALID: checked_at_utc is not a round-trip timestamp'
+    }
+}
+
+function Assert-D32FixtureBuildBudgetScope {
+    param(
+        [AllowNull()][object]$OwnerBinding,
+        [bool]$BuildD31RecoverySeeder,
+        [int]$TimeoutSeconds,
+        [int]$FixtureBuildTimeoutSeconds,
+        [int]$BuildJobs,
+        [AllowNull()][object]$Capacity
+    )
+
+    if ($null -ne $OwnerBinding -and -not $BuildD31RecoverySeeder) {
+        if ($TimeoutSeconds -ne 14400 -or $FixtureBuildTimeoutSeconds -ne 28800 -or $BuildJobs -ne 4 -or $null -eq $Capacity) {
+            throw 'FIXTURE_BUILD_BUDGET_BLOCKED: owner-bound Phase0 requires 14400-second Phase0 commands, exactly 28800-second fixture builds, four Cargo jobs, and recorded capacity'
+        }
+        Assert-D32FixtureBuildBudgetRecord -Document $Capacity -ExpectedPhase0TimeoutSeconds $TimeoutSeconds
+        return
+    }
+    if ($FixtureBuildTimeoutSeconds -ne 600 -or $BuildJobs -ne 1) {
+        throw 'FIXTURE_BUILD_BUDGET_BLOCKED: standalone and D31-seeder modes remain limited to the 600-second/jobs-1 defaults'
     }
 }
 
@@ -6105,12 +6168,12 @@ function Assert-D32FixtureBuildProvenanceShape {
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
-        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
+        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
     $actual = @($Document.Keys | ForEach-Object { [string]$_ })
     if ($actual.Count -ne $expected.Count -or
         @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
         @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
-        [int]$Document.schema_version -ne 5 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V5' -or
+        [int]$Document.schema_version -ne 6 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V6' -or
         [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [uint64]$Document.fixture_manifest_bytes -le 0 -or
@@ -6118,6 +6181,7 @@ function Assert-D32FixtureBuildProvenanceShape {
         [string]$Document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar schema, version, manifest hash, bytes, or identity is invalid'
     }
+    Assert-D32FixtureBuildBudgetRecord -Document $Document.fixture_build_budget -ExpectedPhase0TimeoutSeconds 14400
     $grant = $Document.vendored_protoc_run_grant
     if (-not (Test-D32VendoredObjectExactProperties -Object $grant -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
         $grant.path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $grant.path) -or
@@ -6149,6 +6213,20 @@ function Assert-D32FixtureBuildProvenanceShape {
         $Document.environment.fetch_manifests.Count -eq 0 -or
         -not [bool]$Document.environment.offline_after_fetch) {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar environment must match the exact ten-field versioned provenance shape'
+    }
+    if ($Document.environment.fetch_manifests.Count -ne 3) {
+        throw 'FIXTURE_PROVENANCE_INVALID: exact three locked fetches are required before the five fixed fixture builds'
+    }
+    for ($i = 0; $i -lt $script:FixtureSpecs.Count; $i++) {
+        $spec = $script:FixtureSpecs[$i]
+        $manifest = [IO.Path]::GetFullPath((Join-Path ([string]$Document.source_repo) ([string]$spec.manifest)))
+        $expectedArguments = @('build', '--quiet', '--locked', '--manifest-path', $manifest, '--bin', [string]$spec.binary)
+        if ($spec.features.Count -gt 0) { $expectedArguments += @('--features', ($spec.features -join ' ')) }
+        $expectedArguments += @('--jobs', '4')
+        $entry = $Document.process_traces[$Document.environment.fetch_manifests.Count + $i]
+        if (($entry.arguments -join "`0") -cne ($expectedArguments -join "`0")) {
+            throw "FIXTURE_PROVENANCE_INVALID: fixed fixture command or jobs=4 budget differs at phase $($i + 1)"
+        }
     }
     $storageFields = @('evidence_root', 'owner_marker', 'run_root', 'cargo_home', 'temp_root', 'run_id')
     $storage = $Document.storage
@@ -6397,6 +6475,9 @@ function Invoke-D32DebugSelfTestProcess {
 }
 
 function Invoke-D32SelfTest {
+    if ($PSVersionTable.PSVersion -lt [Version]'7.5') {
+        throw 'SELFTEST_REQUIRES_POWERSHELL_75: strict budget timestamp round-trip uses ConvertFrom-Json -DateKind String'
+    }
     Ensure-D32NativeLauncher
     $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-selftest-' + [Guid]::NewGuid().ToString('N'))
     $passed = 0
@@ -6414,6 +6495,39 @@ function Invoke-D32SelfTest {
             throw 'SELFTEST_FAILED: four-hour timeout was accepted for a D31 recovery-seeder run'
         }
         catch { if ($_.Exception.Message -notlike 'PHASE0_TIMEOUT_SCOPE_BLOCKED:*') { throw } }
+        $passed++
+
+        $validBuildBudget = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_PHASE0_FIXTURE_BUILD_BUDGET_V1'
+            phase0_command_timeout_seconds = 14400
+            fixture_build_timeout_seconds = 28800
+            cargo_build_jobs = 4
+            logical_processor_count = 8
+            available_physical_memory_bytes = 12L * 1024L * 1024L * 1024L
+            evidence_volume_free_bytes = 200L * 1024L * 1024L * 1024L
+            competing_target_writer_count = 0
+            target_writer_check = 'Win32-CIM-active-build-process-census'
+            checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        Assert-D32FixtureBuildBudgetScope -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false -TimeoutSeconds 14400 -FixtureBuildTimeoutSeconds 28800 -BuildJobs 4 -Capacity $validBuildBudget
+        foreach ($invalidBudget in @(
+                [PSCustomObject]@{ Timeout = 14400; Jobs = 1; Phase0Timeout = $null },
+                [PSCustomObject]@{ Timeout = 14400; Jobs = 2; Phase0Timeout = $null },
+                [PSCustomObject]@{ Timeout = 14400; Jobs = 5; Phase0Timeout = $null },
+                [PSCustomObject]@{ Timeout = 28801; Jobs = 4; Phase0Timeout = $null },
+                [PSCustomObject]@{ Timeout = 14400; Jobs = 4; Phase0Timeout = 14399 },
+                [PSCustomObject]@{ Timeout = 14400; Jobs = 4; Phase0Timeout = 28800 }
+            )) {
+            $badCapacity = [ordered]@{}
+            foreach ($key in $validBuildBudget.Keys) { $badCapacity[$key] = $validBuildBudget[$key] }
+            if ($null -ne $invalidBudget.Phase0Timeout) { $badCapacity.phase0_command_timeout_seconds = $invalidBudget.Phase0Timeout }
+            $wrongBudgetRejected = $false
+            try { Assert-D32FixtureBuildBudgetScope -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false -TimeoutSeconds $(if ($null -ne $invalidBudget.Phase0Timeout) { [int]$invalidBudget.Phase0Timeout } else { 14400 }) -FixtureBuildTimeoutSeconds $invalidBudget.Timeout -BuildJobs $invalidBudget.Jobs -Capacity $badCapacity }
+            catch { $wrongBudgetRejected = $_.Exception.Message -like 'FIXTURE_BUILD_BUDGET_BLOCKED:*' -or $_.Exception.Message -like 'FIXTURE_BUILD_BUDGET_INVALID:*' }
+            if (-not $wrongBudgetRejected) { throw 'SELFTEST_FAILED: wrong Phase0 build budget was accepted' }
+        }
+        Assert-D32FixtureBuildBudgetScope -OwnerBinding $null -BuildD31RecoverySeeder $false -TimeoutSeconds 600 -FixtureBuildTimeoutSeconds 600 -BuildJobs 1 -Capacity $null
         $passed++
 
         $priorProcessEvidence = $script:D32LastProcessEvidence
@@ -8091,10 +8205,32 @@ public static class D32DebugSelfTestLauncher
         $provenanceRunRoot = Join-Path $provenanceEvidenceRoot 'r'
         $provenanceCargoHome = Join-Path $provenanceRunRoot 'c'
         $provenanceTempRoot = Join-Path $provenanceRunRoot 't'
-        $provenanceFetchArguments = @(
-            'fetch', '--locked', '--manifest-path', $provenanceManifestPath,
-            '--target', 'x86_64-pc-windows-msvc'
-        )
+        $provenanceLockManifests = @('vita-agent-protocol/Cargo.toml', 'vita-agent/Cargo.toml', 'src-tauri/Cargo.toml')
+        $provenanceFetchManifests = [System.Collections.Generic.List[object]]::new()
+        $provenanceFetchArguments = [System.Collections.Generic.List[object]]::new()
+        for ($fetchIndex = 0; $fetchIndex -lt $provenanceLockManifests.Count; $fetchIndex++) {
+            $fetchManifestPath = $provenanceLockManifests[$fetchIndex]
+            $fetchManifestFullPath = [IO.Path]::GetFullPath((Join-Path $fakeRepo $fetchManifestPath))
+            $fetchArguments = @('fetch', '--locked', '--manifest-path', $fetchManifestFullPath, '--target', 'x86_64-pc-windows-msvc')
+            $provenanceFetchArguments.Add($fetchArguments)
+            $provenanceFetchManifests.Add([ordered]@{
+                    manifest_path = $fetchManifestPath
+                    lock_sha256 = ('f' * 64)
+                    command = $fetchArguments
+                    status = 'succeeded'
+                    exit_code = 0
+                    process_identity = [ordered]@{
+                        process_id = 1234 + $fetchIndex
+                        parent_process_id = [int]$PID
+                        name = 'cargo.exe'
+                        image_path = $provenanceCargoPath
+                        creation_date = '2026-09-23T00:00:00.0000000Z'
+                        command_line = ConvertTo-D32CommandLine (@($provenanceCargoPath) + $fetchArguments)
+                        observed_at_utc = '2026-09-23T00:00:01.0000000Z'
+                        identity_verified = $true
+                    }
+                })
+        }
         $provenanceEnvironment = [ordered]@{
             toolchain_profile_path = (Join-Path $root 'profile.json')
             toolchain_profile_sha256 = ('a' * 64)
@@ -8104,23 +8240,7 @@ public static class D32DebugSelfTestLauncher
             cargo_home = $provenanceCargoHome
             temp_root = $provenanceTempRoot
             run_id = '0123456789abcdef0123456789abcdef'
-            fetch_manifests = @([ordered]@{
-                    manifest_path = 'vita-agent/Cargo.toml'
-                    lock_sha256 = ('f' * 64)
-                    command = $provenanceFetchArguments
-                    status = 'succeeded'
-                    exit_code = 0
-                    process_identity = [ordered]@{
-                        process_id = 1234
-                        parent_process_id = [int]$PID
-                        name = 'cargo.exe'
-                        image_path = $provenanceCargoPath
-                        creation_date = '2026-09-23T00:00:00.0000000Z'
-                        command_line = ConvertTo-D32CommandLine (@($provenanceCargoPath) + $provenanceFetchArguments)
-                        observed_at_utc = '2026-09-23T00:00:01.0000000Z'
-                        identity_verified = $true
-                    }
-                })
+            fetch_manifests = @($provenanceFetchManifests.ToArray())
             offline_after_fetch = $true
         }
         $debuggerCreation = [DateTime]::UtcNow.ToFileTimeUtc()
@@ -8180,8 +8300,17 @@ public static class D32DebugSelfTestLauncher
         }
         $traceNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch', 'd29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
         $traceRecords = [System.Collections.Generic.List[object]]::new()
-        foreach ($traceName in $traceNames) {
-            $traceArguments = @($provenanceFetchArguments)
+        foreach ($traceIndex in 0..($traceNames.Count - 1)) {
+            $traceName = $traceNames[$traceIndex]
+            if ($traceIndex -lt 3) {
+                $traceArguments = @($provenanceFetchArguments[$traceIndex])
+            }
+            else {
+                $spec = $script:FixtureSpecs[$traceIndex - 3]
+                $traceArguments = @('build', '--quiet', '--locked', '--manifest-path', [IO.Path]::GetFullPath((Join-Path $fakeRepo ([string]$spec.manifest))), '--bin', [string]$spec.binary)
+                if ($spec.features.Count -gt 0) { $traceArguments += @('--features', ($spec.features -join ' ')) }
+                $traceArguments += @('--jobs', '4')
+            }
             $traceRecords.Add([ordered]@{
                 name = $traceName
                 executable = $provenanceCargoPath
@@ -8193,8 +8322,8 @@ public static class D32DebugSelfTestLauncher
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
         $provenanceDocument = [ordered]@{
-            schema_version = 5
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
+            schema_version = 6
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
             candidate_sha = '0123456789abcdef0123456789abcdef01234567'
             source_repo = $fakeRepo
             fixture_manifest_path = $sample
@@ -8212,6 +8341,7 @@ public static class D32DebugSelfTestLauncher
                 run_id = $provenanceEnvironment.run_id
             }
             process_traces = @($traceRecords.ToArray())
+            fixture_build_budget = $validBuildBudget
             vendored_protoc_run_grant = [ordered]@{
                 path = (Join-Path $provenanceEvidenceRoot 'D32-PHASE0-VENDORED-PROTOC-RUN-GRANT.json')
                 bytes = [Int64]1
@@ -8265,6 +8395,38 @@ public static class D32DebugSelfTestLauncher
             throw 'SELFTEST_FAILED: old fixture provenance v1 was accepted without process event evidence'
         }
         catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
+        foreach ($oldProvenanceVersion in @(
+                [PSCustomObject]@{ Version = 5; Type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'; Name = 'previous V5' },
+                [PSCustomObject]@{ Version = 99; Type = 'D32_FIXTURE_BUILD_PROVENANCE_V99'; Name = 'unknown V99' }
+            )) {
+            $versionedProvenance = [ordered]@{}
+            foreach ($field in $provenanceDocument.Keys) { $versionedProvenance[$field] = $provenanceDocument[$field] }
+            $versionedProvenance.schema_version = $oldProvenanceVersion.Version
+            $versionedProvenance.record_type = $oldProvenanceVersion.Type
+            $versionRejected = $false
+            try { Assert-D32FixtureBuildProvenanceShape -Document $versionedProvenance }
+            catch { $versionRejected = $_.Exception.Message -like 'FIXTURE_PROVENANCE_INVALID:*' }
+            if (-not $versionRejected) { throw "SELFTEST_FAILED: $($oldProvenanceVersion.Name) fixture provenance was accepted" }
+        }
+        $budgetPreserved = [ordered]@{}
+        foreach ($field in $provenanceDocument.fixture_build_budget.Keys) { $budgetPreserved[$field] = $provenanceDocument.fixture_build_budget[$field] }
+        foreach ($budgetMutation in @(
+                [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 14400 },
+                [PSCustomObject]@{ Field = 'fixture_build_timeout_seconds'; Value = 28801 },
+                [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 1 },
+                [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 2 },
+                [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 5 }
+            )) {
+            $provenanceDocument.fixture_build_budget = [ordered]@{}
+            foreach ($field in $budgetPreserved.Keys) { $provenanceDocument.fixture_build_budget[$field] = $budgetPreserved[$field] }
+            $provenanceDocument.fixture_build_budget[$budgetMutation.Field] = $budgetMutation.Value
+            $budgetMutationRejected = $false
+            try { Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument }
+            catch { $budgetMutationRejected = $_.Exception.Message -like 'FIXTURE_PROVENANCE_INVALID:*' -or $_.Exception.Message -like 'FIXTURE_BUILD_BUDGET_INVALID:*' }
+            if (-not $budgetMutationRejected) { throw "SELFTEST_FAILED: fixture provenance accepted $($budgetMutation.Field)=$($budgetMutation.Value)" }
+        }
+        $provenanceDocument.fixture_build_budget = [ordered]@{}
+        foreach ($field in $budgetPreserved.Keys) { $provenanceDocument.fixture_build_budget[$field] = $budgetPreserved[$field] }
         $goodAccounting = $fakeProcessTrace.accounting_consistent
         $fakeProcessTrace.accounting_consistent = $false
         try {
@@ -8297,7 +8459,7 @@ public static class D32DebugSelfTestLauncher
             $provenanceFile.bytes -ne $provenanceFileOnDisk.bytes) {
             throw 'SELFTEST_FAILED: separate versioned fixture provenance record was not written and bound'
         }
-        $parsedProvenance = [IO.File]::ReadAllText($provenanceJsonPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable
+        $parsedProvenance = [IO.File]::ReadAllText($provenanceJsonPath, [Text.Encoding]::UTF8) | ConvertFrom-Json -AsHashtable -DateKind String
         Assert-D32FixtureBuildProvenanceShape -Document $parsedProvenance
         if ($parsedProvenance.environment.fetch_manifests[0].process_identity.command_line -cne
             $provenanceEnvironment.fetch_manifests[0].process_identity.command_line) {
@@ -8865,6 +9027,13 @@ Assert-D32FixtureTimeoutScope `
     -TimeoutSeconds $TimeoutSeconds `
     -OwnerBinding $Phase0OwnerBinding `
     -BuildD31RecoverySeeder ([bool]$BuildD31RecoverySeeder)
+Assert-D32FixtureBuildBudgetScope `
+    -OwnerBinding $Phase0OwnerBinding `
+    -BuildD31RecoverySeeder ([bool]$BuildD31RecoverySeeder) `
+    -TimeoutSeconds $TimeoutSeconds `
+    -FixtureBuildTimeoutSeconds $Phase0FixtureBuildTimeoutSeconds `
+    -BuildJobs $BuildJobs `
+    -Capacity $Phase0FixtureBuildCapacity
 if ([String]::IsNullOrWhiteSpace($PinnedGitPath) -or
     [String]::IsNullOrWhiteSpace($PinnedGitSha256) -or
     [String]::IsNullOrWhiteSpace($ExpectedCandidateSha) -or
@@ -9084,7 +9253,7 @@ try {
         }
         $arguments += @('--jobs', [string]$BuildJobs)
         $phaseLog = Join-Path $logRoot (('{0:D2}-{1}' -f $phase, $spec.name))
-        Write-Host "D32_FIXTURE_PHASE=$phase name=$($spec.name) timeout_seconds=$TimeoutSeconds"
+        Write-Host "D32_FIXTURE_PHASE=$phase name=$($spec.name) timeout_seconds=$Phase0FixtureBuildTimeoutSeconds cargo_build_jobs=$BuildJobs"
         $phaseEnvironment = $offlineFixtureEnvironment
         $phaseVendoredGrant = $script:D32VendoredProtocRunGrant
         if ([string]$spec.project -ceq 'src-tauri') {
@@ -9100,7 +9269,7 @@ try {
                 -Arguments $arguments `
                 -WorkingDirectory $RepoRoot `
                 -PhaseLog $phaseLog `
-                -TimeoutSeconds $TimeoutSeconds `
+                -TimeoutSeconds $Phase0FixtureBuildTimeoutSeconds `
                 -ChildEnvironment $phaseEnvironment `
                 -RequireDebugEvents `
                 -AllowPinnedCargoVctip `
@@ -9360,7 +9529,7 @@ $manifestDocument = [ordered]@{
     elapsed_ms = ([DateTimeOffset]::UtcNow - $startedAt).TotalMilliseconds
     working_tree_status = $gitStatus
     build_policy = [ordered]@{
-        timeout_seconds = $TimeoutSeconds
+        timeout_seconds = if ($BuildD31RecoverySeeder) { 600 } else { $Phase0FixtureBuildTimeoutSeconds }
         cargo_build_jobs = $BuildJobs
         nested_builds = $false
         process_tree_timeout_action = $script:D32FixtureProcessTreePolicy
@@ -9387,8 +9556,8 @@ $processTraceRecords = @($phaseEvidence | ForEach-Object {
     }
 })
 $fixtureBuildProvenance = [ordered]@{
-    schema_version = 5
-    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'
+    schema_version = 6
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
     candidate_sha = $candidateSha
     source_repo = $RepoRoot
     fixture_manifest_path = $ManifestPath
@@ -9399,6 +9568,7 @@ $fixtureBuildProvenance = [ordered]@{
     environment = $fixtureEnvironmentPlan
     storage = $script:D32Phase0StorageContext
     process_traces = $processTraceRecords
+    fixture_build_budget = $Phase0FixtureBuildCapacity
     vendored_protoc_run_grant = $script:D32VendoredProtocRunGrant.Reference
     tauri_macros_source_patch = $script:D32TauriMacrosSourcePatchAuthority.Reference
 }

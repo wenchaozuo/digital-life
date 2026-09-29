@@ -46,3 +46,11 @@ This Contract covers D32 final-gate completion only. Work stops after Sol Max re
 - Sol Max records D32 closure for the exact candidate SHA.
 
 Missing evidence means BLOCKED. This Contract does not confer a gate PASS, candidate freeze or FROZEN status by itself.
+
+## Approved Phase0 fixture-build budget addendum
+
+Under the prospective, narrowly scoped ADR-D32-PHASE0-FIXTURE-BUDGET-V1, the five fixed owner-bound Phase0 fixture builds may use exactly `--jobs 4` and an explicitly caller-pinned 28,800-second per-build limit (`-Phase0FixtureBuildTimeoutSeconds 28800`). Formal Phase0 must still explicitly pin `-Phase0TimeoutSeconds 14400` for the three locked fetches, tool/list/test/focused commands, and H7 authority suite. The Phase0 default remains 1,800 seconds; standalone/default fixture work remains 600 seconds/jobs=1 and cannot attest a Phase0 budget.
+
+Before Cargo starts, the runner must record and enforce at least 8 logical CPUs, 12 GiB available physical memory, 200 GiB free on the evidence volume, and zero competing target writers. Since Windows process census does not supply a reliable working directory, any active Cargo/rustc/cl/link/build-script process is conservatively treated as a possible target writer and blocks. It must retain the fresh empty owner-bound CargoHome and TempRoot, fixed lock/toolchain/argv other than the authorized five-build jobs token, normal target directories, V2 trace/Job accounting and cleanup, all five fixtures, all complete local suites and negative evidence, and only the existing five output-quarantine paths. No cache copy, target override, release/D31 timeout change, or ordinary test-concurrency change is permitted.
+
+The strict schema sequence is fixture provenance V6, Phase0 V6, release attestation V7, and aggregate V6; old and unknown versions or any budget/argv drift are BLOCKED. Fixture manifest v3 and its six original environment fields, Profile V2, Trace V2, D31 seeder provenance V2, and every SC-D32-V1 gate requirement remain unchanged. This addendum changes no exit criterion and does not authorize a formal run by itself.

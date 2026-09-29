@@ -139,6 +139,32 @@ function Assert-D32FixtureBuildBudgetScope {
     }
 }
 
+function Get-D32FixtureBuildMode {
+    param(
+        [AllowNull()][object]$OwnerBinding,
+        [bool]$BuildD31RecoverySeeder
+    )
+
+    if ($BuildD31RecoverySeeder) { return 'D31Seeder' }
+    if ($null -ne $OwnerBinding) { return 'Phase0' }
+    return 'Standalone'
+}
+
+function Assert-D32FixtureBuildModeAuthority {
+    param([Parameter(Mandatory = $true)][ValidateSet('Phase0', 'Standalone', 'D31Seeder')][string]$Mode)
+
+    switch ($Mode) {
+        'Phase0' { return }
+        'Standalone' { throw 'STANDALONE_FIXTURE_AUTHORITY_BLOCKED: the current locked source/image grants are Phase0/Phase1-only; a standalone run must not reuse them or emit Phase0 provenance' }
+        'D31Seeder' { throw 'D31_RECOVERY_SEEDER_AUTHORITY_BLOCKED: the post-aggregate seeder requires its separate fresh run/home owner marker, per-run grant, and D32 companion attestation; Phase0 authority cannot be reused' }
+    }
+}
+
+function Test-D32FixtureBuildModeEmitsPhase0Provenance {
+    param([Parameter(Mandatory = $true)][ValidateSet('Phase0', 'Standalone', 'D31Seeder')][string]$Mode)
+    return ($Mode -ceq 'Phase0')
+}
+
 $script:OwnerMarkerName = '.d32-fixture-prebuild-owned'
 $script:OwnerMarker = 'D32_FIXTURE_PREBUILD_OWNER_V1'
 $script:SchemaVersion = 3
@@ -6528,6 +6554,33 @@ function Invoke-D32SelfTest {
             if (-not $wrongBudgetRejected) { throw 'SELFTEST_FAILED: wrong Phase0 build budget was accepted' }
         }
         Assert-D32FixtureBuildBudgetScope -OwnerBinding $null -BuildD31RecoverySeeder $false -TimeoutSeconds 600 -FixtureBuildTimeoutSeconds 600 -BuildJobs 1 -Capacity $null
+        Assert-D32FixtureBuildBudgetScope -OwnerBinding $null -BuildD31RecoverySeeder $true -TimeoutSeconds 600 -FixtureBuildTimeoutSeconds 600 -BuildJobs 1 -Capacity $null
+        Assert-D32FixtureBuildBudgetScope -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $true -TimeoutSeconds 600 -FixtureBuildTimeoutSeconds 600 -BuildJobs 1 -Capacity $null
+        if ((Get-D32FixtureBuildMode -OwnerBinding $null -BuildD31RecoverySeeder $false) -cne 'Standalone' -or
+            (Get-D32FixtureBuildMode -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $false) -cne 'Phase0' -or
+            (Get-D32FixtureBuildMode -OwnerBinding ([PSCustomObject]@{}) -BuildD31RecoverySeeder $true) -cne 'D31Seeder' -or
+            (Test-D32FixtureBuildModeEmitsPhase0Provenance -Mode 'Phase0') -ne $true -or
+            (Test-D32FixtureBuildModeEmitsPhase0Provenance -Mode 'Standalone') -ne $false -or
+            (Test-D32FixtureBuildModeEmitsPhase0Provenance -Mode 'D31Seeder') -ne $false) {
+            throw 'SELFTEST_FAILED: fixture build mode classification is not exclusive'
+        }
+        Assert-D32FixtureBuildModeAuthority -Mode 'Phase0'
+        foreach ($blockedMode in @(
+                [PSCustomObject]@{ Mode = 'Standalone'; Prefix = 'STANDALONE_FIXTURE_AUTHORITY_BLOCKED:' },
+                [PSCustomObject]@{ Mode = 'D31Seeder'; Prefix = 'D31_RECOVERY_SEEDER_AUTHORITY_BLOCKED:' }
+            )) {
+            $modeBlocked = $false
+            try { Assert-D32FixtureBuildModeAuthority -Mode $blockedMode.Mode }
+            catch { $modeBlocked = $_.Exception.Message -like ($blockedMode.Prefix + '*') }
+            if (-not $modeBlocked) { throw "SELFTEST_FAILED: $($blockedMode.Mode) mode was not stopped before using Phase0-only authority" }
+        }
+        $runtimeSource = [IO.File]::ReadAllText((Join-Path $script:ScriptRoot 'd32-fixture-prebuild.ps1'))
+        $modeGateOffset = $runtimeSource.IndexOf('Assert-D32FixtureBuildModeAuthority -Mode $fixtureBuildMode', [StringComparison]::Ordinal)
+        $outputRootOffset = $runtimeSource.IndexOf('$OutputRoot = Ensure-D32OwnedDirectory $OutputRoot', [StringComparison]::Ordinal)
+        $fixtureFetchOffset = $runtimeSource.IndexOf('$fixtureFetches = Invoke-D32FixturePreCargoBoundary', [StringComparison]::Ordinal)
+        if ($modeGateOffset -lt 0 -or $outputRootOffset -lt 0 -or $fixtureFetchOffset -lt 0 -or $modeGateOffset -ge $outputRootOffset -or $modeGateOffset -ge $fixtureFetchOffset) {
+            throw 'SELFTEST_FAILED: non-Phase0 fixture modes must stop before output-root creation and any Cargo fetch/build boundary'
+        }
         $passed++
 
         $priorProcessEvidence = $script:D32LastProcessEvidence
@@ -9034,6 +9087,8 @@ Assert-D32FixtureBuildBudgetScope `
     -FixtureBuildTimeoutSeconds $Phase0FixtureBuildTimeoutSeconds `
     -BuildJobs $BuildJobs `
     -Capacity $Phase0FixtureBuildCapacity
+$fixtureBuildMode = Get-D32FixtureBuildMode -OwnerBinding $Phase0OwnerBinding -BuildD31RecoverySeeder ([bool]$BuildD31RecoverySeeder)
+Assert-D32FixtureBuildModeAuthority -Mode $fixtureBuildMode
 if ([String]::IsNullOrWhiteSpace($PinnedGitPath) -or
     [String]::IsNullOrWhiteSpace($PinnedGitSha256) -or
     [String]::IsNullOrWhiteSpace($ExpectedCandidateSha) -or
@@ -9125,7 +9180,7 @@ if (-not [bool]$validatedToolchainProfile.IsValid) {
     throw "TOOLCHAIN_PROFILE_BLOCKED: $($validatedToolchainProfile.Failure)"
 }
 $script:ValidatedToolchainProfile = $validatedToolchainProfile
-if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: operational fixture builds require the fixed Phase0 runner owner binding' }
+if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: Phase0 fixture builds require the fixed Phase0 runner owner binding' }
 $script:D32TauriMacrosSourcePatchAuthority = Test-D32TauriMacrosSourcePatchAuthority `
     -AuthorityPath $TauriMacrosSourceAuthorityPath `
     -ExpectedAuthoritySha256 $ExpectedTauriMacrosSourceAuthoritySha256 `
@@ -9572,18 +9627,26 @@ $fixtureBuildProvenance = [ordered]@{
     vendored_protoc_run_grant = $script:D32VendoredProtocRunGrant.Reference
     tauri_macros_source_patch = $script:D32TauriMacrosSourcePatchAuthority.Reference
 }
-Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance
-$fixtureBuildProvenanceArtifact = Write-D32NewFixtureBuildProvenance -Path $fixtureProvenancePath -Document $fixtureBuildProvenance
-$candidateShaAfterProvenance = Assert-D32PinnedCleanCandidate -Root $RepoRoot
-if ($candidateShaAfterProvenance -ne $candidateSha) {
-    throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed after the fixture provenance sidecar write'
+$fixtureBuildProvenanceArtifact = $null
+if (Test-D32FixtureBuildModeEmitsPhase0Provenance -Mode $fixtureBuildMode) {
+    Assert-D32FixtureBuildProvenanceShape -Document $fixtureBuildProvenance
+    $fixtureBuildProvenanceArtifact = Write-D32NewFixtureBuildProvenance -Path $fixtureProvenancePath -Document $fixtureBuildProvenance
+    $candidateShaAfterProvenance = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+    if ($candidateShaAfterProvenance -ne $candidateSha) {
+        throw 'CANDIDATE_SHA_MISMATCH: candidate HEAD changed after the fixture provenance sidecar write'
+    }
 }
 
 $failures = @($results | Where-Object { $_.status -ne 'succeeded' })
 $failures += @([pscustomobject]@{ name = 'global-process-tree'; status = 'failed' } | Where-Object { $null -ne $globalProcessError })
 Write-Host "D32_FIXTURE_PREBUILD_MANIFEST=$ManifestPath"
-Write-Host "D32_FIXTURE_BUILD_PROVENANCE_PATH=$fixtureProvenancePath"
-Write-Host "D32_FIXTURE_BUILD_PROVENANCE_SHA256=$($fixtureBuildProvenanceArtifact.sha256)"
+if ($null -ne $fixtureBuildProvenanceArtifact) {
+    Write-Host "D32_FIXTURE_BUILD_PROVENANCE_PATH=$fixtureProvenancePath"
+    Write-Host "D32_FIXTURE_BUILD_PROVENANCE_SHA256=$($fixtureBuildProvenanceArtifact.sha256)"
+}
+else {
+    Write-Host 'D32_FIXTURE_BUILD_PROVENANCE=NOT_EMITTED_NON_PHASE0'
+}
 if ($failures.Count -gt 0) {
     $summary = ($failures | ForEach-Object { "$($_.name)=$($_.status)" }) -join ', '
     throw "FIXTURE_PREBUILD_BLOCKED: $summary; see manifest and phase logs: $ManifestPath"

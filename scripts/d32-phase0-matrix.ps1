@@ -86,30 +86,52 @@ function Get-D32Phase0FixtureBuildCapacity {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$EvidenceRoot,
-        [Parameter(Mandatory = $true)][int]$Phase0TimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$Phase0TimeoutSeconds,
+        [AllowNull()][scriptblock]$CimProbe = $null,
+        [AllowNull()][scriptblock]$DriveProbe = $null,
+        [AllowNull()][scriptblock]$ProcessProbe = $null,
+        [AllowNull()][Nullable[int]]$ProcessorCountOverride = $null
     )
 
     if ($Phase0TimeoutSeconds -ne $script:D32Phase0RequiredCommandTimeoutSeconds) {
         throw 'PHASE0_FIXTURE_BUILD_BUDGET_BLOCKED: fixed fetch/list/test/focused/H7 command timeout must remain exactly 14400 seconds'
     }
-    $cpuCount = [int][Environment]::ProcessorCount
-    $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-    if ($null -eq $operatingSystem -or $null -eq $operatingSystem.FreePhysicalMemory) {
+    $cpuCount = if ($null -eq $ProcessorCountOverride) { [int][Environment]::ProcessorCount } else { [int]$ProcessorCountOverride }
+    try {
+        if ($null -eq $CimProbe) { $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop }
+        else { $operatingSystem = & $CimProbe 'Win32_OperatingSystem' }
+    }
+    catch { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: Win32_OperatingSystem CIM probe failed' }
+    $memoryProperty = if ($null -eq $operatingSystem) { $null } else { $operatingSystem.PSObject.Properties['FreePhysicalMemory'] }
+    if ($null -eq $memoryProperty -or -not (Test-D32Phase0Integer -Value $memoryProperty.Value)) {
         throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: available physical memory could not be verified'
     }
-    $availableMemoryBytes = [Int64]$operatingSystem.FreePhysicalMemory * 1024L
-    $driveRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($EvidenceRoot))
-    $drive = [IO.DriveInfo]::new($driveRoot)
-    if (-not $drive.IsReady) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence volume is not ready' }
-    $freeBytes = [Int64]$drive.AvailableFreeSpace
-
-    $targetWriters = [System.Collections.Generic.List[string]]::new()
-    $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
-    foreach ($process in $processes) {
-        $processName = [string]$process.Name
-        if ($processName -notin @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'build-script-build.exe')) { continue }
-        $targetWriters.Add("$processName PID=$($process.ProcessId): active build-class process cannot be excluded from candidate target trees")
+    try { $availableMemoryBytes = [Int64]$memoryProperty.Value * 1024L }
+    catch { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: available physical memory value is not a verified integer' }
+    if ($availableMemoryBytes -lt 0) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: available physical memory value is invalid' }
+    try {
+        $driveRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($EvidenceRoot))
+        if ($null -eq $DriveProbe) { $drive = [IO.DriveInfo]::new($driveRoot) }
+        else { $drive = & $DriveProbe $driveRoot }
     }
+    catch { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence-volume disk-capacity probe failed' }
+    if ($null -eq $drive) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence-volume disk-capacity probe returned no result' }
+    $driveReadyProperty = $drive.PSObject.Properties['IsReady']
+    $driveFreeProperty = $drive.PSObject.Properties['AvailableFreeSpace']
+    if ($null -eq $driveReadyProperty -or $driveReadyProperty.Value -isnot [bool]) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence-volume readiness could not be verified' }
+    if (-not [bool]$driveReadyProperty.Value) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence volume is not ready' }
+    if ($null -eq $driveFreeProperty -or -not (Test-D32Phase0Integer -Value $driveFreeProperty.Value)) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: evidence-volume free space could not be verified' }
+    $freeBytes = [Int64]$driveFreeProperty.Value
+
+    try {
+        if ($null -eq $ProcessProbe) { $processResults = Get-CimInstance -ClassName Win32_Process -ErrorAction Stop }
+        else { $processResults = & $ProcessProbe }
+    }
+    catch { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: Win32_Process target-writer census failed' }
+    if ($null -eq $processResults) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: target-writer census returned no verifiable result' }
+    $processes = @($processResults)
+    if ($processes.Count -eq 0) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: target-writer census returned an empty, unverifiable result' }
+    $targetWriters = @(Get-D32Phase0TargetWriterDescriptions -Processes $processes)
     if ($targetWriters.Count -gt 0) {
         throw "PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: competing target writer exists: $($targetWriters -join '; ')"
     }
@@ -132,6 +154,39 @@ function Get-D32Phase0FixtureBuildCapacity {
     }
     Assert-D32Phase0FixtureBuildBudgetRecord -Document $capacity -ExpectedPhase0TimeoutSeconds $Phase0TimeoutSeconds
     return $capacity
+}
+
+function Get-D32Phase0TargetWriterDescriptions {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Processes)
+
+    $writerNames = @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'build-script-build.exe')
+    $targetWriters = [System.Collections.Generic.List[string]]::new()
+    foreach ($process in $Processes) {
+        $nameProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['Name'] }
+        $processIdProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['ProcessId'] }
+        if ($null -eq $nameProperty -or $null -eq $processIdProperty -or $nameProperty.Value -isnot [string] -or
+            [String]::IsNullOrWhiteSpace([string]$nameProperty.Value) -or -not (Test-D32Phase0Integer -Value $processIdProperty.Value) -or
+            [Int64]$processIdProperty.Value -le 0) {
+            throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: target-writer census contains an incomplete process identity'
+        }
+        $processName = [string]$nameProperty.Value
+        if ($processName -notin $writerNames) { continue }
+        $targetWriters.Add("$processName PID=$($processIdProperty.Value): active build-class process cannot be excluded from candidate target trees")
+    }
+    return @($targetWriters.ToArray())
+}
+
+function Invoke-D32Phase0FixtureBuildAdmission {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$MeasureCapacity,
+        [Parameter(Mandatory = $true)][scriptblock]$ClaimOutputRoot
+    )
+
+    $capacity = & $MeasureCapacity
+    if ($null -eq $capacity) { throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: measurement did not return the strict capacity record' }
+    $binding = & $ClaimOutputRoot
+    if ($null -eq $binding) { throw 'PHASE0_EVIDENCE_ROOT_BLOCKED: owner-bound output-root claim did not return identity evidence' }
+    return [PSCustomObject]@{ Capacity = $capacity; OutputRootBinding = $binding }
 }
 $script:D32Phase0Status = 'PASS'
 $script:D32Phase0BundleHashes = 'PENDING'
@@ -1820,7 +1875,7 @@ function Test-D32Phase0MatrixRecord {
         if (Test-D32Phase0JsonDuplicateKeys -Json $fixtureRaw) { throw 'Phase0 fixture manifest has duplicate JSON keys' }
         $fixtureDocument = $fixtureRaw | ConvertFrom-D32Phase0Json
         $fixtureFindings = New-D32FindingList
-        Test-D32FixtureManifest -FixtureManifest $fixtureDocument -FixtureManifestPath $fixturePath -Head $ExpectedCandidateSha -Repository $repo -Findings $fixtureFindings
+        Test-D32FixtureManifest -FixtureManifest $fixtureDocument -FixtureManifestPath $fixturePath -Head $ExpectedCandidateSha -Repository $repo -Findings $fixtureFindings -RequirePhase0BuildPolicy
         if (@($fixtureFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'Phase0 fixture schema/artifact validation failed' }
         if (-not (Test-D32Phase0ExactProperties -Object $fixtureDocument.build_policy -Expected @('timeout_seconds', 'cargo_build_jobs', 'nested_builds', 'process_tree_timeout_action')) -or
             -not (Test-D32Phase0Integer -Value $fixtureDocument.build_policy.timeout_seconds) -or [Int64]$fixtureDocument.build_policy.timeout_seconds -ne $script:D32Phase0FixtureBuildTimeoutSeconds -or
@@ -2383,14 +2438,16 @@ function Invoke-D32Phase0Matrix {
     $findings = [System.Collections.ArrayList]::new()
     Test-D32Governance -Repository $repo -Findings $findings
     if (@($findings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'PHASE0_GOVERNANCE_BLOCKED: current governance inputs failed preflight' }
-    $fixtureBuildCapacity = Get-D32Phase0FixtureBuildCapacity -Repository $repo -EvidenceRoot $output -Phase0TimeoutSeconds $TimeoutSeconds
-    $script:D32Phase0FixtureBuildCapacity = $fixtureBuildCapacity
-
-    # Claim the already caller-pinned, previously absent evidence root before
-    # invoking the fixture producer. This lets the runner preserve the exact
-    # producer failure even when the producer cannot reach its own root setup.
     $runId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
-    $outputBinding = New-D32Phase0FixtureOutputRoot -Path $output -Repository $repo -ExpectedCandidateSha $ExpectedSha -ValidatedProfile $profile -RunId $runId
+    # Capacity probes must all succeed before the output root is claimed; the
+    # fixture producer (and every Cargo fetch/build) is reachable only after
+    # this gate returns both a strict capacity record and owner-bound root.
+    $fixtureAdmission = Invoke-D32Phase0FixtureBuildAdmission `
+        -MeasureCapacity { Get-D32Phase0FixtureBuildCapacity -Repository $repo -EvidenceRoot $output -Phase0TimeoutSeconds $TimeoutSeconds }.GetNewClosure() `
+        -ClaimOutputRoot { New-D32Phase0FixtureOutputRoot -Path $output -Repository $repo -ExpectedCandidateSha $ExpectedSha -ValidatedProfile $profile -RunId $runId }.GetNewClosure()
+    $fixtureBuildCapacity = $fixtureAdmission.Capacity
+    $script:D32Phase0FixtureBuildCapacity = $fixtureBuildCapacity
+    $outputBinding = $fixtureAdmission.OutputRootBinding
     $output = [string]$outputBinding.Path
     $script:D32Phase0FailureContext = [PSCustomObject]@{
         EvidenceRoot = $output
@@ -2501,7 +2558,7 @@ function Invoke-D32Phase0Matrix {
     if (Test-D32Phase0JsonDuplicateKeys -Json $fixtureRaw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture manifest contains duplicate or invalid JSON structure' }
     $fixtureDoc = $fixtureRaw | ConvertFrom-D32Phase0Json
     $fixtureFindings = [System.Collections.ArrayList]::new()
-    Test-D32FixtureManifest -FixtureManifest $fixtureDoc -FixtureManifestPath $fixtureManifestPath -Head $ExpectedSha -Repository $repo -Findings $fixtureFindings
+    Test-D32FixtureManifest -FixtureManifest $fixtureDoc -FixtureManifestPath $fixtureManifestPath -Head $ExpectedSha -Repository $repo -Findings $fixtureFindings -RequirePhase0BuildPolicy
     if (@($fixtureFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -gt 0) { throw 'PHASE0_FIXTURE_BLOCKED: fixed fixture manifest or generated output validation failed' }
     $fixtureNames = @($fixtureDoc.fixtures | ForEach-Object { [string]$_.name })
     $expectedFixtureNames = @('d29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
@@ -2902,6 +2959,63 @@ function Test-D32Phase0MatrixRecordSelfTest {
     }
     & $add 'Phase0 fixture-build budget rejects CPU, RAM, evidence-volume, competing-writer, and measurement-source drift' `
         ($capacityFloorResults.Count -eq 5 -and @($capacityFloorResults | Where-Object { -not $_ }).Count -eq 0)
+
+    $healthyCapacityCimProbe = {
+        param([string]$ClassName)
+        if ($ClassName -ceq 'Win32_OperatingSystem') { return [PSCustomObject]@{ FreePhysicalMemory = [Int64](16L * 1024L * 1024L) } }
+        throw 'unexpected class'
+    }
+    $healthyCapacityDriveProbe = {
+        param([string]$DriveRoot)
+        return [PSCustomObject]@{ IsReady = $true; AvailableFreeSpace = [Int64](250L * 1024L * 1024L * 1024L) }
+    }
+    $healthyCapacityProcessProbe = { return [PSCustomObject]@{ Name = 'powershell.exe'; ProcessId = 9001 } }
+    $runCapacityAdmissionNegative = {
+        param([scriptblock]$Cim, [scriptblock]$Drive, [scriptblock]$Processes)
+        $rootClaimCount = [ref]0
+        $postAdmissionCount = [ref]0
+        $measureCapacity = {
+            Get-D32Phase0FixtureBuildCapacity -Repository 'C:\d32-selftest-repo' -EvidenceRoot 'C:\d32-selftest-evidence' `
+                -Phase0TimeoutSeconds 14400 -CimProbe $Cim -DriveProbe $Drive -ProcessProbe $Processes -ProcessorCountOverride 8
+        }.GetNewClosure()
+        $claimOutputRoot = { $rootClaimCount.Value++; return [PSCustomObject]@{ Claimed = $true } }.GetNewClosure()
+        $blocked = $false
+        try {
+            $admission = Invoke-D32Phase0FixtureBuildAdmission -MeasureCapacity $measureCapacity -ClaimOutputRoot $claimOutputRoot
+            $postAdmissionCount.Value++
+        }
+        catch { $blocked = $_.Exception.Message -like 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED:*' }
+        return [PSCustomObject]@{ Blocked = $blocked; RootClaims = $rootClaimCount.Value; PostAdmission = $postAdmissionCount.Value }
+    }.GetNewClosure()
+    $capacityProbeFailures = [System.Collections.Generic.List[object]]::new()
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim { param($ClassName) throw 'CIM unavailable' } -Drive $healthyCapacityDriveProbe -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim { param($ClassName) if ($ClassName -ceq 'Win32_OperatingSystem') { return $null }; throw 'unexpected class' } -Drive $healthyCapacityDriveProbe -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim { param($ClassName) if ($ClassName -ceq 'Win32_OperatingSystem') { return [PSCustomObject]@{} }; throw 'unexpected class' } -Drive $healthyCapacityDriveProbe -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive { param($DriveRoot) throw 'disk probe failed' } -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive { param($DriveRoot) return [PSCustomObject]@{ IsReady = $false; AvailableFreeSpace = 0 } } -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive { param($DriveRoot) return [PSCustomObject]@{ IsReady = $true } } -Processes $healthyCapacityProcessProbe))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes { throw 'process census failed' }))
+    $capacityProbeFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes { return $null }))
+    $capacityProbeFailuresValid = @($capacityProbeFailures | Where-Object { -not $_.Blocked -or $_.RootClaims -ne 0 -or $_.PostAdmission -ne 0 }).Count -eq 0
+    & $add 'unavailable/failed CIM and disk-capacity probes stop before owner-root claim or post-admission Cargo boundary' $capacityProbeFailuresValid "cases=$($capacityProbeFailures.Count)"
+
+    $targetWriterNames = @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'build-script-build.exe')
+    $writerAdmissionFailures = [System.Collections.Generic.List[object]]::new()
+    foreach ($writerName in $targetWriterNames) {
+        $writerProcessProbe = { return [PSCustomObject]@{ Name = $writerName; ProcessId = 9100 } }.GetNewClosure()
+        $writerAdmissionFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes $writerProcessProbe))
+    }
+    $writerAdmissionFailuresValid = @($writerAdmissionFailures | Where-Object { -not $_.Blocked -or $_.RootClaims -ne 0 -or $_.PostAdmission -ne 0 }).Count -eq 0
+    & $add 'each active Cargo/rustc/MSVC/build-script writer class stops before owner-root claim or post-admission Cargo boundary' `
+        ($writerAdmissionFailures.Count -eq $targetWriterNames.Count -and $writerAdmissionFailuresValid) "writer_classes=$($targetWriterNames -join ',')"
+
+    $phase0SourceForAdmission = [IO.File]::ReadAllText($script:D32Phase0ScriptPath)
+    $admissionCallOffset = $phase0SourceForAdmission.IndexOf('$fixtureAdmission = Invoke-D32Phase0FixtureBuildAdmission', [StringComparison]::Ordinal)
+    $rootClaimCallbackOffset = $phase0SourceForAdmission.IndexOf('-ClaimOutputRoot { New-D32Phase0FixtureOutputRoot', [StringComparison]::Ordinal)
+    $producerBoundaryOffset = $phase0SourceForAdmission.IndexOf('$fixtureProducer = { & $fixtureScript @fixtureArguments }', [StringComparison]::Ordinal)
+    & $add 'production capacity admission claims the EvidenceRoot only after measurement and precedes the fixture/Cargo producer' `
+        ($admissionCallOffset -ge 0 -and $rootClaimCallbackOffset -gt $admissionCallOffset -and $producerBoundaryOffset -gt $rootClaimCallbackOffset) `
+        "admission=$admissionCallOffset root_claim=$rootClaimCallbackOffset producer=$producerBoundaryOffset"
 
     $timeoutContractFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($timeoutContract in @(

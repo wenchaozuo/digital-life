@@ -3495,7 +3495,8 @@ function Test-D32FixtureManifest {
         [Parameter(Mandatory = $true)][string]$FixtureManifestPath,
         [AllowNull()][string]$Head,
         [Parameter(Mandatory = $true)][string]$Repository,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Findings
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.ArrayList]$Findings,
+        [switch]$RequirePhase0BuildPolicy
     )
 
     if ($null -eq $FixtureManifest) {
@@ -3555,11 +3556,18 @@ function Test-D32FixtureManifest {
         $action = Get-D32JsonProperty -Object $policy -Name 'process_tree_timeout_action'
         $timeout = Get-D32JsonProperty -Object $policy -Name 'timeout_seconds'
         $jobs = Get-D32JsonProperty -Object $policy -Name 'cargo_build_jobs'
-        if ($nested -ne $false -or $timeout -isnot [ValueType] -or [double]$timeout -ne 28800 -or $jobs -isnot [ValueType] -or [double]$jobs -ne 4 -or $action -cne $script:D32FixtureProcessTreePolicy) {
-            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message 'bounded existing-only build policy is not exact'
+        $phase0Policy = $timeout -is [ValueType] -and [double]$timeout -eq 28800 -and $jobs -is [ValueType] -and [double]$jobs -eq 4
+        $standalonePolicy = $timeout -is [ValueType] -and [double]$timeout -eq 600 -and $jobs -is [ValueType] -and [double]$jobs -eq 1
+        $policyInvalid = $nested -ne $false -or $action -cne $script:D32FixtureProcessTreePolicy -or
+            ($RequirePhase0BuildPolicy -and -not $phase0Policy) -or
+            (-not $RequirePhase0BuildPolicy -and -not ($phase0Policy -or $standalonePolicy))
+        if ($policyInvalid) {
+            $expectedPolicy = if ($RequirePhase0BuildPolicy) { 'exact owner-bound Phase0 jobs=4/timeout_seconds=28800' } else { 'exact standalone jobs=1/timeout_seconds=600 or owner-bound Phase0 jobs=4/timeout_seconds=28800' }
+            Add-D32Finding -Findings $Findings -Severity ERROR -Check 'fixture-manifest.policy' -Message "bounded existing-only build policy must be $expectedPolicy"
         }
         else {
-            Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.policy' -Message 'fixed five-fixture policy validates exact jobs=4 and timeout_seconds=28800'
+            $validatedPolicy = if ($phase0Policy) { 'owner-bound Phase0 jobs=4/timeout_seconds=28800' } else { 'non-Phase0 standalone jobs=1/timeout_seconds=600; not Phase0 evidence' }
+            Add-D32Finding -Findings $Findings -Severity PASS -Check 'fixture-manifest.policy' -Message "fixed fixture manifest policy validates exact $validatedPolicy"
         }
     }
     $processCheck = Get-D32JsonProperty -Object $FixtureManifest -Name 'process_tree_check'
@@ -5660,6 +5668,18 @@ function Invoke-D32SelfTest {
 
         $validFixtureJson = [System.IO.File]::ReadAllText($fixtureManifest)
 
+        $standaloneFixturePolicy = $validFixtureJson | ConvertFrom-D32Json
+        $standaloneFixturePolicy.build_policy.timeout_seconds = 600
+        $standaloneFixturePolicy.build_policy.cargo_build_jobs = 1
+        $standalonePolicyFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest $standaloneFixturePolicy -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $standalonePolicyFindings
+        Assert-D32SelfTest -Condition (@($standalonePolicyFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -eq 0) `
+            -Name 'non-Phase0 standalone manifest accepts only the frozen 600-second/jobs-1 policy without claiming Phase0 authority' -Failures $failures
+        $standaloneStrictFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest $standaloneFixturePolicy -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $standaloneStrictFindings -RequirePhase0BuildPolicy
+        Assert-D32SelfTest -Condition (@($standaloneStrictFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) `
+            -Name 'Phase0 manifest consumer rejects the standalone 600-second/jobs-1 policy' -Failures $failures
+
         foreach ($missingField in @('generated_at_utc', 'started_at_utc', 'elapsed_ms', 'working_tree_status', 'process_tree_error')) {
             $missingTopLevel = $validFixtureJson | ConvertFrom-D32Json
             Remove-D32JsonProperty -Object $missingTopLevel -Name $missingField
@@ -5734,7 +5754,6 @@ function Invoke-D32SelfTest {
         Assert-D32SelfTest -Condition (@($wrongFixturePolicyFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'fixture manifest non-canonical timeout action is reported' -Failures $failures
 
         foreach ($wrongBudget in @(
-                [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 1 },
                 [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 2 },
                 [PSCustomObject]@{ Field = 'cargo_build_jobs'; Value = 5 },
                 [PSCustomObject]@{ Field = 'timeout_seconds'; Value = 14400 },
@@ -5743,7 +5762,7 @@ function Invoke-D32SelfTest {
             $wrongBudgetManifest = $validFixtureJson | ConvertFrom-D32Json
             $wrongBudgetManifest.build_policy.($wrongBudget.Field) = $wrongBudget.Value
             $wrongBudgetFindings = New-D32FindingList
-            Test-D32FixtureManifest -FixtureManifest $wrongBudgetManifest -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongBudgetFindings
+            Test-D32FixtureManifest -FixtureManifest $wrongBudgetManifest -FixtureManifestPath $fixtureManifest -Head $head -Repository $fixture -Findings $wrongBudgetFindings -RequirePhase0BuildPolicy
             Assert-D32SelfTest -Condition (@($wrongBudgetFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) `
                 -Name "fixture manifest rejects $($wrongBudget.Field)=$($wrongBudget.Value) after the owner-bound build-budget migration" -Failures $failures
         }

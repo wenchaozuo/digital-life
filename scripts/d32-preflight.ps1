@@ -3630,9 +3630,13 @@ function Assert-D32PreflightTestInventoryBinding {
     $discoveryRoot = [IO.Path]::GetDirectoryName([string]$authority.discovery.path)
     if (-not (Test-D32ProfileNoReparsePath -Path $discoveryRoot) -or
         (Test-D32ProfilePathWithin -Child $discoveryRoot -Parent $Repository) -or
-        (Test-D32ProfilePathEqual -Left $discoveryRoot -Right $Phase0OutputRoot) -or
         -not (Test-D32ProfilePathEqual -Left $discovery.evidence_root_identity.path -Right $discoveryRoot)) {
-        throw 'test-inventory discovery must retain its own distinct external non-reparse owner-bound root'
+        throw 'test-inventory discovery must retain its own external non-reparse owner-bound root'
+    }
+    $null = Assert-D32TestInventoryRootsDisjoint -DiscoveryRoot $discoveryRoot -Phase0OutputRoot $Phase0OutputRoot
+    if ((ConvertTo-Json -InputObject $discovery.source_patch_authority -Depth 6 -Compress) -cne
+        (ConvertTo-Json -InputObject $Phase0Document.tauri_macros_source_patch -Depth 6 -Compress)) {
+        throw 'test-inventory discovery source-patch reference differs from the independently validated Phase0 source-patch authority'
     }
     $null = Test-D32ProfileDirectoryIdentity -Path $discoveryRoot -VolumeSerialHex ([string]$discovery.evidence_root_identity.volume_serial_hex) -FileIdHex ([string]$discovery.evidence_root_identity.file_id_hex)
     $null = Test-D32Phase0FileReference -Reference $discovery.owner_marker -AllowedRoot $discoveryRoot
@@ -3670,7 +3674,8 @@ function New-D32PreflightSelfTestPhase0Command {
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$StdoutLines,
         [ValidateSet('cargo', 'rustc')][string]$Tool = 'cargo',
-        [int]$RootProcessId = 0
+        [int]$RootProcessId = 0,
+        [AllowEmptyString()][string]$StartedAtUtc = ''
     )
     $toolIdentity = $ValidatedProfile.Profile.toolchain.$Tool
     $executable = [string]$toolIdentity.path
@@ -3707,7 +3712,8 @@ function New-D32PreflightSelfTestPhase0Command {
     $rootProcess = ConvertFrom-D32Phase0DebugProcess -Process $process -CommandLine $commandLine
     $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootProcess -ValidatedProfile $ValidatedProfile -Repository $Repository `
         -ExpectedRootPath $executable -VendoredProtocGrant $null -H7CGitRunGrant $null
-    $started = [string]$trace.started_at_utc
+    $started = if ([String]::IsNullOrWhiteSpace($StartedAtUtc)) { [string]$trace.started_at_utc } else { $StartedAtUtc }
+    $completed = [DateTimeOffset]::Parse($started, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).AddSeconds(1).ToString('o')
     return [ordered]@{
         name = $Name
         timeout_seconds = [Int64]$TimeoutSeconds
@@ -3723,7 +3729,7 @@ function New-D32PreflightSelfTestPhase0Command {
         candidate_sha_before = $CandidateSha
         clean_before = $true
         started_at_utc = $started
-        completed_at_utc = [DateTimeOffset]::UtcNow.AddSeconds(1).ToString('o')
+        completed_at_utc = $completed
         exit_code = 0
         root_process = $rootRecord
         descendant_processes = @()
@@ -3822,13 +3828,15 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     $cargo = [string]$ValidatedProfile.Profile.toolchain.cargo.path
     $ordinal = 0
     $fetches = [System.Collections.Generic.List[object]]::new()
+    $inventoryTimelineStart = [DateTimeOffset]::UtcNow.AddSeconds(-80)
     foreach ($index in 0..2) {
         $lock = $lockInputs[$index]
         $arguments = @('fetch', '--locked', '--manifest-path', [string]$lock.ManifestFullPath, '--target', [string]$ValidatedProfile.Profile.target_triple)
         $fetches.Add((New-D32PreflightSelfTestPhase0Command -Name ('inventory-fetch-{0:D2}' -f ($index + 1)) `
             -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -LogRoot $logsRoot `
             -LogStem ('inventory-fetch-{0:D2}' -f ($index + 1)) -Arguments $arguments -TimeoutSeconds 14400 `
-            -StdoutLines @('selftest locked fetch output') -RootProcessId (41000 + $index)))
+            -StdoutLines @('selftest locked fetch output') -RootProcessId (41000 + $index) `
+            -StartedAtUtc $inventoryTimelineStart.AddSeconds(5 * $index).ToString('o')))
     }
     $archivePath = Join-Path $cargoHome $script:D32VendoredProtocArchiveRelativePath
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($archivePath))
@@ -3852,10 +3860,13 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         foreach ($row in $rows) { $listLines.Add("$($row.full_name): $($row.kind)") }
         $testCount = [Int64]@($rows | Where-Object { $_.kind -ceq 'test' }).Count
         $benchmarkCount = [Int64]@($rows | Where-Object { $_.kind -ceq 'benchmark' }).Count
-        $listLines.Add("$testCount tests, $benchmarkCount benchmarks")
+        $testLabel = if ($testCount -eq 1) { 'test' } else { 'tests' }
+        $benchmarkLabel = if ($benchmarkCount -eq 1) { 'benchmark' } else { 'benchmarks' }
+        $listLines.Add("$testCount $testLabel, $benchmarkCount $benchmarkLabel")
         $command = New-D32PreflightSelfTestPhase0Command -Name $expected.name -Repository $Repository -CandidateSha $CandidateSha `
             -ValidatedProfile $ValidatedProfile -LogRoot $logsRoot -LogStem ('inventory-list-{0:D2}' -f ($index + 1)) `
-            -Arguments @($expected.arguments) -TimeoutSeconds 28800 -StdoutLines @($listLines.ToArray()) -RootProcessId (42000 + $index)
+            -Arguments @($expected.arguments) -TimeoutSeconds 28800 -StdoutLines @($listLines.ToArray()) -RootProcessId (42000 + $index) `
+            -StartedAtUtc $inventoryTimelineStart.AddSeconds(15 + 5 * $index).ToString('o')
         $parsed = Get-D32TestInventoryListOutput -Lines @($listLines.ToArray()) -Package $expected.package -ListingKind $expected.listing_kind
         $inventoryCommands.Add([ordered]@{
             package = [string]$expected.package
@@ -3920,8 +3931,8 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
             package_digests = @($packageDigests.ToArray())
             category_counts = $categoryCounts
         }
-        started_at_utc = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
-        completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        started_at_utc = $inventoryTimelineStart.AddSeconds(-10).ToString('o')
+        completed_at_utc = $inventoryTimelineStart.AddSeconds(50).ToString('o')
         final_candidate_sha = $CandidateSha
         final_clean = $true
     }
@@ -3954,6 +3965,95 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         catch { $schemaRejected = $_.Exception.Message -like 'TEST_INVENTORY_DISCOVERY_BLOCKED:*strict V1 schema*' }
         $discoverySchemaMutationResults.Add([PSCustomObject]@{ Name = [string]$schemaCase.Name; Rejected = $schemaRejected })
     }
+    $discoveryOriginalRaw = [IO.File]::ReadAllText($discoveryPath, [Text.Encoding]::UTF8)
+    $discoveryReferenceMutationResults = [System.Collections.Generic.List[object]]::new()
+    $discoveryReferenceMutationCases = @(
+        [PSCustomObject]@{ Name = 'source authority stale opened identity'; Expected = '*source-patch authority bytes/opened identity*'; Mutation = { param($doc) $doc.source_patch_authority.volume_serial_hex = '0000000000000000' } },
+        [PSCustomObject]@{ Name = 'source authority extra reference field'; Expected = '*source-patch reference must retain complete opened-file identity*'; Mutation = { param($doc) $doc.source_patch_authority | Add-Member -NotePropertyName unexpected -NotePropertyValue 'unbound' -Force } }
+    )
+    foreach ($case in $discoveryReferenceMutationCases) {
+        $mutatedDiscovery = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $validatedDiscovery.Document -Depth 40 -Compress)
+        & $case.Mutation $mutatedDiscovery
+        [IO.File]::WriteAllText($discoveryPath, (ConvertTo-Json -InputObject $mutatedDiscovery -Depth 40 -Compress), [Text.UTF8Encoding]::new($false))
+        $mutatedReference = Get-D32Phase0FileReference -Path $discoveryPath
+        $sourceReferenceRejected = $false
+        try {
+            $null = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $mutatedReference -ExpectedSha256 ([string]$mutatedReference.sha256) `
+                -Repository $Repository -CandidateSha $CandidateSha -Profile $ValidatedProfile -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -LockInputs $lockInputs
+        }
+        catch { $sourceReferenceRejected = $_.Exception.Message -like ('TEST_INVENTORY_DISCOVERY_BLOCKED:' + [string]$case.Expected) }
+        finally { [IO.File]::WriteAllText($discoveryPath, $discoveryOriginalRaw, [Text.UTF8Encoding]::new($false)) }
+        $discoveryReferenceMutationResults.Add([PSCustomObject]@{ Name = [string]$case.Name; Rejected = $sourceReferenceRejected })
+    }
+    $discoveryTimestampMutationResults = [System.Collections.Generic.List[object]]::new()
+    $discoveryTimestampMutationCases = @(
+        [PSCustomObject]@{ Name = 'discovery completion precedes start'; Mutation = { param($doc) $doc.completed_at_utc = ([DateTimeOffset]::Parse([string]$doc.started_at_utc).AddSeconds(-1).ToString('o')) } },
+        [PSCustomObject]@{ Name = 'fetch commands out of order'; Mutation = { param($doc) $doc.fetches[1].started_at_utc = [string]$doc.fetches[0].started_at_utc } },
+        [PSCustomObject]@{ Name = 'list commands out of order'; Mutation = { param($doc) $doc.inventory_commands[1].command.started_at_utc = [string]$doc.inventory_commands[0].command.started_at_utc } },
+        [PSCustomObject]@{ Name = 'command extends beyond discovery interval'; Mutation = { param($doc) $last = $doc.inventory_commands[5].command; $doc.completed_at_utc = [DateTimeOffset]::Parse([string]$last.completed_at_utc).AddSeconds(-1).ToString('o') } }
+    )
+    foreach ($case in $discoveryTimestampMutationCases) {
+        $mutatedDiscovery = ConvertFrom-D32Phase0Json -Json (ConvertTo-Json -InputObject $validatedDiscovery.Document -Depth 40 -Compress)
+        & $case.Mutation $mutatedDiscovery
+        [IO.File]::WriteAllText($discoveryPath, (ConvertTo-Json -InputObject $mutatedDiscovery -Depth 40 -Compress), [Text.UTF8Encoding]::new($false))
+        $mutatedReference = Get-D32Phase0FileReference -Path $discoveryPath
+        $timestampRejected = $false
+        try {
+            $null = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $mutatedReference -ExpectedSha256 ([string]$mutatedReference.sha256) `
+                -Repository $Repository -CandidateSha $CandidateSha -Profile $ValidatedProfile -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -LockInputs $lockInputs
+        }
+        catch { $timestampRejected = $_.Exception.Message -like 'TEST_INVENTORY_DISCOVERY_BLOCKED:*' }
+        finally { [IO.File]::WriteAllText($discoveryPath, $discoveryOriginalRaw, [Text.UTF8Encoding]::new($false)) }
+        $discoveryTimestampMutationResults.Add([PSCustomObject]@{ Name = [string]$case.Name; Rejected = $timestampRejected })
+    }
+    $validatedDiscovery = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $discoveryReference `
+        -ExpectedSha256 ([string]$discoveryReference.sha256) -Repository $Repository -CandidateSha $CandidateSha `
+        -Profile $ValidatedProfile -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -LockInputs $lockInputs
+    $protocolProtocTraceRejected = $false
+    $protocolListExpected = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)[0]
+    $protocolListCommand = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize(
+        $validatedDiscovery.Document.inventory_commands[0].command))
+    $protocolTrace = $protocolListCommand.process_trace
+    $rootTraceProcess = $protocolTrace.processes[0]
+    $childPid = [int]$rootTraceProcess.process_id + 1
+    $childCreation = [Int64]$rootTraceProcess.creation_filetime + 10000000
+    $protocImage = $validatedDiscovery.ProtocGrant.Image
+    $childCreatedAt = [DateTime]::FromFileTimeUtc($childCreation).ToString('o')
+    $protocolTrace.processes[0].exit_sequence = 4
+    $protocolTrace.process_events = @(
+        $protocolTrace.process_events[0],
+        [ordered]@{ sequence = 2; kind = 'CREATE'; process_id = $childPid; parent_process_id = [int]$rootTraceProcess.process_id; creation_filetime = $childCreation; parent_creation_filetime = [Int64]$rootTraceProcess.creation_filetime; exit_code = 0 },
+        [ordered]@{ sequence = 3; kind = 'EXIT'; process_id = $childPid; parent_process_id = [int]$rootTraceProcess.process_id; creation_filetime = $childCreation; parent_creation_filetime = [Int64]$rootTraceProcess.creation_filetime; exit_code = 0 },
+        [ordered]@{ sequence = 4; kind = 'EXIT'; process_id = [int]$rootTraceProcess.process_id; parent_process_id = [int]$rootTraceProcess.parent_process_id; creation_filetime = [Int64]$rootTraceProcess.creation_filetime; parent_creation_filetime = [Int64]$rootTraceProcess.parent_creation_filetime; exit_code = 0 }
+    )
+    $protocolTrace.processes[0].exit_sequence = 4
+    $protocolTrace.processes += [ordered]@{
+        process_id = $childPid; parent_process_id = [int]$rootTraceProcess.process_id; creation_filetime = $childCreation
+        parent_creation_filetime = [Int64]$rootTraceProcess.creation_filetime; image_path = [string]$protocImage.Path
+        bytes = [Int64]$protocImage.Bytes; sha256 = [string]$protocImage.Sha256
+        volume_serial_hex = [string]$protocImage.VolumeSerialHex; file_id_hex = [string]$protocImage.FileIdHex
+        allowed_image_reason = 'vendored-protoc-run-grant'; image_verified = $true; exited = $true; exit_code = 0
+        create_sequence = 2; exit_sequence = 3; created_at_utc = $childCreatedAt; exited_at_utc = $childCreatedAt
+    }
+    $protocolTrace.debug_event_count = 4
+    $protocolTrace.process_create_event_count = 2
+    $protocolTrace.process_exit_event_count = 2
+    $protocolTrace.process_event_count = 4
+    $protocolTrace.job_total_processes = 2
+    $protocolTrace.retained_process_handle_count = 3
+    $protocolListCommand.process_tree_cleanup.retained_process_handle_count = 3
+    $protocolListCommand.descendant_processes = @([ordered]@{
+        process_id = $childPid; parent_process_id = [int]$rootTraceProcess.process_id; name = 'protoc.exe'
+        image_path = [string]$protocImage.Path; command_line = 'protoc.exe --selftest'; creation_date = $childCreatedAt
+        observed_at_utc = $childCreatedAt; sha256 = [string]$protocImage.Sha256; bytes = [Int64]$protocImage.Bytes
+        volume_serial_hex = [string]$protocImage.VolumeSerialHex; file_id_hex = [string]$protocImage.FileIdHex; identity_verified = $true
+    })
+    try {
+        $null = Test-D32Phase0InventoryProcessRecord -Command $protocolListCommand -Name $protocolListExpected.name -Executable $protocolListExpected.executable `
+            -Arguments $protocolListExpected.arguments -TimeoutSeconds 28800 -RunnerProcessId ([int]$validatedDiscovery.Document.runner_process_id) `
+            -Profile $ValidatedProfile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $discoveryRoot -VendoredProtocGrant $null
+    }
+    catch { $protocolProtocTraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
     $baseline = New-D32TestInventoryBaselineDocument -Discovery $validatedDiscovery.Document -DiscoveryReference $validatedDiscovery.Reference `
         -PackageInventories $validatedDiscovery.PackageInventories -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
     $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)
@@ -3964,7 +4064,18 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     $baselineReference = Write-D32TestInventoryJsonCreateNew -Path $baselinePath -Document $baseline -Repository $Repository -DiscoveryRoot $discoveryRoot
     $validatedAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $baselinePath -BaselineSha256 ([string]$baselineReference.sha256 `
         ) -Repository $Repository -EvidenceRoot (Join-Path $Root 'phase0') -CandidateSha $CandidateSha -Profile $ValidatedProfile `
-        -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -ExpectedBaselineReference $baselineReference
+        -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -SourcePatchAuthorityReference $SourcePatchAuthority.Reference `
+        -ExpectedBaselineReference $baselineReference
+    $nestedPhase0Root = Join-Path $discoveryRoot 'nested-phase0-root'
+    $nestedPhase0RootRejected = $false
+    try {
+        $null = Test-D32Phase0TestInventoryAuthority -BaselinePath $baselinePath -BaselineSha256 ([string]$baselineReference.sha256 `
+            ) -Repository $Repository -EvidenceRoot $nestedPhase0Root -CandidateSha $CandidateSha -Profile $ValidatedProfile `
+            -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -SourcePatchAuthorityReference $SourcePatchAuthority.Reference `
+            -ExpectedBaselineReference $baselineReference
+    }
+    catch { $nestedPhase0RootRejected = $_.Exception.Message -like 'TEST_INVENTORY_ROOT_BLOCKED:*' }
+    $nestedPhase0RootRejected = $nestedPhase0RootRejected -and -not [IO.Directory]::Exists($nestedPhase0Root)
 
     $expectedCommandsForMutation = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)
     $mutateAndValidateBaseline = {
@@ -4002,6 +4113,9 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         [PSCustomObject]@{ Name = 'stale profile identity'; Reseal = $false; Mutation = { param($doc) $doc.toolchain_profile.file_id_hex = ('0' * 32) } },
         [PSCustomObject]@{ Name = 'wrong target'; Reseal = $false; Mutation = { param($doc) $doc.target_triple = 'aarch64-pc-windows-msvc' } },
         [PSCustomObject]@{ Name = 'wrong discovery root'; Reseal = $false; Mutation = { param($doc) $doc.discovery.evidence_root.path = 'C:\other-discovery-root' } },
+        [PSCustomObject]@{ Name = 'copied discovery completion timestamp mismatch'; Reseal = $false; Mutation = { param($doc) $doc.discovery.completed_at_utc = [DateTimeOffset]::Parse([string]$doc.discovery.completed_at_utc).AddSeconds(1).ToString('o') } },
+        [PSCustomObject]@{ Name = 'baseline generated before discovery completion'; Reseal = $false; Mutation = { param($doc) $doc.generated_at_utc = [DateTimeOffset]::Parse([string]$doc.discovery.completed_at_utc).AddSeconds(-1).ToString('o') } },
+        [PSCustomObject]@{ Name = 'malformed baseline generated timestamp'; Reseal = $false; Mutation = { param($doc) $doc.generated_at_utc = 'not-an-iso-timestamp' } },
         [PSCustomObject]@{ Name = 'wrong command jobs'; Reseal = $false; Mutation = { param($doc) $jobs = [Array]::IndexOf([string[]]$doc.commands[0].argv, '--jobs'); if ($jobs -lt 0) { throw 'self-test fixture command omitted --jobs' }; $doc.commands[0].argv[$jobs + 1] = '1' } },
         [PSCustomObject]@{ Name = 'wrong command timeout'; Reseal = $false; Mutation = { param($doc) $doc.commands[0].timeout_seconds = 28801 } },
         [PSCustomObject]@{ Name = 'added ordinary name'; Reseal = $true; Mutation = { param($doc) $doc.entries = @($doc.entries) + @([ordered]@{ package = 'protocol'; kind = 'test'; full_name = 'protocol::tests::added_ordinary'; category = 'ordinary' }) } },
@@ -4022,7 +4136,8 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     try {
         $null = Test-D32Phase0TestInventoryAuthority -BaselinePath $lateBaselinePath -BaselineSha256 ([string]$lateBaselineReference.sha256 `
             ) -Repository $Repository -EvidenceRoot $lateBaselineRoot -CandidateSha $CandidateSha -Profile $ValidatedProfile `
-            -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -ExpectedBaselineReference $lateBaselineReference
+            -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -SourcePatchAuthorityReference $SourcePatchAuthority.Reference `
+            -ExpectedBaselineReference $lateBaselineReference
     }
     catch { $lateBaselineRejected = $_.Exception.Message -like 'TEST_INVENTORY_BASELINE_BLOCKED:*' }
     return [PSCustomObject]@{
@@ -4033,6 +4148,10 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         BaselinePath = $baselinePath
         PackageInventories = @($validatedDiscovery.PackageInventories)
         DiscoverySchemaMutationResults = @($discoverySchemaMutationResults.ToArray())
+        DiscoveryReferenceMutationResults = @($discoveryReferenceMutationResults.ToArray())
+        DiscoveryTimestampMutationResults = @($discoveryTimestampMutationResults.ToArray())
+        NestedPhase0RootRejectedWithoutCreation = $nestedPhase0RootRejected
+        ProtocolProtocTraceRejectedWithoutGrant = $protocolProtocTraceRejected
         BaselineMutationResults = @($baselineMutationResults.ToArray())
         LateBaselineRejected = $lateBaselineRejected
     }
@@ -5627,9 +5746,19 @@ function Invoke-D32SelfTest {
         $discoverySchemaMutationFailures = @($inventoryArtifacts.DiscoverySchemaMutationResults | Where-Object { -not $_.Rejected })
         Assert-D32SelfTest -Condition ($inventoryArtifacts.DiscoverySchemaMutationResults.Count -eq 2 -and $discoverySchemaMutationFailures.Count -eq 0) `
             -Name 'discovery reader rejects prior and unknown schema versions even when each mutated record is correctly rehashed' -Failures $failures
+        $discoveryReferenceMutationFailures = @($inventoryArtifacts.DiscoveryReferenceMutationResults | Where-Object { -not $_.Rejected })
+        Assert-D32SelfTest -Condition ($inventoryArtifacts.DiscoveryReferenceMutationResults.Count -eq 2 -and $discoveryReferenceMutationFailures.Count -eq 0) `
+            -Name 'discovery reader rejects rehashed stale source-authority opened identity and extra reference fields' -Failures $failures
+        $discoveryTimestampMutationFailures = @($inventoryArtifacts.DiscoveryTimestampMutationResults | Where-Object { -not $_.Rejected })
+        Assert-D32SelfTest -Condition ($inventoryArtifacts.DiscoveryTimestampMutationResults.Count -eq 4 -and $discoveryTimestampMutationFailures.Count -eq 0) `
+            -Name 'discovery reader rejects rehashed invalid top-level interval, out-of-order fetch/list commands, and commands outside interval' -Failures $failures
+        Assert-D32SelfTest -Condition $inventoryArtifacts.NestedPhase0RootRejectedWithoutCreation `
+            -Name 'formal Phase0 EvidenceRoot nested beneath discovery is rejected before the root is created' -Failures $failures
+        Assert-D32SelfTest -Condition $inventoryArtifacts.ProtocolProtocTraceRejectedWithoutGrant `
+            -Name 'protocol inventory trace containing a valid pinned protoc CREATE is rejected when its package-scoped grant is null' -Failures $failures
         $baselineMutationFailures = @($inventoryArtifacts.BaselineMutationResults | Where-Object { -not $_.Rejected })
-        Assert-D32SelfTest -Condition ($inventoryArtifacts.BaselineMutationResults.Count -eq 12 -and $baselineMutationFailures.Count -eq 0) `
-            -Name 'Coordinator baseline rejects prior/unknown/self-pinned, stale candidate/profile/root, wrong jobs/timeout, and resealed ordinary add/remove/rename mutations' -Failures $failures
+        Assert-D32SelfTest -Condition ($inventoryArtifacts.BaselineMutationResults.Count -eq 15 -and $baselineMutationFailures.Count -eq 0) `
+            -Name 'Coordinator baseline rejects prior/unknown/self-pinned, stale bindings, wrong budget, ordinary set drift, completion mismatch, and invalid generated timestamps' -Failures $failures
         Assert-D32SelfTest -Condition $inventoryArtifacts.LateBaselineRejected `
             -Name 'baseline placed inside the eventual Phase0 EvidenceRoot is rejected as late and cannot self-baseline' -Failures $failures
         $phase0LogRoot = Join-Path $phase0Root 'logs'
@@ -6427,6 +6556,77 @@ function Invoke-D32SelfTest {
         $pinnedBundleFindings = New-D32FindingList
         Test-D32ReleaseEvidenceBundle -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleFilePath $bundleManifest -Attestation $validAttestationObject -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $pinnedBundleFindings
         Assert-D32SelfTest -Condition (@($pinnedBundleFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -eq 0) -Name 'bundle attestation references match independent Phase0/profile pins' -Failures $failures
+
+        $consumerAttestationRaw = [IO.File]::ReadAllText($attestationPath, [Text.Encoding]::UTF8)
+        $consumerBundleRaw = [IO.File]::ReadAllText($bundleManifest, [Text.Encoding]::UTF8)
+        $consumerAggregateRaw = [IO.File]::ReadAllText($aggregateRecordPath, [Text.Encoding]::UTF8)
+        $downstreamAuthorityTamperCasesPassed = $true
+        try {
+            foreach ($authorityField in @('baseline', 'discovery')) {
+                $mutatedAttestation = ConvertFrom-D32Phase0Json -Json $consumerAttestationRaw
+                $mutatedAttestation.test_inventory_authority.$authorityField.sha256 = '0' * 64
+                Write-D32Json -Path $attestationPath -Value $mutatedAttestation
+                $mutatedAttestationDigest = Get-D32EvidenceFileDigest -Path $attestationPath
+                $mutatedBundle = ConvertFrom-D32Phase0Json -Json $consumerBundleRaw
+                $mutatedBundle.attestation_sha256 = [string]$mutatedAttestationDigest.Hash
+                Write-D32Json -Path $bundleManifest -Value $mutatedBundle
+                $releaseAuthorityFindings = New-D32FindingList
+                Test-D32ReleaseEvidenceBundle -Bundle $mutatedBundle -BundleFilePath $bundleManifest -Attestation $mutatedAttestation `
+                    -AttestationFilePath $attestationPath -AttestationSha256 ([string]$mutatedAttestationDigest.Hash) -Head $head -Repository $fixture `
+                    -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
+                    -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $releaseAuthorityFindings
+                $releaseRejected = @($releaseAuthorityFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+                if (-not $releaseRejected) { $downstreamAuthorityTamperCasesPassed = $false }
+
+                $mutatedAggregate = ConvertFrom-D32Phase0Json -Json $consumerAggregateRaw
+                $aggregateReferenceName = 'test_inventory_{0}' -f [string]$authorityField
+                $mutatedAggregate.references.$aggregateReferenceName.sha256 = '0' * 64
+                Write-D32Json -Path $aggregateRecordPath -Value $mutatedAggregate
+                $mutatedAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+                $aggregateAuthorityFindings = New-D32FindingList
+                $mutatedAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
+                    -ExpectedRecordSha256 ([string]$mutatedAggregateDigest.Hash) -Repository $fixture -ExpectedCandidateSha $head `
+                    -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
+                    -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
+                    -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateAuthorityFindings
+                $aggregateRejected = -not $mutatedAggregateValidation.IsValid -and
+                    @($aggregateAuthorityFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+                if (-not $aggregateRejected) { $downstreamAuthorityTamperCasesPassed = $false }
+            }
+        }
+        finally {
+            [IO.File]::WriteAllText($attestationPath, $consumerAttestationRaw, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($bundleManifest, $consumerBundleRaw, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($aggregateRecordPath, $consumerAggregateRaw, [Text.UTF8Encoding]::new($false))
+        }
+        Assert-D32SelfTest -Condition $downstreamAuthorityTamperCasesPassed `
+            -Name 'Release V8 and Aggregate V7 consumers reject changed baseline and discovery references after their enclosing records are rehashed' -Failures $failures
+
+        $protocolInventoryStdoutPath = [string]$inventoryArtifacts.Discovery.inventory_commands[0].command.stdout.path
+        $protocolInventoryStdoutBytes = [IO.File]::ReadAllBytes($protocolInventoryStdoutPath)
+        $downstreamRawInventoryLogCasesPassed = $true
+        try {
+            [IO.File]::AppendAllText($protocolInventoryStdoutPath, "tampered::unlisted_test: test`n", [Text.UTF8Encoding]::new($false))
+            $releaseRawLogFindings = New-D32FindingList
+            Test-D32ReleaseEvidenceBundle -Bundle ($consumerBundleRaw | ConvertFrom-D32Json) -BundleFilePath $bundleManifest `
+                -Attestation ($consumerAttestationRaw | ConvertFrom-D32Json) -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha `
+                -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
+                -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $releaseRawLogFindings
+            $releaseRawLogRejected = @($releaseRawLogFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+
+            $aggregateRawLogFindings = New-D32FindingList
+            $aggregateRawLogValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
+                -ExpectedRecordSha256 ([string](Get-D32EvidenceFileDigest -Path $aggregateRecordPath).Hash) -Repository $fixture -ExpectedCandidateSha $head `
+                -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
+                -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
+                -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateRawLogFindings
+            $aggregateRawLogRejected = -not $aggregateRawLogValidation.IsValid -and
+                @($aggregateRawLogFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+            $downstreamRawInventoryLogCasesPassed = $releaseRawLogRejected -and $aggregateRawLogRejected
+        }
+        finally { [IO.File]::WriteAllBytes($protocolInventoryStdoutPath, $protocolInventoryStdoutBytes) }
+        Assert-D32SelfTest -Condition $downstreamRawInventoryLogCasesPassed `
+            -Name 'Release V8 and Aggregate V7 consumers revalidate formal raw test-list stdout bytes instead of trusting sealed inventory references' -Failures $failures
 
         $wrongPhase0PinFindings = New-D32FindingList
         Test-D32ReleaseEvidenceBundle -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleFilePath $bundleManifest -Attestation $validAttestationObject -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture -ExpectedPhase0RecordPath (Join-Path $phase0Root 'unrelated-phase0.json') -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $wrongPhase0PinFindings

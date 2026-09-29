@@ -47,14 +47,14 @@ function Get-D32TestInventoryListOutput {
         [Parameter(Mandatory = $true)][ValidateSet('all', 'ignored')][string]$ListingKind
     )
 
-    if ($Package -notin @('protocol', 'vita', 'host')) { throw "TEST_INVENTORY_BLOCKED: unknown package $Package" }
+    if ($Package -cnotin @('protocol', 'vita', 'host')) { throw "TEST_INVENTORY_BLOCKED: unknown package $Package" }
     if ($Lines.Count -eq 0) { throw "TEST_INVENTORY_BLOCKED: $Package/$ListingKind stdout is empty" }
     $rows = [System.Collections.Generic.List[object]]::new()
     $summaries = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($line in $Lines) {
         if ($line -ceq '') { throw "TEST_INVENTORY_BLOCKED: blank/truncated libtest list output row in $Package/$ListingKind" }
-        if ($line -match '^(?<name>.+): (?<kind>test|benchmark)$') {
+        if ($line -cmatch '^(?<name>.+): (?<kind>test|benchmark)$') {
             $name = [string]$Matches.name
             $kind = [string]$Matches.kind
             if ([String]::IsNullOrWhiteSpace($name) -or $name.Trim() -cne $name -or $name -match '[\x00-\x1f\x7f]' -or
@@ -64,7 +64,12 @@ function Get-D32TestInventoryListOutput {
             $rows.Add([PSCustomObject][ordered]@{ package = $Package; kind = $kind; full_name = $name })
             continue
         }
-        if ($line -match '^(?<tests>\d+) tests?, (?<benches>\d+) benchmarks?$') {
+        if ($line -cmatch '^(?<tests>\d+) (?<test_label>test|tests), (?<benches>\d+) (?<benchmark_label>benchmark|benchmarks)$') {
+            $testLabel = if ([Int64]$Matches.tests -eq 1) { 'test' } else { 'tests' }
+            $benchmarkLabel = if ([Int64]$Matches.benches -eq 1) { 'benchmark' } else { 'benchmarks' }
+            if ($Matches.test_label -cne $testLabel -or $Matches.benchmark_label -cne $benchmarkLabel) {
+                throw "TEST_INVENTORY_BLOCKED: count-specific libtest summary grammar is invalid in $Package/$ListingKind"
+            }
             $summaries.Add([PSCustomObject][ordered]@{ tests = [Int64]$Matches.tests; benchmarks = [Int64]$Matches.benches })
             continue
         }
@@ -549,7 +554,8 @@ function Test-D32TestInventoryBaselineDocument {
         $Document.discovery.candidate_sha -cne $ExpectedCandidateSha -or $Document.discovery.run_id -cne $Discovery.run_id -or
         (ConvertTo-Json -InputObject $Document.discovery.evidence_root -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Discovery.evidence_root_identity -Depth 6 -Compress) -or
         (ConvertTo-Json -InputObject $Document.discovery.cargo_home -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Discovery.storage.cargo_home -Depth 6 -Compress) -or
-        (ConvertTo-Json -InputObject $Document.discovery.temp_root -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Discovery.storage.temp_root -Depth 6 -Compress)) {
+        (ConvertTo-Json -InputObject $Document.discovery.temp_root -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $Discovery.storage.temp_root -Depth 6 -Compress) -or
+        $Document.discovery.completed_at_utc -isnot [string] -or $Document.discovery.completed_at_utc -cne [string]$Discovery.completed_at_utc) {
         throw 'TEST_INVENTORY_BASELINE_BLOCKED: discovery reference/run/root/CargoHome/TempRoot binding differs from validated source record'
     }
     if ($Document.commands.Count -ne $ExpectedCommands.Count) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: exactly six ordered list command records required' }
@@ -596,7 +602,10 @@ function Test-D32TestInventoryBaselineDocument {
         if ($discoveryCommandSet.Count -ne 2) { throw "TEST_INVENTORY_BASELINE_BLOCKED: discovery lacks both list captures for $package" }
     }
     $generated = [DateTimeOffset]::MinValue
-    if ($Document.generated_at_utc -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$Document.generated_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$generated)) {
+    $discoveryCompleted = [DateTimeOffset]::MinValue
+    if ($Document.generated_at_utc -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$Document.generated_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$generated) -or
+        -not [DateTimeOffset]::TryParse([string]$Discovery.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$discoveryCompleted) -or
+        $generated -lt $discoveryCompleted) {
         throw 'TEST_INVENTORY_BASELINE_BLOCKED: generated_at_utc must be an ISO timestamp'
     }
     return $true

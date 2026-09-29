@@ -97,17 +97,17 @@ $discoveryGrant = New-D32VendoredProtocRunGrant -AuthorityPath $VendoredProtocAu
 $discoveryGrant = Test-D32VendoredProtocRunGrant -Reference $discoveryGrant.Reference -Repository $repo -CandidateSha $ExpectedCandidateSha `
     -ValidatedProfile $profile -EvidenceRoot $output -ExpectedRunId $runId -CargoHome $cargoHome -AuthorityPath $VendoredProtocAuthorityPath `
     -AuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 -OwnerMarkerReference $ownerRoot.OwnerMarker -Scope 'D32_TEST_INVENTORY_DISCOVERY_ONLY'
-$offlineEnvironment = New-D32VendoredProtocEnvironment -Environment $offlineEnvironment -RunGrant $discoveryGrant
-
 $packageRows = @{}
 $packageCommandMetadata = Get-D32TestInventoryExpectedCommands -Profile $profile.Profile
 foreach ($expected in $packageCommandMetadata) {
     $arguments = @($expected.arguments)
     $name = [string]$expected.name
+    $protocPolicy = Resolve-D32TestInventoryProtocPolicy -Package ([string]$expected.package) -Environment $offlineEnvironment `
+        -RunGrant $(if ([string]$expected.package -ceq 'protocol') { $null } else { $discoveryGrant })
     $command = Invoke-D32Phase0LoggedCommand -Name $name -Executable $cargo -Arguments $arguments -Ordinal ([ref]$ordinal) `
         -Records ([System.Collections.Generic.List[object]]::new()) -LogRoot $logsRoot -Repository $repo -ValidatedProfile $profile `
-        -Environment $offlineEnvironment -TimeoutSeconds $Phase0InventoryListTimeoutSeconds -ExpectedCandidateSha $ExpectedCandidateSha `
-        -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -VendoredProtocRunGrant $discoveryGrant -H7CGitAuthority $null -H7CGitRunGrant $null
+        -Environment $protocPolicy.Environment -TimeoutSeconds $Phase0InventoryListTimeoutSeconds -ExpectedCandidateSha $ExpectedCandidateSha `
+        -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -VendoredProtocRunGrant $protocPolicy.RunGrant -H7CGitAuthority $null -H7CGitRunGrant $null
     $lines = @(Read-D32TestInventoryLogReference -Reference $command.stdout -AllowedRoot $output)
     $parsed = Get-D32TestInventoryListOutput -Lines $lines -Package $expected.package -ListingKind $expected.listing_kind
     $inventoryCommands.Add([ordered]@{

@@ -1768,6 +1768,36 @@ function Get-D32TestInventoryExpectedCommands {
     return @($commands.ToArray())
 }
 
+function Assert-D32TestInventoryRootsDisjoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$DiscoveryRoot,
+        [Parameter(Mandatory = $true)][string]$Phase0OutputRoot
+    )
+    $discoveryFull = [IO.Path]::GetFullPath($DiscoveryRoot)
+    $phase0Full = [IO.Path]::GetFullPath($Phase0OutputRoot)
+    if ((Test-D32ProfilePathEqual -Left $discoveryFull -Right $phase0Full) -or
+        (Test-D32ProfilePathWithin -Child $discoveryFull -Parent $phase0Full) -or
+        (Test-D32ProfilePathWithin -Child $phase0Full -Parent $discoveryFull)) {
+        throw 'TEST_INVENTORY_ROOT_BLOCKED: discovery and formal Phase0 roots must be disjoint and non-nested'
+    }
+    return $true
+}
+
+function Resolve-D32TestInventoryProtocPolicy {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('protocol', 'vita', 'host')][string]$Package,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
+        [AllowNull()][object]$RunGrant
+    )
+
+    if ($Environment.Contains('PROTOC')) { throw 'TEST_INVENTORY_PROTOC_BLOCKED: inventory base environment must remain PROTOC-free' }
+    if ($Package -ceq 'protocol' -and $null -ne $RunGrant) { throw 'TEST_INVENTORY_PROTOC_BLOCKED: protocol inventory has no vendored protoc grant scope' }
+    if ($Package -cin @('vita', 'host') -and $null -eq $RunGrant) { throw 'TEST_INVENTORY_PROTOC_BLOCKED: Vita/Host inventory requires the separately validated discovery grant' }
+    $childEnvironment = [ordered]@{}
+    foreach ($key in $Environment.Keys) { $childEnvironment[[string]$key] = [string]$Environment[$key] }
+    return [PSCustomObject]@{ Package = $Package; Environment = $childEnvironment; RunGrant = $RunGrant }
+}
+
 function Get-D32Phase0TestInventoryClassificationPolicy {
     return [PSCustomObject]@{
         deferred_vita = @($script:D32Phase0DeferredVita)
@@ -1897,10 +1927,11 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
         $document.run_id -isnot [string] -or $document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
         $document.fetches -isnot [Array] -or $document.fetches.Count -ne 3 -or
         $document.inventory_commands -isnot [Array] -or $document.inventory_commands.Count -ne 6) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: strict V1 schema/status/candidate/process/list inventory mismatch' }
-    foreach ($stamp in @('started_at_utc', 'completed_at_utc')) {
-        $parsed = [DateTimeOffset]::MinValue
-        if ($document.$stamp -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$document.$stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $stamp malformed" }
-    }
+    $discoveryStart = [DateTimeOffset]::MinValue
+    $discoveryEnd = [DateTimeOffset]::MinValue
+    if ($document.started_at_utc -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$document.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$discoveryStart) -or
+        $document.completed_at_utc -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$document.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$discoveryEnd) -or
+        $discoveryEnd -lt $discoveryStart) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery interval is malformed or completes before it starts' }
     if (-not (Test-D32Phase0ExactProperties -Object $document.evidence_root_identity -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
         -not (Test-D32ProfilePathEqual -Left $document.evidence_root_identity.path -Right $root)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery EvidenceRoot identity path malformed' }
     $rootIdentity = Test-D32ProfileDirectoryIdentity -Path $root -VolumeSerialHex ([string]$document.evidence_root_identity.volume_serial_hex) -FileIdHex ([string]$document.evidence_root_identity.file_id_hex)
@@ -1932,8 +1963,14 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
             [Int64]$document.lock_inputs[$index].lock_bytes -ne [Int64]$LockInputs[$index].LockBytes) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: current three Cargo.lock inputs differ' }
     }
     $sourceRef = $document.source_patch_authority
+    if (-not (Test-D32Phase0ExactProperties -Object $sourceRef -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: source-patch reference must retain complete opened-file identity'
+    }
     $sourceAuth = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath ([string]$sourceRef.path) -ExpectedAuthoritySha256 ([string]$sourceRef.sha256) `
         -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $Profile -EvidenceRoot $root
+    if ((ConvertTo-Json -InputObject $sourceAuth.Reference -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $sourceRef -Depth 6 -Compress)) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: source-patch authority bytes/opened identity differ from the complete discovery reference'
+    }
     $protocFields = @('authority', 'run_grant')
     if (-not (Test-D32Phase0ExactProperties -Object $document.protoc -Expected $protocFields)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: separate discovery protoc authority/grant is required' }
     $discoveryProtocAuthority = Test-D32VendoredProtocAuthority -AuthorityPath ([string]$document.protoc.authority.path) `
@@ -1949,6 +1986,7 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
     $git = Get-D32Phase0GitState -Repository $Repository -GitPath $GitPath -GitSha256 $GitSha256
     if ($git.Head -cne $CandidateSha) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: current candidate differs from pinned discovery SHA' }
     $cargo = [string]$Profile.Profile.toolchain.cargo.path
+    $previousCommandEnd = $discoveryStart
     for ($index = 0; $index -lt 3; $index++) {
         $lock = $LockInputs[$index]
         $fetch = $document.fetches[$index]
@@ -1956,6 +1994,12 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
         $name = 'inventory-fetch-{0:D2}' -f ($index + 1)
         $null = Test-D32Phase0InventoryProcessRecord -Command $fetch -Name $name -Executable $cargo -Arguments $args -TimeoutSeconds 14400 `
             -RunnerProcessId ([int]$document.runner_process_id) -Profile $Profile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $root -VendoredProtocGrant $null
+        $fetchStart = [DateTimeOffset]::Parse([string]$fetch.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        $fetchEnd = [DateTimeOffset]::Parse([string]$fetch.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        if ($fetchStart -lt $previousCommandEnd -or $fetchStart -lt $discoveryStart -or $fetchEnd -gt $discoveryEnd) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $name lies outside or out of order in the discovery interval"
+        }
+        $previousCommandEnd = $fetchEnd
     }
     $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $Profile.Profile)
     $packageRows = @{}
@@ -1969,8 +2013,16 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
             -not $(if ($expected.listing_kind -ceq 'all') { Test-D32Phase0Integer -Value $actual.row_count -Positive } else { Test-D32Phase0Integer -Value $actual.row_count }) -or
             -not (Test-D32Phase0Integer -Value $actual.test_count) -or
             -not (Test-D32Phase0Integer -Value $actual.benchmark_count)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: inventory command record[$index] schema/order mismatch" }
+        $protocPolicy = Resolve-D32TestInventoryProtocPolicy -Package ([string]$expected.package) -Environment @{} `
+            -RunGrant $(if ([string]$expected.package -ceq 'protocol') { $null } else { $discoveryGrant })
         $null = Test-D32Phase0InventoryProcessRecord -Command $actual.command -Name $expected.name -Executable $expected.executable -Arguments $expected.arguments `
-            -TimeoutSeconds 28800 -RunnerProcessId ([int]$document.runner_process_id) -Profile $Profile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $root -VendoredProtocGrant $discoveryGrant
+            -TimeoutSeconds 28800 -RunnerProcessId ([int]$document.runner_process_id) -Profile $Profile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $root -VendoredProtocGrant $protocPolicy.RunGrant
+        $listStart = [DateTimeOffset]::Parse([string]$actual.command.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        $listEnd = [DateTimeOffset]::Parse([string]$actual.command.completed_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        if ($listStart -lt $previousCommandEnd -or $listStart -lt $discoveryStart -or $listEnd -gt $discoveryEnd) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $($expected.name) lies outside or out of order in the discovery interval"
+        }
+        $previousCommandEnd = $listEnd
         $lines = Read-D32TestInventoryLogReference -Reference $actual.command.stdout -AllowedRoot $root
         $parsed = Get-D32TestInventoryListOutput -Lines $lines -Package $expected.package -ListingKind $expected.listing_kind
         if (@($actual.rows | Where-Object { $_.package -isnot [string] -or $_.package -cne $expected.package -or $_.kind -isnot [string] -or $_.full_name -isnot [string] }).Count -gt 0 -or
@@ -2036,6 +2088,7 @@ function Test-D32Phase0TestInventoryAuthority {
         [Parameter(Mandatory = $true)][object]$Profile,
         [Parameter(Mandatory = $true)][string]$GitPath,
         [Parameter(Mandatory = $true)][string]$GitSha256,
+        [Parameter(Mandatory = $true)][object]$SourcePatchAuthorityReference,
         [AllowNull()][object]$ExpectedBaselineReference
     )
     if ([IO.Path]::GetFileName($BaselinePath) -cne 'D32-TEST-INVENTORY-BASELINE.json' -or
@@ -2050,11 +2103,15 @@ function Test-D32Phase0TestInventoryAuthority {
     $discoveryReference = $baselineRead.Document.discovery.reference
     $discovery = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $discoveryReference -ExpectedSha256 ([string]$discoveryReference.sha256) `
         -Repository $Repository -CandidateSha $CandidateSha -Profile $Profile -GitPath $GitPath -GitSha256 $GitSha256
-    if (Test-D32ProfilePathEqual -Left $discovery.Root -Right $EvidenceRoot) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: discovery and formal Phase0 must use distinct fresh owner-bound roots' }
+    $null = Assert-D32TestInventoryRootsDisjoint -DiscoveryRoot $discovery.Root -Phase0OutputRoot $EvidenceRoot
+    if ((ConvertTo-Json -InputObject $discovery.Document.source_patch_authority -Depth 6 -Compress) -cne
+        (ConvertTo-Json -InputObject $SourcePatchAuthorityReference -Depth 6 -Compress)) {
+        throw 'TEST_INVENTORY_BASELINE_BLOCKED: discovery source-patch authority differs from the independently validated Phase0 source authority reference'
+    }
     $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $Profile.Profile)
     $null = Test-D32TestInventoryBaselineDocument -Document $baselineRead.Document -Discovery $discovery.Document -DiscoveryReference $discovery.Reference `
         -ExpectedCandidateSha $CandidateSha -Repository $Repository -Profile $Profile -LockInputs $discovery.LockInputs `
-        -SourcePatchAuthorityReference $discovery.Document.source_patch_authority -ProtocAuthorityReference $discovery.Document.protoc.authority `
+        -SourcePatchAuthorityReference $SourcePatchAuthorityReference -ProtocAuthorityReference $discovery.Document.protoc.authority `
         -ExpectedCommands $expectedCommands
     return [PSCustomObject]@{ Baseline = $baselineRead.Document; BaselineReference = $baselineReference; Discovery = $discovery }
 }
@@ -2269,6 +2326,7 @@ function Test-D32Phase0MatrixRecord {
         $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath ([string]$document.test_inventory_authority.baseline.path) `
             -BaselineSha256 ([string]$document.test_inventory_authority.baseline.sha256) -Repository $repo -EvidenceRoot $outputRoot `
             -CandidateSha $ExpectedCandidateSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 `
+            -SourcePatchAuthorityReference $tauriMacrosAuthority.Reference `
             -ExpectedBaselineReference $document.test_inventory_authority.baseline
         if ((ConvertTo-Json -InputObject $inventoryAuthority.Discovery.Reference -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $document.test_inventory_authority.discovery -Depth 6 -Compress)) {
             throw 'Phase0 discovery reference does not match the external Coordinator-pinned baseline source'
@@ -2816,7 +2874,8 @@ function Invoke-D32Phase0Matrix {
         -Repository $repo -CandidateSha $ExpectedSha -ValidatedProfile $profile `
         -EvidenceRoot $output -TempRoot $expectedTempRoot -GitImage $gitImage -TimeoutSeconds $TimeoutSeconds
     $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $TestInventoryBaselinePath -BaselineSha256 $ExpectedTestInventoryBaselineSha256 `
-        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 -ExpectedBaselineReference $null
+        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 `
+        -SourcePatchAuthorityReference $tauriMacrosAuthority.Reference -ExpectedBaselineReference $null
     Set-D32GitCaptureContext -ValidatedProfile $profile -GitPath $GitPath -GitSha256 $GitSha256 -TimeoutSeconds 120
     $pre = Get-D32Phase0GitState -Repository $repo -GitPath $GitPath -GitSha256 $GitSha256
     if ($pre.Head -cne $ExpectedSha) { throw 'PHASE0_CANDIDATE_BLOCKED: current HEAD does not equal caller-pinned candidate SHA' }
@@ -3035,7 +3094,8 @@ function Invoke-D32Phase0Matrix {
     foreach ($package in @('protocol', 'vita', 'host')) { $inventoryHashtable[$package] = $listCommands[$package] }
     $null = Test-D32Phase0FixedInventory -Inventories $inventoryHashtable
     $inventoryAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $TestInventoryBaselinePath -BaselineSha256 $ExpectedTestInventoryBaselineSha256 `
-        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 -ExpectedBaselineReference $inventoryAuthority.BaselineReference
+        -Repository $repo -EvidenceRoot $output -CandidateSha $ExpectedSha -Profile $profile -GitPath $GitPath -GitSha256 $GitSha256 `
+        -SourcePatchAuthorityReference $tauriMacrosAuthority.Reference -ExpectedBaselineReference $inventoryAuthority.BaselineReference
     foreach ($package in @('protocol', 'vita', 'host')) {
         [string[]]$deferredNames = @()
         [string[]]$focusedNames = @()
@@ -3946,6 +4006,11 @@ function Test-D32Phase0MatrixRecordSelfTest {
         ,@('protocol::ordinary: test', 'protocol::ordinary: test', '2 tests, 0 benchmarks'),
         ,@('protocol::ordinary: test', '2 tests, 0 benchmarks'),
         ,@('unknown libtest banner'),
+        ,@('protocol::ordinary: test', '1 tests, 0 benchmarks'),
+        ,@('protocol::ordinary: test', '2 test, 0 benchmarks'),
+        ,@('protocol::ordinary: test', '0 tests, 1 benchmarks'),
+        ,@('PROTOCOL::ordinary: TEST', '1 test, 0 benchmarks'),
+        ,@('PROTOCOL::ordinary: TEST', '1 tests, 0 benchmarks'),
         ,@('protocol::ordinary: test', '1 tests, 1 benchmarks')
     )) {
         $rejected = $false
@@ -3954,6 +4019,44 @@ function Test-D32Phase0MatrixRecordSelfTest {
         if (-not $rejected) { $malformedInventoryRejected = $false }
     }
     & $add 'inventory parser rejects duplicate, missing-summary, unknown, and count-mismatched rows' $malformedInventoryRejected
+    $caseSensitivePackageRejected = $false
+    try { $null = Get-D32TestInventoryListOutput -Lines @('protocol::ordinary: test', '1 test, 0 benchmarks') -Package 'Protocol' -ListingKind all }
+    catch { $caseSensitivePackageRejected = $true }
+    & $add 'inventory package names and libtest row/count grammar are ordinal case-sensitive' $caseSensitivePackageRejected
+    $rootOverlapRejectedBothDirections = $true
+    foreach ($rootPair in @(
+        [PSCustomObject]@{ Discovery = 'C:\evidence\phase0'; Phase0 = 'C:\evidence\phase0\discovery' },
+        [PSCustomObject]@{ Discovery = 'C:\evidence\phase0\discovery'; Phase0 = 'C:\evidence\phase0' },
+        [PSCustomObject]@{ Discovery = 'C:\evidence\same'; Phase0 = 'C:\evidence\same' }
+    )) {
+        $rejected = $false
+        try { $null = Assert-D32TestInventoryRootsDisjoint -DiscoveryRoot $rootPair.Discovery -Phase0OutputRoot $rootPair.Phase0 }
+        catch { $rejected = $_.Exception.Message -like 'TEST_INVENTORY_ROOT_BLOCKED:*' }
+        if (-not $rejected) { $rootOverlapRejectedBothDirections = $false }
+    }
+    & $add 'inventory discovery and Phase0 root binding rejects equal, discovery-ancestor, and discovery-descendant overlap' $rootOverlapRejectedBothDirections
+    $inventoryEnvironmentBase = [ordered]@{ CARGO_HOME = 'C:\inventory-selftest\r\c'; CARGO_NET_OFFLINE = 'true' }
+    $inventoryGrantProbe = [PSCustomObject]@{ Reference = 'exact-run-grant' }
+    $protocolProtocPolicy = Resolve-D32TestInventoryProtocPolicy -Package protocol -Environment $inventoryEnvironmentBase -RunGrant $null
+    $vitaProtocPolicy = Resolve-D32TestInventoryProtocPolicy -Package vita -Environment $inventoryEnvironmentBase -RunGrant $inventoryGrantProbe
+    $hostProtocPolicy = Resolve-D32TestInventoryProtocPolicy -Package host -Environment $inventoryEnvironmentBase -RunGrant $inventoryGrantProbe
+    $inventoryGrantScopeRejected = $false
+    try { $null = Resolve-D32TestInventoryProtocPolicy -Package protocol -Environment $inventoryEnvironmentBase -RunGrant $inventoryGrantProbe }
+    catch { $inventoryGrantScopeRejected = $_.Exception.Message -like 'TEST_INVENTORY_PROTOC_BLOCKED:*protocol*' }
+    $inventoryAmbientProtocRejected = $false
+    try { $null = Resolve-D32TestInventoryProtocPolicy -Package vita -Environment ([ordered]@{ PROTOC = 'C:\ambient\protoc.exe' }) -RunGrant $inventoryGrantProbe }
+    catch { $inventoryAmbientProtocRejected = $_.Exception.Message -like 'TEST_INVENTORY_PROTOC_BLOCKED:*PROTOC-free*' }
+    & $add 'discovery list policy remains PROTOC-free for protocol, Vita, and Host while granting only Vita/Host' `
+        (-not $protocolProtocPolicy.Environment.Contains('PROTOC') -and -not $vitaProtocPolicy.Environment.Contains('PROTOC') -and
+            -not $hostProtocPolicy.Environment.Contains('PROTOC') -and $null -eq $protocolProtocPolicy.RunGrant -and
+            [object]::ReferenceEquals($vitaProtocPolicy.RunGrant, $inventoryGrantProbe) -and
+            [object]::ReferenceEquals($hostProtocPolicy.RunGrant, $inventoryGrantProbe) -and
+            $inventoryGrantScopeRejected -and $inventoryAmbientProtocRejected)
+    $discoveryRunnerText = [IO.File]::ReadAllText((Join-Path $script:D32Phase0ScriptRoot 'd32-test-inventory-discovery.ps1'))
+    $discoveryRunnerScopeValid = $discoveryRunnerText.Contains('Resolve-D32TestInventoryProtocPolicy') -and
+        $discoveryRunnerText.Contains('-VendoredProtocRunGrant $protocPolicy.RunGrant') -and
+        $discoveryRunnerText -notmatch 'New-D32VendoredProtocEnvironment\s+-Environment\s+\$offlineEnvironment'
+    & $add 'discovery production loop resolves a per-package PROTOC-free environment/grant policy instead of pre-populating ambient PROTOC' $discoveryRunnerScopeValid
     $ignoredOutsideAllRejected = $false
     try { $null = Get-D32TestInventoryCategoryAssignments -Package protocol -AllRows $listFixture.rows -IgnoredRows @([ordered]@{ package = 'protocol'; kind = 'test'; full_name = 'protocol::not-listed' }) -DeferredNames @() -FocusedSuffixes @() }
     catch { $ignoredOutsideAllRejected = $true }

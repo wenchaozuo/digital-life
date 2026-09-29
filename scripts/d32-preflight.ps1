@@ -4009,7 +4009,8 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     $validatedDiscovery = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $discoveryReference `
         -ExpectedSha256 ([string]$discoveryReference.sha256) -Repository $Repository -CandidateSha $CandidateSha `
         -Profile $ValidatedProfile -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256 -LockInputs $lockInputs
-    $protocolProtocTraceRejected = $false
+    $protocolProtocTraceAcceptedWithGrant = $false
+    $protocolProtocTraceRejectedWithoutGrant = $false
     $protocolListExpected = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)[0]
     $protocolListCommand = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize(
         $validatedDiscovery.Document.inventory_commands[0].command))
@@ -4032,7 +4033,7 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         parent_creation_filetime = [Int64]$rootTraceProcess.creation_filetime; image_path = [string]$protocImage.Path
         bytes = [Int64]$protocImage.Bytes; sha256 = [string]$protocImage.Sha256
         volume_serial_hex = [string]$protocImage.VolumeSerialHex; file_id_hex = [string]$protocImage.FileIdHex
-        allowed_image_reason = 'vendored-protoc-run-grant'; image_verified = $true; exited = $true; exit_code = 0
+        allowed_image_reason = 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root'; image_verified = $true; exited = $true; exit_code = 0
         create_sequence = 2; exit_sequence = 3; created_at_utc = $childCreatedAt; exited_at_utc = $childCreatedAt
     }
     $protocolTrace.debug_event_count = 4
@@ -4051,9 +4052,17 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     try {
         $null = Test-D32Phase0InventoryProcessRecord -Command $protocolListCommand -Name $protocolListExpected.name -Executable $protocolListExpected.executable `
             -Arguments $protocolListExpected.arguments -TimeoutSeconds 28800 -RunnerProcessId ([int]$validatedDiscovery.Document.runner_process_id) `
+            -Profile $ValidatedProfile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $discoveryRoot `
+            -VendoredProtocGrant $validatedDiscovery.ProtocGrant
+        $protocolProtocTraceAcceptedWithGrant = $true
+    }
+    catch { $protocolProtocTraceAcceptedWithGrant = $false }
+    try {
+        $null = Test-D32Phase0InventoryProcessRecord -Command $protocolListCommand -Name $protocolListExpected.name -Executable $protocolListExpected.executable `
+            -Arguments $protocolListExpected.arguments -TimeoutSeconds 28800 -RunnerProcessId ([int]$validatedDiscovery.Document.runner_process_id) `
             -Profile $ValidatedProfile -Repository $Repository -CandidateSha $CandidateSha -EvidenceRoot $discoveryRoot -VendoredProtocGrant $null
     }
-    catch { $protocolProtocTraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
+    catch { $protocolProtocTraceRejectedWithoutGrant = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
     $baseline = New-D32TestInventoryBaselineDocument -Discovery $validatedDiscovery.Document -DiscoveryReference $validatedDiscovery.Reference `
         -PackageInventories $validatedDiscovery.PackageInventories -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
     $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)
@@ -4151,7 +4160,8 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
         DiscoveryReferenceMutationResults = @($discoveryReferenceMutationResults.ToArray())
         DiscoveryTimestampMutationResults = @($discoveryTimestampMutationResults.ToArray())
         NestedPhase0RootRejectedWithoutCreation = $nestedPhase0RootRejected
-        ProtocolProtocTraceRejectedWithoutGrant = $protocolProtocTraceRejected
+        ProtocolProtocTraceAcceptedWithGrant = $protocolProtocTraceAcceptedWithGrant
+        ProtocolProtocTraceRejectedWithoutGrant = $protocolProtocTraceRejectedWithoutGrant
         BaselineMutationResults = @($baselineMutationResults.ToArray())
         LateBaselineRejected = $lateBaselineRejected
     }
@@ -5754,8 +5764,8 @@ function Invoke-D32SelfTest {
             -Name 'discovery reader rejects rehashed invalid top-level interval, out-of-order fetch/list commands, and commands outside interval' -Failures $failures
         Assert-D32SelfTest -Condition $inventoryArtifacts.NestedPhase0RootRejectedWithoutCreation `
             -Name 'formal Phase0 EvidenceRoot nested beneath discovery is rejected before the root is created' -Failures $failures
-        Assert-D32SelfTest -Condition $inventoryArtifacts.ProtocolProtocTraceRejectedWithoutGrant `
-            -Name 'protocol inventory trace containing a valid pinned protoc CREATE is rejected when its package-scoped grant is null' -Failures $failures
+        Assert-D32SelfTest -Condition ($inventoryArtifacts.ProtocolProtocTraceAcceptedWithGrant -and $inventoryArtifacts.ProtocolProtocTraceRejectedWithoutGrant) `
+            -Name 'protocol inventory trace with the canonical pinned protoc identity passes only with its package-scoped grant and rejects without it' -Failures $failures
         $baselineMutationFailures = @($inventoryArtifacts.BaselineMutationResults | Where-Object { -not $_.Rejected })
         Assert-D32SelfTest -Condition ($inventoryArtifacts.BaselineMutationResults.Count -eq 15 -and $baselineMutationFailures.Count -eq 0) `
             -Name 'Coordinator baseline rejects prior/unknown/self-pinned, stale bindings, wrong budget, ordinary set drift, completion mismatch, and invalid generated timestamps' -Failures $failures
@@ -6560,9 +6570,29 @@ function Invoke-D32SelfTest {
         $consumerAttestationRaw = [IO.File]::ReadAllText($attestationPath, [Text.Encoding]::UTF8)
         $consumerBundleRaw = [IO.File]::ReadAllText($bundleManifest, [Text.Encoding]::UTF8)
         $consumerAggregateRaw = [IO.File]::ReadAllText($aggregateRecordPath, [Text.Encoding]::UTF8)
-        $downstreamAuthorityTamperCasesPassed = $true
+        $consumerControlReleaseFindings = New-D32FindingList
+        Test-D32ReleaseEvidenceBundle -Bundle ($consumerBundleRaw | ConvertFrom-D32Json) -BundleFilePath $bundleManifest `
+            -Attestation ($consumerAttestationRaw | ConvertFrom-D32Json) -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha `
+            -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
+            -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $consumerControlReleaseFindings
+        $consumerControlReleasePassed = @($consumerControlReleaseFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -eq 0
+        $consumerAggregateSnapshot = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $consumerControlAggregateFindings = New-D32FindingList
+        $consumerControlAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
+            -ExpectedRecordSha256 ([string]$consumerAggregateSnapshot.Hash) -Repository $fixture -ExpectedCandidateSha $head `
+            -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
+            -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
+            -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $consumerControlAggregateFindings
+        $consumerControlAggregatePassed = $consumerControlAggregateValidation.IsValid -and
+            @($consumerControlAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'PASS' }).Count -eq 1
+        Assert-D32SelfTest -Condition ($consumerControlReleasePassed -and $consumerControlAggregatePassed) `
+            -Name 'Release V8 and Aggregate V7 byte-mutation controls begin from independently valid clean consumer inputs' -Failures $failures
+        $downstreamAuthorityTamperCasesPassed = $consumerControlReleasePassed -and $consumerControlAggregatePassed
         try {
             foreach ($authorityField in @('baseline', 'discovery')) {
+                [IO.File]::WriteAllText($attestationPath, $consumerAttestationRaw, [Text.UTF8Encoding]::new($false))
+                [IO.File]::WriteAllText($bundleManifest, $consumerBundleRaw, [Text.UTF8Encoding]::new($false))
+                [IO.File]::WriteAllText($aggregateRecordPath, $consumerAggregateRaw, [Text.UTF8Encoding]::new($false))
                 $mutatedAttestation = ConvertFrom-D32Phase0Json -Json $consumerAttestationRaw
                 $mutatedAttestation.test_inventory_authority.$authorityField.sha256 = '0' * 64
                 Write-D32Json -Path $attestationPath -Value $mutatedAttestation
@@ -6578,6 +6608,10 @@ function Invoke-D32SelfTest {
                 $releaseRejected = @($releaseAuthorityFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' }).Count -gt 0
                 if (-not $releaseRejected) { $downstreamAuthorityTamperCasesPassed = $false }
 
+                # Restore the release inputs before exercising Aggregate, so its result can
+                # only be caused by the aggregate reference under test.
+                [IO.File]::WriteAllText($attestationPath, $consumerAttestationRaw, [Text.UTF8Encoding]::new($false))
+                [IO.File]::WriteAllText($bundleManifest, $consumerBundleRaw, [Text.UTF8Encoding]::new($false))
                 $mutatedAggregate = ConvertFrom-D32Phase0Json -Json $consumerAggregateRaw
                 $aggregateReferenceName = 'test_inventory_{0}' -f [string]$authorityField
                 $mutatedAggregate.references.$aggregateReferenceName.sha256 = '0' * 64
@@ -6599,34 +6633,94 @@ function Invoke-D32SelfTest {
             [IO.File]::WriteAllText($bundleManifest, $consumerBundleRaw, [Text.UTF8Encoding]::new($false))
             [IO.File]::WriteAllText($aggregateRecordPath, $consumerAggregateRaw, [Text.UTF8Encoding]::new($false))
         }
+        $downstreamAuthorityTamperCasesPassed = $downstreamAuthorityTamperCasesPassed -and
+            ([IO.File]::ReadAllText($attestationPath, [Text.Encoding]::UTF8) -ceq $consumerAttestationRaw) -and
+            ([IO.File]::ReadAllText($bundleManifest, [Text.Encoding]::UTF8) -ceq $consumerBundleRaw) -and
+            ([IO.File]::ReadAllText($aggregateRecordPath, [Text.Encoding]::UTF8) -ceq $consumerAggregateRaw)
         Assert-D32SelfTest -Condition $downstreamAuthorityTamperCasesPassed `
             -Name 'Release V8 and Aggregate V7 consumers reject changed baseline and discovery references after their enclosing records are rehashed' -Failures $failures
 
-        $protocolInventoryStdoutPath = [string]$inventoryArtifacts.Discovery.inventory_commands[0].command.stdout.path
-        $protocolInventoryStdoutBytes = [IO.File]::ReadAllBytes($protocolInventoryStdoutPath)
-        $downstreamRawInventoryLogCasesPassed = $true
-        try {
-            [IO.File]::AppendAllText($protocolInventoryStdoutPath, "tampered::unlisted_test: test`n", [Text.UTF8Encoding]::new($false))
-            $releaseRawLogFindings = New-D32FindingList
-            Test-D32ReleaseEvidenceBundle -Bundle ($consumerBundleRaw | ConvertFrom-D32Json) -BundleFilePath $bundleManifest `
-                -Attestation ($consumerAttestationRaw | ConvertFrom-D32Json) -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha `
-                -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
-                -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $releaseRawLogFindings
-            $releaseRawLogRejected = @($releaseRawLogFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' }).Count -gt 0
-
-            $aggregateRawLogFindings = New-D32FindingList
-            $aggregateRawLogValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
-                -ExpectedRecordSha256 ([string](Get-D32EvidenceFileDigest -Path $aggregateRecordPath).Hash) -Repository $fixture -ExpectedCandidateSha $head `
-                -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
-                -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
-                -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateRawLogFindings
-            $aggregateRawLogRejected = -not $aggregateRawLogValidation.IsValid -and
-                @($aggregateRawLogFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -gt 0
-            $downstreamRawInventoryLogCasesPassed = $releaseRawLogRejected -and $aggregateRawLogRejected
+        $phase0ProtocolListCommands = @($phase0Document.commands | Where-Object { [string]$_.name -ceq 'protocol-test-list' })
+        if ($phase0ProtocolListCommands.Count -ne 1 -or [String]::IsNullOrWhiteSpace([string]$phase0ProtocolListCommands[0].stdout.path)) {
+            throw 'self-test expected exactly one formal Phase0 protocol-test-list stdout artifact'
         }
-        finally { [IO.File]::WriteAllBytes($protocolInventoryStdoutPath, $protocolInventoryStdoutBytes) }
-        Assert-D32SelfTest -Condition $downstreamRawInventoryLogCasesPassed `
-            -Name 'Release V8 and Aggregate V7 consumers revalidate formal raw test-list stdout bytes instead of trusting sealed inventory references' -Failures $failures
+        $downstreamReferencedBytesCases = @(
+            [PSCustomObject]@{
+                Name = 'discovery protocol-test-list stdout'
+                Path = [string]$inventoryArtifacts.Discovery.inventory_commands[0].command.stdout.path
+                Marker = "tampered::discovery-unlisted-test: test`n"
+            },
+            [PSCustomObject]@{
+                Name = 'formal Phase0 protocol-test-list stdout'
+                Path = [string]$phase0ProtocolListCommands[0].stdout.path
+                Marker = "tampered::phase0-unlisted-test: test`n"
+            },
+            [PSCustomObject]@{
+                Name = 'referenced test-inventory baseline JSON'
+                Path = [string]$inventoryArtifacts.BaselineReference.path
+                Marker = "tampered-baseline-reference`n"
+            },
+            [PSCustomObject]@{
+                Name = 'referenced test-inventory discovery JSON'
+                Path = [string]$inventoryArtifacts.DiscoveryReference.path
+                Marker = "tampered-discovery-reference`n"
+            }
+        )
+        foreach ($referencedBytesCase in $downstreamReferencedBytesCases) {
+            if ([String]::IsNullOrWhiteSpace([string]$referencedBytesCase.Path) -or -not (Test-Path -LiteralPath $referencedBytesCase.Path -PathType Leaf)) {
+                throw "self-test referenced-byte case is missing its source artifact: $($referencedBytesCase.Name)"
+            }
+        }
+        $referencedBytesControlReleaseFindings = New-D32FindingList
+        Test-D32ReleaseEvidenceBundle -Bundle ($consumerBundleRaw | ConvertFrom-D32Json) -BundleFilePath $bundleManifest `
+            -Attestation ($consumerAttestationRaw | ConvertFrom-D32Json) -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha `
+            -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
+            -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $referencedBytesControlReleaseFindings
+        $referencedBytesControlReleasePassed = @($referencedBytesControlReleaseFindings | Where-Object { $_.Severity -eq 'ERROR' }).Count -eq 0
+        $referencedBytesControlAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $referencedBytesControlAggregateFindings = New-D32FindingList
+        $referencedBytesControlAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
+            -ExpectedRecordSha256 ([string]$referencedBytesControlAggregateDigest.Hash) -Repository $fixture -ExpectedCandidateSha $head `
+            -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
+            -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
+            -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $referencedBytesControlAggregateFindings
+        $referencedBytesControlAggregatePassed = $referencedBytesControlAggregateValidation.IsValid -and
+            @($referencedBytesControlAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'PASS' }).Count -eq 1
+        Assert-D32SelfTest -Condition ($referencedBytesControlReleasePassed -and $referencedBytesControlAggregatePassed) `
+            -Name 'Release V8 and Aggregate V7 referenced-byte mutations have clean independently valid positive controls' -Failures $failures
+
+        $downstreamReferencedBytesCasesPassed = $referencedBytesControlReleasePassed -and $referencedBytesControlAggregatePassed
+        foreach ($referencedBytesCase in $downstreamReferencedBytesCases) {
+            $originalReferencedBytes = [IO.File]::ReadAllBytes([string]$referencedBytesCase.Path)
+            try {
+                [IO.File]::AppendAllText([string]$referencedBytesCase.Path, [string]$referencedBytesCase.Marker, [Text.UTF8Encoding]::new($false))
+                $releaseReferencedBytesFindings = New-D32FindingList
+                Test-D32ReleaseEvidenceBundle -Bundle ($consumerBundleRaw | ConvertFrom-D32Json) -BundleFilePath $bundleManifest `
+                    -Attestation ($consumerAttestationRaw | ConvertFrom-D32Json) -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha `
+                    -Head $head -Repository $fixture -ExpectedPhase0RecordPath $phase0Snapshot.Path -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 `
+                    -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $releaseReferencedBytesFindings
+                $releaseReferencedBytesRejected = @($releaseReferencedBytesFindings | Where-Object { $_.Check -eq 'attestation.phase0-toolchain' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+
+                $aggregateReferencedBytesFindings = New-D32FindingList
+                $aggregateReferencedBytesValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath `
+                    -ExpectedRecordSha256 ([string]$referencedBytesControlAggregateDigest.Hash) -Repository $fixture -ExpectedCandidateSha $head `
+                    -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath `
+                    -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance `
+                    -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateReferencedBytesFindings
+                $aggregateReferencedBytesRejected = -not $aggregateReferencedBytesValidation.IsValid -and
+                    @($aggregateReferencedBytesFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -gt 0
+                if (-not ($releaseReferencedBytesRejected -and $aggregateReferencedBytesRejected)) {
+                    $downstreamReferencedBytesCasesPassed = $false
+                }
+            }
+            finally { [IO.File]::WriteAllBytes([string]$referencedBytesCase.Path, $originalReferencedBytes) }
+            $restoredReferencedBytes = [IO.File]::ReadAllBytes([string]$referencedBytesCase.Path)
+            if ([Convert]::ToBase64String($restoredReferencedBytes) -cne [Convert]::ToBase64String($originalReferencedBytes)) {
+                $downstreamReferencedBytesCasesPassed = $false
+            }
+        }
+        Assert-D32SelfTest -Condition $downstreamReferencedBytesCasesPassed `
+            -Name 'Release V8 and Aggregate V7 independently reopen and reject tampered discovery stdout, formal Phase0 list stdout, baseline, and discovery bytes with pinned references unchanged' -Failures $failures
 
         $wrongPhase0PinFindings = New-D32FindingList
         Test-D32ReleaseEvidenceBundle -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleFilePath $bundleManifest -Attestation $validAttestationObject -AttestationFilePath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture -ExpectedPhase0RecordPath (Join-Path $phase0Root 'unrelated-phase0.json') -ExpectedPhase0RecordSha256 $phase0Snapshot.Sha256 -ExpectedToolchainProfilePath $profileSnapshot.Path -ExpectedToolchainProfileSha256 $profileSnapshot.Sha256 -Findings $wrongPhase0PinFindings

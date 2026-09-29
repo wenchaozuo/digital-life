@@ -2584,6 +2584,45 @@ function Get-D32ExternalEvidenceReferenceSnapshot {
     return $snapshot
 }
 
+function Assert-D32Phase0FixtureManifestCorrelation {
+    param(
+        [Parameter(Mandatory = $true)][object]$Phase0Document,
+        [Parameter(Mandatory = $true)][string]$FixtureManifestPath,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot,
+        [AllowNull()][object]$AggregateReference
+    )
+
+    if (-not (Test-D32Phase0ExactProperties -Object $Phase0Document.fixture -Expected @('manifest', 'build_provenance', 'transcript', 'schema_version', 'process_tree_check', 'fixture_names', 'fixture_records', 'log_references', 'per_phase_git_states'))) {
+        throw 'Phase0 fixture reference shape is invalid while binding the external fixture manifest'
+    }
+    $phase0Reference = $Phase0Document.fixture.manifest
+    if (-not (Test-D32Phase0ExactProperties -Object $phase0Reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) {
+        throw 'Phase0 fixture manifest reference has missing or extra fields'
+    }
+    if (-not (Test-D32ProfileCanonicalPathString -Path $FixtureManifestPath) -or -not (Test-D32ProfileNoReparsePath -Path $FixtureManifestPath) -or
+        -not (Test-D32ProfilePathEqual -Left $FixtureManifestPath -Right ([string]$phase0Reference.path))) {
+        throw 'supplied fixture manifest path is not the exact Phase0-recorded manifest path'
+    }
+    $null = Test-D32Phase0FileReference -Reference $phase0Reference -AllowedRoot $EvidenceRoot
+
+    if ($null -ne $AggregateReference) {
+        if (-not (Test-D32Phase0ExactProperties -Object $AggregateReference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) {
+            throw 'aggregate fixture manifest reference has missing or extra fields'
+        }
+        if ([Int64]$AggregateReference.bytes -ne [Int64]$phase0Reference.bytes) {
+            throw 'aggregate fixture manifest bytes differ from the Phase0-recorded opened-file identity'
+        }
+        foreach ($field in @('sha256', 'volume_serial_hex', 'file_id_hex')) {
+            if ([string]$AggregateReference.$field -cne [string]$phase0Reference.$field) {
+                throw "aggregate fixture manifest $field differs from the Phase0-recorded opened-file identity"
+            }
+        }
+        if (-not (Test-D32ProfilePathEqual -Left ([string]$AggregateReference.path) -Right ([string]$phase0Reference.path))) {
+            throw 'aggregate fixture manifest path differs from the Phase0-recorded manifest path'
+        }
+    }
+}
+
 function Test-D32PreflightPhase0VendoredProtocBinding {
     param(
         [Parameter(Mandatory = $true)][object]$Phase0Document,
@@ -3338,7 +3377,7 @@ function Test-D32PostBundleAggregateReadiness {
         'git.trusted-image', 'git.head', 'git.clean', 'git.expected-sha', 'phase0.record',
         'governance.index', 'governance.model-routing', 'provenance.candidate_sha', 'provenance.source_repo', 'provenance.image_path',
         'provenance.image_sha256', 'provenance.git_status', 'provenance.build_profile', 'provenance.build_command',
-        'fixture-manifest.candidate_sha', 'fixture-manifest.source_repo', 'fixture-manifest.policy', 'fixture-manifest.cleanup',
+        'fixture-manifest.candidate_sha', 'fixture-manifest.source_repo', 'fixture-manifest.policy', 'fixture-manifest.cleanup', 'fixture-manifest.phase0-binding',
         'bundle.candidate_sha', 'bundle.source_clone', 'bundle.path', 'bundle.attestation-hash', 'bundle.runtime_resources',
         'bundle.tauri-resources', 'bundle.total_bytes', 'attestation.phase0-toolchain', 'd32.modes'
     )
@@ -3449,6 +3488,8 @@ function Test-D32PostBundleAggregateRecord {
             $phase0Document.final_candidate_sha -isnot [string] -or $phase0Document.final_candidate_sha -cne $ExpectedCandidateSha -or
             $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or
             $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'aggregate-referenced Phase0 matrix is not the supported exact V6 local PASS schema' }
+        Assert-D32Phase0FixtureManifestCorrelation -Phase0Document $phase0Document -FixtureManifestPath $FixtureManifestPath `
+            -EvidenceRoot $phase0OutputRoot -AggregateReference $references.fixture_manifest
         Assert-D32Phase0FixtureBuildBudgetRecord -Document $phase0Document.fixture_build_budget -ExpectedPhase0TimeoutSeconds 14400
         $phase0ProfileRepository = Get-D32RustRepositoryPath -Path $repo
         $phase0Profile = Test-D32BuildToolchainProfile -ProfilePath ([string]$references.toolchain_profile.path) -ExpectedSha256 ([string]$references.toolchain_profile.sha256) -Repository $phase0ProfileRepository -EvidenceRoot $phase0OutputRoot
@@ -3707,6 +3748,7 @@ function Invoke-D32Validation {
     $phase0PinValues = @($Phase0RecordPath, $Phase0RecordSha256, $ToolchainProfilePath, $ExpectedToolchainProfileSha256)
     $hasAnyPhase0Pin = @($phase0PinValues | Where-Object { -not [String]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0
     $hasAllPhase0Pins = @($phase0PinValues | Where-Object { [String]::IsNullOrWhiteSpace([string]$_) }).Count -eq 0
+    $phase0Validation = $null
     if ($hasAnyPhase0Pin -and -not $hasAllPhase0Pins) {
         Add-D32Finding -Findings $findings -Severity ERROR -Check 'phase0.record' -Message 'Phase0 record/profile path and independently expected hashes must be supplied as a complete set'
     }
@@ -3788,7 +3830,22 @@ function Invoke-D32Validation {
     else {
         $fixtureManifestObject = Read-D32Json -Path $FixtureManifest -Findings $findings -Check 'fixture-manifest.json'
     }
-    Test-D32FixtureManifest -FixtureManifest $fixtureManifestObject -FixtureManifestPath $FixtureManifest -Head $head -Repository $Repository -Findings $findings
+    if ($hasAnyPhase0Pin) {
+        if ($null -eq $phase0Validation -or -not $phase0Validation.IsValid) {
+            Add-D32Finding -Findings $findings -Severity ERROR -Check 'fixture-manifest.phase0-binding' -Message 'Phase0-bound fixture-manifest validation requires a fully validated caller-pinned Phase0 record'
+        }
+        else {
+            try {
+                Assert-D32Phase0FixtureManifestCorrelation -Phase0Document $phase0Validation.Record -FixtureManifestPath $FixtureManifest `
+                    -EvidenceRoot $phase0Validation.OutputRoot -AggregateReference $null
+                Add-D32Finding -Findings $findings -Severity PASS -Check 'fixture-manifest.phase0-binding' -Message 'fixture manifest path and current opened-file identity exactly match the validated Phase0 record'
+            }
+            catch {
+                Add-D32Finding -Findings $findings -Severity ERROR -Check 'fixture-manifest.phase0-binding' -Message $_.Exception.Message
+            }
+        }
+    }
+    Test-D32FixtureManifest -FixtureManifest $fixtureManifestObject -FixtureManifestPath $FixtureManifest -Head $head -Repository $Repository -Findings $findings -RequirePhase0BuildPolicy:$hasAnyPhase0Pin
 
     $bundleObject = $null
     $bundleLoaded = $null
@@ -5191,7 +5248,7 @@ function Invoke-D32SelfTest {
         $aggregateReferences = [ordered]@{
             phase0_matrix = New-D32PostBundleAggregateFileReference -Path $phase0RecordPath -Repository $fixture
             toolchain_profile = New-D32PostBundleAggregateFileReference -Path $profilePath -Repository $fixture
-            fixture_manifest = New-D32PostBundleAggregateFileReference -Path $fixtureManifest -Repository $fixture
+            fixture_manifest = New-D32PostBundleAggregateFileReference -Path $phase0FixtureManifestPath -Repository $fixture
             provenance_manifest = New-D32PostBundleAggregateFileReference -Path $provenance -Repository $fixture
             bundle_manifest = New-D32PostBundleAggregateFileReference -Path $bundleManifest -Repository $fixture
             attestation = New-D32PostBundleAggregateFileReference -Path $attestationPath -Repository $fixture
@@ -5212,11 +5269,54 @@ function Invoke-D32SelfTest {
         Write-D32JsonCreateNew -Path $aggregateRecordPath -Value $aggregateRecordDocument
         $aggregateRecordDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
         $aggregateRecordFindings = New-D32FindingList
-        $aggregateRecordValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateRecordDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateRecordFindings
+        $aggregateRecordValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateRecordDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $aggregateRecordFindings
         if (-not $aggregateRecordValidation.IsValid) {
             foreach ($finding in $aggregateRecordFindings) { Write-Host ("  AGGREGATE RECORD SELFTEST [{0}] {1}: {2}" -f $finding.Severity, $finding.Check, $finding.Message) }
         }
         Assert-D32SelfTest -Condition ($aggregateRecordValidation.IsValid -and @($aggregateRecordFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'PASS' }).Count -eq 1) -Name 'exact-SHA aggregate record schema binds current sources and explicitly defers downstream gates' -Failures $failures
+
+        $standaloneAggregateManifestPath = Join-Path $root 'standalone-fixture-manifest.json'
+        $standaloneAggregateManifest = [IO.File]::ReadAllText($fixtureManifest, [Text.Encoding]::UTF8) | ConvertFrom-D32Json
+        $standaloneAggregateManifest.build_policy.timeout_seconds = 600
+        $standaloneAggregateManifest.build_policy.cargo_build_jobs = 1
+        Write-D32Json -Path $standaloneAggregateManifestPath -Value $standaloneAggregateManifest
+        $strictStandaloneFindings = New-D32FindingList
+        Test-D32FixtureManifest -FixtureManifest $standaloneAggregateManifest -FixtureManifestPath $standaloneAggregateManifestPath -Head $head -Repository $fixture -Findings $strictStandaloneFindings -RequirePhase0BuildPolicy
+        Assert-D32SelfTest -Condition (@($strictStandaloneFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) `
+            -Name 'standalone jobs=1/600-second fixture manifest is not Phase0 evidence' -Failures $failures
+
+        $standaloneAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $standaloneAggregateRecord.references.fixture_manifest = New-D32PostBundleAggregateFileReference -Path $standaloneAggregateManifestPath -Repository $fixture
+        Write-D32Json -Path $aggregateRecordPath -Value $standaloneAggregateRecord
+        $standaloneAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $standaloneAggregateFindings = New-D32FindingList
+        $standaloneAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $standaloneAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $standaloneAggregateManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $standaloneAggregateFindings
+        Assert-D32SelfTest -Condition (-not $standaloneAggregateValidation.IsValid -and @($standaloneAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*exact Phase0-recorded manifest path*' }).Count -eq 1) `
+            -Name 'aggregate reader refuses an otherwise valid PRE_DOWNSTREAM record carrying standalone fixture evidence' -Failures $failures
+
+        $copiedPhase0ManifestPath = Join-Path $root 'copied-phase0-fixture-manifest.json'
+        [IO.File]::Copy($phase0FixtureManifestPath, $copiedPhase0ManifestPath)
+        $copiedManifestAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $copiedManifestAggregateRecord.references.fixture_manifest = New-D32PostBundleAggregateFileReference -Path $copiedPhase0ManifestPath -Repository $fixture
+        Write-D32Json -Path $aggregateRecordPath -Value $copiedManifestAggregateRecord
+        $copiedManifestAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+        $copiedManifestAggregateFindings = New-D32FindingList
+        $copiedManifestAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $copiedManifestAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $copiedPhase0ManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $copiedManifestAggregateFindings
+        Assert-D32SelfTest -Condition (-not $copiedManifestAggregateValidation.IsValid -and @($copiedManifestAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*exact Phase0-recorded manifest path*' }).Count -eq 1) `
+            -Name 'aggregate reader rejects a byte-identical manifest copy with a different opened path and file identity' -Failures $failures
+
+        foreach ($manifestIdentityField in @('sha256', 'file_id_hex')) {
+            $staleManifestAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+            $staleManifestAggregateRecord.references.fixture_manifest.$manifestIdentityField = '0' * $(if ($manifestIdentityField -ceq 'sha256') { 64 } else { 32 })
+            Write-D32Json -Path $aggregateRecordPath -Value $staleManifestAggregateRecord
+            $staleManifestAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
+            $staleManifestAggregateFindings = New-D32FindingList
+            $staleManifestAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $staleManifestAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $staleManifestAggregateFindings
+            Assert-D32SelfTest -Condition (-not $staleManifestAggregateValidation.IsValid -and @($staleManifestAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*current bytes/opened-handle identity differ from the aggregate reference*' }).Count -eq 1) `
+                -Name "aggregate reader rejects a stale fixture-manifest $manifestIdentityField even when its path is exact" -Failures $failures
+        }
+
+        Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
         $phase0RawForAggregateSchemaTests = [IO.File]::ReadAllText($phase0RecordPath, [Text.Encoding]::UTF8)
         $aggregateRawForPhase0SchemaTests = [IO.File]::ReadAllText($aggregateRecordPath, [Text.Encoding]::UTF8)
         try {
@@ -5237,7 +5337,7 @@ function Invoke-D32SelfTest {
                 Write-D32Json -Path $aggregateRecordPath -Value $aggregateVariant
                 $aggregateVariantDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
                 $phase0SchemaFindings = New-D32FindingList
-                $phase0SchemaValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateVariantDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $phase0SchemaFindings
+                $phase0SchemaValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateVariantDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $phase0SchemaFindings
                 Assert-D32SelfTest -Condition (-not $phase0SchemaValidation.IsValid -and @($phase0SchemaFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*not the supported exact V6 local PASS schema*' }).Count -eq 1) -Name "aggregate reader rejects $($phase0SchemaCase.Name) Phase0 after a fresh complete reference pin" -Failures $failures
             }
         }
@@ -5251,7 +5351,7 @@ function Invoke-D32SelfTest {
         Write-D32Json -Path $aggregateRecordPath -Value $legacyAggregateRecord
         $legacyAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
         $legacyAggregateFindings = New-D32FindingList
-        $legacyAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $legacyAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $legacyAggregateFindings
+        $legacyAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $legacyAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $legacyAggregateFindings
         Assert-D32SelfTest -Condition (-not $legacyAggregateValidation.IsValid -and @($legacyAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects prior V5 after fixture budget migration' -Failures $failures
         $unknownAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
         $unknownAggregateRecord.schema_version = 99
@@ -5259,7 +5359,7 @@ function Invoke-D32SelfTest {
         Write-D32Json -Path $aggregateRecordPath -Value $unknownAggregateRecord
         $unknownAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
         $unknownAggregateFindings = New-D32FindingList
-        $unknownAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $unknownAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $unknownAggregateFindings
+        $unknownAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $unknownAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $unknownAggregateFindings
         Assert-D32SelfTest -Condition (-not $unknownAggregateValidation.IsValid -and @($unknownAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects an unknown future version with a fresh exact-SHA pin' -Failures $failures
         Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
         $invalidAggregateRecord = [System.IO.File]::ReadAllText($aggregateRecordPath) | ConvertFrom-D32Json
@@ -5267,7 +5367,7 @@ function Invoke-D32SelfTest {
         Write-D32Json -Path $aggregateRecordPath -Value $invalidAggregateRecord
         $invalidAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
         $invalidAggregateFindings = New-D32FindingList
-        $invalidAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $invalidAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $invalidAggregateFindings
+        $invalidAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $invalidAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $invalidAggregateFindings
         Assert-D32SelfTest -Condition (-not $invalidAggregateValidation.IsValid -and @($invalidAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects an artifact-only status even with a fresh exact-SHA pin' -Failures $failures
         foreach ($invalidAggregateState in @(
                 [PSCustomObject]@{ Field = 'bundle_hashes'; Value = 'PENDING'; Name = 'pending bundle hashes' },
@@ -5279,7 +5379,7 @@ function Invoke-D32SelfTest {
             Write-D32Json -Path $aggregateRecordPath -Value $invalidAggregateStateDocument
             $invalidAggregateStateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
             $invalidAggregateStateFindings = New-D32FindingList
-            $invalidAggregateStateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $invalidAggregateStateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $invalidAggregateStateFindings
+            $invalidAggregateStateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $invalidAggregateStateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $invalidAggregateStateFindings
             Assert-D32SelfTest -Condition (-not $invalidAggregateStateValidation.IsValid -and @($invalidAggregateStateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name "aggregate record rejects $($invalidAggregateState.Name) even with a fresh exact-SHA pin" -Failures $failures
         }
         Assert-D32SelfTest -Condition (Test-D32JsonDuplicateKeys -Json '{"schema_version":1,"schema_version":1}') -Name 'duplicate JSON object keys are rejected before schema parsing' -Failures $failures
@@ -5302,7 +5402,7 @@ function Invoke-D32SelfTest {
             Write-D32Json -Path $aggregateRecordPath -Value $aggregateRecordDocument
             $aggregateRecordDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
             $blockedAggregateFindings = New-D32FindingList
-            $blockedAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateRecordDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $fixtureManifest -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $blockedAggregateFindings
+            $blockedAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $aggregateRecordDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $blockedAggregateFindings
             Assert-D32SelfTest -Condition (-not $blockedAggregateValidation.IsValid -and @($blockedAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' -and $_.Message -like '*blocked-diagnostic sidecar exists*' }).Count -eq 1) -Name 'aggregate reader refuses a forged PASS blocked-diagnostic sidecar' -Failures $failures
         }
         finally { if (Test-Path -LiteralPath $blockedDiagnosticPath) { [IO.File]::Delete($blockedDiagnosticPath) } }

@@ -6575,10 +6575,36 @@ function Invoke-D32SelfTest {
             if (-not $modeBlocked) { throw "SELFTEST_FAILED: $($blockedMode.Mode) mode was not stopped before using Phase0-only authority" }
         }
         $runtimeSource = [IO.File]::ReadAllText((Join-Path $script:ScriptRoot 'd32-fixture-prebuild.ps1'))
-        $modeGateOffset = $runtimeSource.IndexOf('Assert-D32FixtureBuildModeAuthority -Mode $fixtureBuildMode', [StringComparison]::Ordinal)
-        $outputRootOffset = $runtimeSource.IndexOf('$OutputRoot = Ensure-D32OwnedDirectory $OutputRoot', [StringComparison]::Ordinal)
-        $fixtureFetchOffset = $runtimeSource.IndexOf('$fixtureFetches = Invoke-D32FixturePreCargoBoundary', [StringComparison]::Ordinal)
-        if ($modeGateOffset -lt 0 -or $outputRootOffset -lt 0 -or $fixtureFetchOffset -lt 0 -or $modeGateOffset -ge $outputRootOffset -or $modeGateOffset -ge $fixtureFetchOffset) {
+        $runtimeTokens = $null
+        $runtimeParseErrors = $null
+        $runtimeAst = [System.Management.Automation.Language.Parser]::ParseInput($runtimeSource, [ref]$runtimeTokens, [ref]$runtimeParseErrors)
+        if ($runtimeParseErrors.Count -gt 0) { throw 'SELFTEST_FAILED: fixture runner source did not parse for the production mode-order check' }
+        $allRuntimeCommands = @($runtimeAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+        $productionRuntimeCommands = @($allRuntimeCommands | Where-Object {
+                $cursor = $_.Parent
+                $insideFunction = $false
+                while ($null -ne $cursor) {
+                    if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $insideFunction = $true; break }
+                    $cursor = $cursor.Parent
+                }
+                -not $insideFunction
+            })
+        $productionModeCalls = @($productionRuntimeCommands | Where-Object {
+                $_.GetCommandName() -ceq 'Assert-D32FixtureBuildModeAuthority' -and
+                $_.CommandElements.Count -eq 3 -and $_.CommandElements[1].Extent.Text -ceq '-Mode' -and $_.CommandElements[2].Extent.Text -ceq '$fixtureBuildMode'
+            })
+        $outputRootClaims = @($productionRuntimeCommands | Where-Object {
+                $_.GetCommandName() -ceq 'Ensure-D32OwnedDirectory' -and @($_.CommandElements | Where-Object { $_.Extent.Text -ceq '$OutputRoot' }).Count -eq 1
+            })
+        $ownedDirectoryClaims = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Ensure-D32OwnedDirectory' })
+        $phase0StorageClaims = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Initialize-D32FixturePhase0Storage' })
+        $fixtureFetchBoundaries = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Invoke-D32FixturePreCargoBoundary' })
+        if ($productionModeCalls.Count -ne 1 -or $outputRootClaims.Count -ne 1 -or $ownedDirectoryClaims.Count -eq 0 -or
+            $phase0StorageClaims.Count -ne 1 -or $fixtureFetchBoundaries.Count -ne 1 -or
+            @($ownedDirectoryClaims | Where-Object { $_.Extent.StartOffset -le $productionModeCalls[0].Extent.StartOffset }).Count -gt 0 -or
+            $productionModeCalls[0].Extent.StartOffset -ge $outputRootClaims[0].Extent.StartOffset -or
+            $productionModeCalls[0].Extent.StartOffset -ge $phase0StorageClaims[0].Extent.StartOffset -or
+            $productionModeCalls[0].Extent.StartOffset -ge $fixtureFetchBoundaries[0].Extent.StartOffset) {
             throw 'SELFTEST_FAILED: non-Phase0 fixture modes must stop before output-root creation and any Cargo fetch/build boundary'
         }
         $passed++

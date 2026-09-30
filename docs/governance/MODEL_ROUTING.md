@@ -2,12 +2,14 @@
 
 ## 当前映射
 
-| Role | Model signal | Current family | Purpose |
+| Role | Current model signal | Model family | Purpose |
 |---|---|---|---|
-| Coordinator | Sol Medium | GPT-6 | 日常总控、调度、汇总、路由 |
-| Architect | Sol Max | GPT-6 | 架构、invariant、阶段闭合、下一阶段 |
-| Worker | Luna Max | GPT-6 | 实际工程调查、实现、repair、测试/证据 |
-| Independent Gate | Luna High | GPT-6 | whole-candidate 独立门禁 |
+| Coordinator | GPT-6.1 Sol Medium | GPT-6.1 Sol | 日常总控、调度、汇总、路由 |
+| Architect | GPT-6.1 Sol Max | GPT-6.1 Sol | 架构、invariant、阶段闭合、下一阶段 |
+| Worker | GPT-6 Luna Max | GPT-6 Luna | 实际工程调查、实现、repair、测试/证据 |
+| Independent Gate | GPT-6 Luna High | GPT-6 Luna | whole-candidate 独立门禁 |
+
+本表只记录当前模型映射，不改变角色职责或开发流程，也不追溯改写既有 ADR、decision authority、阶段报告或 exact-SHA 证据。角色定义优先于模型名称；模型信号变化不改变职责边界。
 
 ## Coordinator — Sol Medium
 

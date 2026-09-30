@@ -1,7 +1,7 @@
 # WORKER TASK PACKET
 
-Prepared by: Sol Medium Coordinator
-Worker: Luna Max / GPT-6
+Prepared by: GPT-6.1 Sol Medium Coordinator
+Worker: GPT-6 Luna Max
 
 ## Role
 Scout / Implementer / Repair / Tester / Evidence / Red-Team / Integration-Build-Owner

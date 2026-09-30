@@ -23,6 +23,11 @@ param(
     [ValidateRange(1, 28800)][int]$Phase0FixtureBuildTimeoutSeconds = 28800
 )
 
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $Phase0ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $Phase0ExpectedToolchainProfileSha256 `
+    -LocalSelfTestOnly:$Phase0SelfTest
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'PHASE0_LOCATION_BLOCKED: the Phase0 runner must be loaded from its exact script file' }
@@ -5932,7 +5937,8 @@ function Get-D32Phase0PreflightDependencyFailures {
     $expectedPath = [IO.Path]::GetFullPath($PreflightLibraryPath)
     $failures = [System.Collections.Generic.List[string]]::new()
     foreach ($name in $script:D32Phase0PreflightDependencyFunctionNames) {
-        $command = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue | Select-Object -First 1
+        $commands = @(Microsoft.PowerShell.Core\Get-Command -Name $name -CommandType Function -ListImported -ErrorAction SilentlyContinue)
+        $command = if ($commands.Count -gt 0) { $commands[0] } else { $null }
         if ($null -eq $command) {
             $failures.Add("missing:$name")
             continue

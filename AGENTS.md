@@ -7,16 +7,18 @@
 
 ## 1. 当前模型映射
 
-本项目当前模型信号由用户配置为 GPT-6 系列：
+本项目当前模型信号由用户配置为以下映射：
 
-- **Coordinator:** Sol Medium / GPT-6
-- **Architect:** Sol Max / GPT-6
-- **Codex Worker:** Luna Max / GPT-6
-- **Independent Gate:** Luna High / GPT-6
+- **Coordinator:** GPT-6.1 Sol Medium
+- **Architect:** GPT-6.1 Sol Max
+- **Codex Worker:** GPT-6 Luna Max
+- **Independent Gate:** GPT-6 Luna High
 
 核心原则：
 
 > **Sol Medium 协调；Luna Max 执行；Sol Max 定架构与阶段；Luna High 独立门禁。**
+
+本映射只记录当前模型信号，不改变既有角色职责或开发流程，也不追溯改写历史 ADR、decision authority、阶段报告或 exact-SHA evidence。
 
 角色定义优先于未来具体模型名；模型名称变化时保持职责不变，除非用户明确更新治理规则。
 

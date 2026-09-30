@@ -73,6 +73,11 @@ param(
     [string[]]$RequestedModes
 )
 
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+    -LocalSelfTestOnly:$SelfTest
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:D32PreflightGitCaptureModule = $null

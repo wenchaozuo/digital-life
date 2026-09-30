@@ -11,6 +11,10 @@ param(
     [Parameter(Mandatory = $true)][string]$BaselineOutputPath
 )
 
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: exact baseline builder script location is required' }

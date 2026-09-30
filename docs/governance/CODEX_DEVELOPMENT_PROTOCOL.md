@@ -9,12 +9,14 @@
 
 让多 Agent 真正并行进行调查和代码产出，同时避免大型 Rust/Tauri 项目因多 worktree 重复编译造成磁盘与时间浪费。
 
-当前模型职责：
+当前模型映射（仅表示本次用户配置）：
 
-- Sol Medium / GPT-6：Coordinator
-- Luna Max / GPT-6：Worker
-- Sol Max / GPT-6：Architect
-- Luna High / GPT-6：Independent Gate
+- GPT-6.1 Sol Medium：Coordinator
+- GPT-6 Luna Max：Worker
+- GPT-6.1 Sol Max：Architect
+- GPT-6 Luna High：Independent Gate
+
+本映射不改变角色职责或开发流程，也不追溯改写既有 ADR、decision authority、阶段报告或 exact-SHA evidence。角色定义优先于模型名称；未来模型名称变化不改变本协议职责边界。
 
 核心执行方式：
 

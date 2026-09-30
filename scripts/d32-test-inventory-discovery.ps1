@@ -16,6 +16,10 @@ param(
     [Parameter(DontShow = $true)][switch]$LoaderSelfTest
 )
 
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 -LocalSelfTestOnly:$LoaderSelfTest
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact runner script location is required' }
@@ -41,7 +45,8 @@ function Test-D32InventoryRunnerLoaderDependencyClosure {
         (Join-Path $scriptRoot 'd32-h7c-git-child-authority.ps1'),
         (Join-Path $scriptRoot 'd32-test-inventory-authority.ps1'),
         (Join-Path $scriptRoot 'd32-preflight.ps1'),
-        (Join-Path $scriptRoot 'd32-fixture-prebuild.ps1')
+        (Join-Path $scriptRoot 'd32-fixture-prebuild.ps1'),
+        (Join-Path $scriptRoot 'd32-powershell-module-authority.ps1')
     )
     $expectedSourcePaths = @($expectedSourcePaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
     $expectedSourceSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -81,7 +86,7 @@ function Test-D32InventoryRunnerLoaderDependencyClosure {
     while ($pending.Count -gt 0) {
         $commandName = $pending.Dequeue()
         if (-not $visitedCommands.Add($commandName)) { continue }
-        $command = Get-Command -Name $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
+        $command = Microsoft.PowerShell.Core\Get-Command -Name $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             if ($staticFunctions.ContainsKey($commandName)) {
                 $definition = $staticFunctions[$commandName]
@@ -126,7 +131,22 @@ function Test-D32InventoryRunnerLoaderDependencyClosure {
         if ($command.CommandType -eq [System.Management.Automation.CommandTypes]::Cmdlet) {
             $moduleName = [string]$command.ModuleName
             if (-not [String]::IsNullOrWhiteSpace($moduleName)) {
-                if ($moduleName -notlike 'Microsoft.PowerShell.*' -and $moduleName -cne 'CimCmdlets') { $failures.Add("unapproved-cmdlet-module:$moduleName") }
+                if ($moduleName -cnotin @('Microsoft.PowerShell.Core', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'CimCmdlets')) {
+                    $failures.Add("unapproved-cmdlet-module:$moduleName")
+                }
+                elseif ($moduleName -cne 'Microsoft.PowerShell.Core') {
+                    $expectedModulePath = switch ($moduleName) {
+                        'Microsoft.PowerShell.Management' { [IO.Path]::Combine([IO.Path]::GetFullPath([IO.Path]::Combine($PSHOME, 'Modules')), 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Management.psd1') }
+                        'Microsoft.PowerShell.Utility' { [IO.Path]::Combine([IO.Path]::GetFullPath([IO.Path]::Combine($PSHOME, 'Modules')), 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1') }
+                        'CimCmdlets' { [IO.Path]::Combine($PSHOME, 'Microsoft.Management.Infrastructure.CimCmdlets.dll') }
+                    }
+                    $actualModulePath = if ($null -eq $command.Module) { '' } else { [string]$command.Module.Path }
+                    if ([String]::IsNullOrWhiteSpace($actualModulePath) -or
+                        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($actualModulePath), [IO.Path]::GetFullPath($expectedModulePath)) -or
+                        -not (Test-D32PowerShellAuthorityPathNoReparse -Path $actualModulePath)) {
+                        $failures.Add("untrusted-cmdlet-module-path:$moduleName")
+                    }
+                }
                 [void]$visitedModules.Add($moduleName)
             }
             continue
@@ -145,12 +165,15 @@ function Test-D32InventoryRunnerLoaderDependencyClosure {
 if ($LoaderSelfTest) {
     $runnerScriptPaths = @(
         [IO.Path]::GetFullPath($PSCommandPath),
-        [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-test-inventory-baseline.ps1'))
+        [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-test-inventory-baseline.ps1')),
+        [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-phase0-matrix.ps1')),
+        [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
     )
     $loader = Test-D32InventoryRunnerLoaderDependencyClosure -RunnerScriptPaths $runnerScriptPaths
     if (-not $loader.Passed) { throw "TEST_INVENTORY_DISCOVERY_LOADER_SELFTEST_FAILED: $($loader.Failures -join ', ')" }
     Write-Output 'D32_TEST_INVENTORY_DISCOVERY_LOADER=PASS'
     Write-Output 'discovery_admission=PAST_IMPORT'
+    Write-Output 'powershell_module_authority=EXACT_PSHOME_MODULES_NO_AUTOLOAD'
     Write-Output "custom_function_dependencies=$($loader.FunctionCount)"
     Write-Output "cmdlet_modules=$($loader.Modules -join ',')"
     Write-Output 'cargo_invocations=0'

@@ -1443,7 +1443,11 @@ function Test-D32PowerShellAuthorityJsonMatchesObject {
         foreach ($name in $names) {
             $property = [System.Text.Json.JsonElement]::new()
             if (-not $Element.TryGetProperty($name, [ref]$property)) { return $false }
-            $child = if ($Value -is [System.Collections.IDictionary]) { $Value[$name] } else { $Value.PSObject.Properties[$name].Value }
+            # Assign outside an if-expression: PowerShell enumerates output from
+            # the expression pipeline, which collapses a one-element array and
+            # makes strict JSON shape checks misread nested singleton arrays.
+            if ($Value -is [System.Collections.IDictionary]) { $child = $Value[$name] }
+            else { $child = $Value.PSObject.Properties[$name].Value }
             if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $property -Value $child)) { return $false }
         }
         return $true

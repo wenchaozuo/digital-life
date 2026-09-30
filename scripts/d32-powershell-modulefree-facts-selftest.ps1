@@ -123,6 +123,18 @@ function Test-D32FactsSelfTestJsonEqual {
 }
 
 try {
+    $singletonArrayJson = [System.Text.Json.JsonDocument]::Parse('{"distribution":{"protected_ancestors":[{"path":"C:\\","depth":0}]}}')
+    try {
+        $singletonArrayCandidate = [ordered]@{ distribution = [ordered]@{ protected_ancestors = @([ordered]@{ path = 'C:\'; depth = [int64]0 }) } }
+        $singletonObjectCandidate = [ordered]@{ distribution = [ordered]@{ protected_ancestors = [ordered]@{ path = 'C:\'; depth = [int64]0 } } }
+        $singletonArrayAccepted = Test-D32PowerShellAuthorityJsonMatchesObject -Element $singletonArrayJson.RootElement -Value $singletonArrayCandidate
+        $singletonObjectRejected = -not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $singletonArrayJson.RootElement -Value $singletonObjectCandidate)
+        Add-D32FactsSelfTestCase 'strict authority JSON comparison preserves nested singleton arrays and rejects object substitution' `
+            ($singletonArrayAccepted -and $singletonObjectRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+            'A one-element protected_ancestors array must remain an array through recursive comparison; this test is module-free.'
+    }
+    finally { $singletonArrayJson.Dispose() }
+
     $helperPath = [IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1')
     $helperText = [IO.File]::ReadAllText($helperPath, [Text.UTF8Encoding]::new($false, $true))
     $assertStart = $helperText.IndexOf('function Assert-D32PowerShellModuleAdmissionCurrent', [StringComparison]::Ordinal)

@@ -141,6 +141,28 @@ function Test-D32FactsSelfTestJsonEqual {
     }
 }
 
+$emptyAdmissionArray = [object[]]::new(0)
+$emptyAdmissionDictionary = [ordered]@{ active_environment = $emptyAdmissionArray }
+$emptyAdmissionObject = [PSCustomObject]@{ active_environment = $emptyAdmissionArray }
+$emptyFromDictionary = Get-D32PowerShellModuleAdmissionField -Record $emptyAdmissionDictionary -Name 'active_environment'
+$emptyFromObject = Get-D32PowerShellModuleAdmissionField -Record $emptyAdmissionObject -Name 'active_environment'
+$admissionGet = {
+    param($record, $name)
+    $value = Get-D32PowerShellModuleAdmissionField -Record $record -Name $name
+    if ($value -is [Array]) { return ,$value }
+    return $value
+}
+$emptyThroughAdmissionGet = & $admissionGet $emptyAdmissionDictionary 'active_environment'
+$singleAdmissionArray = [object[]]@('one')
+$singleFromDictionary = Get-D32PowerShellModuleAdmissionField -Record ([ordered]@{ modules = $singleAdmissionArray }) -Name 'modules'
+$scalarFromDictionary = Get-D32PowerShellModuleAdmissionField -Record ([ordered]@{ status = 'ADMITTED' }) -Name 'status'
+Add-D32FactsSelfTestCase 'shared admission accessor preserves empty arrays for strict typed records' `
+    ($emptyFromDictionary -is [Array] -and $emptyFromDictionary.Count -eq 0 -and $emptyFromObject -is [Array] -and $emptyFromObject.Count -eq 0 -and $emptyThroughAdmissionGet -is [Array] -and $emptyThroughAdmissionGet.Count -eq 0) `
+    'An empty resolver active_environment array must remain an array through both the shared field accessor and validator getter.'
+Add-D32FactsSelfTestCase 'shared admission accessor preserves singleton arrays and scalar values' `
+    ($singleFromDictionary -is [Array] -and $singleFromDictionary.Count -eq 1 -and $singleFromDictionary[0] -ceq 'one' -and $scalarFromDictionary -is [string] -and $scalarFromDictionary -ceq 'ADMITTED') `
+    'Field reads retain collection shape without wrapping scalar record fields.'
+
 try {
     $singletonArrayJson = [System.Text.Json.JsonDocument]::Parse('{"distribution":{"protected_ancestors":[{"path":"C:\\","depth":0}]}}')
     try {
@@ -202,12 +224,13 @@ try {
     $admissionValidatorStart = $helperText.IndexOf('function Test-D32PowerShellModuleAdmissionRecord', [StringComparison]::Ordinal)
     $admissionValidatorEnd = $helperText.IndexOf('function Test-D32PowerShellModuleAdmissionProducerBinding', $admissionValidatorStart, [StringComparison]::Ordinal)
     $admissionValidatorBody = if ($admissionValidatorEnd -gt $admissionValidatorStart) { $helperText.Substring($admissionValidatorStart, $admissionValidatorEnd - $admissionValidatorStart) } else { '' }
-    $admissionValidatorSafeLocals = $admissionValidatorBody.Contains("`$hostRecord = & `$get `$Document 'powershell_host'") -and
+    $admissionValidatorSafeLocals = $admissionValidatorBody.Contains("Get-D32PowerShellModuleAdmissionField -Record `$Document -Name 'powershell_host'") -and
         $admissionValidatorBody.Contains("`$powerShellHome = & `$get `$hostRecord 'pshome'") -and
+        $admissionValidatorBody.Contains('if ($value -is [Array]) { return ,$value }') -and
         -not [regex]::IsMatch($admissionValidatorBody, '(?i)\$(?:host|pshome)\b') -and
         $admissionValidatorBody.Contains("Combine(`$powerShellHome, 'Modules')") -and
         $admissionValidatorBody.Contains('-Parent $powerShellHome') -and
-        $admissionValidatorBody.Contains("`$hostRecord 'file_id_hex'")
+        $admissionValidatorBody.Contains('Get-D32PowerShellModuleAdmissionField')
     Add-D32FactsSelfTestCase 'strict admission validator reads runner fields without assigning constant automatic variables' `
         $admissionValidatorSafeLocals 'The powershell_host record and its pshome field use ordinary local names; $Host and $PSHOME are constant automatic variables.'
     $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and

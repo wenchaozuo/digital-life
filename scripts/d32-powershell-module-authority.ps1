@@ -249,6 +249,24 @@ function Test-D32PowerShellAuthorityTokenRecord {
     return $true
 }
 
+function Get-D32PowerShellModuleAdmissionField {
+    param(
+        [Parameter(Mandatory = $true)][object]$Record,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($Record -is [System.Collections.IDictionary]) { $value = $Record[$Name] }
+    else {
+        $property = $Record.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        $value = $property.Value
+    }
+    # Keep an empty or singleton array as an array across the PowerShell
+    # function-output pipeline. This is required for strict record shapes such
+    # as active_environment=[], where ordinary `return $value` emits no object.
+    if ($value -is [Array]) { return ,$value }
+    return $value
+}
+
 function Get-D32PowerShellAuthorityHandleIdentity {
     param([Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle)
     Initialize-D32PowerShellAuthorityNativeApi
@@ -1888,10 +1906,15 @@ function Test-D32PowerShellModuleAdmissionRecord {
     else { foreach ($property in $Document.PSObject.Properties) { $actual.Add([string]$property.Name) } }
     if ($actual.Count -ne $fields.Count) { return $false }
     foreach ($field in $fields) { if (-not $actual.Contains($field)) { return $false } }
-    $get = { param($object, $name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
-    $recordType = & $get $Document 'record_type'; $version = & $get $Document 'schema_version'; $status = & $get $Document 'status'
-    $candidate = & $get $Document 'candidate_sha'; $repository = & $get $Document 'source_repo'; $attempts = & $get $Document 'import_attempts'
-    $order = & $get $Document 'module_import_order'
+    $get = {
+        param($object, $name)
+        $value = Get-D32PowerShellModuleAdmissionField -Record $object -Name $name
+        if ($value -is [Array]) { return ,$value }
+        return $value
+    }
+    $recordType = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'record_type'; $version = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'schema_version'; $status = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'status'
+    $candidate = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'candidate_sha'; $repository = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'source_repo'; $attempts = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'import_attempts'
+    $order = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'module_import_order'
     if ($recordType -isnot [string] -or $recordType -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2' -or
         -not ($version -is [byte] -or $version -is [int16] -or $version -is [uint16] -or $version -is [int32] -or $version -is [uint32] -or $version -is [int64] -or $version -is [uint64]) -or [Int64]$version -ne 2 -or
         $status -isnot [string] -or $status -cne 'ADMITTED' -or $candidate -isnot [string] -or $candidate -cnotmatch '^[0-9a-f]{40}$' -or
@@ -1905,15 +1928,15 @@ function Test-D32PowerShellModuleAdmissionRecord {
         [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string](& $get $Document 'entry_script_path')), $repository)) { return $false }
     $referenceFields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
     foreach ($referenceName in @('authority_reference','profile_reference','git_image')) {
-        $reference = & $get $Document $referenceName
+        $reference = Get-D32PowerShellModuleAdmissionField -Record $Document -Name $referenceName
         if ($null -eq $reference) { return $false }
         $referenceNames = [System.Collections.Generic.List[string]]::new()
         if ($reference -is [System.Collections.IDictionary]) { foreach ($key in $reference.Keys) { $referenceNames.Add([string]$key) } }
         else { foreach ($property in $reference.PSObject.Properties) { $referenceNames.Add([string]$property.Name) } }
         if ($referenceNames.Count -ne $referenceFields.Count) { return $false }
         foreach ($field in $referenceFields) { if (-not $referenceNames.Contains($field)) { return $false } }
-        $path = & $get $reference 'path'; $sha = & $get $reference 'sha256'; $bytes = & $get $reference 'bytes'
-        $volume = & $get $reference 'volume_serial_hex'; $fileId = & $get $reference 'file_id_hex'
+        $path = Get-D32PowerShellModuleAdmissionField -Record $reference -Name 'path'; $sha = Get-D32PowerShellModuleAdmissionField -Record $reference -Name 'sha256'; $bytes = Get-D32PowerShellModuleAdmissionField -Record $reference -Name 'bytes'
+        $volume = Get-D32PowerShellModuleAdmissionField -Record $reference -Name 'volume_serial_hex'; $fileId = Get-D32PowerShellModuleAdmissionField -Record $reference -Name 'file_id_hex'
         if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
             $sha -isnot [string] -or $sha -cnotmatch '^[0-9a-f]{64}$' -or
             -not ($bytes -is [int32] -or $bytes -is [int64] -or $bytes -is [uint32] -or $bytes -is [uint64]) -or [Int64]$bytes -le 0 -or
@@ -1921,8 +1944,8 @@ function Test-D32PowerShellModuleAdmissionRecord {
         if ((Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $repository) -or
             (Test-D32PowerShellAuthorityPathWithin -Child $repository -Parent $path)) { return $false }
     }
-    $hostRecord = & $get $Document 'powershell_host'; $runner = & $get $Document 'runner_process'; $startup = & $get $Document 'startup'
-    $entry = & $get $Document 'entry_script_path'; $entryFile = & $get $Document 'entry_script'; $closure = & $get $Document 'module_closure'; $verification = & $get $Document 'import_verification'
+    $hostRecord = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'powershell_host'; $runner = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'runner_process'; $startup = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'startup'
+    $entry = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'entry_script_path'; $entryFile = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'entry_script'; $closure = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'module_closure'; $verification = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'import_verification'
     if ($null -eq $hostRecord -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
         -not [IO.Path]::IsPathRooted($entry) -or [IO.Path]::GetFullPath($entry) -cne $entry) { return $false }
     $verifyNames = [System.Collections.Generic.List[string]]::new()
@@ -2044,7 +2067,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
     $resolverFields = @('state','policy_id','resolver_sha256','os_security_inventory_sha256','native_policy','module_search_path','trusted_platform_paths','loaded_managed_assembly_paths','deps_paths','native_directories','native_module_paths','active_environment')
     if ($resolverNames.Count -ne $resolverFields.Count) { return $false }
     foreach ($field in $resolverFields) { if (-not $resolverNames.Contains($field)) { return $false } }
-    $resolverGet = { param($object,$name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
+    $resolverGet = $get
     if ((& $resolverGet $resolver 'state') -cne 'VERIFIED' -or (& $resolverGet $resolver 'policy_id') -cne 'D32_POWERSHELL_RESOLVER_DOMAIN_V2' -or
         (& $resolverGet $resolver 'native_policy') -cne 'LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32; SetDllDirectoryW(NULL); verified in current process' -or
         (& $resolverGet $resolver 'module_search_path') -cne [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellHome,'Modules')) -or

@@ -192,6 +192,15 @@ try {
     $crossProcessBinding = $helperText.IndexOf('return $null -ne $Document -and [Int64]$Document.runner_process.process_id -eq $ExpectedProcessId', [StringComparison]::Ordinal)
     $expectedContextLifecycleBinding = $helperText.IndexOf("foreach (`$field in @('authority_reference','profile_reference','git_image','powershell_host','module_import_order','module_closure','resolver_admission','import_verification','import_attempts'))", [StringComparison]::Ordinal)
     $currentProcessIdentityCheck = $helperText.IndexOf('$process.StartTime.ToUniversalTime().Ticks -ne [Int64]$State.Admission.runner_process.start_time_utc_ticks', $assertCurrentStart, [StringComparison]::Ordinal)
+    $assertCurrentEnd = $helperText.IndexOf('function Initialize-D32PowerShellModuleAuthority', $assertCurrentStart, [StringComparison]::Ordinal)
+    $reuseCurrentBody = if ($assertCurrentEnd -gt $assertCurrentStart) { $helperText.Substring($assertCurrentStart, $assertCurrentEnd - $assertCurrentStart) } else { '' }
+    $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and
+        $reuseCurrentBody.Contains('-OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256)') -and
+        $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents') -and
+        -not $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityCurrentOsSecurityComponents') -and
+        $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityDefenderPlatformSnapshot') -and
+        $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityRuntimeDistributionDiff')
+    $statePinsOsComponentDigest = $helperText.Contains('OsSecurityInventorySha256 = [string]$admission.resolver_admission.os_security_inventory_sha256')
     $producerFiles = @('d32-preflight.ps1','d32-phase0-matrix.ps1','d32-phase0-vendored-authority.ps1','d32-fixture-prebuild.ps1','d32-debug-trace-load-selftest.ps1','d32-tauri-macros-source-attestation.ps1','d32-test-inventory-baseline.ps1','d32-test-inventory-discovery.ps1')
     $producersBound = $true
     foreach ($producerName in $producerFiles) {
@@ -229,8 +238,9 @@ try {
          $reuseUpdate -gt $reuseTransition -and $reuseModuleCheck -gt $reuseUpdate -and $reuseCommandOrigins -gt $reuseModuleCheck -and $reuseStrictCheck -gt $reuseCommandOrigins -and
          $reuseCallerPins -gt $reuseBranchStart -and $reuseAssertPrior -gt $reuseCallerPins -and $digestRoleProof -gt 0 -and $crossProcessBinding -gt 0 -and
          $expectedContextLifecycleBinding -gt 0 -and $currentProcessIdentityCheck -gt $assertCurrentStart -and $producersBound -and $consumersBound -and $runnerConsumersBound -and $fixtureRunnerEvidenceBound -and
+         $reuseUsesPinnedOsComponents -and $statePinsOsComponentDigest -and
          $global:D32PowerShellModuleImportAttempts -eq 0) `
-        ("initialize=$initializePostSnapshot/$initializeTransition/$initializeAdmission/$initializePostDigest/$initializeOriginEvidence/$initializeAssertCurrent; reuse=$reusePriorSnapshot/$reuseCurrentSnapshot/$reuseTransition/$reuseUpdate/$reuseCommandOrigins/$reuseStrictCheck; digest=$digestRoleProof; process=$crossProcessBinding/$expectedContextLifecycleBinding/$currentProcessIdentityCheck; producers=$producersBound; consumers=$consumersBound; runner_consumers=$runnerConsumersBound; fixture_trace=$fixtureRunnerEvidenceBound; import_attempts=0")
+        ("initialize=$initializePostSnapshot/$initializeTransition/$initializeAdmission/$initializePostDigest/$initializeOriginEvidence/$initializeAssertCurrent; reuse=$reusePriorSnapshot/$reuseCurrentSnapshot/$reuseTransition/$reuseUpdate/$reuseCommandOrigins/$reuseStrictCheck; digest=$digestRoleProof; process=$crossProcessBinding/$expectedContextLifecycleBinding/$currentProcessIdentityCheck; os_components_pinned=$reuseUsesPinnedOsComponents/$statePinsOsComponentDigest; producers=$producersBound; consumers=$consumersBound; runner_consumers=$runnerConsumersBound; fixture_trace=$fixtureRunnerEvidenceBound; import_attempts=0")
 
     $everyoneCreateDirectory = [int64][Security.AccessControl.FileSystemRights]::CreateDirectories
     $programDataSafe = [int64][Security.AccessControl.FileSystemRights]::CreateFiles -bor [int64][Security.AccessControl.FileSystemRights]::CreateDirectories -bor `
@@ -396,6 +406,29 @@ try {
         }
     )
     $osComponentsDigest = Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $osComponents
+    $expectedStaticDistribution = [ordered]@{
+        directories = @([ordered]@{ kind = 'directory'; path = $system32Path; volume_serial_hex = '0000000000000001'; file_id_hex = ('3' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('c' * 64) })
+        files = @(
+            [ordered]@{ kind = 'file'; path = $kernelBasePath; bytes = [Int64]1; sha256 = ('d' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = ('4' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('e' * 64) },
+            [ordered]@{ kind = 'file'; path = $ntdllPath; bytes = [Int64]1; sha256 = ('f' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = ('5' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('a' * 64) }
+        )
+        protected_ancestors = @()
+    }
+    $actualStaticDistribution = [ordered]@{
+        directories = @([ordered]@{ kind = 'directory'; path = $system32Path; volume_serial_hex = '0000000000000001'; file_id_hex = ('3' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('c' * 64) })
+        files = @(
+            [ordered]@{ kind = 'file'; path = $kernelBasePath; bytes = [Int64]2; sha256 = ('9' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = ('4' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('e' * 64) },
+            [ordered]@{ kind = 'file'; path = [IO.Path]::Combine($system32Path, 'd32-added.dll'); bytes = [Int64]1; sha256 = ('b' * 64); volume_serial_hex = '0000000000000001'; file_id_hex = ('6' * 32); owner_sid = 'S-1-5-18'; security_descriptor_sddl = 'D:P'; security_descriptor_sha256 = ('c' * 64) }
+        )
+        protected_ancestors = @()
+    }
+    $distributionDiff = Get-D32PowerShellAuthorityRuntimeDistributionDiff -Expected $expectedStaticDistribution -Actual $actualStaticDistribution `
+        -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'static component distribution comparison reports added, removed, and exact content/identity field differences without file writes' `
+        ($distributionDiff.Added.Count -eq 1 -and $distributionDiff.Removed.Count -eq 1 -and $distributionDiff.Changed.Count -eq 1 -and
+         @($distributionDiff.Changed[0].fields | Where-Object { $_ -in @('bytes','sha256') }).Count -eq 2 -and
+         $distributionDiff.Added[0].path.domain -ceq 'WINDOWS_OS' -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $distributionDiff)
     $resolverParameters = @{
         TrustedPlatformAssemblyPaths = @($trustedPlatformFile)
         ManagedAssemblyPaths = @($trustedPlatformFile, $kernelBasePath)
@@ -449,6 +482,7 @@ try {
         -NativeModulePaths $resolverPostImport.NativeModulePaths -ActiveEnvironment $resolverPostImport.ActiveEnvironment -NativePolicy $resolverPostImport.NativePolicy -NativeFileComponents $resolverPostImport.NativeFileComponents
     Add-D32FactsSelfTestCase 'authorized post-import native and managed origins are admitted only as exact caller-pinned additions, and V2 resolver digest recomputes with component roles' `
         ($positiveTransition.Passed -and $resolverPositive.ResolverSha256 -cne $resolverPostImport.ResolverSha256 -and
+         $resolverPositive.OsSecurityInventorySha256 -ceq $resolverPostImport.OsSecurityInventorySha256 -and
          $resolverPositive.PolicySha256 -ceq $resolverPostImport.PolicySha256 -and
          $preResolverDigests.ResolverSha256 -ceq $resolverPositive.ResolverSha256 -and $postResolverDigests.ResolverSha256 -ceq $resolverPostImport.ResolverSha256 -and
          $reconstructedResolver.ResolverSha256 -ceq $resolverPositive.ResolverSha256 -and $reconstructedResolver.PolicySha256 -ceq $resolverPositive.PolicySha256 -and
@@ -456,6 +490,15 @@ try {
          $positiveTransition.Diagnostic.managed_assemblies.added_content_refs.Count -eq 1 -and $positiveTransition.Diagnostic.managed_assemblies.added_content_refs[0].caller_pinned -and
          $global:D32PowerShellModuleImportAttempts -eq 0) `
         ("policy-sha=$($resolverPostImport.PolicySha256); resolver-sha-before=$($resolverPositive.ResolverSha256); resolver-sha-after=$($resolverPostImport.ResolverSha256); diagnostic=$positiveTransitionJson; import_attempts=0")
+
+    $unpinnedWindowsNativePath = [IO.Path]::Combine($system32Path, 'D32SyntheticUnpinnedModule.dll')
+    $unpinnedWindowsNativeParameters = $resolverParameters.Clone()
+    $unpinnedWindowsNativeParameters.NativeModulePaths = @($resolverParameters.NativeModulePaths + $unpinnedWindowsNativePath)
+    $unpinnedWindowsNative = Get-D32PowerShellAuthorityResolverSnapshot @unpinnedWindowsNativeParameters
+    Add-D32FactsSelfTestCase 'a newly observed Windows native origin cannot expand the caller-pinned OS component inventory' `
+        (@($unpinnedWindowsNative.Blockers | Where-Object { $_ -match 'no exact caller-pinned OS component file reference' }).Count -eq 1 -and
+         $unpinnedWindowsNative.OsSecurityInventorySha256 -ceq $osComponentsDigest -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        ($unpinnedWindowsNative.Blockers -join '; ')
 
     $unknownNativePath = 'C:\ProgramData\D32Synthetic\unclassified-native.dll'
     $resolverUnknownParameters = $resolverParameters.Clone()

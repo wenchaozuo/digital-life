@@ -937,6 +937,54 @@ function Get-D32PowerShellAuthorityDefenderPlatformSnapshot {
     return [ordered]@{ root_path = $root; inventory_sha256 = $digest; directories = $directories.ToArray(); files = $files.ToArray(); protected_ancestors = $ancestors.ToArray(); trusted_writer_sids = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') }
 }
 
+function Get-D32PowerShellAuthorityRuntimeDistributionDiff {
+    param(
+        [Parameter(Mandatory = $true)][object]$Expected,
+        [Parameter(Mandatory = $true)][object]$Actual,
+        [Parameter(Mandatory = $true)][string]$PowerShellRoot,
+        [Parameter(Mandatory = $true)][string]$WindowsRoot,
+        [Parameter(Mandatory = $true)][string]$DefenderRoot
+    )
+    $groups = @(
+        [PSCustomObject]@{ Name = 'directories'; Fields = @('kind','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') },
+        [PSCustomObject]@{ Name = 'files'; Fields = @('kind','bytes','sha256','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') },
+        [PSCustomObject]@{ Name = 'protected_ancestors'; Fields = @('kind','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') }
+    )
+    $added = [System.Collections.Generic.List[object]]::new()
+    $removed = [System.Collections.Generic.List[object]]::new()
+    $changed = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in $groups) {
+        $expectedByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $actualByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($record in @($Expected.($group.Name))) {
+            if (-not $expectedByPath.TryAdd([string]$record.path, $record)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned static component repeats a $($group.Name) path" }
+        }
+        foreach ($record in @($Actual.($group.Name))) {
+            if (-not $actualByPath.TryAdd([string]$record.path, $record)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: current static component repeats a $($group.Name) path" }
+        }
+        foreach ($record in @($Actual.($group.Name))) {
+            $path = [string]$record.path
+            $label = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+            if (-not $expectedByPath.ContainsKey($path)) { $added.Add([PSCustomObject]@{ group = [string]$group.Name; path = $label }); continue }
+            $prior = $expectedByPath[$path]
+            $fields = [System.Collections.Generic.List[string]]::new()
+            if (-not [StringComparer]::Ordinal.Equals([string]$prior.path, [string]$record.path)) { $fields.Add('path_case') }
+            foreach ($field in $group.Fields) {
+                if ([string]$prior.$field -cne [string]$record.$field) { $fields.Add([string]$field) }
+            }
+            if ($fields.Count -gt 0) { $changed.Add([PSCustomObject]@{ group = [string]$group.Name; path = $label; fields = $fields.ToArray() }) }
+        }
+        foreach ($record in @($Expected.($group.Name))) {
+            $path = [string]$record.path
+            if (-not $actualByPath.ContainsKey($path)) {
+                $label = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+                $removed.Add([PSCustomObject]@{ group = [string]$group.Name; path = $label })
+            }
+        }
+    }
+    return [PSCustomObject]@{ Added = $added.ToArray(); Removed = $removed.ToArray(); Changed = $changed.ToArray() }
+}
+
 function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
     param(
         [AllowEmptyString()][string]$ExpectedDefenderRoot,
@@ -2470,14 +2518,73 @@ function Assert-D32PowerShellModuleAdmissionCurrent {
         }
     }
     Assert-D32PowerShellAuthorityRuntimeEntriesCurrent -Snapshot $State.RuntimeDistribution
+    if ($State.OsSecurityComponents.Count -ne 2 -or
+        [string]$State.OsSecurityComponents[0].component_type -cne 'MICROSOFT_WINDOWS_OS_INSTALLATION' -or
+        [string]$State.OsSecurityComponents[1].component_type -cne 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM') {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: admitted OS component roles are missing or reordered at reuse boundary'
+    }
+    $windowsComponent = $State.OsSecurityComponents[0]
+    $defenderComponent = $State.OsSecurityComponents[1]
+    $windowsRoot = Get-D32PowerShellAuthorityWindowsRootPath
+    $systemRoot = [IO.Path]::GetFullPath([string]$env:SystemRoot)
+    $osVersion = [Environment]::OSVersion.VersionString
+    $windowsSource = $windowsComponent.source_proof
+    $defenderRoot = [IO.Path]::GetFullPath([string]$defenderComponent.root_path)
+    $expectedWindowsRoot = [IO.Path]::GetFullPath([string]$windowsComponent.root_path)
+    $expectedSystemRoot = [IO.Path]::GetFullPath([string]$windowsSource.environment_system_root)
+    $defenderParent = [IO.Path]::GetDirectoryName($defenderRoot)
+    $componentDigest = Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents
     $verificationFiles = [System.Collections.Generic.List[object]]::new()
+    $currentDefender = $null
+    $defenderDistributionDiff = $null
     try {
-        $currentOs = Get-D32PowerShellAuthorityCurrentOsSecurityComponents -ExpectedDefenderRoot ([string]$State.OsSecurityComponents[1].root_path) -DirectoryFences $State.DirectoryFences -OpenFiles $verificationFiles
-        if ($currentOs.InventorySha256 -cne [string]$State.Admission.resolver_admission.os_security_inventory_sha256) {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows/Defender source, inventory, resolver image or namespace digest changed at reuse boundary'
+        $currentDefender = Get-D32PowerShellAuthorityDefenderPlatformSnapshot -RootPath $defenderRoot `
+            -DirectoryFences $State.DirectoryFences -OpenFiles $verificationFiles
+        $defenderDistributionDiff = Get-D32PowerShellAuthorityRuntimeDistributionDiff `
+            -Expected $defenderComponent.distribution -Actual $currentDefender `
+            -PowerShellRoot $State.PowerShellRoot -WindowsRoot $expectedWindowsRoot -DefenderRoot $defenderRoot
+    }
+    finally {
+        foreach ($file in $verificationFiles) {
+            if ($null -ne $file.Stream -and -not $file.Stream.SafeFileHandle.IsClosed) { $file.Stream.Dispose() }
         }
     }
-    finally { foreach ($file in $verificationFiles) { if ($null -ne $file.Stream -and -not $file.Stream.SafeFileHandle.IsClosed) { $file.Stream.Dispose() } } }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($windowsRoot, $expectedWindowsRoot) -or
+        -not [StringComparer]::Ordinal.Equals($systemRoot, $expectedSystemRoot) -or
+        $osVersion -cne [string]$windowsSource.os_version -or
+        [string]$windowsSource.api_path -cne [string]$windowsComponent.root_path -or
+        [string]$windowsComponent.version -cne $osVersion -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($defenderParent, 'C:\ProgramData\Microsoft\Windows Defender\Platform') -or
+        [IO.Path]::GetFileName($defenderRoot) -cne [string]$defenderComponent.version -or
+        $currentDefender.inventory_sha256 -cne [string]$defenderComponent.distribution.inventory_sha256 -or
+        $defenderDistributionDiff.Added.Count -gt 0 -or $defenderDistributionDiff.Removed.Count -gt 0 -or $defenderDistributionDiff.Changed.Count -gt 0 -or
+        $componentDigest -cne [string]$State.OsSecurityInventorySha256 -or
+        $componentDigest -cne [string]$State.Admission.resolver_admission.os_security_inventory_sha256) {
+        $diagnostic = [ordered]@{
+            record_type = 'D32_POWERSHELL_OS_COMPONENT_REUSE_DIAGNOSTIC_V2'
+            role_order = @([string]$windowsComponent.component_type, [string]$defenderComponent.component_type)
+            windows = [ordered]@{
+                pinned_root = $expectedWindowsRoot; actual_root = $windowsRoot
+                pinned_environment_root = $expectedSystemRoot; actual_environment_root = $systemRoot
+                pinned_version = [string]$windowsComponent.version; actual_version = $osVersion
+                pinned_api_path = [string]$windowsSource.api_path
+            }
+            defender = [ordered]@{
+                pinned_root = $defenderRoot; pinned_version = [string]$defenderComponent.version
+                pinned_inventory_sha256 = [string]$defenderComponent.distribution.inventory_sha256
+                actual_inventory_sha256 = [string]$currentDefender.inventory_sha256
+                path_differences = [ordered]@{
+                    added = @($defenderDistributionDiff.Added); removed = @($defenderDistributionDiff.Removed); changed = @($defenderDistributionDiff.Changed)
+                }
+            }
+            component_inventory = [ordered]@{
+                state_sha256 = [string]$State.OsSecurityInventorySha256
+                admission_sha256 = [string]$State.Admission.resolver_admission.os_security_inventory_sha256
+                recomputed_from_admitted_components_sha256 = [string]$componentDigest
+            }
+        }
+        throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: admitted Windows/Defender source binding changed at reuse boundary; diagnostic=' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $diagnostic))
+    }
     $process = [Diagnostics.Process]::GetCurrentProcess()
     try {
         if ($process.Id -ne [Int32]$State.Admission.runner_process.process_id -or
@@ -2488,12 +2595,18 @@ function Assert-D32PowerShellModuleAdmissionCurrent {
     }
     finally { $process.Dispose() }
     $priorResolver = Get-D32PowerShellAuthorityResolverSnapshotFromAdmission -Admission $State.Admission
-    $currentResolver = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $currentOs.Components -OsSecurityInventorySha256 $currentOs.InventorySha256 -ConfigureNativeSearch
+    # The component inventory is the caller-pinned source/content authority. The
+    # Defender package inventory was re-enumerated above, but native/managed
+    # process origins remain a separate runtime observation checked below
+    # against exact admitted file references. Rebuilding component authority
+    # from the process's current module list would conflate those two records.
+    $currentResolver = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $State.OsSecurityComponents `
+        -OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256) -ConfigureNativeSearch
     $transitionNativeFiles = [System.Collections.Generic.List[object]]::new()
     foreach ($file in $State.RuntimeDistribution.files) { $transitionNativeFiles.Add($file) }
     $transitionManagedFiles = [System.Collections.Generic.List[object]]::new()
     foreach ($file in $State.RuntimeDistribution.files) { $transitionManagedFiles.Add($file) }
-    foreach ($component in $currentOs.Components) {
+    foreach ($component in $State.OsSecurityComponents) {
         foreach ($file in @($component.native_files)) { $transitionNativeFiles.Add($file) }
         foreach ($file in @($component.distribution.files)) { $transitionManagedFiles.Add($file) }
     }
@@ -2842,6 +2955,7 @@ function Initialize-D32PowerShellModuleAuthority {
         $state = [PSCustomObject]@{
             RepositoryRoot = $repo; PowerShellRoot = $powerShellRoot; ModuleRoot = $moduleRoot; ImportOrder = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
             ExpectedModuleManifestPaths = $expectedModulePaths; OpenFiles = $openFiles.ToArray(); DirectoryFences = $directoryFences; RuntimeDistribution = $runtimeDistribution; OsSecurityComponents = $osSecurity.Components
+            OsSecurityInventorySha256 = [string]$admission.resolver_admission.os_security_inventory_sha256
             OsProtectedFilePaths = $osProtectedFilePaths; OsSecurityDirectoryPaths = $osSecurityDirectoryPaths; OsSecurityAncestorPaths = $osSecurityAncestorPaths; ImportAttempts = $importAttempts
             AuthorityReference = $admission.authority_reference; ProfileReference = $admission.profile_reference; Admission = $admission
             Startup = [PSCustomObject]@{ FileOperand = [string]$admission.startup.file_operand; Switches = [string[]]@($admission.startup.switches) }

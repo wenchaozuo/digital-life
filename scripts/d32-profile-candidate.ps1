@@ -1,35 +1,66 @@
 #Requires -Version 7.5
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Repository,
-    [Parameter(Mandatory = $true)][string]$OutputPath,
-    [Parameter(Mandatory = $true)][string]$RustToolchainRoot,
-    [Parameter(Mandatory = $true)][string]$MsvcRoot,
-    [Parameter(Mandatory = $true)][string]$WindowsSdkRoot,
-    [Parameter(Mandatory = $true)][string[]]$MsvcPathEntry,
-    [Parameter(Mandatory = $true)][string[]]$WindowsSdkPathEntry,
-    [Parameter(Mandatory = $true)][string[]]$MsvcIncludeDirectory,
-    [Parameter(Mandatory = $true)][string[]]$WindowsSdkIncludeDirectory,
-    [Parameter(Mandatory = $true)][string[]]$MsvcLibDirectory,
-    [Parameter(Mandatory = $true)][string[]]$WindowsSdkLibDirectory,
-    [Parameter(Mandatory = $true)][string[]]$MsvcLibPathDirectory,
-    [Parameter(Mandatory = $true)][string[]]$WindowsSdkLibPathDirectory,
-    [Parameter(Mandatory = $true)][string]$VCToolsVersion,
-    [Parameter(Mandatory = $true)][string]$WindowsSDKVersion,
-    [string]$VCToolsRedistDir,
-    [string]$VSInstallDir,
-    [string]$VisualStudioVersion,
-    [string]$VscmdVersion
+    [Parameter(Mandatory = $true)][string]$FactsRequestPath,
+    [Parameter(Mandatory = $true)][string]$OutputPath
 )
 
 # Profile facts are deliberately collected without importing any PowerShell
 # module. This is a candidate generator only; it does not self-authorize or
 # claim that its output passed the independent Profile V2 validator.
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$profileLibraryPath = [IO.Path]::Combine($PSScriptRoot, 'd32-build-toolchain-profile.ps1')
+. $profileLibraryPath
 $global:PSModuleAutoLoadingPreference = 'None'
+$env:PSModulePath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules'))
+$global:D32PowerShellModuleImportAttempts = 0
+$loadedModulesAtStart = Get-D32PowerShellAuthorityLoadedModuleSet
 $null = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $PSCommandPath
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$requiredFacts = @(
+    'schema_version','record_type','repository','rust_toolchain_root','msvc_root','windows_sdk_root',
+    'msvc_path_entries','windows_sdk_path_entries','msvc_include_directories','windows_sdk_include_directories',
+    'msvc_lib_directories','windows_sdk_lib_directories','msvc_libpath_directories','windows_sdk_libpath_directories',
+    'vc_tools_version','windows_sdk_version'
+)
+$optionalFacts = @('vc_tools_redist_dir','vs_install_dir','visual_studio_version','vscmd_version')
+$facts = Read-D32PowerShellAuthorityFactsRequest -Path $FactsRequestPath -ExpectedRecordType 'D32_BUILD_TOOLCHAIN_PROFILE_FACTS_REQUEST_V1' `
+    -RequiredFields $requiredFacts -OptionalFields $optionalFacts
+foreach ($field in @('repository','rust_toolchain_root','msvc_root','windows_sdk_root','vc_tools_version','windows_sdk_version')) {
+    $value = $facts.PSObject.Properties[$field].Value
+    if ($value -isnot [string] -or [String]::IsNullOrWhiteSpace($value)) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' must be a nonempty string" }
+}
+foreach ($field in @('msvc_path_entries','windows_sdk_path_entries','msvc_include_directories','windows_sdk_include_directories','msvc_lib_directories','windows_sdk_lib_directories','msvc_libpath_directories','windows_sdk_libpath_directories')) {
+    $value = $facts.PSObject.Properties[$field].Value
+    if ($value -isnot [Array] -or $value.Count -eq 0) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' must be a nonempty JSON array" }
+    foreach ($item in $value) { if ($item -isnot [string] -or [String]::IsNullOrWhiteSpace($item)) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' contains a non-string or empty value" } }
+}
+foreach ($field in $optionalFacts) {
+    $property = $facts.PSObject.Properties[$field]
+    if ($null -ne $property -and ($property.Value -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$property.Value))) {
+        throw "PROFILE_CANDIDATE_BLOCKED: optional facts request field '$field' must be a nonempty string when present"
+    }
+}
+$Repository = [string]$facts.repository
+$RustToolchainRoot = [string]$facts.rust_toolchain_root
+$MsvcRoot = [string]$facts.msvc_root
+$WindowsSdkRoot = [string]$facts.windows_sdk_root
+$MsvcPathEntry = [string[]]$facts.msvc_path_entries
+$WindowsSdkPathEntry = [string[]]$facts.windows_sdk_path_entries
+$MsvcIncludeDirectory = [string[]]$facts.msvc_include_directories
+$WindowsSdkIncludeDirectory = [string[]]$facts.windows_sdk_include_directories
+$MsvcLibDirectory = [string[]]$facts.msvc_lib_directories
+$WindowsSdkLibDirectory = [string[]]$facts.windows_sdk_lib_directories
+$MsvcLibPathDirectory = [string[]]$facts.msvc_libpath_directories
+$WindowsSdkLibPathDirectory = [string[]]$facts.windows_sdk_libpath_directories
+$VCToolsVersion = [string]$facts.vc_tools_version
+$WindowsSDKVersion = [string]$facts.windows_sdk_version
+$VCToolsRedistDir = if ($null -ne $facts.PSObject.Properties['vc_tools_redist_dir']) { [string]$facts.vc_tools_redist_dir } else { $null }
+$VSInstallDir = if ($null -ne $facts.PSObject.Properties['vs_install_dir']) { [string]$facts.vs_install_dir } else { $null }
+$VisualStudioVersion = if ($null -ne $facts.PSObject.Properties['visual_studio_version']) { [string]$facts.visual_studio_version } else { $null }
+$VscmdVersion = if ($null -ne $facts.PSObject.Properties['vscmd_version']) { [string]$facts.vscmd_version } else { $null }
 
 $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
 $openedFiles = [System.Collections.Generic.List[object]]::new()
@@ -89,9 +120,13 @@ function Get-CandidateDirectoryFileInventory {
     param([Parameter(Mandatory = $true)][string[]]$Directories, [Parameter(Mandatory = $true)][string[]]$Extensions, [Parameter(Mandatory = $true)][string]$Reason)
     $records = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $enumerationOptions = [IO.EnumerationOptions]::new()
+    $enumerationOptions.AttributesToSkip = [IO.FileAttributes]::None
+    $enumerationOptions.RecurseSubdirectories = $false
+    $enumerationOptions.IgnoreInaccessible = $false
     foreach ($directory in $Directories) {
         $null = Assert-CandidateDirectory -Path $directory
-        foreach ($path in [IO.Directory]::GetFiles($directory, '*', [IO.SearchOption]::TopDirectoryOnly)) {
+        foreach ($path in [IO.Directory]::EnumerateFiles($directory, '*', $enumerationOptions)) {
             $extension = [IO.Path]::GetExtension($path)
             if ($extension -notin $Extensions) { continue }
             $full = [IO.Path]::GetFullPath($path)
@@ -225,7 +260,7 @@ try {
         cargo_policy = 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER'
     }
 
-    $json = [System.Text.Json.JsonSerializer]::Serialize([object]$profile)
+    $json = ConvertTo-D32PowerShellAuthorityJsonText -Value $profile
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
     $outputStream = [IO.File]::Open($outputFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try { $outputStream.Write($bytes, 0, $bytes.Length); $outputStream.Flush($true) }
@@ -241,6 +276,10 @@ try {
         }
     }
     finally { $profileDocument.Dispose() }
+    $profileValidation = Test-D32BuildToolchainProfileModuleFree -ProfilePath $outputFull -ExpectedSha256 ([string]$outputSnapshot.Record.sha256) -Repository $repoFull
+    if (-not $profileValidation.IsValid) { throw "PROFILE_CANDIDATE_BLOCKED: complete module-free Profile V2 validation failed: $($profileValidation.Failure)" }
+    if ($global:D32PowerShellModuleImportAttempts -ne 0) { throw 'PROFILE_CANDIDATE_BLOCKED: facts preparation unexpectedly recorded a module import attempt' }
+    Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedModulesAtStart
     [Console]::WriteLine("D32_PROFILE_CANDIDATE_PATH=$outputFull")
     [Console]::WriteLine("D32_PROFILE_CANDIDATE_SHA256=$($outputSnapshot.Record.sha256)")
     [Console]::WriteLine('D32_PROFILE_CANDIDATE_VERSION=2')

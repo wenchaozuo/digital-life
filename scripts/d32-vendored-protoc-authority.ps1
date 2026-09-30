@@ -385,6 +385,96 @@ function Get-D32VendoredLockPackageRecords {
     return [PSCustomObject]@{ Path = $lockPath; Snapshot = $lockSnapshot; Umbrella = $umbrella; Win32 = $win32 }
 }
 
+function Get-D32VendoredLockPackageRecordsModuleFree {
+    param([Parameter(Mandatory = $true)][string]$Repository)
+    if (-not [IO.Path]::IsPathRooted($Repository) -or [IO.Path]::GetFullPath($Repository) -cne $Repository) { throw 'VENDORED_PROTOC_FACTS_BLOCKED: repository must be literal, canonical, and absolute' }
+    $lockPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository, 'vita-agent', 'Cargo.lock'))
+    if (-not (Test-D32PowerShellAuthorityPathWithin -Child $lockPath -Parent $Repository)) { throw 'VENDORED_PROTOC_FACTS_BLOCKED: current lock path escaped the exact repository' }
+    $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $opened = $null
+    try {
+        $opened = Open-D32PowerShellAuthorityFile -Path $lockPath -DirectoryFences $directoryFences
+        $lock = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$opened.Bytes)
+        $packages = [System.Collections.Generic.List[object]]::new()
+        foreach ($block in [regex]::Split($lock, '(?m)(?=^\[\[package\]\]\s*$)')) {
+            if ($block -notmatch '(?m)^name\s*=\s*"(protoc-bin-vendored(?:-win32)?)"\s*$') { continue }
+            $name = [string]$Matches[1]
+            $versionMatch = [regex]::Match($block, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+            $sourceMatch = [regex]::Match($block, '(?m)^source\s*=\s*"([^"]+)"\s*$')
+            $checksumMatch = [regex]::Match($block, '(?m)^checksum\s*=\s*"([0-9a-f]{64})"\s*$')
+            if (-not $versionMatch.Success -or -not $sourceMatch.Success -or -not $checksumMatch.Success) { throw "VENDORED_PROTOC_FACTS_BLOCKED: incomplete locked package record: $name" }
+            $packages.Add([PSCustomObject]@{ name = $name; version = [string]$versionMatch.Groups[1].Value; source = [string]$sourceMatch.Groups[1].Value; checksum = [string]$checksumMatch.Groups[1].Value })
+        }
+        $umbrellaMatches = [System.Collections.Generic.List[object]]::new()
+        $win32Matches = [System.Collections.Generic.List[object]]::new()
+        foreach ($package in $packages) {
+            if ($package.name -ceq 'protoc-bin-vendored') { $umbrellaMatches.Add($package) }
+            elseif ($package.name -ceq 'protoc-bin-vendored-win32') { $win32Matches.Add($package) }
+        }
+        if ($umbrellaMatches.Count -ne 1 -or $win32Matches.Count -ne 1) { throw 'VENDORED_PROTOC_FACTS_BLOCKED: Vita lock must contain exactly one umbrella and one win32 protoc package' }
+        $umbrella = $umbrellaMatches[0]
+        $win32 = $win32Matches[0]
+        $source = 'registry+https://github.com/rust-lang/crates.io-index'
+        if ($umbrella.version -cne '3.2.0' -or $umbrella.source -cne $source -or $umbrella.checksum -cne $script:D32VendoredProtocUmbrellaChecksum -or
+            $win32.version -cne '3.2.0' -or $win32.source -cne $source -or $win32.checksum -cne $script:D32VendoredProtocWin32Checksum) {
+            throw 'VENDORED_PROTOC_FACTS_BLOCKED: locked protoc package tuple differs from the exact V1 authority schema'
+        }
+        return [PSCustomObject]@{
+            Path = [string]$opened.Record.path
+            Snapshot = [PSCustomObject]@{ Path = [string]$opened.Record.path; Sha256 = [string]$opened.Record.sha256; Bytes = [Int64]$opened.Record.bytes; VolumeSerialHex = [string]$opened.Record.volume_serial_hex; FileIdHex = [string]$opened.Record.file_id_hex }
+            Umbrella = $umbrella
+            Win32 = $win32
+        }
+    }
+    catch { throw "VENDORED_PROTOC_FACTS_BLOCKED: $($_.Exception.Message)" }
+    finally {
+        if ($null -ne $opened -and $null -ne $opened.Stream) { $opened.Stream.Dispose() }
+        foreach ($fence in $directoryFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+    }
+}
+
+function New-D32VendoredProtocAuthorityModuleFreeCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$EvidenceRoot
+    )
+    $repo = [IO.Path]::GetFullPath($Repository)
+    $root = [IO.Path]::GetFullPath($EvidenceRoot)
+    if ($Repository -cne $repo -or $EvidenceRoot -cne $root -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+        $null -eq $ValidatedProfile -or -not [bool]$ValidatedProfile.IsValid -or
+        (Test-D32PowerShellAuthorityPathWithin -Child $root -Parent $repo) -or (Test-D32PowerShellAuthorityPathWithin -Child $repo -Parent $root) -or
+        [IO.File]::Exists($root) -or [IO.Directory]::Exists($root) -or
+        -not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($root)) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path ([IO.Path]::GetDirectoryName($root)))) {
+        throw 'VENDORED_PROTOC_FACTS_BLOCKED: candidate/profile/root binding or fresh external EvidenceRoot is invalid'
+    }
+    $lock = Get-D32VendoredLockPackageRecordsModuleFree -Repository $repo
+    return [ordered]@{
+        schema_version = 1
+        record_type = $script:D32VendoredProtocAuthorityType
+        scope = 'D32_TEST_INVENTORY_DISCOVERY_ONLY'
+        candidate_sha = $CandidateSha
+        toolchain_profile = [ordered]@{
+            path = [string]$ValidatedProfile.ProfilePath
+            sha256 = [string]$ValidatedProfile.Digest
+            bytes = [Int64]$ValidatedProfile.Identity.Bytes
+            volume_serial_hex = [string]$ValidatedProfile.Identity.VolumeSerialHex
+            file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex
+        }
+        evidence_root_path = $root
+        cargo_home_path = [IO.Path]::GetFullPath([IO.Path]::Combine($root, 'r', 'c'))
+        temp_root_path = [IO.Path]::GetFullPath([IO.Path]::Combine($root, 'r', 't'))
+        vita_cargo_lock = [ordered]@{ path = $lock.Snapshot.Path; sha256 = $lock.Snapshot.Sha256; bytes = [Int64]$lock.Snapshot.Bytes }
+        packages = @(
+            [ordered]@{ name = $lock.Umbrella.name; version = $lock.Umbrella.version; source = $lock.Umbrella.source; checksum = $lock.Umbrella.checksum },
+            [ordered]@{ name = $lock.Win32.name; version = $lock.Win32.version; source = $lock.Win32.source; checksum = $lock.Win32.checksum }
+        )
+        cargo_archive = [ordered]@{ relative_path = $script:D32VendoredProtocArchiveRelativePath; bytes = $script:D32VendoredProtocArchiveBytes; sha256 = $script:D32VendoredProtocWin32Checksum }
+        image = [ordered]@{ relative_path = [IO.Path]::Combine($script:D32VendoredProtocSourceRelativePath, 'bin', 'protoc.exe'); bytes = $script:D32VendoredProtocImageBytes; sha256 = $script:D32VendoredProtocImageSha256 }
+    }
+}
+
 function New-D32VendoredProtocAuthorityDocument {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,

@@ -97,11 +97,19 @@ function Get-D32PowerShellAuthorityAuthenticodeSourceProof {
     $trustData = [IntPtr]::Zero
     $actionPointer = [IntPtr]::Zero
     try {
-        $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromSignedFile($full)
+        $signedCertificate = [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($full)
+        try { $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($signedCertificate) }
+        finally { if ($null -ne $signedCertificate) { $signedCertificate.Dispose() } }
         $pathPointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($full)
         $fileInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal(32)
         $trustData = [Runtime.InteropServices.Marshal]::AllocHGlobal(88)
         $actionPointer = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+        # WINTRUST_DATA includes the trailing pSignatureSettings member on
+        # supported Windows versions. AllocHGlobal is not zero-initializing;
+        # clear the complete ABI records before writing fields so an
+        # indeterminate trailing pointer cannot be dereferenced by wintrust.
+        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(32), 0, $fileInfo, 32)
+        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(88), 0, $trustData, 88)
         [Runtime.InteropServices.Marshal]::StructureToPtr([Guid]'00AAC56B-CD44-11d0-8CC2-00C04FC295EE', $actionPointer, $false)
         [Runtime.InteropServices.Marshal]::WriteInt32($fileInfo, 0, 32)
         [Runtime.InteropServices.Marshal]::WriteIntPtr($fileInfo, 8, $pathPointer)
@@ -323,22 +331,51 @@ function Test-D32PowerShellAuthorityProtectedSecurity {
     $securityPath = ''
     $pathProperty = $Security.PSObject.Properties['Path']
     if ($null -ne $pathProperty) { $securityPath = [string]$pathProperty.Value }
+    $isExactProgramData = [StringComparer]::OrdinalIgnoreCase.Equals($securityPath, 'C:\ProgramData')
+    $volumeRoot = ''
+    $powerShellRoot = ''
+    try {
+        $powerShellRoot = [IO.Path]::GetFullPath([string]$PSHOME)
+        $volumeRoot = [IO.Path]::GetPathRoot($powerShellRoot)
+    }
+    catch { return $false }
+    $isLocalVolumeRoot = $volumeRoot -cmatch '^[A-Za-z]:\\$'
+    $isExactVolumeRootAncestor = $IsProtectedAncestor -and $isLocalVolumeRoot -and
+        [StringComparer]::OrdinalIgnoreCase.Equals($securityPath, $volumeRoot) -and
+        (Test-D32PowerShellAuthorityPathWithin -Child $powerShellRoot -Parent $securityPath) -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($powerShellRoot, $securityPath) -and
+        [string]$Security.OwnerSid -ceq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' -and
+        $IsDirectory -and $Security.Security.AreAccessRulesProtected
+    if ($isExactProgramData -and (-not $IsDirectory -or [string]$Security.OwnerSid -cne 'S-1-5-18')) { return $false }
     if ([StringComparer]::OrdinalIgnoreCase.Equals($securityPath, 'C:\ProgramData\Microsoft') -and
         (-not $IsDirectory -or [string]$Security.OwnerSid -cne 'S-1-5-18' -or -not $Security.Security.AreAccessRulesProtected)) { return $false }
     $writeMask = [int64]0x00000002 -bor [int64]0x00000004 -bor [int64]0x00000010 -bor [int64]0x00000040 -bor
         [int64]0x00000100 -bor [int64]0x00010000 -bor [int64]0x00040000 -bor [int64]0x00080000 -bor
         [int64]0x01000000 -bor [int64]0x10000000 -bor [int64]0x40000000
-    if ($IsProtectedAncestor) { $writeMask = $writeMask -band (-bnot ([int64]0x00000002 -bor [int64]0x00000004)) }
     # ProgramData is a known Windows ancestor used by Defender's platform
     # directory. Its stock Everyone ACE permits metadata changes and creation
     # of unrelated children, but not deleting/replacing a child, changing its
     # ACL/owner, or writing the existing Microsoft child. Permit only those
     # exact non-redirecting bits here; all other ProgramData write rights fail.
+    # The exception is deliberately exact: it cannot be applied to arbitrary
+    # ancestors such as C:\Windows, and only a SYSTEM-owned ProgramData
+    # directory qualifies.
     $programDataSafeAdditions = [int64]0x00000002 -bor [int64]0x00000004 -bor [int64]0x00000010 -bor [int64]0x00000100
+    # The exact local volume root is a non-resolver ancestor, not a resolver
+    # directory. Only an untrusted directory-child creation right (0x4) is
+    # tolerated there after its opened identity, owner and protected descriptor
+    # are recorded in the independently pinned full-distribution ancestor
+    # inventory. Absolute PSHOME/System32 roots and the finite admitted resolver
+    # inputs keep a newly created root sibling outside the resolver domain.
+    # Never extend this to PSHOME itself, another drive/UNC/nested ancestor, or
+    # any file-creation, metadata, delete/rename/reparse, DACL/owner right.
+    $volumeRootSafeAdditions = [int64]0x00000004
     if ($IsProgramDataAncestor) {
-        if (-not $IsDirectory -or -not [StringComparer]::OrdinalIgnoreCase.Equals($securityPath, 'C:\ProgramData')) { return $false }
+        if (-not $isExactProgramData) { return $false }
         $writeMask = $writeMask -band (-bnot $programDataSafeAdditions)
     }
+    elseif ($isExactVolumeRootAncestor) { $writeMask = $writeMask -band (-bnot $volumeRootSafeAdditions) }
+    elseif ($isExactProgramData) { return $false }
     foreach ($rule in $Security.Security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
             ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
@@ -348,6 +385,9 @@ function Test-D32PowerShellAuthorityProtectedSecurity {
         $untrustedWrite = $mask -band $writeMask
         if ($IsProgramDataAncestor) {
             if (($untrustedWrite -band (-bnot $programDataSafeAdditions)) -ne 0) { return $false }
+        }
+        elseif ($isExactVolumeRootAncestor) {
+            if (($untrustedWrite -band (-bnot $volumeRootSafeAdditions)) -ne 0) { return $false }
         }
         elseif ($untrustedWrite -ne 0) { return $false }
     }
@@ -416,7 +456,8 @@ function Add-D32PowerShellAuthorityDirectoryChain {
 function Open-D32PowerShellAuthorityFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [ValidateRange(1, 2147483647)][Int64]$MaximumBytes = [Int32]::MaxValue
     )
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $full)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: missing or reparse-backed file: $full" }
@@ -430,7 +471,7 @@ function Open-D32PowerShellAuthorityFile {
         $before = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
         $finalPath = Get-D32PowerShellAuthorityFinalHandlePath -Handle $stream.SafeFileHandle
         if (($before.Attributes -band [int][IO.FileAttributes]::Directory) -ne 0 -or
-            ($before.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Bytes -le 0 -or $before.Bytes -gt [Int32]::MaxValue -or
+            ($before.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Bytes -le 0 -or $before.Bytes -gt $MaximumBytes -or $before.Bytes -gt [Int32]::MaxValue -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals($finalPath, $full)) {
             throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: expected bounded regular opened file: $full"
         }
@@ -475,6 +516,97 @@ function Test-D32PowerShellAuthorityJsonDuplicates {
         }
     }
     return $false
+}
+
+function ConvertFrom-D32PowerShellAuthorityJsonElement {
+    param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element)
+    switch ($Element.ValueKind) {
+        ([System.Text.Json.JsonValueKind]::Object) {
+            $properties = [ordered]@{}
+            foreach ($property in $Element.EnumerateObject()) { $properties.Add($property.Name, (ConvertFrom-D32PowerShellAuthorityJsonElement -Element $property.Value)) }
+            return [PSCustomObject]$properties
+        }
+        ([System.Text.Json.JsonValueKind]::Array) {
+            $items = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $Element.EnumerateArray()) { $items.Add((ConvertFrom-D32PowerShellAuthorityJsonElement -Element $item)) }
+            return ,$items.ToArray()
+        }
+        ([System.Text.Json.JsonValueKind]::String) { return $Element.GetString() }
+        ([System.Text.Json.JsonValueKind]::Number) {
+            $number = [Int64]0
+            if (-not $Element.TryGetInt64([ref]$number)) { throw 'FACTS_REQUEST_BLOCKED: JSON numbers must be signed 64-bit integers' }
+            return $number
+        }
+        ([System.Text.Json.JsonValueKind]::True) { return $true }
+        ([System.Text.Json.JsonValueKind]::False) { return $false }
+        ([System.Text.Json.JsonValueKind]::Null) { return $null }
+        default { throw 'FACTS_REQUEST_BLOCKED: JSON contains an unsupported token' }
+    }
+}
+
+function Read-D32PowerShellAuthorityFactsRequest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedRecordType,
+        [Parameter(Mandatory = $true)][string[]]$RequiredFields,
+        [string[]]$OptionalFields = @(),
+        [ValidateRange(1024, 1048576)][int]$MaximumBytes = 65536
+    )
+    if (-not [IO.Path]::IsPathRooted($Path) -or [IO.Path]::GetFullPath($Path) -cne $Path) { throw 'FACTS_REQUEST_BLOCKED: input path must be literal, canonical, and absolute' }
+    $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $opened = $null
+    try {
+        $opened = Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $directoryFences -MaximumBytes $MaximumBytes
+        $jsonText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$opened.Bytes)
+        $document = [System.Text.Json.JsonDocument]::Parse($jsonText, [System.Text.Json.JsonDocumentOptions]@{ MaxDepth = 24; CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow; AllowTrailingCommas = $false })
+        try {
+            $element = $document.RootElement
+            if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $element)) {
+                throw 'FACTS_REQUEST_BLOCKED: input must be a duplicate-free JSON object'
+            }
+            $expected = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($field in $RequiredFields) { if (-not $expected.Add([string]$field)) { throw 'FACTS_REQUEST_BLOCKED: internal required field list has duplicates' } }
+            foreach ($field in $OptionalFields) { if (-not $expected.Add([string]$field)) { throw 'FACTS_REQUEST_BLOCKED: internal optional field list overlaps or has duplicates' } }
+            $actual = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($property in $element.EnumerateObject()) {
+                if (-not $actual.Add($property.Name) -or -not $expected.Contains($property.Name)) { throw "FACTS_REQUEST_BLOCKED: input has duplicate or extra field '$($property.Name)'" }
+            }
+            foreach ($field in $RequiredFields) { if (-not $actual.Contains([string]$field)) { throw "FACTS_REQUEST_BLOCKED: input is missing required field '$field'" } }
+            if ($element.GetProperty('record_type').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $element.GetProperty('record_type').GetString() -cne $ExpectedRecordType -or
+                $element.GetProperty('schema_version').ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $element.GetProperty('schema_version').GetRawText() -cne '1') {
+                throw 'FACTS_REQUEST_BLOCKED: input record type or version is unsupported'
+            }
+            return ConvertFrom-D32PowerShellAuthorityJsonElement -Element $element
+        }
+        finally { $document.Dispose() }
+    }
+    catch {
+        if ([string]$_.Exception.Message -like 'FACTS_REQUEST_BLOCKED:*') { throw }
+        throw "FACTS_REQUEST_BLOCKED: $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $opened -and $null -ne $opened.Stream) { $opened.Stream.Dispose() }
+        foreach ($fence in $directoryFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+    }
+}
+
+function Get-D32PowerShellAuthorityLoadedModuleSet {
+    $identities = [System.Collections.Generic.List[string]]::new()
+    foreach ($module in (Microsoft.PowerShell.Core\Get-Module)) {
+        $path = if ([String]::IsNullOrWhiteSpace([string]$module.Path)) { '<in-memory>' } else { [IO.Path]::GetFullPath([string]$module.Path) }
+        $identities.Add(([string]$module.Name + '|' + $path))
+    }
+    $identities.Sort([StringComparer]::OrdinalIgnoreCase)
+    return ,$identities.ToArray()
+}
+
+function Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected)
+    $actual = Get-D32PowerShellAuthorityLoadedModuleSet
+    if ($actual.Count -ne $Expected.Count) { throw 'FACTS_PREPARATION_BLOCKED: module-free facts preparation changed the loaded module set' }
+    for ($index = 0; $index -lt $actual.Count; $index++) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actual[$index], $Expected[$index])) { throw 'FACTS_PREPARATION_BLOCKED: module-free facts preparation changed the loaded module set' }
+    }
 }
 
 function Test-D32PowerShellAuthorityJsonFields {
@@ -1706,14 +1838,14 @@ function Test-D32PowerShellModuleAdmissionRunnerBinding {
 function ConvertTo-D32PowerShellAuthorityJsonText {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return 'null' }
-    if ($Value -is [string]) { return [System.Text.Json.JsonSerializer]::Serialize([string]$Value) }
+    if ($Value -is [string]) { return [System.Text.Json.JsonSerializer]::Serialize([string]$Value, [type][string], [System.Text.Json.JsonSerializerOptions]::new()) }
     if ($Value -is [bool]) { return ([string]$Value).ToLowerInvariant() }
     if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64]) {
         return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Value -is [System.Collections.IDictionary]) {
         $parts = [System.Collections.Generic.List[string]]::new()
-        foreach ($key in $Value.Keys) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$key) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $Value[$key]))) }
+        foreach ($key in $Value.Keys) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$key, [type][string], [System.Text.Json.JsonSerializerOptions]::new()) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $Value[$key]))) }
         return '{' + ($parts -join ',') + '}'
     }
     if ($Value -is [System.Collections.IEnumerable]) {
@@ -1723,7 +1855,7 @@ function ConvertTo-D32PowerShellAuthorityJsonText {
     }
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
         $parts = [System.Collections.Generic.List[string]]::new()
-        foreach ($property in $Value.PSObject.Properties) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$property.Name) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $property.Value))) }
+        foreach ($property in $Value.PSObject.Properties) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$property.Name, [type][string], [System.Text.Json.JsonSerializerOptions]::new()) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $property.Value))) }
         return '{' + ($parts -join ',') + '}'
     }
     throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unsupported JSON candidate value type: $($Value.GetType().FullName)"
@@ -1880,10 +2012,10 @@ function Assert-D32PowerShellModuleAdmissionCurrent {
             }
         }
     }
+    $State.Admission.import_verification.commands = @($commandOrigins.Values)
     if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $State.Admission -CandidateSha ([string]$State.Admission.candidate_sha) -Repository ([string]$State.Admission.source_repo))) {
         throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: stale, forged, or malformed shared admission context'
     }
-    $State.Admission.import_verification.commands = @($commandOrigins.Values)
 }
 
 function Initialize-D32PowerShellModuleAuthority {

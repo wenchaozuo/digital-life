@@ -1,43 +1,71 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Admitted')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
     [string]$ArchivePath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string]$CandidateSha,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
     [string]$ToolchainProfilePath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
     [ValidatePattern('^[0-9a-f]{64}$')]
     [string]$ExpectedToolchainProfileSha256,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
     [string]$Repository,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
     [string]$PowerShellModuleAuthorityPath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
     [ValidatePattern('^[0-9a-f]{64}$')]
     [string]$ExpectedPowerShellModuleAuthoritySha256,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
     [string]$PinnedGitPath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admitted')]
     [ValidatePattern('^[0-9a-f]{64}$')]
-    [string]$PinnedGitSha256
+    [string]$PinnedGitSha256,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
+    [switch]$FactsOnly,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FactsOnly')]
+    [string]$FactsOutputPath
 )
 
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
-$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
-    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
-    -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
-    -CallerCandidateSha $CandidateSha -CallerRepository $Repository -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
-    -EntryScriptPath $PSCommandPath
+if ($PSCmdlet.ParameterSetName -ceq 'FactsOnly') {
+    $global:PSModuleAutoLoadingPreference = 'None'
+    $env:PSModulePath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules'))
+    $global:D32PowerShellModuleImportAttempts = 0
+    $loadedModulesAtStart = Get-D32PowerShellAuthorityLoadedModuleSet
+    $null = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $PSCommandPath
+    . ([IO.Path]::Combine($PSScriptRoot, 'd32-build-toolchain-profile.ps1'))
+    $factsRepository = [IO.Path]::GetFullPath($Repository)
+    $codeRepository = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
+    if ($Repository -cne $factsRepository -or -not [StringComparer]::OrdinalIgnoreCase.Equals($factsRepository, $codeRepository)) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: FactsOnly repository must be the exact canonical repository containing this entry script'
+    }
+    $factsProfile = Test-D32BuildToolchainProfileModuleFree -ProfilePath $ToolchainProfilePath -ExpectedSha256 $ExpectedToolchainProfileSha256 -Repository $factsRepository
+    if (-not $factsProfile.IsValid) { throw "TAURI_MACROS_SOURCE_PATCH_BLOCKED: module-free full Profile V2 validation failed: $($factsProfile.Failure)" }
+}
+else {
+    $null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+        -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+        -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+        -CallerCandidateSha $CandidateSha -CallerRepository $Repository -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
+        -EntryScriptPath $PSCommandPath
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -109,9 +137,9 @@ function Assert-D32RegularFile {
 
     if (-not [IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
     $fullPath = [IO.Path]::GetFullPath($Path)
-    $item = Get-Item -LiteralPath $fullPath -Force
-    if ($item -isnot [IO.FileInfo] -or -not $item.Exists) { throw "Expected a regular file: $fullPath" }
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Reparse-point file is not accepted: $fullPath" }
+    if (-not [IO.File]::Exists($fullPath)) { throw "Expected a regular file: $fullPath" }
+    $attributes = [IO.File]::GetAttributes($fullPath)
+    if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($attributes -band [IO.FileAttributes]::Directory) -ne 0) { throw "Reparse-point or non-regular file is not accepted: $fullPath" }
     return $fullPath
 }
 
@@ -135,7 +163,9 @@ function Get-D32ArchiveMembers {
                     }
                     $relativePath = $name.Substring($prefix.Length)
                     $segments = $relativePath.Split('/')
-                    if ($relativePath.Length -eq 0 -or @($segments | Where-Object { $_.Length -eq 0 -or $_ -ceq '.' -or $_ -ceq '..' }).Count -ne 0) {
+                    $unsafeSegment = $relativePath.Length -eq 0
+                    foreach ($segment in $segments) { if ($segment.Length -eq 0 -or $segment -ceq '.' -or $segment -ceq '..') { $unsafeSegment = $true; break } }
+                    if ($unsafeSegment) {
                         throw "Unsafe archive member path: $name"
                     }
                     if (-not $caseFolded.Add($relativePath)) { throw "Duplicate/case-colliding archive member: $relativePath" }
@@ -180,8 +210,8 @@ function Get-D32TreeDigest {
 function Get-D32VendorMembers {
     param([Parameter(Mandatory = $true)][string]$Root)
 
-    $rootItem = Get-Item -LiteralPath $Root -Force
-    if ($rootItem -isnot [IO.DirectoryInfo] -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    $rootItem = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Root))
+    if (-not $rootItem.Exists -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
         throw "Vendored crate root must be a real directory: $Root"
     }
 
@@ -213,7 +243,7 @@ if ($archiveBytes.LongLength -ne $script:ExpectedArchiveBytes -or $archiveSha256
     throw 'Locked tauri-macros 2.6.3 archive byte count or SHA-256 mismatch.'
 }
 
-$profileInfo = Get-Item -LiteralPath $profileFullPath -Force
+$profileInfo = [IO.FileInfo]::new($profileFullPath)
 $profileSha256 = Get-D32FileSha256Hex -Path $profileFullPath
 if ($profileSha256 -cne $ExpectedToolchainProfileSha256) { throw 'Toolchain profile SHA-256 differs from caller-pinned expectation.' }
 
@@ -223,9 +253,9 @@ $sourceTreeSha256 = Get-D32TreeDigest -Members $archivedMembers
 if ($sourceTreeSha256 -cne $script:ExpectedSourceTreeSha256) { throw 'Locked source tree digest mismatch.' }
 if (-not $archivedMembers.ContainsKey($script:WrapperRelativePath)) { throw 'Locked source archive omits the patched wrapper source.' }
 
-$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$tauriRoot = Join-Path $repoRoot 'src-tauri'
-$vendorRoot = Join-Path (Join-Path $tauriRoot 'vendor') $script:PackageRootName
+$repoRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
+$tauriRoot = [IO.Path]::Combine($repoRoot, 'src-tauri')
+$vendorRoot = [IO.Path]::Combine($tauriRoot, 'vendor', $script:PackageRootName)
 $vendoredMembers = Get-D32VendorMembers -Root $vendorRoot
 if ($vendoredMembers.Count -ne $archivedMembers.Count) { throw 'Vendored source file count differs from the locked archive.' }
 foreach ($relativePath in $archivedMembers.Keys) {
@@ -286,10 +316,10 @@ foreach ($relativePath in $archivedMembers.Keys) {
     }
 }
 
-$vendorPackageManifest = Join-Path $vendorRoot 'Cargo.toml'
-$vendorPackageLock = Join-Path $vendorRoot 'Cargo.lock'
-$rootManifest = Join-Path $tauriRoot 'Cargo.toml'
-$rootLock = Join-Path $tauriRoot 'Cargo.lock'
+$vendorPackageManifest = [IO.Path]::Combine($vendorRoot, 'Cargo.toml')
+$vendorPackageLock = [IO.Path]::Combine($vendorRoot, 'Cargo.lock')
+$rootManifest = [IO.Path]::Combine($tauriRoot, 'Cargo.toml')
+$rootLock = [IO.Path]::Combine($tauriRoot, 'Cargo.lock')
 $vendorManifestText = $utf8Strict.GetString($vendoredMembers['Cargo.toml'])
 if ($vendorManifestText -notmatch '(?m)^name\s*=\s*"tauri-macros"\s*$' -or $vendorManifestText -notmatch '(?m)^version\s*=\s*"2\.6\.3"\s*$') {
     throw 'Vendored package manifest identity is not tauri-macros 2.6.3.'
@@ -300,7 +330,10 @@ $requiredPatch = '[patch.crates-io]' + $lf + 'tauri-macros = { path = "vendor/ta
 if (-not $rootManifestText.Contains($requiredPatch)) { throw 'Root Cargo.toml does not contain the exact candidate-local crates.io patch declaration.' }
 $rootLockBytes = ConvertTo-D32CanonicalTextBytes -Bytes ([IO.File]::ReadAllBytes($rootLock))
 $rootLockText = $utf8Strict.GetString($rootLockBytes)
-$packageBlocks = @($rootLockText -split '(?m)^\[\[package\]\]\r?\n' | Where-Object { $_ -match '(?m)^name = "tauri-macros"\r?$' })
+$packageBlocks = [System.Collections.Generic.List[string]]::new()
+foreach ($packageBlock in ($rootLockText -split '(?m)^\[\[package\]\]\r?\n')) {
+    if ($packageBlock -match '(?m)^name = "tauri-macros"\r?$') { $packageBlocks.Add($packageBlock) }
+}
 if ($packageBlocks.Count -ne 1 -or $packageBlocks[0] -notmatch '(?m)^version = "2\.6\.3"\r?$' -or $packageBlocks[0] -match '(?m)^(source|checksum)\s*=') {
     throw 'Root Cargo.lock does not contain exactly one local tauri-macros 2.6.3 package entry without registry source/checksum.'
 }
@@ -358,4 +391,28 @@ $record = [ordered]@{
     vendor_lock_sha256 = $vendorLockSha256
 }
 
-Write-Output ($record | ConvertTo-Json -Depth 8 -Compress)
+$recordJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $record
+if ($PSCmdlet.ParameterSetName -ceq 'FactsOnly') {
+    if ($global:D32PowerShellModuleImportAttempts -ne 0) { throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: FactsOnly unexpectedly attempted a module import' }
+    Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedModulesAtStart
+    $outputFull = [IO.Path]::GetFullPath($FactsOutputPath)
+    $repoFull = [IO.Path]::GetFullPath($Repository)
+    $outputParent = [IO.Path]::GetDirectoryName($outputFull)
+    if ($FactsOutputPath -cne $outputFull -or [IO.File]::Exists($outputFull) -or [IO.Directory]::Exists($outputFull) -or
+        (Test-D32PowerShellAuthorityPathWithin -Child $outputFull -Parent $repoFull) -or
+        -not [IO.Directory]::Exists($outputParent) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $outputParent)) {
+        throw 'TAURI_MACROS_SOURCE_PATCH_BLOCKED: facts output must be a canonical absent external file beneath an existing non-reparse parent'
+    }
+    $outputBytes = [Text.UTF8Encoding]::new($false).GetBytes($recordJson + "`n")
+    $outputStream = [IO.File]::Open($outputFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $outputStream.Write($outputBytes, 0, $outputBytes.Length); $outputStream.Flush($true) }
+    finally { $outputStream.Dispose() }
+    $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    try {
+        $written = Open-D32PowerShellAuthorityFile -Path $outputFull -DirectoryFences $directoryFences
+        try { [Console]::WriteLine("D32_TAURI_SOURCE_FACTS_PATH=$outputFull"); [Console]::WriteLine("D32_TAURI_SOURCE_FACTS_SHA256=$($written.Record.sha256)"); [Console]::WriteLine("D32_TAURI_SOURCE_FACTS_BYTES=$($written.Record.bytes)") }
+        finally { $written.Stream.Dispose() }
+    }
+    finally { foreach ($fence in $directoryFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } }
+}
+else { Write-Output $recordJson }

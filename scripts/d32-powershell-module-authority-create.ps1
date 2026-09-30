@@ -14,6 +14,7 @@ param(
 $global:PSModuleAutoLoadingPreference = 'None'
 $env:PSModulePath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules'))
 $global:D32PowerShellModuleImportAttempts = 0
+$loadedModulesAtStart = Get-D32PowerShellAuthorityLoadedModuleSet
 if ($CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $ExpectedToolchainProfileSha256 -cnotmatch '^[0-9a-f]{64}$') {
     throw 'MODULE_AUTHORITY_CREATE_BLOCKED: candidate and Profile V2 SHA pins must be exact lowercase digests'
 }
@@ -108,6 +109,8 @@ $json = ConvertTo-D32PowerShellAuthorityJsonText -Value $candidate
 $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
 $outputParent = [IO.Path]::GetDirectoryName($outputPathFull)
 if (-not [IO.Directory]::Exists($outputParent) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $outputParent)) { throw 'MODULE_AUTHORITY_CREATE_BLOCKED: output parent must exist and be non-reparse' }
+if ([int]$global:D32PowerShellModuleImportAttempts -ne 0) { throw 'MODULE_AUTHORITY_CREATE_BLOCKED: candidate generation attempted a module import' }
+Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedModulesAtStart
 $stream = [IO.FileStream]::new($outputPathFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
 try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
 finally { $stream.Dispose() }

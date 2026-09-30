@@ -194,6 +194,11 @@ try {
     $currentProcessIdentityCheck = $helperText.IndexOf('$process.StartTime.ToUniversalTime().Ticks -ne [Int64]$State.Admission.runner_process.start_time_utc_ticks', $assertCurrentStart, [StringComparison]::Ordinal)
     $assertCurrentEnd = $helperText.IndexOf('function Initialize-D32PowerShellModuleAuthority', $assertCurrentStart, [StringComparison]::Ordinal)
     $reuseCurrentBody = if ($assertCurrentEnd -gt $assertCurrentStart) { $helperText.Substring($assertCurrentStart, $assertCurrentEnd - $assertCurrentStart) } else { '' }
+    $reuseResolverRootsBound = $reuseCurrentBody.Contains('-WindowsRoot $expectedWindowsRoot -DefenderRoot $defenderRoot') -and
+        $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents -PowerShellRoot ([string]$State.PowerShellRoot)') -and
+        -not $reuseCurrentBody.Contains('$currentOs.')
+    Add-D32FactsSelfTestCase 'reuse resolver transition and native-origin reconciliation use current admitted roots and pinned OS components' `
+        $reuseResolverRootsBound 'AssertCurrent must use its locally revalidated pinned Windows/Defender roots and admitted component records; no unbound currentOs variable may enter the fixed resolver proof.'
     $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and
         $reuseCurrentBody.Contains('-OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256)') -and
         $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents') -and

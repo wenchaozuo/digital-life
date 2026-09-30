@@ -2612,13 +2612,13 @@ function Assert-D32PowerShellModuleAdmissionCurrent {
     }
     $resolverTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $priorResolver -After $currentResolver `
         -PinnedNativeFiles $transitionNativeFiles.ToArray() -PinnedManagedFiles $transitionManagedFiles.ToArray() `
-        -PowerShellRoot ([string]$State.PowerShellRoot) -WindowsRoot ([string]$currentOs.WindowsRoot) -DefenderRoot ([string]$currentOs.DefenderRoot)
+        -PowerShellRoot ([string]$State.PowerShellRoot) -WindowsRoot $expectedWindowsRoot -DefenderRoot $defenderRoot
     if (-not $resolverTransition.Passed) {
         $diagnosticText = ConvertTo-D32PowerShellAuthorityJsonText -Value $resolverTransition.Diagnostic
         throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: current resolver admission transition denied; diagnostic=' + $diagnosticText)
     }
     $nativeEvidence = Get-D32PowerShellAuthorityNativeOriginEvidence -ResolverSnapshot $currentResolver -RuntimeDistributionFiles $State.RuntimeDistribution.files `
-        -OsSecurityComponents $currentOs.Components -PowerShellRoot ([string]$State.PowerShellRoot)
+        -OsSecurityComponents $State.OsSecurityComponents -PowerShellRoot ([string]$State.PowerShellRoot)
     Update-D32PowerShellAuthorityAdmissionResolverSnapshot -Admission $State.Admission -ResolverSnapshot $currentResolver -NativeEvidence $nativeEvidence
     if ($State.ImportAttempts -lt 3 -or $State.Admission.record_type -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2') { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module admission did not complete the three fixed imports' }
     $moduleInfos = @(Microsoft.PowerShell.Core\Get-Module)

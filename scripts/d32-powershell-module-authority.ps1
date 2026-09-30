@@ -1974,6 +1974,62 @@ function Test-D32PowerShellModuleAdmissionClosureFileRecord {
     return $true
 }
 
+function Test-D32PowerShellModuleAdmissionAssemblyOriginRecord {
+    param(
+        [AllowNull()][object]$AssemblyRecord,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string,object]]$FileRecordsByPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$SeenAssemblyPaths
+    )
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.property-set'
+    if ($null -eq $AssemblyRecord -or $AssemblyRecord -is [string] -or $AssemblyRecord -is [Array] -or $AssemblyRecord -is [ValueType]) { return $false }
+    $assemblyFields = [System.Collections.Generic.List[string]]::new()
+    if ($AssemblyRecord -is [System.Collections.IDictionary]) { foreach ($key in $AssemblyRecord.Keys) { $assemblyFields.Add([string]$key) } }
+    else { foreach ($property in $AssemblyRecord.PSObject.Properties) { $assemblyFields.Add([string]$property.Name) } }
+    $referenceFields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
+    if ($assemblyFields.Count -ne $referenceFields.Count) { return $false }
+    foreach ($field in $referenceFields) { if (-not $assemblyFields.Contains($field)) { return $false } }
+
+    $get = {
+        param($record, $name)
+        $value = Get-D32PowerShellModuleAdmissionField -Record $record -Name $name
+        if ($value -is [Array]) { return ,$value }
+        return $value
+    }
+    $path = & $get $AssemblyRecord 'path'
+    $sha = & $get $AssemblyRecord 'sha256'
+    $bytes = & $get $AssemblyRecord 'bytes'
+    $volume = & $get $AssemblyRecord 'volume_serial_hex'
+    $fileId = & $get $AssemblyRecord 'file_id_hex'
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.identity-types'
+    if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or
+        $sha -isnot [string] -or $sha -cnotmatch '^[0-9a-f]{64}$' -or
+        -not ($bytes -is [int32] -or $bytes -is [int64] -or $bytes -is [uint32] -or $bytes -is [uint64]) -or [Int64]$bytes -le 0 -or
+        $volume -isnot [string] -or $volume -cnotmatch '^[0-9a-f]{16}$' -or
+        $fileId -isnot [string] -or $fileId -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    try {
+        if ([IO.Path]::GetFullPath($path) -cne $path) { return $false }
+    }
+    catch { return $false }
+
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.pinned-closure-path'
+    if (-not $FileRecordsByPath.ContainsKey($path)) { return $false }
+    $file = $FileRecordsByPath[$path]
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path, [string](& $get $file 'path'))) { return $false }
+
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.unique-path'
+    if ($SeenAssemblyPaths.Contains($path)) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.sha256-reference'
+    if ($sha -cne (& $get $file 'sha256')) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.bytes-reference'
+    if ([Int64]$bytes -ne [Int64](& $get $file 'bytes')) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.volume-reference'
+    if ($volume -cne (& $get $file 'volume_serial_hex')) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin.file-id-reference'
+    if ($fileId -cne (& $get $file 'file_id_hex')) { return $false }
+    [void]$SeenAssemblyPaths.Add($path)
+    return $true
+}
+
 function Test-D32PowerShellModuleAdmissionRecord {
     param([AllowNull()][object]$Document, [AllowNull()][string]$CandidateSha, [AllowNull()][string]$Repository, [AllowNull()][object]$ExpectedContext)
     $script:D32PowerShellModuleAdmissionValidationContext = 'record.shape'
@@ -2220,15 +2276,8 @@ function Test-D32PowerShellModuleAdmissionRecord {
     foreach ($record in $moduleRecords) { foreach ($file in (& $get $record 'files')) { $fileRecordsByPath[[string](& $get $file 'path')] = $file } }
     $assemblyPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($assembly in (& $get $verification 'assemblies')) {
-        $script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-assembly-origin'
-        $assemblyFields = [System.Collections.Generic.List[string]]::new()
-        if ($assembly -is [System.Collections.IDictionary]) { foreach ($key in $assembly.Keys) { $assemblyFields.Add([string]$key) } } else { foreach ($property in $assembly.PSObject.Properties) { $assemblyFields.Add([string]$property.Name) } }
-        if ($assemblyFields.Count -ne 5) { return $false }
-        foreach ($field in $referenceFields) { if (-not $assemblyFields.Contains($field)) { return $false } }
-        $path = [string](& $get $assembly 'path')
-        if (-not $fileRecordsByPath.ContainsKey($path) -or -not $assemblyPaths.Add($path)) { return $false }
-        $file = $fileRecordsByPath[$path]
-        foreach ($field in $referenceFields) { if ((& $get $assembly $field) -cne (& $get $file $field)) { return $false } }
+        if (-not (Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $assembly `
+            -FileRecordsByPath $fileRecordsByPath -SeenAssemblyPaths $assemblyPaths)) { return $false }
     }
     foreach ($requiredAssemblyPath in (Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot $powerShellRoot)) {
         $script:D32PowerShellModuleAdmissionValidationContext = 'record.required-import-assembly-closure'

@@ -243,6 +243,48 @@ Add-D32FactsSelfTestCase 'module closure file references reject duplicate paths 
     ($firstDuplicatePathAccepted -and $samePathRejected -and $firstDuplicateIdAccepted -and $sameIdRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
     'Path and volume/file-ID uniqueness are checked independently while the fixture remains synthetic and module-free.'
 
+$assemblyFileRecords = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+$assemblyFileRecords.Add($cimNativePath, $validCimClosureFile)
+$validAssemblyOrigin = [ordered]@{
+    path = $cimNativePath; sha256 = $validCimClosureFile.sha256; bytes = $validCimClosureFile.bytes
+    volume_serial_hex = $validCimClosureFile.volume_serial_hex; file_id_hex = $validCimClosureFile.file_id_hex
+}
+$validAssemblySeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$validAssemblyAccepted = Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $validAssemblyOrigin `
+    -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $validAssemblySeen
+$caseVariantAssemblyOrigin = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin
+$caseVariantAssemblyOrigin['path'] = $cimNativePath.ToUpperInvariant()
+$caseVariantAssemblySeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$caseVariantAssemblyAccepted = Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $caseVariantAssemblyOrigin `
+    -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $caseVariantAssemblySeen
+$unpinnedAssemblyOrigin = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin
+$unpinnedAssemblyOrigin['path'] = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'unlisted-assembly.dll'))
+$unpinnedAssemblySeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$unpinnedAssemblyRejected = -not (Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $unpinnedAssemblyOrigin `
+    -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $unpinnedAssemblySeen)
+$wrongAssemblyHash = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $wrongAssemblyHash['sha256'] = ('b' * 64)
+$wrongAssemblyBytes = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $wrongAssemblyBytes['bytes'] = [Int64]($validCimClosureFile.bytes + 1)
+$wrongAssemblyVolume = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $wrongAssemblyVolume['volume_serial_hex'] = '0000000000000002'
+$wrongAssemblyFileId = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $wrongAssemblyFileId['file_id_hex'] = '00000000000000000000000000000002'
+$extraAssemblyField = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $extraAssemblyField['unexpected'] = 'denied'
+$missingAssemblyField = Copy-D32FactsSelfTestMap -Value $validAssemblyOrigin; $missingAssemblyField.Remove('file_id_hex')
+$badAssemblyOrigins = @($wrongAssemblyHash,$wrongAssemblyBytes,$wrongAssemblyVolume,$wrongAssemblyFileId,$extraAssemblyField,$missingAssemblyField)
+$badAssemblyOriginsRejected = $true
+foreach ($badAssemblyOrigin in $badAssemblyOrigins) {
+    $badAssemblySeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    if (Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $badAssemblyOrigin `
+        -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $badAssemblySeen) { $badAssemblyOriginsRejected = $false }
+}
+$duplicateAssemblySeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$firstAssemblyAccepted = Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $validAssemblyOrigin `
+    -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $duplicateAssemblySeen
+$duplicateAssemblyRejected = -not (Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $caseVariantAssemblyOrigin `
+    -FileRecordsByPath $assemblyFileRecords -SeenAssemblyPaths $duplicateAssemblySeen)
+Add-D32FactsSelfTestCase 'actual assembly-origin references match pinned closure case-insensitively and reject unpinned, duplicate, malformed, or drifted content' `
+    ($validAssemblyAccepted -and $caseVariantAssemblyAccepted -and $unpinnedAssemblyRejected -and $badAssemblyOriginsRejected -and
+     $firstAssemblyAccepted -and $duplicateAssemblyRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+    'Synthetic references replay the production predicate without importing assemblies; path case is Windows-insensitive while content identity remains exact.'
+
 try {
     $singletonArrayJson = [System.Text.Json.JsonDocument]::Parse('{"distribution":{"protected_ancestors":[{"path":"C:\\","depth":0}]}}')
     try {
@@ -315,10 +357,18 @@ try {
         $admissionValidatorSafeLocals 'The powershell_host record and its pshome field use ordinary local names; $Host and $PSHOME are constant automatic variables.'
     $validatorContextDiagnostics = $admissionValidatorBody.Contains("`$script:D32PowerShellModuleAdmissionValidationContext = 'record.resolver-active-environment-empty-array'") -and
         $admissionValidatorBody.Contains("`$script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-command-origin'") -and
+        $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionAssemblyOriginRecord') -and
+        $helperText.Contains("record.actual-assembly-origin.property-set") -and
+        $helperText.Contains("record.actual-assembly-origin.pinned-closure-path") -and
+        $helperText.Contains("record.actual-assembly-origin.sha256-reference") -and
+        $helperText.Contains("record.actual-assembly-origin.bytes-reference") -and
+        $helperText.Contains("record.actual-assembly-origin.volume-reference") -and
+        $helperText.Contains("record.actual-assembly-origin.file-id-reference") -and
         $helperText.Contains('validator_context=$script:D32PowerShellModuleAdmissionValidationContext')
     Add-D32FactsSelfTestCase 'strict admission self-validation reports the failing record section without changing its fail-closed decision' `
-        $validatorContextDiagnostics 'The shared-record validator keeps a non-authoritative section diagnostic for the exact strict predicate group that rejects a positive context.'
+        $validatorContextDiagnostics 'The shared-record validator keeps non-authoritative predicate diagnostics, including individual actual-assembly-origin closure-reference fields.'
     $closureFilePredicateContexts = $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionClosureFileRecord') -and
+        $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionAssemblyOriginRecord') -and
         $admissionValidatorBody.Contains('Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and
         $helperText.Contains('function Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and
         $helperText.Contains('$names = @($role.Nested) + @($role.Assemblies) + @($role.Extra)') -and
@@ -1072,6 +1122,7 @@ try {
                     $moduleClosureFactsValid = $authorityModules.GetArrayLength() -eq 3
                     $moduleClosureSeenPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
                     $moduleClosureSeenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $moduleClosureFileRecords = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
                     $cimNativeClosurePinned = $false
                     $cimUnmanagedClosurePinned = $false
                     foreach ($module in $authorityModules.EnumerateArray()) {
@@ -1091,6 +1142,7 @@ try {
                             if (-not (Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $fileReference -Role $roleName `
                                 -ModuleDirectory $moduleDirectory -AllowedRootFilePaths $allowedRootPaths `
                                 -SeenPaths $moduleClosureSeenPaths -SeenFileIds $moduleClosureSeenIds)) { $moduleClosureFactsValid = $false }
+                            if (-not $moduleClosureFileRecords.TryAdd([string]$fileReference.path, $fileReference)) { $moduleClosureFactsValid = $false }
                             $fileReferences.Add($fileReference)
                             if ($roleName -ceq 'CimCmdlets' -and $fileReference.path -ceq [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.dll'))) { $cimNativeClosurePinned = $true }
                             if ($roleName -ceq 'CimCmdlets' -and $fileReference.path -ceq [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.unmanaged.dll'))) { $cimUnmanagedClosurePinned = $true }
@@ -1101,6 +1153,23 @@ try {
                     $moduleClosureFactsValid = $moduleClosureFactsValid -and $cimNativeClosurePinned -and $cimUnmanagedClosurePinned -and $global:D32PowerShellModuleImportAttempts -eq 0
                     Add-D32FactsSelfTestCase 'generated module authority file references satisfy strict role-bound per-file predicates and pinned digests without imports' `
                         $moduleClosureFactsValid 'All three generated module inventories were replayed through the same strict file-reference validator. CimCmdlets root Extra DLLs stay pinned closure facts, not resolver assembly allowlist entries.'
+                    $fixedAssemblyClosureSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $fixedAssemblyClosureValid = $true
+                    $fixedAssemblyPaths = @(Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot ([string]$PSHOME))
+                    foreach ($assemblyPath in $fixedAssemblyPaths) {
+                        if (-not $moduleClosureFileRecords.ContainsKey([string]$assemblyPath)) { $fixedAssemblyClosureValid = $false; continue }
+                        $assemblyFile = $moduleClosureFileRecords[[string]$assemblyPath]
+                        $assemblyReference = [ordered]@{
+                            path = [string]$assemblyPath; sha256 = [string]$assemblyFile.sha256; bytes = [Int64]$assemblyFile.bytes
+                            volume_serial_hex = [string]$assemblyFile.volume_serial_hex; file_id_hex = [string]$assemblyFile.file_id_hex
+                        }
+                        if (-not (Test-D32PowerShellModuleAdmissionAssemblyOriginRecord -AssemblyRecord $assemblyReference `
+                            -FileRecordsByPath $moduleClosureFileRecords -SeenAssemblyPaths $fixedAssemblyClosureSeen)) { $fixedAssemblyClosureValid = $false }
+                    }
+                    $fixedAssemblyClosureValid = $fixedAssemblyClosureValid -and $fixedAssemblyPaths.Count -gt 0 -and
+                        $fixedAssemblyClosureSeen.Count -eq $fixedAssemblyPaths.Count -and $global:D32PowerShellModuleImportAttempts -eq 0
+                    Add-D32FactsSelfTestCase 'generated module authority inventories close every exact fixed import assembly through the shared actual-origin predicate' `
+                        $fixedAssemblyClosureValid "The no-import candidate inventory was replayed against $($fixedAssemblyPaths.Count) exact import-assembly paths; case-insensitive Windows path lookup does not widen content identity."
                     $osComponentElements = $authorityElement.GetProperty('resolver_policy').GetProperty('os_security_components')
                     $osComponentRoles = [System.Collections.Generic.List[string]]::new()
                     foreach ($component in $osComponentElements.EnumerateArray()) { $osComponentRoles.Add($component.GetProperty('component_type').GetString()) }

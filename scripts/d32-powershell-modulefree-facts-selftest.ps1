@@ -386,6 +386,70 @@ try {
         $global:D32PowerShellModuleImportAttempts -eq 0
     Add-D32FactsSelfTestCase 'main preflight Git setup failures retain bounded sanitized V2 process evidence' `
         $gitSetupDiagnosticsBound 'The code-owned init/add/commit path keeps exit, capture, raw-output digest/excerpt, process trace and cleanup context; temporary selftest paths and credential-like text are sanitized.'
+
+    $preflightLibraryPinFactoryStart = $preflightText.IndexOf('function Get-D32PreflightModuleLibraryAdmissionPins', [StringComparison]::Ordinal)
+    $preflightGitModuleStart = $preflightText.IndexOf('function Get-D32PreflightGitCaptureModule', $preflightLibraryPinFactoryStart, [StringComparison]::Ordinal)
+    $preflightPinFactory = if ($preflightGitModuleStart -gt $preflightLibraryPinFactoryStart) { $preflightText.Substring($preflightLibraryPinFactoryStart, $preflightGitModuleStart - $preflightLibraryPinFactoryStart) } else { '' }
+    $preflightPinMapFields = @(
+        'RepoRoot = [string]$RepoRoot',
+        'ExpectedCandidateSha = [string]$ModuleAuthorityCandidateSha',
+        'ToolchainProfilePath = [string]$ToolchainProfilePath',
+        'ExpectedToolchainProfileSha256 = [string]$ExpectedToolchainProfileSha256',
+        'PowerShellModuleAuthorityPath = [string]$PowerShellModuleAuthorityPath',
+        'ExpectedPowerShellModuleAuthoritySha256 = [string]$ExpectedPowerShellModuleAuthoritySha256',
+        'PinnedGitPath = [string]$TrustedGitPath',
+        'PinnedGitSha256 = [string]$TrustedGitSha256'
+    )
+    $preflightPinFactoryComplete = $preflightLibraryPinFactoryStart -ge 0 -and
+        @($preflightPinMapFields | Where-Object { -not $preflightPinFactory.Contains($_) }).Count -eq 0
+    $preflightGitModuleReuseBound = $preflightText.Contains('-ArgumentList @($fixtureScript, $libraryAdmissionPins)') -and
+        $preflightText.Contains('param([string]$FixtureScriptPath, [System.Collections.IDictionary]$AdmissionPins)') -and
+        $preflightText.Contains('. $FixtureScriptPath -D32LauncherLibraryOnly @AdmissionPins')
+    $preflightReleaseLauncherReuseBound = $preflightText.Contains('$fixtureLibraryAdmissionPins = Get-D32PreflightModuleLibraryAdmissionPins') -and
+        $preflightText.Contains('param([string]$FixtureLauncherPath, [System.Collections.IDictionary]$AdmissionPins)') -and
+        $preflightText.Contains('. $FixtureLauncherPath -D32LauncherLibraryOnly @AdmissionPins')
+    $phase0Text = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-phase0-matrix.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $phase0PinForwarding = $phase0Text.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly') -and
+        $phase0Text.Contains('-RepoRoot $Phase0RepoRoot -ModuleAuthorityCandidateSha $Phase0ExpectedCandidateSha') -and
+        $phase0Text.Contains('-ToolchainProfilePath $Phase0ToolchainProfilePath -ExpectedToolchainProfileSha256 $Phase0ExpectedToolchainProfileSha256') -and
+        $phase0Text.Contains('-PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath') -and
+        $phase0Text.Contains('-TrustedGitPath $Phase0PinnedGitPath -TrustedGitSha256 $Phase0PinnedGitSha256')
+    $phase0StartupReuseBound = $phase0Text.Contains('-ArgumentList @($script:D32Phase0ScriptPath, $fixtureStartupScriptPath, $startupPhase0AdmissionPins, $startupPreflightAdmissionPins, $startupFixtureAdmissionPins)') -and
+        $phase0Text.Contains('. $Phase0ScriptPath -Phase0LibraryOnly @Phase0AdmissionPins') -and
+        $phase0Text.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly @PreflightAdmissionPins') -and
+        $phase0Text.Contains('. $FixtureScriptPath -D32LauncherLibraryOnly @FixtureAdmissionPins')
+    $debugLoaderText = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-debug-trace-load-selftest.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $debugLoaderReuseBound = $debugLoaderText.Contains('. $fixtureScript -D32LauncherLibraryOnly @fixtureLibraryAdmissionPins')
+    foreach ($field in @(
+            'RepoRoot = [string]$Repository',
+            'ExpectedCandidateSha = [string]$ExpectedCandidateSha',
+            'ToolchainProfilePath = [string]$ToolchainProfilePath',
+            'ExpectedToolchainProfileSha256 = [string]$ExpectedToolchainProfileSha256',
+            'PowerShellModuleAuthorityPath = [string]$PowerShellModuleAuthorityPath',
+            'ExpectedPowerShellModuleAuthoritySha256 = [string]$ExpectedPowerShellModuleAuthoritySha256',
+            'PinnedGitPath = [string]$PinnedGitPath',
+            'PinnedGitSha256 = [string]$PinnedGitSha256'
+        )) { if (-not $debugLoaderText.Contains($field)) { $debugLoaderReuseBound = $false } }
+    $baselineSource = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-baseline.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $discoverySource = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-discovery.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $inventoryHelpersReuseBound = $baselineSource.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha') -and
+        $discoverySource.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha') -and
+        $baselineSource.Contains('-PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256') -and
+        $discoverySource.Contains('-PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256') -and
+        $baselineSource.Contains('-TrustedGitPath $PinnedGitPath -TrustedGitSha256 $PinnedGitSha256') -and
+        $discoverySource.Contains('-TrustedGitPath $PinnedGitPath -TrustedGitSha256 $PinnedGitSha256')
+    $reuseSourceParseFailures = [System.Collections.Generic.List[string]]::new()
+    foreach ($sourceName in @('d32-preflight.ps1', 'd32-phase0-matrix.ps1', 'd32-debug-trace-load-selftest.ps1', 'd32-test-inventory-baseline.ps1', 'd32-test-inventory-discovery.ps1')) {
+        $sourceTokens = $null
+        $sourceErrors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile([IO.Path]::Combine($PSScriptRoot, $sourceName), [ref]$sourceTokens, [ref]$sourceErrors)
+        foreach ($sourceError in $sourceErrors) { $reuseSourceParseFailures.Add("${sourceName}:$($sourceError.Extent.StartLineNumber):$($sourceError.Message)") }
+    }
+    $reuseSourcesParse = $reuseSourceParseFailures.Count -eq 0
+    Add-D32FactsSelfTestCase 'every D32 fixture-library reuse edge forwards the exact direct-entry caller pins before AssertCurrent' `
+        ($preflightPinFactoryComplete -and $preflightGitModuleReuseBound -and $preflightReleaseLauncherReuseBound -and
+            $phase0PinForwarding -and $phase0StartupReuseBound -and $debugLoaderReuseBound -and $inventoryHelpersReuseBound -and $reuseSourcesParse -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        ("preflight_factory=$preflightPinFactoryComplete; git_capture=$preflightGitModuleReuseBound; release_launcher=$preflightReleaseLauncherReuseBound; phase0_dependency=$phase0PinForwarding; phase0_startup_selftest=$phase0StartupReuseBound; debug_loader=$debugLoaderReuseBound; inventory_helpers=$inventoryHelpersReuseBound; parse_failures=$($reuseSourceParseFailures -join ','); import_attempts=$global:D32PowerShellModuleImportAttempts")
     $closureFilePredicateContexts = $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionClosureFileRecord') -and
         $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionAssemblyOriginRecord') -and
         $admissionValidatorBody.Contains('Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and

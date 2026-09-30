@@ -1558,15 +1558,35 @@ function Invoke-D32Git {
     return [PSCustomObject]$result
 }
 
+function Get-D32PreflightModuleLibraryAdmissionPins {
+    $pins = [ordered]@{
+        RepoRoot = [string]$RepoRoot
+        ExpectedCandidateSha = [string]$ModuleAuthorityCandidateSha
+        ToolchainProfilePath = [string]$ToolchainProfilePath
+        ExpectedToolchainProfileSha256 = [string]$ExpectedToolchainProfileSha256
+        PowerShellModuleAuthorityPath = [string]$PowerShellModuleAuthorityPath
+        ExpectedPowerShellModuleAuthoritySha256 = [string]$ExpectedPowerShellModuleAuthoritySha256
+        PinnedGitPath = [string]$TrustedGitPath
+        PinnedGitSha256 = [string]$TrustedGitSha256
+    }
+    foreach ($name in $pins.Keys) {
+        if ([String]::IsNullOrWhiteSpace([string]$pins[$name])) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller-owned pin is unavailable for library reuse: $name"
+        }
+    }
+    return ,$pins
+}
+
 function Get-D32PreflightGitCaptureModule {
     if ($null -ne $script:D32PreflightGitCaptureModule) { return $script:D32PreflightGitCaptureModule }
     $fixtureScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
     if (-not (Test-D32NoReparseComponents -Path $fixtureScript) -or -not (Test-Path -LiteralPath $fixtureScript -PathType Leaf)) {
         throw 'trusted Git V2 launcher path is missing or reparse-backed'
     }
-    $script:D32PreflightGitCaptureModule = New-Module -Name D32PreflightGitCapture -ArgumentList $fixtureScript -ScriptBlock {
-        param([string]$FixtureScriptPath)
-        . $FixtureScriptPath -D32LauncherLibraryOnly
+    $libraryAdmissionPins = Get-D32PreflightModuleLibraryAdmissionPins
+    $script:D32PreflightGitCaptureModule = New-Module -Name D32PreflightGitCapture -ArgumentList @($fixtureScript, $libraryAdmissionPins) -ScriptBlock {
+        param([string]$FixtureScriptPath, [System.Collections.IDictionary]$AdmissionPins)
+        . $FixtureScriptPath -D32LauncherLibraryOnly @AdmissionPins
 
         function Invoke-D32PreflightPinnedGitCapture {
             param(
@@ -5181,7 +5201,11 @@ function Invoke-D32GenerateBundle {
         $cargoEnvironment = Get-D32BuildToolchainEnvironment -ValidatedProfile $toolchainProfileValidation -CargoHome ([string]$phase0Validation.Record.cargo_home.path) -TempRoot ([string]$phase0Validation.Record.cargo_home.temp_root) -Offline $true
         if (-not ('D32FixtureNativeProcessV2' -as [type])) {
             $fixtureLauncher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
-            $launcherOutput = @(& { . $fixtureLauncher -D32LauncherLibraryOnly } *>&1)
+            $fixtureLibraryAdmissionPins = Get-D32PreflightModuleLibraryAdmissionPins
+            $launcherOutput = @(& {
+                    param([string]$FixtureLauncherPath, [System.Collections.IDictionary]$AdmissionPins)
+                    . $FixtureLauncherPath -D32LauncherLibraryOnly @AdmissionPins
+                } $fixtureLauncher $fixtureLibraryAdmissionPins *>&1)
             if ($launcherOutput.Count -gt 16 -or -not ('D32FixtureNativeProcessV2' -as [type])) { throw 'shared native Job Object launcher did not initialize cleanly' }
         }
         $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $toolchainProfileValidation

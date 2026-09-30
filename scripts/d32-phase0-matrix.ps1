@@ -4573,12 +4573,48 @@ function Test-D32Phase0MatrixRecordSelfTest {
         & $add 'materializer rejects an existing Cargo source tree whose member bytes differ from the locked archive' $mismatchedSourceTreeRejected
 
         $fixtureStartupScriptPath = Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'
+        $startupPhase0AdmissionPins = [ordered]@{
+            Phase0ToolchainProfilePath = [string]$Phase0ToolchainProfilePath
+            Phase0ExpectedToolchainProfileSha256 = [string]$Phase0ExpectedToolchainProfileSha256
+            Phase0PowerShellModuleAuthorityPath = [string]$Phase0PowerShellModuleAuthorityPath
+            Phase0ExpectedPowerShellModuleAuthoritySha256 = [string]$Phase0ExpectedPowerShellModuleAuthoritySha256
+            Phase0ExpectedCandidateSha = [string]$Phase0ExpectedCandidateSha
+            Phase0RepoRoot = [string]$Phase0RepoRoot
+            Phase0PinnedGitPath = [string]$Phase0PinnedGitPath
+            Phase0PinnedGitSha256 = [string]$Phase0PinnedGitSha256
+        }
+        $startupPreflightAdmissionPins = [ordered]@{
+            RepoRoot = [string]$Phase0RepoRoot
+            ModuleAuthorityCandidateSha = [string]$Phase0ExpectedCandidateSha
+            ToolchainProfilePath = [string]$Phase0ToolchainProfilePath
+            ExpectedToolchainProfileSha256 = [string]$Phase0ExpectedToolchainProfileSha256
+            PowerShellModuleAuthorityPath = [string]$Phase0PowerShellModuleAuthorityPath
+            ExpectedPowerShellModuleAuthoritySha256 = [string]$Phase0ExpectedPowerShellModuleAuthoritySha256
+            TrustedGitPath = [string]$Phase0PinnedGitPath
+            TrustedGitSha256 = [string]$Phase0PinnedGitSha256
+        }
+        $startupFixtureAdmissionPins = [ordered]@{
+            RepoRoot = [string]$Phase0RepoRoot
+            ExpectedCandidateSha = [string]$Phase0ExpectedCandidateSha
+            ToolchainProfilePath = [string]$Phase0ToolchainProfilePath
+            ExpectedToolchainProfileSha256 = [string]$Phase0ExpectedToolchainProfileSha256
+            PowerShellModuleAuthorityPath = [string]$Phase0PowerShellModuleAuthorityPath
+            ExpectedPowerShellModuleAuthoritySha256 = [string]$Phase0ExpectedPowerShellModuleAuthoritySha256
+            PinnedGitPath = [string]$Phase0PinnedGitPath
+            PinnedGitSha256 = [string]$Phase0PinnedGitSha256
+        }
         $startupTestModuleBody = {
-            param([string]$Phase0ScriptPath, [string]$FixtureScriptPath)
-            . $Phase0ScriptPath -Phase0LibraryOnly
+            param(
+                [string]$Phase0ScriptPath,
+                [string]$FixtureScriptPath,
+                [System.Collections.IDictionary]$Phase0AdmissionPins,
+                [System.Collections.IDictionary]$PreflightAdmissionPins,
+                [System.Collections.IDictionary]$FixtureAdmissionPins
+            )
+            . $Phase0ScriptPath -Phase0LibraryOnly @Phase0AdmissionPins
             $preflightLibraryPath = Join-Path (Split-Path -Parent $Phase0ScriptPath) 'd32-preflight.ps1'
-            . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
-            . $FixtureScriptPath -D32LauncherLibraryOnly
+            . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly @PreflightAdmissionPins
+            . $FixtureScriptPath -D32LauncherLibraryOnly @FixtureAdmissionPins
 
             function Invoke-D32Phase0StartupSelfTest {
                 param(
@@ -4730,7 +4766,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         $startupSelfTestModule = New-Module `
             -Name $startupSelfTestModuleName `
-            -ArgumentList @($script:D32Phase0ScriptPath, $fixtureStartupScriptPath) `
+            -ArgumentList @($script:D32Phase0ScriptPath, $fixtureStartupScriptPath, $startupPhase0AdmissionPins, $startupPreflightAdmissionPins, $startupFixtureAdmissionPins) `
             -ScriptBlock $startupTestModuleBody
         Import-Module $startupSelfTestModule -Force
         $startupSelfTestCases = @(Invoke-D32Phase0StartupSelfTest `
@@ -6005,7 +6041,12 @@ try {
     if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
         throw 'PHASE0_DEPENDENCY_BLOCKED: exact d32-preflight.ps1 library path is missing or reparse-backed'
     }
-    . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+    . $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly `
+        -RepoRoot $Phase0RepoRoot -ModuleAuthorityCandidateSha $Phase0ExpectedCandidateSha `
+        -ToolchainProfilePath $Phase0ToolchainProfilePath -ExpectedToolchainProfileSha256 $Phase0ExpectedToolchainProfileSha256 `
+        -PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath `
+        -ExpectedPowerShellModuleAuthoritySha256 $Phase0ExpectedPowerShellModuleAuthoritySha256 `
+        -TrustedGitPath $Phase0PinnedGitPath -TrustedGitSha256 $Phase0PinnedGitSha256
     $preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
     if ($preflightDependencyFailures.Count -gt 0) {
         throw "PHASE0_DEPENDENCY_BLOCKED: preflight helper library is incomplete or shadowed ($($preflightDependencyFailures -join ', '))"

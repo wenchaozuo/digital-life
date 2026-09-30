@@ -21,7 +21,17 @@ $ErrorActionPreference = 'Stop'
 $descendantCount = 291
 
 $fixtureScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
-. $fixtureScript -D32LauncherLibraryOnly
+$fixtureLibraryAdmissionPins = [ordered]@{
+    RepoRoot = [string]$Repository
+    ExpectedCandidateSha = [string]$ExpectedCandidateSha
+    ToolchainProfilePath = [string]$ToolchainProfilePath
+    ExpectedToolchainProfileSha256 = [string]$ExpectedToolchainProfileSha256
+    PowerShellModuleAuthorityPath = [string]$PowerShellModuleAuthorityPath
+    ExpectedPowerShellModuleAuthoritySha256 = [string]$ExpectedPowerShellModuleAuthoritySha256
+    PinnedGitPath = [string]$PinnedGitPath
+    PinnedGitSha256 = [string]$PinnedGitSha256
+}
+. $fixtureScript -D32LauncherLibraryOnly @fixtureLibraryAdmissionPins
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-debug-trace-load-' + [Guid]::NewGuid().ToString('N'))
 [void](Ensure-D32OwnedDirectory -Path $root)

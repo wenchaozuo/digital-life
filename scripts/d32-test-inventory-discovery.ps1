@@ -12,7 +12,8 @@ param(
     [Parameter(Mandatory = $true)][string]$VendoredProtocAuthorityPath,
     [Parameter(Mandatory = $true)][string]$ExpectedVendoredProtocAuthoritySha256,
     [ValidateRange(60, 14400)][int]$Phase0TimeoutSeconds = 1800,
-    [ValidateRange(1, 28800)][int]$Phase0InventoryListTimeoutSeconds = 28800
+    [ValidateRange(1, 28800)][int]$Phase0InventoryListTimeoutSeconds = 28800,
+    [Parameter(DontShow = $true)][switch]$LoaderSelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -20,6 +21,142 @@ $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact runner script location is required' }
 $scriptRoot = Split-Path -Parent ([IO.Path]::GetFullPath($PSCommandPath))
 . (Join-Path $scriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly
+$preflightLibraryPath = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
+if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
+    throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact d32-preflight.ps1 helper library is missing or reparse-backed'
+}
+. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+$preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
+if ($preflightDependencyFailures.Count -gt 0) {
+    throw "TEST_INVENTORY_DISCOVERY_BLOCKED: preflight helper library is incomplete or shadowed ($($preflightDependencyFailures -join ', '))"
+}
+
+function Test-D32InventoryRunnerLoaderDependencyClosure {
+    param([Parameter(Mandatory = $true)][string[]]$RunnerScriptPaths)
+
+    $expectedSourcePaths = @($RunnerScriptPaths) + @(
+        (Join-Path $scriptRoot 'd32-phase0-matrix.ps1'),
+        (Join-Path $scriptRoot 'd32-build-toolchain-profile.ps1'),
+        (Join-Path $scriptRoot 'd32-vendored-protoc-authority.ps1'),
+        (Join-Path $scriptRoot 'd32-h7c-git-child-authority.ps1'),
+        (Join-Path $scriptRoot 'd32-test-inventory-authority.ps1'),
+        (Join-Path $scriptRoot 'd32-preflight.ps1'),
+        (Join-Path $scriptRoot 'd32-fixture-prebuild.ps1')
+    )
+    $expectedSourcePaths = @($expectedSourcePaths | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
+    $expectedSourceSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($expectedSource in $expectedSourcePaths) { [void]$expectedSourceSet.Add([string]$expectedSource) }
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $staticFunctions = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($expectedSource in $expectedSourcePaths) {
+        $sourceTokens = $null
+        $sourceErrors = $null
+        $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($expectedSource, [ref]$sourceTokens, [ref]$sourceErrors)
+        if ($sourceErrors.Count -gt 0) {
+            foreach ($sourceError in $sourceErrors) { $failures.Add("dependency-parse:$([IO.Path]::GetFileName($expectedSource)):$($sourceError.Message)") }
+            continue
+        }
+        foreach ($definition in $sourceAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $staticFunctions[[string]$definition.Name] = $definition
+        }
+    }
+    $visitedCommands = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $visitedFunctions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $visitedModules = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($runnerScriptPath in $RunnerScriptPaths) {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($runnerScriptPath, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count -gt 0) {
+            foreach ($parseError in $parseErrors) { $failures.Add("parse:$([IO.Path]::GetFileName($runnerScriptPath)):$($parseError.Message)") }
+            continue
+        }
+        foreach ($commandAst in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $commandName = $commandAst.GetCommandName()
+            if (-not [String]::IsNullOrWhiteSpace($commandName)) { $pending.Enqueue([string]$commandName) }
+        }
+    }
+
+    while ($pending.Count -gt 0) {
+        $commandName = $pending.Dequeue()
+        if (-not $visitedCommands.Add($commandName)) { continue }
+        $command = Get-Command -Name $commandName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $command) {
+            if ($staticFunctions.ContainsKey($commandName)) {
+                $definition = $staticFunctions[$commandName]
+                $sourcePath = [IO.Path]::GetFullPath([string]$definition.Extent.File)
+                if (-not $expectedSourceSet.Contains($sourcePath)) {
+                    $failures.Add("static-function-from-unexpected-source:$commandName")
+                    continue
+                }
+                if (-not $visitedFunctions.Add($commandName)) { continue }
+                foreach ($nestedCommandAst in $definition.Body.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                    $nestedCommandName = $nestedCommandAst.GetCommandName()
+                    if (-not [String]::IsNullOrWhiteSpace($nestedCommandName)) { $pending.Enqueue([string]$nestedCommandName) }
+                }
+                continue
+            }
+            $failures.Add("missing-command:$commandName")
+            continue
+        }
+        if ($command.CommandType -eq [System.Management.Automation.CommandTypes]::Alias) {
+            if ([String]::IsNullOrWhiteSpace([string]$command.Definition)) { $failures.Add("unresolved-alias:$commandName") }
+            else { $pending.Enqueue([string]$command.Definition) }
+            continue
+        }
+        if ($command.CommandType -eq [System.Management.Automation.CommandTypes]::Function) {
+            $sourcePath = [string]$command.ScriptBlock.Ast.Extent.File
+            if ([String]::IsNullOrWhiteSpace($sourcePath)) {
+                $failures.Add("function-without-source:$commandName")
+                continue
+            }
+            $sourcePath = [IO.Path]::GetFullPath($sourcePath)
+            if (-not $expectedSourceSet.Contains($sourcePath)) {
+                $failures.Add("function-from-unexpected-source:$commandName")
+                continue
+            }
+            if (-not $visitedFunctions.Add($commandName)) { continue }
+            foreach ($nestedCommandAst in $command.ScriptBlock.Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $nestedCommandName = $nestedCommandAst.GetCommandName()
+                if (-not [String]::IsNullOrWhiteSpace($nestedCommandName)) { $pending.Enqueue([string]$nestedCommandName) }
+            }
+            continue
+        }
+        if ($command.CommandType -eq [System.Management.Automation.CommandTypes]::Cmdlet) {
+            $moduleName = [string]$command.ModuleName
+            if (-not [String]::IsNullOrWhiteSpace($moduleName)) {
+                if ($moduleName -notlike 'Microsoft.PowerShell.*' -and $moduleName -cne 'CimCmdlets') { $failures.Add("unapproved-cmdlet-module:$moduleName") }
+                [void]$visitedModules.Add($moduleName)
+            }
+            continue
+        }
+        $failures.Add("unapproved-command-type:$commandName/$($command.CommandType)")
+    }
+
+    return [PSCustomObject]@{
+        Passed = ($failures.Count -eq 0)
+        FunctionCount = $visitedFunctions.Count
+        Modules = @($visitedModules | Sort-Object -CaseSensitive)
+        Failures = @($failures.ToArray())
+    }
+}
+
+if ($LoaderSelfTest) {
+    $runnerScriptPaths = @(
+        [IO.Path]::GetFullPath($PSCommandPath),
+        [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-test-inventory-baseline.ps1'))
+    )
+    $loader = Test-D32InventoryRunnerLoaderDependencyClosure -RunnerScriptPaths $runnerScriptPaths
+    if (-not $loader.Passed) { throw "TEST_INVENTORY_DISCOVERY_LOADER_SELFTEST_FAILED: $($loader.Failures -join ', ')" }
+    Write-Output 'D32_TEST_INVENTORY_DISCOVERY_LOADER=PASS'
+    Write-Output 'discovery_admission=PAST_IMPORT'
+    Write-Output "custom_function_dependencies=$($loader.FunctionCount)"
+    Write-Output "cmdlet_modules=$($loader.Modules -join ',')"
+    Write-Output 'cargo_invocations=0'
+    Write-Output 'evidence_root_claimed=false'
+    return
+}
 
 foreach ($required in @('Phase0TimeoutSeconds', 'Phase0InventoryListTimeoutSeconds')) {
     if (-not $PSBoundParameters.ContainsKey($required)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: caller must explicitly pin -$required" }

@@ -16,6 +16,15 @@ $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: exact baseline builder script location is required' }
 $scriptRoot = Split-Path -Parent ([IO.Path]::GetFullPath($PSCommandPath))
 . (Join-Path $scriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly
+$preflightLibraryPath = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
+if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
+    throw 'TEST_INVENTORY_BASELINE_BLOCKED: exact d32-preflight.ps1 helper library is missing or reparse-backed'
+}
+. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+$preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
+if ($preflightDependencyFailures.Count -gt 0) {
+    throw "TEST_INVENTORY_BASELINE_BLOCKED: preflight helper library is incomplete or shadowed ($($preflightDependencyFailures -join ', '))"
+}
 
 if ($ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $ExpectedDiscoverySha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $ExpectedToolchainProfileSha256 -cnotmatch '^[0-9a-f]{64}$' -or $PinnedGitSha256 -cnotmatch '^[0-9a-f]{64}$') {

@@ -264,6 +264,7 @@ $script:D32Phase0FocusedHost = @(
 $script:D32Phase0PreflightDependencyFunctionNames = @(
     'Get-D32Head',
     'New-D32FindingList',
+    'Set-D32GitCaptureContext',
     'Test-D32FixtureManifest',
     'Test-D32GitClean',
     'Test-D32Governance',

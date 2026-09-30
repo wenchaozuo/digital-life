@@ -36,6 +36,25 @@ function Write-D32FactsSelfTestFile {
     $ownedFiles.Add($Path)
 }
 
+function New-D32FactsSelfTestAuthorityFileReference {
+    param([string]$Path)
+    $canonical = [IO.Path]::GetFullPath($Path)
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical))).ToLowerInvariant()
+    return [PSCustomObject]@{
+        path = $canonical; bytes = [Int64]1; sha256 = $hash
+        volume_serial_hex = '0000000000000001'; file_id_hex = $hash.Substring(0, 32)
+        owner_sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'; security_descriptor_sha256 = ('b' * 64)
+    }
+}
+
+function New-D32FactsSelfTestResolverSnapshotOverride {
+    param([object]$Snapshot, [System.Collections.IDictionary]$Overrides)
+    $copy = [ordered]@{}
+    foreach ($property in $Snapshot.PSObject.Properties) { $copy[[string]$property.Name] = $property.Value }
+    foreach ($key in $Overrides.Keys) { $copy[[string]$key] = $Overrides[$key] }
+    return [PSCustomObject]$copy
+}
+
 function Invoke-D32FactsSelfTestChild {
     param([string[]]$Arguments, [int]$TimeoutSeconds = 300)
     $start = [Diagnostics.ProcessStartInfo]::new($pwsh)
@@ -138,6 +157,8 @@ try {
     $helperPath = [IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1')
     $helperText = [IO.File]::ReadAllText($helperPath, [Text.UTF8Encoding]::new($false, $true))
     $assertStart = $helperText.IndexOf('function Assert-D32PowerShellModuleAdmissionCurrent', [StringComparison]::Ordinal)
+    $helperInitializeStart = $helperText.IndexOf('function Initialize-D32PowerShellModuleAuthority', [StringComparison]::Ordinal)
+    $helperFirstImport = $helperText.IndexOf('Import-Module', $helperInitializeStart, [StringComparison]::Ordinal)
     $originWrite = $helperText.IndexOf('$State.Admission.import_verification.commands = @($commandOrigins.Values)', $assertStart, [StringComparison]::Ordinal)
     $strictRecordCheck = $helperText.IndexOf('Test-D32PowerShellModuleAdmissionRecord -Document $State.Admission', $assertStart, [StringComparison]::Ordinal)
     $originShape = $helperText.IndexOf('effective_module_name = [string]$effective.Module.Name; effective_module_path = [string]$effective.Module.Path', $assertStart, [StringComparison]::Ordinal)
@@ -149,6 +170,58 @@ try {
         ($assertStart -ge 0 -and $exportLoop -gt $assertStart -and $effectiveLookup -gt $exportLoop -and $originMap -gt $effectiveLookup -and
          $moduleOriginShape -gt $originMap -and $originShape -gt $moduleOriginShape -and $originWrite -gt $originShape -and $strictRecordCheck -gt $originWrite) `
         'Static source-lifecycle assertion verifies the record is projected from admitted ExportedCommands and actual Get-Command resolution; positive three-module runtime origins still require newly pinned authority and are intentionally UNVERIFIED.'
+
+    $initializePostSnapshot = $helperText.IndexOf('$postImportResolver = Get-D32PowerShellAuthorityResolverSnapshot', $helperInitializeStart, [StringComparison]::Ordinal)
+    $initializeTransition = $helperText.IndexOf('Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverState -After $postImportResolver', $helperInitializeStart, [StringComparison]::Ordinal)
+    $initializeAdmission = $helperText.IndexOf('$admission = [PSCustomObject][ordered]@{', $initializeTransition, [StringComparison]::Ordinal)
+    $initializePostDigest = $helperText.IndexOf('resolver_sha256 = [string]$postImportResolver.ResolverSha256', $initializeAdmission, [StringComparison]::Ordinal)
+    $initializeOriginEvidence = $helperText.IndexOf('Get-D32PowerShellAuthorityNativeOriginEvidence -ResolverSnapshot $postImportResolver', $initializePostDigest, [StringComparison]::Ordinal)
+    $initializeAssertCurrent = $helperText.IndexOf('Assert-D32PowerShellModuleAdmissionCurrent -State $state', $initializeOriginEvidence, [StringComparison]::Ordinal)
+    $assertCurrentStart = $helperText.IndexOf('function Assert-D32PowerShellModuleAdmissionCurrent', [StringComparison]::Ordinal)
+    $reusePriorSnapshot = $helperText.IndexOf('Get-D32PowerShellAuthorityResolverSnapshotFromAdmission -Admission $State.Admission', $assertCurrentStart, [StringComparison]::Ordinal)
+    $reuseCurrentSnapshot = $helperText.IndexOf('$currentResolver = Get-D32PowerShellAuthorityResolverSnapshot', $reusePriorSnapshot, [StringComparison]::Ordinal)
+    $reuseTransition = $helperText.IndexOf('Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $priorResolver -After $currentResolver', $reuseCurrentSnapshot, [StringComparison]::Ordinal)
+    $reuseUpdate = $helperText.IndexOf('Update-D32PowerShellAuthorityAdmissionResolverSnapshot -Admission $State.Admission', $reuseTransition, [StringComparison]::Ordinal)
+    $reuseModuleCheck = $helperText.IndexOf('foreach ($info in $moduleInfos)', $reuseUpdate, [StringComparison]::Ordinal)
+    $reuseCommandOrigins = $helperText.IndexOf('foreach ($command in $match[0].ExportedCommands.Values)', $reuseModuleCheck, [StringComparison]::Ordinal)
+    $digestRoleProof = $helperText.IndexOf('Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath', $helperText.IndexOf('function Test-D32PowerShellModuleAdmissionRecord', [StringComparison]::Ordinal), [StringComparison]::Ordinal)
+    $reuseStrictCheck = $helperText.IndexOf('Test-D32PowerShellModuleAdmissionRecord -Document $State.Admission', $reuseCommandOrigins, [StringComparison]::Ordinal)
+    $reuseBranchStart = $helperText.IndexOf('if ($null -ne $priorState)', $helperInitializeStart, [StringComparison]::Ordinal)
+    $reuseCallerPins = $helperText.IndexOf('all caller-owned authority, Profile, Git, candidate, repository, and library-entry pins are required for reuse', $reuseBranchStart, [StringComparison]::Ordinal)
+    $reuseAssertPrior = $helperText.IndexOf('Assert-D32PowerShellModuleAdmissionCurrent -State $priorState', $reuseCallerPins, [StringComparison]::Ordinal)
+    $crossProcessBinding = $helperText.IndexOf('return $null -ne $Document -and [Int64]$Document.runner_process.process_id -eq $ExpectedProcessId', [StringComparison]::Ordinal)
+    $expectedContextLifecycleBinding = $helperText.IndexOf("foreach (`$field in @('authority_reference','profile_reference','git_image','powershell_host','module_import_order','module_closure','resolver_admission','import_verification','import_attempts'))", [StringComparison]::Ordinal)
+    $currentProcessIdentityCheck = $helperText.IndexOf('$process.StartTime.ToUniversalTime().Ticks -ne [Int64]$State.Admission.runner_process.start_time_utc_ticks', $assertCurrentStart, [StringComparison]::Ordinal)
+    $producerFiles = @('d32-preflight.ps1','d32-phase0-matrix.ps1','d32-phase0-vendored-authority.ps1','d32-fixture-prebuild.ps1','d32-debug-trace-load-selftest.ps1','d32-tauri-macros-source-attestation.ps1','d32-test-inventory-baseline.ps1','d32-test-inventory-discovery.ps1')
+    $producersBound = $true
+    foreach ($producerName in $producerFiles) {
+        $producerPath = [IO.Path]::Combine($PSScriptRoot, $producerName)
+        if (-not [IO.File]::Exists($producerPath) -or -not [IO.File]::ReadAllText($producerPath, [Text.UTF8Encoding]::new($false, $true)).Contains('Initialize-D32PowerShellModuleAuthority')) { $producersBound = $false }
+    }
+    $consumerFiles = @('d32-preflight.ps1','d32-phase0-matrix.ps1','d32-fixture-prebuild.ps1','d32-test-inventory-authority.ps1')
+    $consumersBound = $true
+    foreach ($consumerName in $consumerFiles) {
+        $consumerPath = [IO.Path]::Combine($PSScriptRoot, $consumerName)
+        $consumerText = if ([IO.File]::Exists($consumerPath)) { [IO.File]::ReadAllText($consumerPath, [Text.UTF8Encoding]::new($false, $true)) } else { '' }
+        if (-not $consumerText.Contains('Test-D32PowerShellModuleAdmissionRecord') -or -not $consumerText.Contains('-ExpectedContext')) { $consumersBound = $false }
+    }
+    $runnerConsumersBound = $true
+    foreach ($consumerName in @('d32-preflight.ps1','d32-phase0-matrix.ps1')) {
+        $consumerPath = [IO.Path]::Combine($PSScriptRoot, $consumerName)
+        $consumerText = if ([IO.File]::Exists($consumerPath)) { [IO.File]::ReadAllText($consumerPath, [Text.UTF8Encoding]::new($false, $true)) } else { '' }
+        if (-not $consumerText.Contains('Test-D32PowerShellModuleAdmissionRunnerBinding') -or -not $consumerText.Contains('Test-D32PowerShellModuleAdmissionProfileRecordBinding')) { $runnerConsumersBound = $false }
+    }
+    $phase0Source = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-phase0-matrix.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $fixtureRunnerEvidenceBound = $phase0Source.Contains('-ExpectedRunnerProcessId ([int]$document.runner_process_id)') -and $phase0Source.Contains('Test-D32Phase0FixtureBuildProvenance')
+    Add-D32FactsSelfTestCase 'three-import admission uses post-import actual origins, strict typed resolver digest, monotonic pinned reuse, actual command provenance, and cross-process consumer binding' `
+        ($helperInitializeStart -ge 0 -and $helperFirstImport -gt $helperInitializeStart -and $initializePostSnapshot -gt $helperFirstImport -and $initializeTransition -gt $initializePostSnapshot -and $initializeAdmission -gt $initializeTransition -and
+         $initializePostDigest -gt $initializeAdmission -and $initializeOriginEvidence -gt $initializePostDigest -and $initializeAssertCurrent -gt $initializeOriginEvidence -and
+         $reusePriorSnapshot -gt $assertCurrentStart -and $reuseCurrentSnapshot -gt $reusePriorSnapshot -and $reuseTransition -gt $reuseCurrentSnapshot -and
+         $reuseUpdate -gt $reuseTransition -and $reuseModuleCheck -gt $reuseUpdate -and $reuseCommandOrigins -gt $reuseModuleCheck -and $reuseStrictCheck -gt $reuseCommandOrigins -and
+         $reuseCallerPins -gt $reuseBranchStart -and $reuseAssertPrior -gt $reuseCallerPins -and $digestRoleProof -gt 0 -and $crossProcessBinding -gt 0 -and
+         $expectedContextLifecycleBinding -gt 0 -and $currentProcessIdentityCheck -gt $assertCurrentStart -and $producersBound -and $consumersBound -and $runnerConsumersBound -and $fixtureRunnerEvidenceBound -and
+         $global:D32PowerShellModuleImportAttempts -eq 0) `
+        ("initialize=$initializePostSnapshot/$initializeTransition/$initializeAdmission/$initializePostDigest/$initializeOriginEvidence/$initializeAssertCurrent; reuse=$reusePriorSnapshot/$reuseCurrentSnapshot/$reuseTransition/$reuseUpdate/$reuseCommandOrigins/$reuseStrictCheck; digest=$digestRoleProof; process=$crossProcessBinding/$expectedContextLifecycleBinding/$currentProcessIdentityCheck; producers=$producersBound; consumers=$consumersBound; runner_consumers=$runnerConsumersBound; fixture_trace=$fixtureRunnerEvidenceBound; import_attempts=0")
 
     $everyoneCreateDirectory = [int64][Security.AccessControl.FileSystemRights]::CreateDirectories
     $programDataSafe = [int64][Security.AccessControl.FileSystemRights]::CreateFiles -bor [int64][Security.AccessControl.FileSystemRights]::CreateDirectories -bor `
@@ -294,18 +367,23 @@ try {
     $trustedPlatformFile = [IO.Path]::Combine([string]$PSHOME, 'System.Management.Automation.dll')
     $depsFile = [IO.Path]::Combine([string]$PSHOME, 'pwsh.deps.json')
     $kernelBasePath = [IO.Path]::Combine($system32Path, 'kernelbase.dll')
+    $ntdllPath = [IO.Path]::Combine($system32Path, 'ntdll.dll')
+    $powershellImagePath = [IO.Path]::Combine([string]$PSHOME, 'pwsh.exe')
+    $powershellImageReference = New-D32FactsSelfTestAuthorityFileReference -Path $powershellImagePath
+    $kernelBaseReference = New-D32FactsSelfTestAuthorityFileReference -Path $kernelBasePath
+    $ntdllReference = New-D32FactsSelfTestAuthorityFileReference -Path $ntdllPath
     $osComponents = @(
         [PSCustomObject]@{
             component_type = 'MICROSOFT_WINDOWS_OS_INSTALLATION'
             inventory_sha256 = ('1' * 64)
-            native_files = @([PSCustomObject]@{ path = $kernelBasePath })
-            distribution = [PSCustomObject]@{ directories = @([PSCustomObject]@{ path = $system32Path }) }
+            native_files = @($kernelBaseReference, $ntdllReference)
+            distribution = [PSCustomObject]@{ directories = @([PSCustomObject]@{ path = $system32Path }); files = @($kernelBaseReference, $ntdllReference) }
         },
         [PSCustomObject]@{
             component_type = 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM'
             inventory_sha256 = ('2' * 64)
             native_files = @()
-            distribution = [PSCustomObject]@{ directories = @() }
+            distribution = [PSCustomObject]@{ directories = @(); files = @() }
         }
     )
     $osComponentsDigest = Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $osComponents
@@ -314,7 +392,7 @@ try {
         ManagedAssemblyPaths = @($trustedPlatformFile, $kernelBasePath)
         DepsFilePaths = @($depsFile)
         NativeDirectoryPaths = @([IO.Path]::GetFullPath([string]$PSHOME), $system32Path)
-        NativeModulePaths = @([IO.Path]::Combine([string]$PSHOME, 'pwsh.exe'), $kernelBasePath)
+        NativeModulePaths = @($powershellImagePath, $kernelBasePath)
         OsSecurityComponents = $osComponents
         OsSecurityInventorySha256 = $osComponentsDigest
     }
@@ -322,6 +400,128 @@ try {
     Add-D32FactsSelfTestCase 'synthetic resolver closure accepts only exact pinned PSHOME and System32 inputs' `
         ($resolverPositive.Blockers.Count -eq 0) ($resolverPositive.Blockers -join '; ')
     $rootSibling = [IO.Path]::Combine($actualVolumeRoot, "d32-synthetic-$testId.dll")
+
+    $resolverPostParameters = $resolverParameters.Clone()
+    $resolverPostParameters.NativeModulePaths = @($resolverParameters.NativeModulePaths + $ntdllPath)
+    $resolverPostParameters.ManagedAssemblyPaths = @($resolverParameters.ManagedAssemblyPaths + $ntdllPath)
+    $resolverPostImport = Get-D32PowerShellAuthorityResolverSnapshot @resolverPostParameters
+    $pinnedNativeRefs = @(
+        $powershellImageReference,
+        $kernelBaseReference,
+        $ntdllReference
+    )
+    $pinnedManagedRefs = @(
+        (New-D32FactsSelfTestAuthorityFileReference -Path $trustedPlatformFile),
+        $kernelBaseReference,
+        $ntdllReference
+    )
+    $syntheticNativeEvidence = Get-D32PowerShellAuthorityNativeOriginEvidence -ResolverSnapshot $resolverPositive -RuntimeDistributionFiles @($powershellImageReference) `
+        -OsSecurityComponents $osComponents -PowerShellRoot ([string]$PSHOME)
+    $syntheticAdmission = [PSCustomObject]@{
+        resolver_admission = [ordered]@{
+            state = 'VERIFIED'; policy_id = 'D32_POWERSHELL_RESOLVER_DOMAIN_V2'; resolver_sha256 = [string]$resolverPositive.ResolverSha256
+            os_security_inventory_sha256 = [string]$resolverPositive.OsSecurityInventorySha256; native_policy = [string]$resolverPositive.NativePolicy
+            module_search_path = [string]$resolverPositive.ModuleSearchPath; trusted_platform_paths = @($resolverPositive.TrustedPlatformPaths)
+            loaded_managed_assembly_paths = @($resolverPositive.LoadedManagedAssemblyPaths); deps_paths = @($resolverPositive.DepsPaths)
+            native_directories = @($resolverPositive.NativeDirectories); native_module_paths = @($resolverPositive.NativeModulePaths)
+            active_environment = @($resolverPositive.ActiveEnvironment)
+        }
+        import_verification = [ordered]@{ native_modules = @($syntheticNativeEvidence) }
+    }
+    $reconstructedResolver = Get-D32PowerShellAuthorityResolverSnapshotFromAdmission -Admission $syntheticAdmission
+    $positiveTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverPostImport `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    $positiveTransitionJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $positiveTransition.Diagnostic
+    $preResolverDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath $resolverPositive.ModuleSearchPath -OsSecurityInventorySha256 $resolverPositive.OsSecurityInventorySha256 `
+        -TrustedPlatformPaths $resolverPositive.TrustedPlatformPaths -DepsPaths $resolverPositive.DepsPaths -NativeDirectories $resolverPositive.NativeDirectories `
+        -NativeModulePaths $resolverPositive.NativeModulePaths -ActiveEnvironment $resolverPositive.ActiveEnvironment -NativePolicy $resolverPositive.NativePolicy -NativeFileComponents $resolverPositive.NativeFileComponents
+    $postResolverDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath $resolverPostImport.ModuleSearchPath -OsSecurityInventorySha256 $resolverPostImport.OsSecurityInventorySha256 `
+        -TrustedPlatformPaths $resolverPostImport.TrustedPlatformPaths -DepsPaths $resolverPostImport.DepsPaths -NativeDirectories $resolverPostImport.NativeDirectories `
+        -NativeModulePaths $resolverPostImport.NativeModulePaths -ActiveEnvironment $resolverPostImport.ActiveEnvironment -NativePolicy $resolverPostImport.NativePolicy -NativeFileComponents $resolverPostImport.NativeFileComponents
+    Add-D32FactsSelfTestCase 'authorized post-import native and managed origins are admitted only as monotonic exact caller-pinned additions, and V2 resolver digest recomputes with component roles' `
+        ($positiveTransition.Passed -and $resolverPositive.ResolverSha256 -cne $resolverPostImport.ResolverSha256 -and
+         $resolverPositive.PolicySha256 -ceq $resolverPostImport.PolicySha256 -and
+         $preResolverDigests.ResolverSha256 -ceq $resolverPositive.ResolverSha256 -and $postResolverDigests.ResolverSha256 -ceq $resolverPostImport.ResolverSha256 -and
+         $reconstructedResolver.ResolverSha256 -ceq $resolverPositive.ResolverSha256 -and $reconstructedResolver.PolicySha256 -ceq $resolverPositive.PolicySha256 -and
+         $positiveTransition.Diagnostic.native_images.added_content_refs.Count -eq 1 -and $positiveTransition.Diagnostic.native_images.added_content_refs[0].caller_pinned -and
+         $positiveTransition.Diagnostic.managed_assemblies.added_content_refs.Count -eq 1 -and $positiveTransition.Diagnostic.managed_assemblies.added_content_refs[0].caller_pinned -and
+         $global:D32PowerShellModuleImportAttempts -eq 0) `
+        ("policy-sha=$($resolverPostImport.PolicySha256); resolver-sha-before=$($resolverPositive.ResolverSha256); resolver-sha-after=$($resolverPostImport.ResolverSha256); diagnostic=$positiveTransitionJson; import_attempts=0")
+
+    $unknownNativePath = 'C:\ProgramData\D32Synthetic\unclassified-native.dll'
+    $resolverUnknownParameters = $resolverParameters.Clone()
+    $resolverUnknownParameters.NativeModulePaths = @($resolverParameters.NativeModulePaths + $unknownNativePath)
+    $resolverUnknown = Get-D32PowerShellAuthorityResolverSnapshot @resolverUnknownParameters
+    $unknownTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverUnknown `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    $unknownDiagnostic = ConvertTo-D32PowerShellAuthorityJsonText -Value $unknownTransition.Diagnostic
+    Add-D32FactsSelfTestCase 'unknown native image is denied with hashed unclassified-path diagnostic and zero imports' `
+        (-not $unknownTransition.Passed -and $unknownDiagnostic.Contains('UNCLASSIFIED') -and -not $unknownDiagnostic.Contains($unknownNativePath) -and $global:D32PowerShellModuleImportAttempts -eq 0) $unknownDiagnostic
+
+    $unknownManagedPath = 'C:\ProgramData\D32Synthetic\unclassified-managed.dll'
+    $resolverUnknownManagedParameters = $resolverParameters.Clone()
+    $resolverUnknownManagedParameters.ManagedAssemblyPaths = @($resolverParameters.ManagedAssemblyPaths + $unknownManagedPath)
+    $resolverUnknownManaged = Get-D32PowerShellAuthorityResolverSnapshot @resolverUnknownManagedParameters
+    $unknownManagedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverUnknownManaged `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'unknown managed assembly is denied outside the caller-pinned PowerShell/Windows domains' `
+        (-not $unknownManagedTransition.Passed -and @($unknownManagedTransition.Diagnostic.issues | Where-Object { $_ -match 'managed assembly' }).Count -gt 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $unknownManagedTransition.Diagnostic)
+
+    $resolverRemovedParameters = $resolverPostParameters.Clone()
+    $resolverRemovedParameters.NativeModulePaths = @($resolverPostParameters.NativeModulePaths | Where-Object { $_ -cne $kernelBasePath })
+    $resolverRemovedParameters.ManagedAssemblyPaths = @($resolverPostParameters.ManagedAssemblyPaths | Where-Object { $_ -cne $kernelBasePath })
+    $resolverRemoved = Get-D32PowerShellAuthorityResolverSnapshot @resolverRemovedParameters
+    $removedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverRemoved `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'native and managed origin disappearance across the fixed imports is denied' `
+        (-not $removedTransition.Passed -and @($removedTransition.Diagnostic.issues | Where-Object { $_ -match 'disappeared' }).Count -eq 2 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $removedTransition.Diagnostic)
+
+    $resolverPolicyDriftParameters = $resolverParameters.Clone()
+    $resolverPolicyDriftParameters.TrustedPlatformAssemblyPaths = @($trustedPlatformFile, $rootSibling)
+    $resolverPolicyDrift = Get-D32PowerShellAuthorityResolverSnapshot @resolverPolicyDriftParameters
+    $policyDriftTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverPolicyDrift `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    $policyDriftDiagnostic = ConvertTo-D32PowerShellAuthorityJsonText -Value $policyDriftTransition.Diagnostic
+    Add-D32FactsSelfTestCase 'fixed TPA resolver policy drift is denied and diagnostic does not disclose unclassified path text' `
+        (-not $policyDriftTransition.Passed -and $policyDriftDiagnostic.Contains('TrustedPlatformPaths') -and -not $policyDriftDiagnostic.Contains($rootSibling) -and $global:D32PowerShellModuleImportAttempts -eq 0) $policyDriftDiagnostic
+
+    $injectedEnvironment = New-D32FactsSelfTestResolverSnapshotOverride -Snapshot $resolverPositive -Overrides ([ordered]@{ ActiveEnvironment = @([ordered]@{ name = 'DOTNET_STARTUP_HOOKS'; value = 'synthetic-sensitive-value' }) })
+    $environmentTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $injectedEnvironment `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    $environmentDiagnostic = ConvertTo-D32PowerShellAuthorityJsonText -Value $environmentTransition.Diagnostic
+    Add-D32FactsSelfTestCase 'synthetic runtime injection-environment drift is denied without logging environment values' `
+        (-not $environmentTransition.Passed -and $environmentDiagnostic.Contains('ActiveEnvironment') -and -not $environmentDiagnostic.Contains('synthetic-sensitive-value') -and $global:D32PowerShellModuleImportAttempts -eq 0) $environmentDiagnostic
+
+    $reorderedOrigins = New-D32FactsSelfTestResolverSnapshotOverride -Snapshot $resolverPostImport -Overrides ([ordered]@{ NativeModulePaths = @($resolverPostImport.NativeModulePaths[1], $resolverPostImport.NativeModulePaths[0], $resolverPostImport.NativeModulePaths[2]) })
+    $reorderedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $reorderedOrigins `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'native image reorder cannot masquerade as an import-only monotonic transition' `
+        (-not $reorderedTransition.Passed -and @($reorderedTransition.Diagnostic.issues | Where-Object { $_ -match 'order changed' }).Count -gt 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $reorderedTransition.Diagnostic)
+
+    $caseChangedPath = $kernelBasePath.Replace('kernelbase.dll', 'KERNELBASE.dll')
+    $caseChangedOrigins = New-D32FactsSelfTestResolverSnapshotOverride -Snapshot $resolverPostImport -Overrides ([ordered]@{ NativeModulePaths = @($powershellImagePath, $caseChangedPath, $ntdllPath) })
+    $caseChangedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $caseChangedOrigins `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'native file identity path case drift is denied despite case-insensitive lookup aliases' `
+        (-not $caseChangedTransition.Passed -and @($caseChangedTransition.Diagnostic.issues | Where-Object { $_ -match 'casing changed' }).Count -gt 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $caseChangedTransition.Diagnostic)
+
+    $wrongRoleComponents = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $resolverPostImport.NativeModulePaths) {
+        $componentType = [string]$resolverPostImport.NativeFileComponents[[string]$path]
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$path, $ntdllPath)) { $componentType = 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM' }
+        $wrongRoleComponents.Add([string]$path, $componentType)
+    }
+    $wrongRoleOrigins = New-D32FactsSelfTestResolverSnapshotOverride -Snapshot $resolverPostImport -Overrides ([ordered]@{ NativeFileComponents = $wrongRoleComponents })
+    $wrongRoleTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $wrongRoleOrigins `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'pinned content cannot be re-labelled as an incompatible Windows/Defender component role' `
+        (-not $wrongRoleTransition.Passed -and $wrongRoleTransition.Diagnostic.native_component_role_differences.Count -gt 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $wrongRoleTransition.Diagnostic)
+
     $resolverSiblingManaged = @{
         TrustedPlatformAssemblyPaths = @($trustedPlatformFile, $rootSibling)
         ManagedAssemblyPaths = @($trustedPlatformFile, $kernelBasePath, $rootSibling)

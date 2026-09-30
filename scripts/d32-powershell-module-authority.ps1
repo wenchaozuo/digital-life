@@ -1120,6 +1120,36 @@ function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
     return [PSCustomObject]@{ Components = $components; InventorySha256 = $overall; WindowsRoot = $windowsRoot; DefenderRoot = [string]$defender.root_path; OpenFiles = $OpenFiles; DirectoryFences = $DirectoryFences }
 }
 
+function Get-D32PowerShellAuthorityResolverDigestSet {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModuleSearchPath,
+        [Parameter(Mandatory = $true)][string]$OsSecurityInventorySha256,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$TrustedPlatformPaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$DepsPaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$NativeDirectories,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$NativeModulePaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$ActiveEnvironment,
+        [Parameter(Mandatory = $true)][string]$NativePolicy,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string,string]]$NativeFileComponents
+    )
+    $material = [System.Collections.Generic.List[string]]::new()
+    $policyMaterial = [System.Collections.Generic.List[string]]::new()
+    $material.Add($ModuleSearchPath); $policyMaterial.Add($ModuleSearchPath)
+    if (-not [String]::IsNullOrWhiteSpace($OsSecurityInventorySha256)) { $material.Add($OsSecurityInventorySha256); $policyMaterial.Add($OsSecurityInventorySha256) }
+    foreach ($value in @($TrustedPlatformPaths) + @($DepsPaths) + @($NativeDirectories)) { $material.Add([string]$value); $policyMaterial.Add([string]$value) }
+    foreach ($path in $NativeModulePaths) {
+        if (-not $NativeFileComponents.ContainsKey([string]$path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver digest lacks an exact native component role for an observed image: $path" }
+        $material.Add('native|' + [string]$path + '|' + [string]$NativeFileComponents[[string]$path])
+    }
+    foreach ($environmentRecord in $ActiveEnvironment) { $material.Add([string]$environmentRecord.name); $policyMaterial.Add([string]$environmentRecord.name) }
+    $material.Add($NativePolicy); $policyMaterial.Add($NativePolicy)
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $resolverDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($encoding.GetBytes([string]::Join("`n", $material.ToArray()) + "`n"))).ToLowerInvariant()
+    $policyDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($encoding.GetBytes([string]::Join("`n", $policyMaterial.ToArray()) + "`n"))).ToLowerInvariant()
+    $nativeDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($encoding.GetBytes([string]::Join("`n", [string[]]$NativeModulePaths) + "`n"))).ToLowerInvariant()
+    return [PSCustomObject]@{ ResolverSha256 = $resolverDigest; PolicySha256 = $policyDigest; NativeModulePathsSha256 = $nativeDigest }
+}
+
 function Get-D32PowerShellAuthorityResolverSnapshot {
     param(
         [AllowNull()][string[]]$NativeModulePaths,
@@ -1257,25 +1287,323 @@ function Get-D32PowerShellAuthorityResolverSnapshot {
     $depsSorted = & $sortUnique ([string[]]$depsPaths)
     $nativeSorted = & $sortUnique ([string[]]$nativePaths)
     $nativeDirsSorted = & $sortUnique ([string[]]$nativeDirs)
-    $materialList = [System.Collections.Generic.List[string]]::new()
-    $materialList.Add($moduleRoot)
-    if (-not [String]::IsNullOrWhiteSpace($OsSecurityInventorySha256)) { $materialList.Add([string]$OsSecurityInventorySha256) }
-    foreach ($value in @($managedSorted) + @($depsSorted) + @($nativeDirsSorted)) { $materialList.Add([string]$value) }
-    foreach ($value in $nativeSorted) {
-        $componentType = if ($osFileComponents.ContainsKey([string]$value)) { [string]$osFileComponents[[string]$value] } else { 'POWERSHELL_DISTRIBUTION' }
-        $materialList.Add('native|' + [string]$value + '|' + $componentType)
+    $nativeFileComponents = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $nativeSorted) {
+        $componentType = if ($osFileComponents.ContainsKey([string]$path)) { [string]$osFileComponents[[string]$path] } else { 'POWERSHELL_DISTRIBUTION' }
+        $nativeFileComponents.Add([string]$path, $componentType)
     }
-    foreach ($environmentRecord in $activeEnvironment) { $materialList.Add([string]$environmentRecord.name) }
-    $materialList.Add([string]$nativePolicy)
-    $material = $materialList.ToArray()
-    $digestText = [string]::Join("`n", [string[]]$material) + "`n"
-    $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($digestText))).ToLowerInvariant()
+    $digests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath $moduleSearchPath -OsSecurityInventorySha256 ([string]$OsSecurityInventorySha256) `
+        -TrustedPlatformPaths $managedSorted -DepsPaths $depsSorted -NativeDirectories $nativeDirsSorted -NativeModulePaths $nativeSorted `
+        -ActiveEnvironment $activeEnvironment.ToArray() -NativePolicy $nativePolicy -NativeFileComponents $nativeFileComponents
     return [PSCustomObject]@{
         Blockers = [string[]]$blockers.ToArray(); TrustedPlatformPaths = [string[]]$managedSorted; LoadedManagedAssemblyPaths = [string[]]$loadedManagedSorted; DepsPaths = [string[]]$depsSorted
         NativeDirectories = [string[]]$nativeDirsSorted; NativeModulePaths = [string[]]$nativeSorted; ActiveEnvironment = $activeEnvironment.ToArray()
-        NativePolicy = $nativePolicy; ModuleSearchPath = [string]$moduleSearchPath; ResolverSha256 = $digest
-        OsSecurityInventorySha256 = [string]$OsSecurityInventorySha256; OsSecurityComponents = @($OsSecurityComponents); NativeFileComponents = $osFileComponents
+        NativePolicy = $nativePolicy; ModuleSearchPath = [string]$moduleSearchPath; ResolverSha256 = [string]$digests.ResolverSha256; PolicySha256 = [string]$digests.PolicySha256; NativeModulePathsSha256 = [string]$digests.NativeModulePathsSha256
+        OsSecurityInventorySha256 = [string]$OsSecurityInventorySha256; OsSecurityComponents = @($OsSecurityComponents); NativeFileComponents = $nativeFileComponents
     }
+}
+
+function Get-D32PowerShellAuthorityResolverDiagnosticPath {
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$PowerShellRoot, [string]$WindowsRoot, [string]$DefenderRoot)
+    $fullPath = $Path
+    try { $fullPath = [IO.Path]::GetFullPath($Path) } catch { }
+    foreach ($root in @(
+        [PSCustomObject]@{ Name = 'PSHOME'; Path = $PowerShellRoot },
+        [PSCustomObject]@{ Name = 'WINDOWS_OS'; Path = $WindowsRoot },
+        [PSCustomObject]@{ Name = 'DEFENDER_PLATFORM'; Path = $DefenderRoot }
+    )) {
+        if ([String]::IsNullOrWhiteSpace([string]$root.Path)) { continue }
+        $canonicalRoot = [IO.Path]::GetFullPath([string]$root.Path)
+        if (-not (Test-D32PowerShellAuthorityPathWithin -Child $fullPath -Parent $canonicalRoot)) { continue }
+        $rootPrefix = $canonicalRoot.TrimEnd([char[]]@('\','/'))
+        if ($rootPrefix.Length -eq 2 -and $rootPrefix[1] -eq ':') { $rootPrefix += [IO.Path]::DirectorySeparatorChar }
+        $relative = if ([StringComparer]::OrdinalIgnoreCase.Equals($fullPath, $canonicalRoot)) { '.' } else { $fullPath.Substring($rootPrefix.Length).TrimStart([char[]]@('\','/')) }
+        return [PSCustomObject]@{ domain = [string]$root.Name; relative_path = $relative }
+    }
+    $pathHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$Path))).ToLowerInvariant()
+    return [PSCustomObject]@{ domain = 'UNCLASSIFIED'; path_sha256 = $pathHash }
+}
+
+function Get-D32PowerShellAuthorityResolverPathDelta {
+    param([AllowEmptyCollection()][string[]]$Before, [AllowEmptyCollection()][string[]]$After)
+    $beforeByPath = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $afterByPath = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $duplicateBefore = $false
+    $duplicateAfter = $false
+    foreach ($path in $Before) { if (-not $beforeByPath.TryAdd([string]$path, [string]$path)) { $duplicateBefore = $true } }
+    foreach ($path in $After) { if (-not $afterByPath.TryAdd([string]$path, [string]$path)) { $duplicateAfter = $true } }
+    $added = [System.Collections.Generic.List[string]]::new()
+    $removed = [System.Collections.Generic.List[string]]::new()
+    $caseChanges = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $beforeByPath.GetEnumerator()) {
+        $newPath = ''
+        if (-not $afterByPath.TryGetValue([string]$entry.Key, [ref]$newPath)) { $removed.Add([string]$entry.Value); continue }
+        if (-not [StringComparer]::Ordinal.Equals([string]$entry.Value, $newPath)) { $caseChanges.Add([PSCustomObject]@{ before = [string]$entry.Value; after = $newPath }) }
+    }
+    foreach ($entry in $afterByPath.GetEnumerator()) { if (-not $beforeByPath.ContainsKey([string]$entry.Key)) { $added.Add([string]$entry.Value) } }
+    $commonBefore = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in $Before) { if ($afterByPath.ContainsKey([string]$path)) { $commonBefore.Add([string]$path) } }
+    $commonAfter = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in $After) { if ($beforeByPath.ContainsKey([string]$path)) { $commonAfter.Add([string]$path) } }
+    $commonOrderChanged = $commonBefore.Count -ne $commonAfter.Count
+    if (-not $commonOrderChanged) {
+        for ($index = 0; $index -lt $commonBefore.Count; $index++) {
+            if (-not [StringComparer]::Ordinal.Equals($commonBefore[$index], $commonAfter[$index])) { $commonOrderChanged = $true; break }
+        }
+    }
+    return [PSCustomObject]@{
+        Added = [string[]]$added.ToArray(); Removed = [string[]]$removed.ToArray(); CaseChanges = $caseChanges.ToArray()
+        DuplicateBefore = $duplicateBefore; DuplicateAfter = $duplicateAfter; CommonOrderChanged = $commonOrderChanged
+        BeforeCount = $Before.Count; AfterCount = $After.Count
+    }
+}
+
+function Add-D32PowerShellAuthorityResolverReferenceRecords {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Records,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string,object]]$ReferenceMap,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$InvalidPaths
+    )
+    foreach ($record in $Records) {
+        $path = [string]$record.path
+        $bytes = [Int64]0
+        try { $bytes = [Int64]$record.bytes } catch { }
+        if ([String]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
+            $bytes -le 0 -or [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$record.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$record.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$record.owner_sid -notin @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') -or
+            [string]$record.security_descriptor_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            $InvalidPaths.Add($path)
+            continue
+        }
+        if (-not $ReferenceMap.TryAdd($path, $record)) { $InvalidPaths.Add($path) }
+    }
+}
+
+function Get-D32PowerShellAuthorityResolverReferenceDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string,object]]$ReferenceMap,
+        [string]$PowerShellRoot,
+        [string]$WindowsRoot,
+        [string]$DefenderRoot
+    )
+    $label = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $Path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+    if (-not $ReferenceMap.ContainsKey([string]$Path)) { return [PSCustomObject]@{ location = $label; caller_pinned = $false } }
+    $file = $ReferenceMap[[string]$Path]
+    return [PSCustomObject]@{
+        location = $label; caller_pinned = $true; bytes = [Int64]$file.bytes; sha256 = [string]$file.sha256
+        volume_serial_hex = [string]$file.volume_serial_hex; file_id_hex = [string]$file.file_id_hex
+        owner_sid = [string]$file.owner_sid; security_descriptor_sha256 = [string]$file.security_descriptor_sha256
+    }
+}
+
+function Test-D32PowerShellAuthorityResolverSnapshotTransition {
+    param(
+        [Parameter(Mandatory = $true)][object]$Before,
+        [Parameter(Mandatory = $true)][object]$After,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$PinnedNativeFiles,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$PinnedManagedFiles,
+        [Parameter(Mandatory = $true)][string]$PowerShellRoot,
+        [Parameter(Mandatory = $true)][string]$WindowsRoot,
+        [Parameter(Mandatory = $true)][string]$DefenderRoot
+    )
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $policyDifferences = [System.Collections.Generic.List[string]]::new()
+    $fixedPathDifferences = [System.Collections.Generic.List[object]]::new()
+    $scalarDifferences = [System.Collections.Generic.List[object]]::new()
+    $beforeBlockers = @($Before.Blockers)
+    $afterBlockers = @($After.Blockers)
+    if ($beforeBlockers.Count -gt 0) { $issues.Add('pre-import resolver snapshot has blockers') }
+    if ($afterBlockers.Count -gt 0) { $issues.Add('post-import resolver snapshot has blockers') }
+    $beforeDigestValid = $false
+    $afterDigestValid = $false
+    try {
+        $beforeDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath ([string]$Before.ModuleSearchPath) -OsSecurityInventorySha256 ([string]$Before.OsSecurityInventorySha256) `
+            -TrustedPlatformPaths ([string[]]$Before.TrustedPlatformPaths) -DepsPaths ([string[]]$Before.DepsPaths) -NativeDirectories ([string[]]$Before.NativeDirectories) `
+            -NativeModulePaths ([string[]]$Before.NativeModulePaths) -ActiveEnvironment ([object[]]$Before.ActiveEnvironment) -NativePolicy ([string]$Before.NativePolicy) -NativeFileComponents $Before.NativeFileComponents
+        $beforeDigestValid = $beforeDigests.ResolverSha256 -ceq [string]$Before.ResolverSha256 -and $beforeDigests.PolicySha256 -ceq [string]$Before.PolicySha256 -and $beforeDigests.NativeModulePathsSha256 -ceq [string]$Before.NativeModulePathsSha256
+    }
+    catch { }
+    try {
+        $afterDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath ([string]$After.ModuleSearchPath) -OsSecurityInventorySha256 ([string]$After.OsSecurityInventorySha256) `
+            -TrustedPlatformPaths ([string[]]$After.TrustedPlatformPaths) -DepsPaths ([string[]]$After.DepsPaths) -NativeDirectories ([string[]]$After.NativeDirectories) `
+            -NativeModulePaths ([string[]]$After.NativeModulePaths) -ActiveEnvironment ([object[]]$After.ActiveEnvironment) -NativePolicy ([string]$After.NativePolicy) -NativeFileComponents $After.NativeFileComponents
+        $afterDigestValid = $afterDigests.ResolverSha256 -ceq [string]$After.ResolverSha256 -and $afterDigests.PolicySha256 -ceq [string]$After.PolicySha256 -and $afterDigests.NativeModulePathsSha256 -ceq [string]$After.NativeModulePathsSha256
+    }
+    catch { }
+    if (-not $beforeDigestValid) { $issues.Add('pre-import resolver snapshot self-digest is invalid') }
+    if (-not $afterDigestValid) { $issues.Add('post-import resolver snapshot self-digest is invalid') }
+    foreach ($field in @('ModuleSearchPath','OsSecurityInventorySha256','NativePolicy','PolicySha256')) {
+        if ([string]$Before.$field -cne [string]$After.$field) {
+            $policyDifferences.Add($field)
+            $beforeValue = [string]$Before.$field
+            $afterValue = [string]$After.$field
+            if ($field -ceq 'ModuleSearchPath') {
+                $beforeLabel = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $beforeValue -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+                $afterLabel = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $afterValue -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+                $scalarDifferences.Add([PSCustomObject]@{ field = $field; before = $beforeLabel; after = $afterLabel })
+            }
+            else { $scalarDifferences.Add([PSCustomObject]@{ field = $field; before = $beforeValue; after = $afterValue }) }
+        }
+    }
+    foreach ($field in @('TrustedPlatformPaths','DepsPaths','NativeDirectories')) {
+        $beforeValues = [System.Collections.Generic.List[string]]::new()
+        $afterValues = [System.Collections.Generic.List[string]]::new()
+        foreach ($value in @($Before.$field)) { $beforeValues.Add([string]$value) }
+        foreach ($value in @($After.$field)) { $afterValues.Add([string]$value) }
+        $same = $beforeValues.Count -eq $afterValues.Count
+        if ($same) {
+            for ($index = 0; $index -lt $beforeValues.Count; $index++) {
+                if (-not [StringComparer]::Ordinal.Equals($beforeValues[$index], $afterValues[$index])) { $same = $false; break }
+            }
+        }
+        if (-not $same) {
+            $policyDifferences.Add($field)
+            $delta = Get-D32PowerShellAuthorityResolverPathDelta -Before ($beforeValues.ToArray()) -After ($afterValues.ToArray())
+            $addedLabels = [System.Collections.Generic.List[object]]::new()
+            foreach ($path in $delta.Added) { $addedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+            $removedLabels = [System.Collections.Generic.List[object]]::new()
+            foreach ($path in $delta.Removed) { $removedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+            $caseLabels = [System.Collections.Generic.List[object]]::new()
+            foreach ($change in $delta.CaseChanges) {
+                $caseLabels.Add([PSCustomObject]@{
+                    before = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.before) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+                    after = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.after) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+                })
+            }
+            $fixedPathDifferences.Add([PSCustomObject]@{ field = $field; before_count = $beforeValues.Count; after_count = $afterValues.Count; added = $addedLabels.ToArray(); removed = $removedLabels.ToArray(); case_changes = $caseLabels.ToArray(); common_order_changed = [bool]$delta.CommonOrderChanged })
+        }
+    }
+    $beforeEnvironmentNames = [System.Collections.Generic.List[string]]::new()
+    $afterEnvironmentNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($Before.ActiveEnvironment)) { $beforeEnvironmentNames.Add([string]$entry.name) }
+    foreach ($entry in @($After.ActiveEnvironment)) { $afterEnvironmentNames.Add([string]$entry.name) }
+    if ($beforeEnvironmentNames.Count -gt 0 -or $afterEnvironmentNames.Count -gt 0) { $policyDifferences.Add('ActiveEnvironment') }
+    if ($beforeEnvironmentNames.Count -ne $afterEnvironmentNames.Count) { $policyDifferences.Add('ActiveEnvironmentTransition') }
+    elseif ($beforeEnvironmentNames.Count -gt 0) {
+        for ($index = 0; $index -lt $beforeEnvironmentNames.Count; $index++) {
+            if (-not [StringComparer]::Ordinal.Equals($beforeEnvironmentNames[$index], $afterEnvironmentNames[$index])) { $policyDifferences.Add('ActiveEnvironmentTransition'); break }
+        }
+    }
+    if ($policyDifferences.Count -gt 0) { $issues.Add('fixed resolver policy or startup environment changed') }
+
+    $nativeDelta = Get-D32PowerShellAuthorityResolverPathDelta -Before ([string[]]@($Before.NativeModulePaths)) -After ([string[]]@($After.NativeModulePaths))
+    $managedDelta = Get-D32PowerShellAuthorityResolverPathDelta -Before ([string[]]@($Before.LoadedManagedAssemblyPaths)) -After ([string[]]@($After.LoadedManagedAssemblyPaths))
+    if ($nativeDelta.DuplicateBefore -or $nativeDelta.DuplicateAfter) { $issues.Add('native origin inventory contains duplicate path aliases') }
+    if ($managedDelta.DuplicateBefore -or $managedDelta.DuplicateAfter) { $issues.Add('loaded managed assembly inventory contains duplicate path aliases') }
+    if ($nativeDelta.Removed.Count -gt 0) { $issues.Add('pre-import native image disappeared before admission completed') }
+    if ($nativeDelta.CaseChanges.Count -gt 0) { $issues.Add('native image path casing changed across imports') }
+    if ($nativeDelta.CommonOrderChanged) { $issues.Add('native image order changed across imports') }
+    if ($managedDelta.Removed.Count -gt 0) { $issues.Add('pre-import managed assembly disappeared before admission completed') }
+    if ($managedDelta.CaseChanges.Count -gt 0) { $issues.Add('managed assembly path casing changed across imports') }
+    if ($managedDelta.CommonOrderChanged) { $issues.Add('managed assembly order changed across imports') }
+
+    $nativeRoleDrift = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in @($Before.NativeModulePaths) + @($After.NativeModulePaths)) {
+        $expectedType = if (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $PowerShellRoot) { 'POWERSHELL_DISTRIBUTION' }
+            elseif (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $DefenderRoot) { 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM' }
+            elseif (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $WindowsRoot) { 'MICROSOFT_WINDOWS_OS_INSTALLATION' }
+            else { '' }
+        $beforeType = if ($Before.NativeFileComponents.ContainsKey([string]$path)) { [string]$Before.NativeFileComponents[[string]$path] } else { '' }
+        $afterType = if ($After.NativeFileComponents.ContainsKey([string]$path)) { [string]$After.NativeFileComponents[[string]$path] } else { '' }
+        if ([String]::IsNullOrWhiteSpace($expectedType) -or ($beforeType.Length -gt 0 -and $beforeType -cne $expectedType) -or ($afterType.Length -gt 0 -and $afterType -cne $expectedType) -or
+            ($beforeType.Length -gt 0 -and $afterType.Length -gt 0 -and $beforeType -cne $afterType)) {
+            $nativeRoleDrift.Add([PSCustomObject]@{ path = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$path) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot; expected = $expectedType; before = $beforeType; after = $afterType })
+        }
+    }
+    if ($nativeRoleDrift.Count -gt 0) { $issues.Add('actual native-origin component role does not match its exact pinned source domain') }
+    $managedDomainDrift = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in @($Before.LoadedManagedAssemblyPaths) + @($After.LoadedManagedAssemblyPaths)) {
+        if (-not (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $PowerShellRoot) -and
+            -not (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $WindowsRoot)) {
+            $managedDomainDrift.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$path) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+        }
+    }
+    if ($managedDomainDrift.Count -gt 0) { $issues.Add('loaded managed assembly is outside the exact PowerShell/Windows content domains') }
+
+    $nativeReferences = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $managedReferences = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $invalidNativeReferences = [System.Collections.Generic.List[string]]::new()
+    $invalidManagedReferences = [System.Collections.Generic.List[string]]::new()
+    Add-D32PowerShellAuthorityResolverReferenceRecords -Records $PinnedNativeFiles -ReferenceMap $nativeReferences -InvalidPaths $invalidNativeReferences
+    Add-D32PowerShellAuthorityResolverReferenceRecords -Records $PinnedManagedFiles -ReferenceMap $managedReferences -InvalidPaths $invalidManagedReferences
+    if ($invalidNativeReferences.Count -gt 0) { $issues.Add('caller-pinned native content references are malformed or duplicated') }
+    if ($invalidManagedReferences.Count -gt 0) { $issues.Add('caller-pinned managed content references are malformed or duplicated') }
+    $unpinnedNative = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @($Before.NativeModulePaths) + @($After.NativeModulePaths)) {
+        if (-not $nativeReferences.ContainsKey([string]$path)) { $unpinnedNative.Add([string]$path) }
+    }
+    if ($nativeDelta.Added.Count -gt 0) {
+        foreach ($path in $nativeDelta.Added) { if (-not $nativeReferences.ContainsKey([string]$path)) { $issues.Add('post-import native image is outside caller-pinned content inventories'); break } }
+    }
+    if ($unpinnedNative.Count -gt 0) { $issues.Add('observed native image lacks an exact caller-pinned content reference') }
+    $unpinnedManaged = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @($Before.LoadedManagedAssemblyPaths) + @($After.LoadedManagedAssemblyPaths)) {
+        if (-not $managedReferences.ContainsKey([string]$path)) { $unpinnedManaged.Add([string]$path) }
+    }
+    if ($managedDelta.Added.Count -gt 0) {
+        foreach ($path in $managedDelta.Added) { if (-not $managedReferences.ContainsKey([string]$path)) { $issues.Add('post-import managed assembly is outside caller-pinned content inventories'); break } }
+    }
+    if ($unpinnedManaged.Count -gt 0) { $issues.Add('observed managed assembly lacks an exact caller-pinned content reference') }
+
+    $nativeAddedLabels = [System.Collections.Generic.List[object]]::new()
+    $nativeAddedReferences = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $nativeDelta.Added) {
+        $nativeAddedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+        $nativeAddedReferences.Add((Get-D32PowerShellAuthorityResolverReferenceDiagnostic -Path $path -ReferenceMap $nativeReferences -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+    }
+    $nativeRemovedLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $nativeDelta.Removed) { $nativeRemovedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+    $nativeCaseChangeLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($change in $nativeDelta.CaseChanges) {
+        $nativeCaseChangeLabels.Add([PSCustomObject]@{
+            before = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.before) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+            after = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.after) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+        })
+    }
+    $nativeUnpinnedLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $unpinnedNative) { $nativeUnpinnedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+    $managedAddedLabels = [System.Collections.Generic.List[object]]::new()
+    $managedAddedReferences = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $managedDelta.Added) {
+        $managedAddedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+        $managedAddedReferences.Add((Get-D32PowerShellAuthorityResolverReferenceDiagnostic -Path $path -ReferenceMap $managedReferences -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+    }
+    $managedRemovedLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $managedDelta.Removed) { $managedRemovedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+    $managedCaseChangeLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($change in $managedDelta.CaseChanges) {
+        $managedCaseChangeLabels.Add([PSCustomObject]@{
+            before = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.before) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+            after = Get-D32PowerShellAuthorityResolverDiagnosticPath -Path ([string]$change.after) -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot
+        })
+    }
+    $managedUnpinnedLabels = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $unpinnedManaged) { $managedUnpinnedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+    $diagnostic = [ordered]@{
+        record_type = 'D32_POWERSHELL_RESOLVER_TRANSITION_DIAGNOSTIC_V1'
+        pre_import_resolver_sha256 = [string]$Before.ResolverSha256
+        post_import_resolver_sha256 = [string]$After.ResolverSha256
+        pre_import_policy_sha256 = [string]$Before.PolicySha256
+        post_import_policy_sha256 = [string]$After.PolicySha256
+        pre_import_native_paths_sha256 = [string]$Before.NativeModulePathsSha256
+        post_import_native_paths_sha256 = [string]$After.NativeModulePathsSha256
+        pre_import_resolver_digest_valid = [bool]$beforeDigestValid
+        post_import_resolver_digest_valid = [bool]$afterDigestValid
+        pre_import_blocker_count = $beforeBlockers.Count
+        post_import_blocker_count = $afterBlockers.Count
+        fixed_policy_differences = $policyDifferences.ToArray()
+        fixed_policy_scalar_differences = $scalarDifferences.ToArray()
+        fixed_policy_path_differences = $fixedPathDifferences.ToArray()
+        active_environment = [ordered]@{ before_names = $beforeEnvironmentNames.ToArray(); after_names = $afterEnvironmentNames.ToArray(); values_omitted = $true }
+        native_component_role_differences = $nativeRoleDrift.ToArray()
+        managed_domain_differences = $managedDomainDrift.ToArray()
+        native_images = [ordered]@{ pre_count = $nativeDelta.BeforeCount; post_count = $nativeDelta.AfterCount; added = $nativeAddedLabels.ToArray(); added_content_refs = $nativeAddedReferences.ToArray(); removed = $nativeRemovedLabels.ToArray(); case_changes = $nativeCaseChangeLabels.ToArray(); common_order_changed = [bool]$nativeDelta.CommonOrderChanged; unpinned = $nativeUnpinnedLabels.ToArray() }
+        managed_assemblies = [ordered]@{ pre_count = $managedDelta.BeforeCount; post_count = $managedDelta.AfterCount; added = $managedAddedLabels.ToArray(); added_content_refs = $managedAddedReferences.ToArray(); removed = $managedRemovedLabels.ToArray(); case_changes = $managedCaseChangeLabels.ToArray(); common_order_changed = [bool]$managedDelta.CommonOrderChanged; unpinned = $managedUnpinnedLabels.ToArray() }
+        issues = $issues.ToArray()
+    }
+    return [PSCustomObject]@{ Passed = ($issues.Count -eq 0); Diagnostic = $diagnostic }
 }
 
 function Assert-D32PowerShellAuthorityRuntimeDistributionRecord {
@@ -1540,6 +1868,12 @@ function Test-D32PowerShellModuleAdmissionRecord {
     $entry = & $get $Document 'entry_script_path'; $entryFile = & $get $Document 'entry_script'; $closure = & $get $Document 'module_closure'; $verification = & $get $Document 'import_verification'
     if ($null -eq $host -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
         -not [IO.Path]::IsPathRooted($entry) -or [IO.Path]::GetFullPath($entry) -cne $entry) { return $false }
+    $verifyNames = [System.Collections.Generic.List[string]]::new()
+    if ($verification -is [System.Collections.IDictionary]) { foreach ($key in $verification.Keys) { $verifyNames.Add([string]$key) } } elseif ($null -ne $verification) { foreach ($property in $verification.PSObject.Properties) { $verifyNames.Add([string]$property.Name) } }
+    if ($verifyNames.Count -ne 6 -or -not $verifyNames.Contains('state') -or -not $verifyNames.Contains('verified_import_count') -or -not $verifyNames.Contains('modules') -or -not $verifyNames.Contains('assemblies') -or -not $verifyNames.Contains('commands') -or -not $verifyNames.Contains('native_modules') -or
+        (& $get $verification 'state') -cne 'VERIFIED' -or (& $get $verification 'verified_import_count') -ne 3 -or (& $get $verification 'modules') -isnot [Array] -or (& $get $verification 'modules').Count -ne 3 -or
+        (& $get $verification 'assemblies') -isnot [Array] -or (& $get $verification 'assemblies').Count -eq 0 -or (& $get $verification 'commands') -isnot [Array] -or (& $get $verification 'commands').Count -eq 0 -or
+        (& $get $verification 'native_modules') -isnot [Array] -or (& $get $verification 'native_modules').Count -eq 0) { return $false }
     $entryFileNames = [System.Collections.Generic.List[string]]::new()
     if ($entryFile -is [System.Collections.IDictionary]) { foreach ($key in $entryFile.Keys) { $entryFileNames.Add([string]$key) } } else { foreach ($property in $entryFile.PSObject.Properties) { $entryFileNames.Add([string]$property.Name) } }
     if ($entryFileNames.Count -ne 5) { return $false }
@@ -1660,9 +1994,6 @@ function Test-D32PowerShellModuleAdmissionRecord {
         (& $resolverGet $resolver 'os_security_inventory_sha256') -isnot [string] -or (& $resolverGet $resolver 'os_security_inventory_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
         (& $resolverGet $resolver 'resolver_sha256') -isnot [string] -or (& $resolverGet $resolver 'resolver_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
         (& $resolverGet $resolver 'resolver_sha256') -cne (& $get $closure 'resolver_sha256')) { return $false }
-    $resolverMaterial = [System.Collections.Generic.List[string]]::new()
-    $resolverMaterial.Add([string](& $resolverGet $resolver 'module_search_path'))
-    $resolverMaterial.Add([string](& $resolverGet $resolver 'os_security_inventory_sha256'))
     $windowsRoot = Get-D32PowerShellAuthorityWindowsRootPath
     $defenderPlatformRoot = 'C:\ProgramData\Microsoft\Windows Defender\Platform'
     foreach ($field in @('trusted_platform_paths','loaded_managed_assembly_paths','deps_paths','native_directories','native_module_paths')) {
@@ -1678,21 +2009,31 @@ function Test-D32PowerShellModuleAdmissionRecord {
                 -not $validDomain -or
                 ($previous.Length -gt 0 -and [StringComparer]::OrdinalIgnoreCase.Compare($previous,$path) -ge 0)) { return $false }
             $previous = $path
-            if ($field -cne 'loaded_managed_assembly_paths' -and $field -cne 'native_module_paths') { $resolverMaterial.Add($path) }
         }
     }
     $activeEnvironment = & $resolverGet $resolver 'active_environment'
     if ($activeEnvironment -isnot [Array] -or $activeEnvironment.Count -ne 0) { return $false }
-    foreach ($nativePath in (& $resolverGet $resolver 'native_module_paths')) { $resolverMaterial.Add('native|' + [string]$nativePath) }
-    $resolverMaterial.Add([string](& $resolverGet $resolver 'native_policy'))
-    $resolverDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]::Join("`n",$resolverMaterial.ToArray()) + "`n"))).ToLowerInvariant()
-    if ($resolverDigest -cne [string](& $resolverGet $resolver 'resolver_sha256')) { return $false }
-    $verifyNames = [System.Collections.Generic.List[string]]::new()
-    if ($verification -is [System.Collections.IDictionary]) { foreach ($key in $verification.Keys) { $verifyNames.Add([string]$key) } } elseif ($null -ne $verification) { foreach ($property in $verification.PSObject.Properties) { $verifyNames.Add([string]$property.Name) } }
-    if ($verifyNames.Count -ne 6 -or -not $verifyNames.Contains('state') -or -not $verifyNames.Contains('verified_import_count') -or -not $verifyNames.Contains('modules') -or -not $verifyNames.Contains('assemblies') -or -not $verifyNames.Contains('commands') -or -not $verifyNames.Contains('native_modules') -or
-        (& $get $verification 'state') -cne 'VERIFIED' -or (& $get $verification 'verified_import_count') -ne 3 -or (& $get $verification 'modules') -isnot [Array] -or (& $get $verification 'modules').Count -ne 3 -or
-        (& $get $verification 'assemblies') -isnot [Array] -or (& $get $verification 'assemblies').Count -eq 0 -or (& $get $verification 'commands') -isnot [Array] -or (& $get $verification 'commands').Count -eq 0 -or
-        (& $get $verification 'native_modules') -isnot [Array] -or (& $get $verification 'native_modules').Count -eq 0) { return $false }
+    $nativeComponentByPath = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($nativeRecord in (& $get $verification 'native_modules')) {
+        $nativeRecordNames = [System.Collections.Generic.List[string]]::new()
+        if ($nativeRecord -is [System.Collections.IDictionary]) { foreach ($key in $nativeRecord.Keys) { $nativeRecordNames.Add([string]$key) } } elseif ($null -ne $nativeRecord) { foreach ($property in $nativeRecord.PSObject.Properties) { $nativeRecordNames.Add([string]$property.Name) } }
+        if ($nativeRecordNames.Count -ne 9 -or -not $nativeRecordNames.Contains('path') -or -not $nativeRecordNames.Contains('component_type')) { return $false }
+        $nativePath = & $get $nativeRecord 'path'; $componentType = & $get $nativeRecord 'component_type'
+        if ($nativePath -isnot [string] -or -not [IO.Path]::IsPathRooted($nativePath) -or [IO.Path]::GetFullPath($nativePath) -cne $nativePath -or
+            $componentType -isnot [string] -or $componentType -cnotin @('POWERSHELL_DISTRIBUTION','MICROSOFT_WINDOWS_OS_INSTALLATION','MICROSOFT_WINDOWS_DEFENDER_PLATFORM') -or
+            -not $nativeComponentByPath.TryAdd($nativePath, $componentType)) { return $false }
+    }
+    $nativePathsForDigest = & $resolverGet $resolver 'native_module_paths'
+    if ($nativeComponentByPath.Count -ne $nativePathsForDigest.Count) { return $false }
+    foreach ($nativePath in $nativePathsForDigest) {
+        if (-not $nativeComponentByPath.ContainsKey([string]$nativePath)) { return $false }
+    }
+    $resolverDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath ([string](& $resolverGet $resolver 'module_search_path')) `
+        -OsSecurityInventorySha256 ([string](& $resolverGet $resolver 'os_security_inventory_sha256')) `
+        -TrustedPlatformPaths ([string[]](& $resolverGet $resolver 'trusted_platform_paths')) -DepsPaths ([string[]](& $resolverGet $resolver 'deps_paths')) `
+        -NativeDirectories ([string[]](& $resolverGet $resolver 'native_directories')) -NativeModulePaths ([string[]]$nativePathsForDigest) `
+        -ActiveEnvironment ([object[]]$activeEnvironment) -NativePolicy ([string](& $resolverGet $resolver 'native_policy')) -NativeFileComponents $nativeComponentByPath
+    if ($resolverDigests.ResolverSha256 -cne [string](& $resolverGet $resolver 'resolver_sha256')) { return $false }
     $observedModules = & $get $verification 'modules'
     $allowedModulePaths = @{}
     $roles = @(Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $powerShellRoot)
@@ -1769,15 +2110,11 @@ function Test-D32PowerShellModuleAdmissionRecord {
             [String]::IsNullOrWhiteSpace($commandName) -or -not $commandKeys.Add($moduleName + '|' + $commandName)) { return $false }
     }
     if ($null -ne $ExpectedContext) {
-        $expectedAuthority = & $get $ExpectedContext 'authority_reference'; $expectedGit = & $get $ExpectedContext 'git_image'; $expectedHost = & $get $ExpectedContext 'powershell_host'; $expectedClosure = & $get $ExpectedContext 'module_closure'
-        $expectedResolver = & $get $ExpectedContext 'resolver_admission'; $expectedVerification = & $get $ExpectedContext 'import_verification'
-        foreach ($pair in @(@('authority_reference',$expectedAuthority),@('git_image',$expectedGit),@('powershell_host',$expectedHost))) {
-            $actualReference = & $get $Document ([string]$pair[0])
-            if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $actualReference) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $pair[1])) { return $false }
+        foreach ($field in @('authority_reference','profile_reference','git_image','powershell_host','module_import_order','module_closure','resolver_admission','import_verification','import_attempts')) {
+            $actualContextValue = & $get $Document $field
+            $expectedContextValue = & $get $ExpectedContext $field
+            if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $actualContextValue) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedContextValue)) { return $false }
         }
-        if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $closure) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedClosure)) { return $false }
-        if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $resolver) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedResolver) -or
-            (ConvertTo-D32PowerShellAuthorityJsonText -Value (& $get $verification 'native_modules')) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value (& $get $expectedVerification 'native_modules'))) { return $false }
     }
     return $true
 }
@@ -1893,6 +2230,93 @@ function Get-D32PowerShellAuthorityProcessStartup {
     return [PSCustomObject]@{ FileOperand = $operand; Switches = [string[]]$switches; ProcessArguments = [string[]]$arguments }
 }
 
+function Get-D32PowerShellAuthorityResolverSnapshotFromAdmission {
+    param([Parameter(Mandatory = $true)][object]$Admission)
+    $resolver = $Admission.resolver_admission
+    $nativeComponents = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($nativeRecord in @($Admission.import_verification.native_modules)) {
+        if (-not $nativeComponents.TryAdd([string]$nativeRecord.path, [string]$nativeRecord.component_type)) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: admitted resolver context repeats an actual native origin'
+        }
+    }
+    $digests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath ([string]$resolver.module_search_path) `
+        -OsSecurityInventorySha256 ([string]$resolver.os_security_inventory_sha256) -TrustedPlatformPaths ([string[]]$resolver.trusted_platform_paths) `
+        -DepsPaths ([string[]]$resolver.deps_paths) -NativeDirectories ([string[]]$resolver.native_directories) `
+        -NativeModulePaths ([string[]]$resolver.native_module_paths) -ActiveEnvironment ([object[]]$resolver.active_environment) `
+        -NativePolicy ([string]$resolver.native_policy) -NativeFileComponents $nativeComponents
+    if ($digests.ResolverSha256 -cne [string]$resolver.resolver_sha256) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: admitted resolver digest does not match its typed actual-origin records'
+    }
+    return [PSCustomObject]@{
+        Blockers = [string[]]@(); TrustedPlatformPaths = [string[]]$resolver.trusted_platform_paths
+        LoadedManagedAssemblyPaths = [string[]]$resolver.loaded_managed_assembly_paths; DepsPaths = [string[]]$resolver.deps_paths
+        NativeDirectories = [string[]]$resolver.native_directories; NativeModulePaths = [string[]]$resolver.native_module_paths
+        ActiveEnvironment = [object[]]$resolver.active_environment; NativePolicy = [string]$resolver.native_policy
+        ModuleSearchPath = [string]$resolver.module_search_path; ResolverSha256 = [string]$digests.ResolverSha256
+        PolicySha256 = [string]$digests.PolicySha256; NativeModulePathsSha256 = [string]$digests.NativeModulePathsSha256
+        OsSecurityInventorySha256 = [string]$resolver.os_security_inventory_sha256; NativeFileComponents = $nativeComponents
+    }
+}
+
+function Get-D32PowerShellAuthorityNativeOriginEvidence {
+    param(
+        [Parameter(Mandatory = $true)][object]$ResolverSnapshot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$RuntimeDistributionFiles,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$OsSecurityComponents,
+        [Parameter(Mandatory = $true)][string]$PowerShellRoot
+    )
+    $runtimeByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $RuntimeDistributionFiles) { if (-not $runtimeByPath.TryAdd([string]$file.path, $file)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: PowerShell distribution repeats a native content path' } }
+    $osByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($component in $OsSecurityComponents) {
+        foreach ($file in @($component.native_files)) {
+            if (-not $osByPath.TryAdd([string]$file.path, [PSCustomObject]@{ ComponentType = [string]$component.component_type; File = $file })) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows/Defender authority repeats a native content path'
+            }
+        }
+    }
+    $evidence = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $ResolverSnapshot.NativeModulePaths) {
+        if (Test-D32PowerShellAuthorityPathWithin -Child ([string]$path) -Parent $PowerShellRoot) {
+            if (-not $runtimeByPath.ContainsKey([string]$path)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: observed PowerShell native origin is absent from the exact pinned distribution inventory' }
+            $file = $runtimeByPath[[string]$path]
+            $source = 'PSHOME_DISTRIBUTION'; $componentType = 'POWERSHELL_DISTRIBUTION'
+        }
+        else {
+            if (-not $osByPath.ContainsKey([string]$path)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: observed OS native origin is absent from the exact pinned component inventory' }
+            $entry = $osByPath[[string]$path]; $file = $entry.File; $componentType = [string]$entry.ComponentType
+            $source = if ($componentType -ceq 'MICROSOFT_WINDOWS_OS_INSTALLATION') { 'WINDOWS_OS_COMPONENT' } else { 'DEFENDER_PLATFORM_COMPONENT' }
+        }
+        $evidence.Add([ordered]@{
+            path = [string]$path; source = $source; component_type = $componentType; bytes = [Int64]$file.bytes
+            sha256 = [string]$file.sha256; volume_serial_hex = [string]$file.volume_serial_hex; file_id_hex = [string]$file.file_id_hex
+            owner_sid = [string]$file.owner_sid; security_descriptor_sha256 = [string]$file.security_descriptor_sha256
+        })
+    }
+    return ,$evidence.ToArray()
+}
+
+function Update-D32PowerShellAuthorityAdmissionResolverSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object]$Admission,
+        [Parameter(Mandatory = $true)][object]$ResolverSnapshot,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$NativeEvidence
+    )
+    $Admission.module_closure.resolver_sha256 = [string]$ResolverSnapshot.ResolverSha256
+    $resolver = $Admission.resolver_admission
+    $resolver.resolver_sha256 = [string]$ResolverSnapshot.ResolverSha256
+    $resolver.os_security_inventory_sha256 = [string]$ResolverSnapshot.OsSecurityInventorySha256
+    $resolver.native_policy = [string]$ResolverSnapshot.NativePolicy
+    $resolver.module_search_path = [string]$ResolverSnapshot.ModuleSearchPath
+    $resolver.trusted_platform_paths = @($ResolverSnapshot.TrustedPlatformPaths)
+    $resolver.loaded_managed_assembly_paths = @($ResolverSnapshot.LoadedManagedAssemblyPaths)
+    $resolver.deps_paths = @($ResolverSnapshot.DepsPaths)
+    $resolver.native_directories = @($ResolverSnapshot.NativeDirectories)
+    $resolver.native_module_paths = @($ResolverSnapshot.NativeModulePaths)
+    $resolver.active_environment = @($ResolverSnapshot.ActiveEnvironment)
+    $Admission.import_verification.native_modules = @($NativeEvidence)
+}
+
 function Assert-D32PowerShellModuleAdmissionCurrent {
     param([Parameter(Mandatory = $true)][object]$State)
     if ($PSModuleAutoLoadingPreference -cne 'None' -or
@@ -1976,10 +2400,26 @@ function Assert-D32PowerShellModuleAdmissionCurrent {
         }
     }
     finally { $process.Dispose() }
-    $resolver = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $State.OsSecurityComponents -OsSecurityInventorySha256 ([string]$State.Admission.resolver_admission.os_security_inventory_sha256) -ConfigureNativeSearch
-    if ($resolver.Blockers.Count -gt 0 -or $resolver.ResolverSha256 -cne [string]$State.Admission.resolver_admission.resolver_sha256) {
-        throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: current resolver domain drifted at reuse boundary: ' + ($resolver.Blockers -join '; '))
+    $priorResolver = Get-D32PowerShellAuthorityResolverSnapshotFromAdmission -Admission $State.Admission
+    $currentResolver = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $currentOs.Components -OsSecurityInventorySha256 $currentOs.InventorySha256 -ConfigureNativeSearch
+    $transitionNativeFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $State.RuntimeDistribution.files) { $transitionNativeFiles.Add($file) }
+    $transitionManagedFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $State.RuntimeDistribution.files) { $transitionManagedFiles.Add($file) }
+    foreach ($component in $currentOs.Components) {
+        foreach ($file in @($component.native_files)) { $transitionNativeFiles.Add($file) }
+        foreach ($file in @($component.distribution.files)) { $transitionManagedFiles.Add($file) }
     }
+    $resolverTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $priorResolver -After $currentResolver `
+        -PinnedNativeFiles $transitionNativeFiles.ToArray() -PinnedManagedFiles $transitionManagedFiles.ToArray() `
+        -PowerShellRoot ([string]$State.PowerShellRoot) -WindowsRoot ([string]$currentOs.WindowsRoot) -DefenderRoot ([string]$currentOs.DefenderRoot)
+    if (-not $resolverTransition.Passed) {
+        $diagnosticText = ConvertTo-D32PowerShellAuthorityJsonText -Value $resolverTransition.Diagnostic
+        throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: current resolver admission transition denied; diagnostic=' + $diagnosticText)
+    }
+    $nativeEvidence = Get-D32PowerShellAuthorityNativeOriginEvidence -ResolverSnapshot $currentResolver -RuntimeDistributionFiles $State.RuntimeDistribution.files `
+        -OsSecurityComponents $currentOs.Components -PowerShellRoot ([string]$State.PowerShellRoot)
+    Update-D32PowerShellAuthorityAdmissionResolverSnapshot -Admission $State.Admission -ResolverSnapshot $currentResolver -NativeEvidence $nativeEvidence
     if ($State.ImportAttempts -lt 3 -or $State.Admission.record_type -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2') { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module admission did not complete the three fixed imports' }
     $moduleInfos = @(Microsoft.PowerShell.Core\Get-Module)
     foreach ($info in $moduleInfos) {
@@ -2265,8 +2705,18 @@ function Initialize-D32PowerShellModuleAuthority {
             Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::GetFullPath([string]$role.Manifest)) -ErrorAction Stop
         }
         $postImportResolver = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $osSecurity.Components -OsSecurityInventorySha256 $osSecurity.InventorySha256 -ConfigureNativeSearch
-        if ($postImportResolver.Blockers.Count -gt 0 -or $postImportResolver.ResolverSha256 -cne [string]$resolverState.ResolverSha256) {
-            throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: post-import resolver origin escaped or policy drifted: ' + ($postImportResolver.Blockers -join '; '))
+        $transitionNativeFiles = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $runtimeDistribution.files) { $transitionNativeFiles.Add($file) }
+        foreach ($component in $osSecurity.Components) { foreach ($file in @($component.native_files)) { $transitionNativeFiles.Add($file) } }
+        $transitionManagedFiles = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $runtimeDistribution.files) { $transitionManagedFiles.Add($file) }
+        foreach ($component in $osSecurity.Components) { foreach ($file in @($component.distribution.files)) { $transitionManagedFiles.Add($file) } }
+        $resolverTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverState -After $postImportResolver `
+            -PinnedNativeFiles $transitionNativeFiles.ToArray() -PinnedManagedFiles $transitionManagedFiles.ToArray() `
+            -PowerShellRoot $powerShellRoot -WindowsRoot ([string]$osSecurity.WindowsRoot) -DefenderRoot ([string]$osSecurity.DefenderRoot)
+        if (-not $resolverTransition.Passed) {
+            $diagnosticText = ConvertTo-D32PowerShellAuthorityJsonText -Value $resolverTransition.Diagnostic
+            throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: pre/post-import resolver transition denied; diagnostic=' + $diagnosticText)
         }
 
         $closureRecords = @($moduleRecords.ToArray())
@@ -2288,8 +2738,8 @@ function Initialize-D32PowerShellModuleAuthority {
             startup = [ordered]@{ file_operand = [string]$startup.FileOperand; switches = @($startup.Switches); startup_policy = 'DIRECT_NO_PROFILE_FILE_V1' }
             entry_script_path = $entryScript
             module_import_order = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
-            module_closure = [ordered]@{ module_root = $moduleRoot; module_root_volume_serial_hex = [string]$moduleRootIdentity.VolumeSerialHex; module_root_file_id_hex = [string]$moduleRootIdentity.FileIdHex; inventory_sha256 = $closureDigest; modules = $closureRecords; runtime_distribution_sha256 = [string]$runtimeDistribution.inventory_sha256; protected_namespace_sha256 = [string]$runtimeDistribution.inventory_sha256; resolver_sha256 = [string]$resolverState.ResolverSha256 }
-            resolver_admission = [ordered]@{ state = 'VERIFIED'; policy_id = 'D32_POWERSHELL_RESOLVER_DOMAIN_V2'; resolver_sha256 = [string]$resolverState.ResolverSha256; os_security_inventory_sha256 = [string]$resolverState.OsSecurityInventorySha256; native_policy = [string]$resolverState.NativePolicy; module_search_path = [string]$resolverState.ModuleSearchPath; trusted_platform_paths = @($resolverState.TrustedPlatformPaths); loaded_managed_assembly_paths = @($resolverState.LoadedManagedAssemblyPaths); deps_paths = @($resolverState.DepsPaths); native_directories = @($resolverState.NativeDirectories); native_module_paths = @($resolverState.NativeModulePaths); active_environment = @($resolverState.ActiveEnvironment) }
+            module_closure = [ordered]@{ module_root = $moduleRoot; module_root_volume_serial_hex = [string]$moduleRootIdentity.VolumeSerialHex; module_root_file_id_hex = [string]$moduleRootIdentity.FileIdHex; inventory_sha256 = $closureDigest; modules = $closureRecords; runtime_distribution_sha256 = [string]$runtimeDistribution.inventory_sha256; protected_namespace_sha256 = [string]$runtimeDistribution.inventory_sha256; resolver_sha256 = [string]$postImportResolver.ResolverSha256 }
+            resolver_admission = [ordered]@{ state = 'VERIFIED'; policy_id = 'D32_POWERSHELL_RESOLVER_DOMAIN_V2'; resolver_sha256 = [string]$postImportResolver.ResolverSha256; os_security_inventory_sha256 = [string]$postImportResolver.OsSecurityInventorySha256; native_policy = [string]$postImportResolver.NativePolicy; module_search_path = [string]$postImportResolver.ModuleSearchPath; trusted_platform_paths = @($postImportResolver.TrustedPlatformPaths); loaded_managed_assembly_paths = @($postImportResolver.LoadedManagedAssemblyPaths); deps_paths = @($postImportResolver.DepsPaths); native_directories = @($postImportResolver.NativeDirectories); native_module_paths = @($postImportResolver.NativeModulePaths); active_environment = @($postImportResolver.ActiveEnvironment) }
             entry_script = [ordered]@{ path = [string]$entrySnapshot.Record.path; bytes = [Int64]$entrySnapshot.Record.bytes; sha256 = [string]$entrySnapshot.Record.sha256; volume_serial_hex = [string]$entrySnapshot.Record.volume_serial_hex; file_id_hex = [string]$entrySnapshot.Record.file_id_hex }
             import_verification = [ordered]@{ state = 'VERIFIED'; verified_import_count = 3; modules = @(); assemblies = @(); commands = @(); native_modules = @() }
             import_attempts = 3
@@ -2335,26 +2785,9 @@ function Initialize-D32PowerShellModuleAuthority {
                 throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: a fixed RootModule/NestedModule/RequiredAssembly did not load from its admitted closure: $assemblyPath"
             }
         }
-        $nativeEvidence = [System.Collections.Generic.List[object]]::new()
-        $runtimeFileByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($runtimeFile in $runtimeDistribution.files) { $runtimeFileByPath.Add([string]$runtimeFile.path, $runtimeFile) }
-        $osFileByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($component in $osSecurity.Components) { foreach ($nativeFile in @($component.native_files)) { $osFileByPath.Add([string]$nativeFile.path, [PSCustomObject]@{ ComponentType = [string]$component.component_type; File = $nativeFile }) } }
-        foreach ($nativePath in $postImportResolver.NativeModulePaths) {
-            if (Test-D32PowerShellAuthorityPathWithin -Child ([string]$nativePath) -Parent $powerShellRoot) {
-                if (-not $runtimeFileByPath.ContainsKey([string]$nativePath)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: loaded native module is absent from pinned full distribution inventory: $nativePath" }
-                $file = $runtimeFileByPath[[string]$nativePath]
-                $nativeEvidence.Add([ordered]@{ path = [string]$nativePath; source = 'PSHOME_DISTRIBUTION'; component_type = 'POWERSHELL_DISTRIBUTION'; bytes = [Int64]$file.bytes; sha256 = [string]$file.sha256; volume_serial_hex = [string]$file.volume_serial_hex; file_id_hex = [string]$file.file_id_hex; owner_sid = [string]$file.owner_sid; security_descriptor_sha256 = [string]$file.security_descriptor_sha256 })
-            }
-            elseif (-not $osFileByPath.ContainsKey([string]$nativePath)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: loaded native module escaped the exact admitted OS component file inventory: $nativePath" }
-            else {
-                $entry = $osFileByPath[[string]$nativePath]
-                $file = $entry.File
-                $source = if ([string]$entry.ComponentType -ceq 'MICROSOFT_WINDOWS_OS_INSTALLATION') { 'WINDOWS_OS_COMPONENT' } else { 'DEFENDER_PLATFORM_COMPONENT' }
-                $nativeEvidence.Add([ordered]@{ path = [string]$nativePath; source = $source; component_type = [string]$entry.ComponentType; bytes = [Int64]$file.bytes; sha256 = [string]$file.sha256; volume_serial_hex = [string]$file.volume_serial_hex; file_id_hex = [string]$file.file_id_hex; owner_sid = [string]$file.owner_sid; security_descriptor_sha256 = [string]$file.security_descriptor_sha256 })
-            }
-        }
-        $admission.import_verification.native_modules = @($nativeEvidence.ToArray())
+        $nativeEvidence = Get-D32PowerShellAuthorityNativeOriginEvidence -ResolverSnapshot $postImportResolver -RuntimeDistributionFiles $runtimeDistribution.files `
+            -OsSecurityComponents $osSecurity.Components -PowerShellRoot $powerShellRoot
+        $admission.import_verification.native_modules = @($nativeEvidence)
         Assert-D32PowerShellModuleAdmissionCurrent -State $state
         if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $admission -CandidateSha $CallerCandidateSha -Repository $repo)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: generated shared module-admission record failed its strict self-validation' }
         $global:D32PowerShellModuleImportAttempts = $importAttempts

@@ -2765,7 +2765,8 @@ function Initialize-D32PowerShellModuleAuthority {
             RepositoryRoot = $repo; PowerShellRoot = $powerShellRoot; ModuleRoot = $moduleRoot; ImportOrder = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
             ExpectedModuleManifestPaths = $expectedModulePaths; OpenFiles = $openFiles.ToArray(); DirectoryFences = $directoryFences; RuntimeDistribution = $runtimeDistribution; OsSecurityComponents = $osSecurity.Components
             OsProtectedFilePaths = $osProtectedFilePaths; OsSecurityDirectoryPaths = $osSecurityDirectoryPaths; OsSecurityAncestorPaths = $osSecurityAncestorPaths; ImportAttempts = $importAttempts
-            AuthorityReference = $admission.authority_reference; ProfileReference = $admission.profile_reference; Admission = $admission; Startup = $admission.startup
+            AuthorityReference = $admission.authority_reference; ProfileReference = $admission.profile_reference; Admission = $admission
+            Startup = [PSCustomObject]@{ FileOperand = [string]$admission.startup.file_operand; Switches = [string[]]@($admission.startup.switches) }
         }
         $global:D32PowerShellModuleAuthorityState = $state
         $moduleInfos = @(Microsoft.PowerShell.Core\Get-Module)

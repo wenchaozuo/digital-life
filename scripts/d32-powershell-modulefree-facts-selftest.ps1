@@ -213,7 +213,16 @@ try {
     }
     $phase0Source = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-phase0-matrix.ps1'), [Text.UTF8Encoding]::new($false, $true))
     $fixtureRunnerEvidenceBound = $phase0Source.Contains('-ExpectedRunnerProcessId ([int]$document.runner_process_id)') -and $phase0Source.Contains('Test-D32Phase0FixtureBuildProvenance')
-    Add-D32FactsSelfTestCase 'three-import admission uses post-import actual origins, strict typed resolver digest, monotonic pinned reuse, actual command provenance, and cross-process consumer binding' `
+    $startupRecordFixture = [ordered]@{ file_operand = 'C:\d32-synthetic-entry.ps1'; switches = @('-NoProfile','-NonInteractive'); startup_policy = 'DIRECT_NO_PROFILE_FILE_V1' }
+    $startupStateFixture = [PSCustomObject]@{ FileOperand = [string]$startupRecordFixture.file_operand; Switches = [string[]]@($startupRecordFixture.switches) }
+    $startupStateRecordBound = $helperText.Contains('Startup = [PSCustomObject]@{ FileOperand = [string]$admission.startup.file_operand; Switches = [string[]]@($admission.startup.switches) }') -and
+        -not $helperText.Contains('Startup = $admission.startup') -and
+        $startupStateFixture.FileOperand -ceq $startupRecordFixture.file_operand -and $startupStateFixture.Switches.Count -eq 2 -and
+        [StringComparer]::Ordinal.Equals($startupStateFixture.Switches[0], [string]$startupRecordFixture.switches[0]) -and
+        [StringComparer]::Ordinal.Equals($startupStateFixture.Switches[1], [string]$startupRecordFixture.switches[1])
+    Add-D32FactsSelfTestCase 'internal reuse state maps the strict snake-case startup record into the typed startup binding' `
+        $startupStateRecordBound 'AdmissionV2 stores startup.file_operand/startup.switches; the reuse helper consumes typed FileOperand/Switches.'
+    Add-D32FactsSelfTestCase 'three-import admission uses post-import actual origins, typed resolver digest, pinned reuse, actual command provenance, and cross-process consumer binding' `
         ($helperInitializeStart -ge 0 -and $helperFirstImport -gt $helperInitializeStart -and $initializePostSnapshot -gt $helperFirstImport -and $initializeTransition -gt $initializePostSnapshot -and $initializeAdmission -gt $initializeTransition -and
          $initializePostDigest -gt $initializeAdmission -and $initializeOriginEvidence -gt $initializePostDigest -and $initializeAssertCurrent -gt $initializeOriginEvidence -and
          $reusePriorSnapshot -gt $assertCurrentStart -and $reuseCurrentSnapshot -gt $reusePriorSnapshot -and $reuseTransition -gt $reuseCurrentSnapshot -and

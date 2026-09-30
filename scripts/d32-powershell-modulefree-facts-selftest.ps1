@@ -27,6 +27,23 @@ function Add-D32FactsSelfTestCase {
     if (-not $Passed) { $failures.Add($Name) }
 }
 
+function Copy-D32FactsSelfTestMap {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Value)
+    $copy = [ordered]@{}
+    foreach ($key in $Value.Keys) { $copy[[string]$key] = $Value[$key] }
+    return $copy
+}
+
+function Invoke-D32FactsSelfTestModuleClosureFileCheck {
+    param([AllowNull()][object]$FileRecord, [Parameter(Mandatory = $true)][string]$ModuleName)
+    $moduleDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::Combine([string]$PSHOME, 'Modules'), $ModuleName))
+    $allowedRootPaths = @(Get-D32PowerShellAuthorityFixedModuleClosureRootPaths -PowerShellRoot ([string]$PSHOME) -ModuleName $ModuleName)
+    $seenPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $seenFileIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    return Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $FileRecord -Role $ModuleName `
+        -ModuleDirectory $moduleDirectory -AllowedRootFilePaths $allowedRootPaths -SeenPaths $seenPaths -SeenFileIds $seenFileIds
+}
+
 function Write-D32FactsSelfTestFile {
     param([string]$Path, [string]$Text)
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
@@ -163,6 +180,69 @@ Add-D32FactsSelfTestCase 'shared admission accessor preserves singleton arrays a
     ($singleFromDictionary -is [Array] -and $singleFromDictionary.Count -eq 1 -and $singleFromDictionary[0] -ceq 'one' -and $scalarFromDictionary -is [string] -and $scalarFromDictionary -ceq 'ADMITTED') `
     'Field reads retain collection shape without wrapping scalar record fields.'
 
+$cimModuleDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules', 'CimCmdlets'))
+$cimNativePath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.dll'))
+$cimUnmanagedPath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.unmanaged.dll'))
+$cimRootClosurePaths = @(Get-D32PowerShellAuthorityFixedModuleClosureRootPaths -PowerShellRoot ([string]$PSHOME) -ModuleName 'CimCmdlets')
+$managementNestedPath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Microsoft.PowerShell.Commands.Management.dll'))
+$moduleClosureRootPathsExact = $cimRootClosurePaths -ccontains $cimNativePath -and $cimRootClosurePaths -ccontains $cimUnmanagedPath -and
+    $cimRootClosurePaths -cnotcontains $managementNestedPath -and $cimRootClosurePaths -cnotcontains ([IO.Path]::Combine([string]$PSHOME, 'unlisted.dll'))
+$validCimClosureFile = [ordered]@{
+    path = $cimNativePath; bytes = [Int64]362288; sha256 = ('a' * 64)
+    volume_serial_hex = '0000000000000001'; file_id_hex = '00000000000000000000000000000001'
+}
+$validCimRootContentAccepted = Invoke-D32FactsSelfTestModuleClosureFileCheck -FileRecord $validCimClosureFile -ModuleName 'CimCmdlets'
+$moduleChildFile = Copy-D32FactsSelfTestMap -Value $validCimClosureFile
+$moduleChildFile['path'] = [IO.Path]::Combine($cimModuleDirectory, 'synthetic-closure.bin')
+$moduleChildAccepted = Invoke-D32FactsSelfTestModuleClosureFileCheck -FileRecord $moduleChildFile -ModuleName 'CimCmdlets'
+$unlistedRootFile = Copy-D32FactsSelfTestMap -Value $validCimClosureFile
+$unlistedRootFile['path'] = [IO.Path]::Combine([string]$PSHOME, 'unlisted.dll')
+$unlistedRootRejected = -not (Invoke-D32FactsSelfTestModuleClosureFileCheck -FileRecord $unlistedRootFile -ModuleName 'CimCmdlets')
+$crossRoleRootFile = Copy-D32FactsSelfTestMap -Value $validCimClosureFile
+$crossRoleRootFile['path'] = $managementNestedPath
+$crossRoleRootRejected = -not (Invoke-D32FactsSelfTestModuleClosureFileCheck -FileRecord $crossRoleRootFile -ModuleName 'CimCmdlets')
+Add-D32FactsSelfTestCase 'module closure admits only exact role-specific PSHOME root content plus the module directory' `
+    ($moduleClosureRootPathsExact -and $validCimRootContentAccepted -and $moduleChildAccepted -and $unlistedRootRejected -and $crossRoleRootRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+    'CimCmdlets fixed Extra DLLs are exact role content paths; unrelated and cross-role PSHOME root DLLs remain denied. No module import is used.'
+
+$badClosureFields = [System.Collections.Generic.List[object]]::new()
+$extraClosureField = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $extraClosureField['unexpected'] = 'denied'; $badClosureFields.Add($extraClosureField)
+$missingClosureField = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $missingClosureField.Remove('file_id_hex'); $badClosureFields.Add($missingClosureField)
+$relativeClosurePath = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $relativeClosurePath['path'] = '..\CimCmdlets\file.dll'; $badClosureFields.Add($relativeClosurePath)
+$noncanonicalClosurePath = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $noncanonicalClosurePath['path'] = [IO.Path]::Combine($cimModuleDirectory, '..', 'CimCmdlets', 'file.dll'); $badClosureFields.Add($noncanonicalClosurePath)
+$badClosureHash = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $badClosureHash['sha256'] = ('a' * 63); $badClosureFields.Add($badClosureHash)
+$zeroClosureBytes = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $zeroClosureBytes['bytes'] = [Int64]0; $badClosureFields.Add($zeroClosureBytes)
+$wrongClosureBytesType = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $wrongClosureBytesType['bytes'] = '362288'; $badClosureFields.Add($wrongClosureBytesType)
+$badClosureVolume = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $badClosureVolume['volume_serial_hex'] = 'not-a-volume'; $badClosureFields.Add($badClosureVolume)
+$badClosureFileId = Copy-D32FactsSelfTestMap -Value $validCimClosureFile; $badClosureFileId['file_id_hex'] = 'not-a-file-id'; $badClosureFields.Add($badClosureFileId)
+$badClosureRecordsRejected = $true
+foreach ($badClosureRecord in $badClosureFields) {
+    if (Invoke-D32FactsSelfTestModuleClosureFileCheck -FileRecord $badClosureRecord -ModuleName 'CimCmdlets') { $badClosureRecordsRejected = $false }
+}
+Add-D32FactsSelfTestCase 'module closure file reference rejects malformed field sets, paths, hashes, sizes, and identities' `
+    ($badClosureRecordsRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+    'The shared per-file predicate rejects extra/missing fields, noncanonical paths, malformed SHA/file IDs, zero or nonnumeric byte counts, and invalid volume identity.'
+
+$duplicatePathRecord = Copy-D32FactsSelfTestMap -Value $validCimClosureFile
+$duplicatePathRecord['file_id_hex'] = '00000000000000000000000000000002'
+$duplicatePathSeenPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$duplicatePathSeenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$firstDuplicatePathAccepted = Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $validCimClosureFile -Role 'CimCmdlets' `
+    -ModuleDirectory $cimModuleDirectory -AllowedRootFilePaths $cimRootClosurePaths -SeenPaths $duplicatePathSeenPaths -SeenFileIds $duplicatePathSeenIds
+$samePathRejected = -not (Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $duplicatePathRecord -Role 'CimCmdlets' `
+    -ModuleDirectory $cimModuleDirectory -AllowedRootFilePaths $cimRootClosurePaths -SeenPaths $duplicatePathSeenPaths -SeenFileIds $duplicatePathSeenIds)
+$duplicateIdRecord = Copy-D32FactsSelfTestMap -Value $validCimClosureFile
+$duplicateIdRecord['path'] = [IO.Path]::Combine($cimModuleDirectory, 'synthetic-duplicate-id.bin')
+$duplicateIdSeenPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$duplicateIdSeenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$firstDuplicateIdAccepted = Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $validCimClosureFile -Role 'CimCmdlets' `
+    -ModuleDirectory $cimModuleDirectory -AllowedRootFilePaths $cimRootClosurePaths -SeenPaths $duplicateIdSeenPaths -SeenFileIds $duplicateIdSeenIds
+$sameIdRejected = -not (Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $duplicateIdRecord -Role 'CimCmdlets' `
+    -ModuleDirectory $cimModuleDirectory -AllowedRootFilePaths $cimRootClosurePaths -SeenPaths $duplicateIdSeenPaths -SeenFileIds $duplicateIdSeenIds)
+Add-D32FactsSelfTestCase 'module closure file references reject duplicate paths and duplicate opened identities across entries' `
+    ($firstDuplicatePathAccepted -and $samePathRejected -and $firstDuplicateIdAccepted -and $sameIdRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+    'Path and volume/file-ID uniqueness are checked independently while the fixture remains synthetic and module-free.'
+
 try {
     $singletonArrayJson = [System.Text.Json.JsonDocument]::Parse('{"distribution":{"protected_ancestors":[{"path":"C:\\","depth":0}]}}')
     try {
@@ -238,6 +318,17 @@ try {
         $helperText.Contains('validator_context=$script:D32PowerShellModuleAdmissionValidationContext')
     Add-D32FactsSelfTestCase 'strict admission self-validation reports the failing record section without changing its fail-closed decision' `
         $validatorContextDiagnostics 'The shared-record validator keeps a non-authoritative section diagnostic for the exact strict predicate group that rejects a positive context.'
+    $closureFilePredicateContexts = $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionClosureFileRecord') -and
+        $admissionValidatorBody.Contains('Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and
+        $helperText.Contains('function Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and
+        $helperText.Contains('$names = @($role.Nested) + @($role.Assemblies) + @($role.Extra)') -and
+        $helperText.Contains('record.module-closure.$Role.file.property-set') -and
+        $helperText.Contains('record.module-closure.$Role.file.identity-types') -and
+        $helperText.Contains('record.module-closure.$Role.file.role-boundary') -and
+        $helperText.Contains('record.module-closure.$Role.file.unique-path') -and
+        $helperText.Contains('record.module-closure.$Role.file.unique-file-id')
+    Add-D32FactsSelfTestCase 'strict admission file validation uses per-predicate diagnostics and exact role content paths without widening assembly origins' `
+        $closureFilePredicateContexts 'The CimCmdlets Extra files are admitted only as exact pinned closure content for that role; the fixed import assembly allowlist remains separate.'
     $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and
         $reuseCurrentBody.Contains('-OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256)') -and
         $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents') -and
@@ -976,7 +1067,40 @@ try {
                             ($rootRawSecurity.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
                     }
                     $moduleRoles = [System.Collections.Generic.List[string]]::new()
-                    foreach ($module in $authorityElement.GetProperty('modules').EnumerateArray()) { $moduleRoles.Add($module.GetProperty('role').GetString()) }
+                    $authorityModules = $authorityElement.GetProperty('modules')
+                    foreach ($module in $authorityModules.EnumerateArray()) { $moduleRoles.Add($module.GetProperty('role').GetString()) }
+                    $moduleClosureFactsValid = $authorityModules.GetArrayLength() -eq 3
+                    $moduleClosureSeenPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $moduleClosureSeenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    $cimNativeClosurePinned = $false
+                    $cimUnmanagedClosurePinned = $false
+                    foreach ($module in $authorityModules.EnumerateArray()) {
+                        $roleName = $module.GetProperty('role').GetString()
+                        $moduleName = $module.GetProperty('module_name').GetString()
+                        $moduleDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules', $moduleName))
+                        $allowedRootPaths = @(Get-D32PowerShellAuthorityFixedModuleClosureRootPaths -PowerShellRoot ([string]$PSHOME) -ModuleName $moduleName)
+                        $fileReferences = [System.Collections.Generic.List[object]]::new()
+                        foreach ($fileElement in $module.GetProperty('files').EnumerateArray()) {
+                            $fileReference = [ordered]@{
+                                path = $fileElement.GetProperty('path').GetString()
+                                bytes = [Int64]$fileElement.GetProperty('bytes').GetInt64()
+                                sha256 = $fileElement.GetProperty('sha256').GetString()
+                                volume_serial_hex = $fileElement.GetProperty('volume_serial_hex').GetString()
+                                file_id_hex = $fileElement.GetProperty('file_id_hex').GetString()
+                            }
+                            if (-not (Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $fileReference -Role $roleName `
+                                -ModuleDirectory $moduleDirectory -AllowedRootFilePaths $allowedRootPaths `
+                                -SeenPaths $moduleClosureSeenPaths -SeenFileIds $moduleClosureSeenIds)) { $moduleClosureFactsValid = $false }
+                            $fileReferences.Add($fileReference)
+                            if ($roleName -ceq 'CimCmdlets' -and $fileReference.path -ceq [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.dll'))) { $cimNativeClosurePinned = $true }
+                            if ($roleName -ceq 'CimCmdlets' -and $fileReference.path -ceq [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'microsoft.management.infrastructure.native.unmanaged.dll'))) { $cimUnmanagedClosurePinned = $true }
+                        }
+                        $moduleDigest = Get-D32PowerShellAuthorityInventoryDigest -Role $roleName -Files $fileReferences.ToArray()
+                        if ($moduleDigest -cne $module.GetProperty('inventory_sha256').GetString()) { $moduleClosureFactsValid = $false }
+                    }
+                    $moduleClosureFactsValid = $moduleClosureFactsValid -and $cimNativeClosurePinned -and $cimUnmanagedClosurePinned -and $global:D32PowerShellModuleImportAttempts -eq 0
+                    Add-D32FactsSelfTestCase 'generated module authority file references satisfy strict role-bound per-file predicates and pinned digests without imports' `
+                        $moduleClosureFactsValid 'All three generated module inventories were replayed through the same strict file-reference validator. CimCmdlets root Extra DLLs stay pinned closure facts, not resolver assembly allowlist entries.'
                     $osComponentElements = $authorityElement.GetProperty('resolver_policy').GetProperty('os_security_components')
                     $osComponentRoles = [System.Collections.Generic.List[string]]::new()
                     foreach ($component in $osComponentElements.EnumerateArray()) { $osComponentRoles.Add($component.GetProperty('component_type').GetString()) }

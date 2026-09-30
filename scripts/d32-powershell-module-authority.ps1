@@ -701,6 +701,29 @@ function Get-D32PowerShellAuthorityFixedImportAssemblyPaths {
     return [string[]]$paths.ToArray()
 }
 
+function Get-D32PowerShellAuthorityFixedModuleClosureRootPaths {
+    param([Parameter(Mandatory = $true)][string]$PowerShellRoot, [Parameter(Mandatory = $true)][string]$ModuleName)
+    $role = $null
+    foreach ($candidate in (Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $PowerShellRoot)) {
+        if ([string]$candidate.Name -ceq $ModuleName) { $role = $candidate; break }
+    }
+    if ($null -eq $role) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unknown fixed module role for closure paths: $ModuleName" }
+
+    # These are only exact PSHOME-root content paths admitted by this role's
+    # frozen manifest relationships. Extra contains fixed non-assembly runtime
+    # dependencies that are part of the module content closure, but are not
+    # import assemblies and must not enter the resolver assembly allowlist.
+    $names = @($role.Nested) + @($role.Assemblies) + @($role.Extra)
+    if (-not [String]::IsNullOrWhiteSpace([string]$role.Root)) { $names += ([string]$role.Root + '.dll') }
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $names) {
+        $path = [IO.Path]::GetFullPath([IO.Path]::Combine($PowerShellRoot, [string]$name))
+        if ($seen.Add($path)) { $paths.Add($path) }
+    }
+    return [string[]]$paths.ToArray()
+}
+
 function Get-D32PowerShellAuthorityAllowedModulePaths {
     param([Parameter(Mandatory = $true)][string]$PowerShellRoot, [Parameter(Mandatory = $true)][object]$Role)
     $paths = [System.Collections.Generic.List[string]]::new()
@@ -1897,6 +1920,60 @@ function Assert-D32PowerShellAuthorityDirectoryRecord {
     }
 }
 
+function Test-D32PowerShellModuleAdmissionClosureFileRecord {
+    param(
+        [AllowNull()][object]$FileRecord,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [Parameter(Mandatory = $true)][string]$ModuleDirectory,
+        [Parameter(Mandatory = $true)][string[]]$AllowedRootFilePaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$SeenPaths,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$SeenFileIds
+    )
+    $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$Role.file.property-set"
+    if ($null -eq $FileRecord -or $FileRecord -is [string] -or $FileRecord -is [Array] -or $FileRecord -is [ValueType]) { return $false }
+    $fileNames = [System.Collections.Generic.List[string]]::new()
+    if ($FileRecord -is [System.Collections.IDictionary]) { foreach ($key in $FileRecord.Keys) { $fileNames.Add([string]$key) } }
+    else { foreach ($property in $FileRecord.PSObject.Properties) { $fileNames.Add([string]$property.Name) } }
+    $referenceFields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
+    if ($fileNames.Count -ne $referenceFields.Count) { return $false }
+    foreach ($field in $referenceFields) { if (-not $fileNames.Contains($field)) { return $false } }
+
+    $get = {
+        param($record, $name)
+        $value = Get-D32PowerShellModuleAdmissionField -Record $record -Name $name
+        if ($value -is [Array]) { return ,$value }
+        return $value
+    }
+    $filePath = & $get $FileRecord 'path'
+    $fileSha = & $get $FileRecord 'sha256'
+    $fileBytes = & $get $FileRecord 'bytes'
+    $volume = & $get $FileRecord 'volume_serial_hex'
+    $fileId = & $get $FileRecord 'file_id_hex'
+
+    $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$Role.file.identity-types"
+    if ($filePath -isnot [string] -or -not [IO.Path]::IsPathRooted($filePath) -or
+        $fileSha -isnot [string] -or $fileSha -cnotmatch '^[0-9a-f]{64}$' -or
+        -not ($fileBytes -is [int32] -or $fileBytes -is [int64] -or $fileBytes -is [uint32] -or $fileBytes -is [uint64]) -or [Int64]$fileBytes -le 0 -or
+        $volume -isnot [string] -or $volume -cnotmatch '^[0-9a-f]{16}$' -or
+        $fileId -isnot [string] -or $fileId -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    try {
+        if ([IO.Path]::GetFullPath($filePath) -cne $filePath) { return $false }
+    }
+    catch { return $false }
+
+    $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$Role.file.role-boundary"
+    if (-not (Test-D32PowerShellAuthorityPathWithin -Child $filePath -Parent $ModuleDirectory) -and $filePath -cnotin $AllowedRootFilePaths) { return $false }
+
+    $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$Role.file.unique-path"
+    if ($SeenPaths.Contains($filePath)) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$Role.file.unique-file-id"
+    $fileIdentity = [string]$volume + ':' + [string]$fileId
+    if ($SeenFileIds.Contains($fileIdentity)) { return $false }
+    [void]$SeenPaths.Add($filePath)
+    [void]$SeenFileIds.Add($fileIdentity)
+    return $true
+}
+
 function Test-D32PowerShellModuleAdmissionRecord {
     param([AllowNull()][object]$Document, [AllowNull()][string]$CandidateSha, [AllowNull()][string]$Repository, [AllowNull()][object]$ExpectedContext)
     $script:D32PowerShellModuleAdmissionValidationContext = 'record.shape'
@@ -2017,6 +2094,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
     if ($closureNames.Count -ne 8) { return $false }
     foreach ($field in @('module_root','module_root_volume_serial_hex','module_root_file_id_hex','inventory_sha256','modules','runtime_distribution_sha256','protected_namespace_sha256','resolver_sha256')) { if (-not $closureNames.Contains($field)) { return $false } }
     $moduleRoot = [string](& $get $closure 'module_root')
+    $powerShellRoot = [IO.Path]::GetDirectoryName($moduleRoot)
     $expectedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellHome, 'Modules'))
     if (-not [IO.Path]::IsPathRooted($moduleRoot) -or $moduleRoot -cne $expectedModuleRoot -or
         (& $get $closure 'module_root_volume_serial_hex') -isnot [string] -or (& $get $closure 'module_root_volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
@@ -2046,23 +2124,12 @@ function Test-D32PowerShellModuleAdmissionRecord {
         if ((& $get $record 'manifest_path') -cne $expectedManifest) { return $false }
         $listedFiles = [System.Collections.Generic.List[object]]::new()
         $manifestIsInInventory = $false
+        $allowedRootFiles = @(Get-D32PowerShellAuthorityFixedModuleClosureRootPaths -PowerShellRoot $powerShellRoot -ModuleName $expectedNames[$index])
         foreach ($file in (& $get $record 'files')) {
-            $script:D32PowerShellModuleAdmissionValidationContext = "record.module-closure.$($expectedRoles[$index]).file"
-            $fileNames = [System.Collections.Generic.List[string]]::new()
-            if ($file -is [System.Collections.IDictionary]) { foreach ($key in $file.Keys) { $fileNames.Add([string]$key) } } else { foreach ($property in $file.PSObject.Properties) { $fileNames.Add([string]$property.Name) } }
-            if ($fileNames.Count -ne 5) { return $false }
-            foreach ($field in $referenceFields) { if (-not $fileNames.Contains($field)) { return $false } }
+            if (-not (Test-D32PowerShellModuleAdmissionClosureFileRecord -FileRecord $file -Role $expectedRoles[$index] `
+                -ModuleDirectory ([IO.Path]::GetFullPath([IO.Path]::Combine($moduleRoot, $expectedNames[$index]))) `
+                -AllowedRootFilePaths $allowedRootFiles -SeenPaths $allClosurePaths -SeenFileIds $allClosureIds)) { return $false }
             $filePath = & $get $file 'path'; $fileSha = & $get $file 'sha256'; $fileBytes = & $get $file 'bytes'
-            if ($filePath -isnot [string] -or -not [IO.Path]::IsPathRooted($filePath) -or [IO.Path]::GetFullPath($filePath) -cne $filePath -or
-                $fileSha -isnot [string] -or $fileSha -cnotmatch '^[0-9a-f]{64}$' -or
-                -not ($fileBytes -is [int32] -or $fileBytes -is [int64] -or $fileBytes -is [uint32] -or $fileBytes -is [uint64]) -or [Int64]$fileBytes -le 0 -or
-                (& $get $file 'volume_serial_hex') -isnot [string] -or (& $get $file 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
-                (& $get $file 'file_id_hex') -isnot [string] -or (& $get $file 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
-            $allowedFileDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine($moduleRoot, $expectedNames[$index]))
-            $powerShellRoot = [IO.Path]::GetDirectoryName($moduleRoot)
-            $fixedRootFiles = @(Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot $powerShellRoot)
-            if (-not $allClosurePaths.Add($filePath) -or -not $allClosureIds.Add(([string](& $get $file 'volume_serial_hex') + ':' + [string](& $get $file 'file_id_hex'))) -or
-                (-not (Test-D32PowerShellAuthorityPathWithin -Child $filePath -Parent $allowedFileDirectory) -and $filePath -cnotin $fixedRootFiles)) { return $false }
             if ([StringComparer]::OrdinalIgnoreCase.Equals($filePath, $expectedManifest)) { $manifestIsInInventory = $true }
             $listedFiles.Add([ordered]@{ path = $filePath; bytes = [Int64]$fileBytes; sha256 = $fileSha; volume_serial_hex = [string](& $get $file 'volume_serial_hex'); file_id_hex = [string](& $get $file 'file_id_hex') })
             $closureFileByPath.Add($filePath, $file)

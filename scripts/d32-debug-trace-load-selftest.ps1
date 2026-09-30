@@ -1,4 +1,21 @@
 #Requires -Version 7.5
+[CmdletBinding()]
+param(
+    [string]$Repository,
+    [string]$ExpectedCandidateSha,
+    [string]$ToolchainProfilePath,
+    [string]$ExpectedToolchainProfileSha256,
+    [string]$PowerShellModuleAuthorityPath,
+    [string]$ExpectedPowerShellModuleAuthoritySha256,
+    [string]$PinnedGitPath,
+    [string]$PinnedGitSha256
+)
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+    -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -CallerCandidateSha $ExpectedCandidateSha -CallerRepository $Repository -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
+    -EntryScriptPath $PSCommandPath
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $descendantCount = 291

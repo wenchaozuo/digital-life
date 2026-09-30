@@ -1,15 +1,18 @@
+# Candidate-owned, module-free bootstrap for strict D32 PowerShell module admission.
+# This file intentionally uses only PowerShell Core/.NET APIs until every pin and
+# content fence has passed. It does not trust ambient module search paths.
+
 function Test-D32PowerShellAuthorityPathNoReparse {
     param([Parameter(Mandatory = $true)][string]$Path)
-
     try {
-        $fullPath = [IO.Path]::GetFullPath($Path)
-        $root = [IO.Path]::GetPathRoot($fullPath)
+        $full = [IO.Path]::GetFullPath($Path)
+        $root = [IO.Path]::GetPathRoot($full)
         if ([String]::IsNullOrWhiteSpace($root)) { return $false }
         $current = $root
-        $segments = $fullPath.Substring($root.Length).Split([IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries)
-        foreach ($segment in $segments) {
-            $current = [IO.Path]::Combine($current, $segment)
-            if (-not [IO.Directory]::Exists($current) -and -not [IO.File]::Exists($current)) { return $false }
+        $parts = @($full.Substring($root.Length) -split '[\\/]+' )
+        foreach ($part in $parts) {
+            if ([String]::IsNullOrWhiteSpace($part)) { continue }
+            $current = [IO.Path]::Combine($current, $part)
             $attributes = [IO.File]::GetAttributes($current)
             if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
         }
@@ -18,65 +21,1323 @@ function Test-D32PowerShellAuthorityPathNoReparse {
     catch { return $false }
 }
 
-function Get-D32PowerShellAuthorityOpenedBytes {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $Path)) {
-        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned file is missing or reparse-backed: $Path"
-    }
-    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+function Test-D32PowerShellAuthorityPathWithin {
+    param([Parameter(Mandatory = $true)][string]$Child, [Parameter(Mandatory = $true)][string]$Parent)
     try {
-        if ($stream.Length -le 0 -or $stream.Length -gt [Int32]::MaxValue) {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned file has an invalid length'
+        $childFull = [IO.Path]::GetFullPath($Child).TrimEnd([char[]]@('\', '/'))
+        $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd([char[]]@('\', '/'))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($childFull, $parentFull)) { return $true }
+        return $childFull.StartsWith($parentFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+}
+
+function Initialize-D32PowerShellAuthorityNativeApi {
+    if ('D32PowerShellModuleNativeV2' -as [type]) { return }
+    $assemblyName = [Reflection.AssemblyName]::new('D32PowerShellModuleNativeV2')
+    $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module = $assembly.DefineDynamicModule('D32PowerShellModuleNativeV2')
+    $type = $module.DefineType('D32PowerShellModuleNativeV2', [Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed)
+    $createFile = $type.DefinePInvokeMethod('CreateFileW', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [Microsoft.Win32.SafeHandles.SafeFileHandle],
+        [type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+    $createFile.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $getInfo = $type.DefinePInvokeMethod('GetFileInformationByHandle', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [bool],
+        [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [IntPtr]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+    $getInfo.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $getFileIdInfo = $type.DefinePInvokeMethod('GetFileInformationByHandleEx', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [bool],
+        [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [int], [IntPtr], [uint32]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+    $getFileIdInfo.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $getFinalPath = $type.DefinePInvokeMethod('GetFinalPathNameByHandleW', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [uint32],
+        [type[]]@([Microsoft.Win32.SafeHandles.SafeFileHandle], [Text.StringBuilder], [uint32], [uint32]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+    $getFinalPath.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $setDefaultDirectories = $type.DefinePInvokeMethod('SetDefaultDllDirectories', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [bool], [type[]]@([uint32]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+    $setDefaultDirectories.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $setDllDirectory = $type.DefinePInvokeMethod('SetDllDirectoryW', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [bool], [type[]]@([string]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+    $setDllDirectory.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $getDllDirectory = $type.DefinePInvokeMethod('GetDllDirectoryW', 'kernel32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [uint32], [type[]]@([uint32], [Text.StringBuilder]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+    $getDllDirectory.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $getTokenInformation = $type.DefinePInvokeMethod('GetTokenInformation', 'advapi32.dll', [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+        [Reflection.CallingConventions]::Standard, [bool], [type[]]@([IntPtr], [int], [IntPtr], [uint32], [IntPtr]),
+        [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
+    $getTokenInformation.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $null = $type.CreateType()
+}
+
+function Get-D32PowerShellAuthorityCurrentToken {
+    $threadIdentity = $null
+    $processIdentity = $null
+    $elevationBuffer = [IntPtr]::Zero
+    $integrityBuffer = [IntPtr]::Zero
+    $returnLength = [IntPtr]::Zero
+    try {
+        $threadIdentity = [Security.Principal.WindowsIdentity]::GetCurrent($true)
+        if ($null -ne $threadIdentity) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: thread impersonation is not accepted during module admission' }
+        $processIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -eq $processIdentity -or $null -eq $processIdentity.Token -or $processIdentity.Token -eq [IntPtr]::Zero -or $null -eq $processIdentity.User) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: current process token identity is unavailable'
         }
-        $bytes = [byte[]]::new([int]$stream.Length)
-        $offset = 0
-        while ($offset -lt $bytes.Length) {
-            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
-            if ($read -le 0) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned file changed while being read' }
-            $offset += $read
+        Initialize-D32PowerShellAuthorityNativeApi
+        $elevationBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+        $integrityBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(256)
+        $returnLength = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+        if (-not [D32PowerShellModuleNativeV2]::GetTokenInformation($processIdentity.Token, 20, $elevationBuffer, 4, $returnLength) -or
+            [Runtime.InteropServices.Marshal]::ReadInt32($returnLength) -ne 4) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token elevation state is unavailable'
         }
-        if ($stream.Position -ne $stream.Length) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned file length changed while being read' }
-        return [PSCustomObject]@{ Stream = $stream; Bytes = $bytes }
+        $isElevated = [Runtime.InteropServices.Marshal]::ReadInt32($elevationBuffer) -ne 0
+        if (-not [D32PowerShellModuleNativeV2]::GetTokenInformation($processIdentity.Token, 25, $integrityBuffer, 256, $returnLength) -or
+            [Runtime.InteropServices.Marshal]::ReadInt32($returnLength) -le 0 -or [Runtime.InteropServices.Marshal]::ReadInt32($returnLength) -gt 256) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token integrity level is unavailable'
+        }
+        $sid = [Runtime.InteropServices.Marshal]::ReadIntPtr($integrityBuffer)
+        if ($sid -eq [IntPtr]::Zero) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token integrity SID is unavailable' }
+        $subAuthorityCount = [Runtime.InteropServices.Marshal]::ReadByte($sid, 1)
+        if ($subAuthorityCount -lt 1 -or $subAuthorityCount -gt 15) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token integrity SID is malformed' }
+        $integrityOffset = 8 + (4 * ($subAuthorityCount - 1))
+        $returnedBytes = [Runtime.InteropServices.Marshal]::ReadInt32($returnLength)
+        $bufferStart = $integrityBuffer.ToInt64()
+        $sidStart = $sid.ToInt64()
+        if ($sidStart -lt $bufferStart -or ($sidStart + $integrityOffset + 4) -gt ($bufferStart + $returnedBytes)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token integrity SID exceeds its returned buffer' }
+        $integrityRid = [uint32][Runtime.InteropServices.Marshal]::ReadInt32($sid, $integrityOffset)
+        $isSystem = [string]$processIdentity.User.Value -ceq 'S-1-5-18'
+        if ($isElevated -or $integrityRid -ge [uint32]0x3000 -or $isSystem) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module admission requires a non-elevated, non-system process token below high integrity'
+        }
+        return [PSCustomObject][ordered]@{ is_elevated = $false; integrity_rid = [Int64]$integrityRid; is_system = $false; thread_impersonating = $false }
     }
     catch {
-        $stream.Dispose()
-        throw
+        if ([string]$_.Exception.Message -like 'POWERSHELL_MODULE_AUTHORITY_BLOCKED:*') { throw }
+        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: cannot validate the current process token: $($_.Exception.Message)"
+    }
+    finally {
+        if ([IntPtr]::Zero -ne $returnLength) { [Runtime.InteropServices.Marshal]::FreeHGlobal($returnLength) }
+        if ([IntPtr]::Zero -ne $integrityBuffer) { [Runtime.InteropServices.Marshal]::FreeHGlobal($integrityBuffer) }
+        if ([IntPtr]::Zero -ne $elevationBuffer) { [Runtime.InteropServices.Marshal]::FreeHGlobal($elevationBuffer) }
+        if ($null -ne $threadIdentity) { $threadIdentity.Dispose() }
+        if ($null -ne $processIdentity) { $processIdentity.Dispose() }
     }
 }
 
-function Assert-D32PowerShellAuthorityModuleInventory {
-    param([Parameter(Mandatory = $true)][string]$ModuleRoot)
+function Test-D32PowerShellAuthorityTokenRecord {
+    param([AllowNull()][object]$Token)
+    if ($null -eq $Token -or $Token -is [string] -or $Token -is [Array] -or $Token -is [ValueType]) { return $false }
+    $fields = [System.Collections.Generic.List[string]]::new()
+    if ($Token -is [System.Collections.IDictionary]) { foreach ($key in $Token.Keys) { $fields.Add([string]$key) } }
+    else { foreach ($property in $Token.PSObject.Properties) { $fields.Add([string]$property.Name) } }
+    if ($fields.Count -ne 4) { return $false }
+    foreach ($field in @('is_elevated','integrity_rid','is_system','thread_impersonating')) { if (-not $fields.Contains($field)) { return $false } }
+    $get = { param($object, $name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
+    $isElevated = & $get $Token 'is_elevated'; $integrityRid = & $get $Token 'integrity_rid'; $isSystem = & $get $Token 'is_system'; $isImpersonating = & $get $Token 'thread_impersonating'
+    if ($isElevated -isnot [bool] -or $isElevated -or $isSystem -isnot [bool] -or $isSystem -or $isImpersonating -isnot [bool] -or $isImpersonating -or
+        -not ($integrityRid -is [int32] -or $integrityRid -is [int64] -or $integrityRid -is [uint32] -or $integrityRid -is [uint64]) -or
+        [Int64]$integrityRid -lt 0x1000 -or [Int64]$integrityRid -ge 0x3000) { return $false }
+    return $true
+}
 
-    $canonicalModuleRoot = [IO.Path]::GetFullPath($ModuleRoot)
+function Get-D32PowerShellAuthorityHandleIdentity {
+    param([Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle)
+    Initialize-D32PowerShellAuthorityNativeApi
+    $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+    $fileIdInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal(24)
+    try {
+        if (-not [D32PowerShellModuleNativeV2]::GetFileInformationByHandle($Handle, $buffer)) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: native opened-handle identity is unavailable'
+        }
+        $attributes = [Runtime.InteropServices.Marshal]::ReadInt32($buffer, 0)
+        if (-not [D32PowerShellModuleNativeV2]::GetFileInformationByHandleEx($Handle, 18, $fileIdInfo, 24)) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: 128-bit opened-handle file identity is unavailable'
+        }
+        $volume = [BitConverter]::ToUInt64([BitConverter]::GetBytes([Runtime.InteropServices.Marshal]::ReadInt64($fileIdInfo, 0)), 0).ToString('x16', [Globalization.CultureInfo]::InvariantCulture)
+        $idBytes = [byte[]]::new(16)
+        [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($fileIdInfo, 8), $idBytes, 0, $idBytes.Length)
+        $fileId = [BitConverter]::ToString($idBytes).Replace('-', '').ToLowerInvariant()
+        $sizeHigh = [uint32][Runtime.InteropServices.Marshal]::ReadInt32($buffer, 32)
+        $sizeLow = [uint32][Runtime.InteropServices.Marshal]::ReadInt32($buffer, 36)
+        $bytes = ([Int64]$sizeHigh * 4294967296L) + [Int64]$sizeLow
+        return [PSCustomObject]@{ Attributes = $attributes; VolumeSerialHex = $volume; FileIdHex = $fileId; Bytes = $bytes }
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($fileIdInfo)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
+    }
+}
+
+function Get-D32PowerShellAuthorityFinalHandlePath {
+    param([Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle)
+    Initialize-D32PowerShellAuthorityNativeApi
+    $buffer = [Text.StringBuilder]::new(32768)
+    $length = [D32PowerShellModuleNativeV2]::GetFinalPathNameByHandleW($Handle, $buffer, [uint32]$buffer.Capacity, 0)
+    if ($length -le 0 -or $length -ge $buffer.Capacity) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: final opened-handle path is unavailable or exceeds the bound' }
+    $path = [string]$buffer.ToString()
+    if ($path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { $path = '\\' + $path.Substring(8) }
+    elseif ($path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) { $path = $path.Substring(4) }
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Get-D32PowerShellAuthorityObjectSecurity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][bool]$IsDirectory,
+        [AllowNull()][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle,
+        [AllowNull()][IO.FileStream]$Stream
+    )
+    try {
+        if ($IsDirectory) {
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($Path))
+        }
+        else {
+            if ($null -eq $Handle -or $Handle.IsClosed -or $Handle.IsInvalid -or $null -eq $Stream -or -not [object]::ReferenceEquals($Stream.SafeFileHandle, $Handle)) { throw 'missing matching opened file stream for ACL read' }
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl($Stream)
+        }
+        $ownerSid = [string]$security.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        $sddl = [string]$security.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access)
+        $aclHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($sddl))).ToLowerInvariant()
+        return [PSCustomObject]@{ OwnerSid = $ownerSid; Sddl = $sddl; AclSha256 = $aclHash; Security = $security }
+    }
+    catch { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: cannot read security descriptor for opened object $Path : $($_.Exception.Message)" }
+}
+
+function Test-D32PowerShellAuthorityProtectedSecurity {
+    param([Parameter(Mandatory = $true)][object]$Security, [Parameter(Mandatory = $true)][bool]$IsDirectory, [switch]$IsProtectedAncestor)
+    $trustedWriterSids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($sid in @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')) { [void]$trustedWriterSids.Add($sid) }
+    if (-not $trustedWriterSids.Contains([string]$Security.OwnerSid)) { return $false }
+    $writeMask = [int64]0x00000002 -bor [int64]0x00000004 -bor [int64]0x00000010 -bor [int64]0x00000040 -bor
+        [int64]0x00000100 -bor [int64]0x00010000 -bor [int64]0x00040000 -bor [int64]0x00080000 -bor
+        [int64]0x01000000 -bor [int64]0x10000000 -bor [int64]0x40000000
+    if ($IsProtectedAncestor) { $writeMask = $writeMask -band (-bnot ([int64]0x00000002 -bor [int64]0x00000004)) }
+    foreach ($rule in $Security.Security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        $sid = [string]$rule.IdentityReference.Value
+        $mask = [int64]$rule.FileSystemRights
+        if (($mask -band $writeMask) -ne 0 -and -not $trustedWriterSids.Contains($sid)) { return $false }
+    }
+    return $true
+}
+
+function Get-D32PowerShellAuthoritySecurityRecord {
+    param([Parameter(Mandatory = $true)][object]$Security)
+    if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $Security -IsDirectory:$false)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: object owner or ACL grants an untrusted trustee namespace write/replace/delete/reparse/DACL/owner rights'
+    }
+    return [ordered]@{ owner_sid = [string]$Security.OwnerSid; security_descriptor_sddl = [string]$Security.Sddl; security_descriptor_sha256 = [string]$Security.AclSha256 }
+}
+
+function Open-D32PowerShellAuthorityDirectoryFence {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    Initialize-D32PowerShellAuthorityNativeApi
+    # V2 handles witness object identity only. Protected namespace policy, not a
+    # directory share-mode lock, proves that untrusted writers cannot redirect it.
+    $handle = [D32PowerShellModuleNativeV2]::CreateFileW($full, 0x80, 0x07, [IntPtr]::Zero, 3, 0x02000000 -bor 0x00200000, [IntPtr]::Zero)
+    if ($null -eq $handle -or $handle.IsInvalid) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: cannot hold stable directory fence: $full" }
+    try {
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $handle
+        $finalPath = Get-D32PowerShellAuthorityFinalHandlePath -Handle $handle
+        if (($identity.Attributes -band [int][IO.FileAttributes]::Directory) -eq 0 -or
+            ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($finalPath, $full)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: directory is not a regular non-reparse object: $full"
+        }
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path $full -IsDirectory:$true -Handle $handle
+        $runtimeDirectory = Test-D32PowerShellAuthorityPathWithin -Child $full -Parent ([string]$PSHOME)
+        $runtimeAncestor = -not $runtimeDirectory -and (Test-D32PowerShellAuthorityPathWithin -Child ([string]$PSHOME) -Parent $full)
+        if (($runtimeDirectory -or $runtimeAncestor) -and -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true -IsProtectedAncestor:$runtimeAncestor)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: untrusted namespace writer on PowerShell runtime directory/ancestor: $full" }
+        $afterSecurity = Get-D32PowerShellAuthorityHandleIdentity -Handle $handle
+        if ($afterSecurity.VolumeSerialHex -cne $identity.VolumeSerialHex -or $afterSecurity.FileIdHex -cne $identity.FileIdHex -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $handle), $full)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: directory object changed during ACL validation: $full"
+        }
+        return [PSCustomObject]@{ Path = $full; VolumeSerialHex = $identity.VolumeSerialHex; FileIdHex = $identity.FileIdHex; OwnerSid = $security.OwnerSid; Sddl = $security.Sddl; AclSha256 = $security.AclSha256; Handle = $handle }
+    }
+    catch { $handle.Dispose(); throw }
+}
+
+function Add-D32PowerShellAuthorityDirectoryChain {
+    param([Parameter(Mandatory = $true)][string]$Directory, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Fences)
+    $full = [IO.Path]::GetFullPath($Directory).TrimEnd([char[]]@('\', '/'))
+    $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Directory))
+    if ([String]::IsNullOrWhiteSpace($root)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: directory path has no root' }
+    $chain = [System.Collections.Generic.List[string]]::new()
+    $current = $root
+    $chain.Add($current)
+    $remainder = [IO.Path]::GetFullPath($Directory).Substring($root.Length)
+    foreach ($part in @($remainder -split '[\\/]+' )) {
+        if ([String]::IsNullOrWhiteSpace($part)) { continue }
+        $current = [IO.Path]::Combine($current, $part)
+        $chain.Add($current)
+    }
+    foreach ($item in $chain) {
+        $key = [IO.Path]::GetFullPath($item).TrimEnd([char[]]@('\', '/'))
+        if ($key.Length -eq 2 -and $key[1] -eq ':') { $key += [IO.Path]::DirectorySeparatorChar }
+        if (-not $Fences.Contains($key)) { $Fences[$key] = Open-D32PowerShellAuthorityDirectoryFence -Path $key }
+    }
+}
+
+function Open-D32PowerShellAuthorityFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $full)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: missing or reparse-backed file: $full" }
+    Add-D32PowerShellAuthorityDirectoryChain -Directory ([IO.Path]::GetDirectoryName($full)) -Fences $DirectoryFences
+    # ACLs prove write exclusion; sharing all modes keeps the loader compatible.
+    # Retained handles and opened IDs detect object substitution at phase boundaries.
+    $share = if (Test-D32PowerShellAuthorityPathWithin -Child $full -Parent ([string]$PSHOME)) { [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete } else { [IO.FileShare]::Read }
+    $stream = [IO.FileStream]::new($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    try {
+        $before = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
+        $finalPath = Get-D32PowerShellAuthorityFinalHandlePath -Handle $stream.SafeFileHandle
+        if (($before.Attributes -band [int][IO.FileAttributes]::Directory) -ne 0 -or
+            ($before.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Bytes -le 0 -or $before.Bytes -gt [Int32]::MaxValue -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($finalPath, $full)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: expected bounded regular opened file: $full"
+        }
+        $bytes = [byte[]]::new([int]$before.Bytes)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: file changed during opened read: $full" }
+            $offset += $read
+        }
+        $after = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path $full -IsDirectory:$false -Handle $stream.SafeFileHandle -Stream $stream
+        if ((Test-D32PowerShellAuthorityPathWithin -Child $full -Parent ([string]$PSHOME)) -and
+            -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$false)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: untrusted namespace writer on PowerShell runtime file: $full" }
+        if ($stream.Length -ne $before.Bytes -or $after.Bytes -ne $before.Bytes -or
+            $before.VolumeSerialHex -cne $after.VolumeSerialHex -or $before.FileIdHex -cne $after.FileIdHex -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($full), [IO.Path]::GetFullPath($stream.Name)) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $stream.SafeFileHandle), $full)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: opened file identity changed while reading: $full"
+        }
+        $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        return [PSCustomObject]@{
+            Record = [ordered]@{ path = $full; bytes = [Int64]$before.Bytes; sha256 = $sha; volume_serial_hex = $before.VolumeSerialHex; file_id_hex = $before.FileIdHex }
+            Security = $security
+            Stream = $stream; Bytes = $bytes
+        }
+    }
+    catch { $stream.Dispose(); throw }
+}
+
+function Test-D32PowerShellAuthorityJsonDuplicates {
+    param([System.Text.Json.JsonElement]$Element)
+    switch ($Element.ValueKind) {
+        ([System.Text.Json.JsonValueKind]::Object) {
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($property in $Element.EnumerateObject()) {
+                if (-not $seen.Add($property.Name) -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $property.Value)) { return $true }
+            }
+        }
+        ([System.Text.Json.JsonValueKind]::Array) {
+            foreach ($item in $Element.EnumerateArray()) { if (Test-D32PowerShellAuthorityJsonDuplicates -Element $item) { return $true } }
+        }
+    }
+    return $false
+}
+
+function Test-D32PowerShellAuthorityJsonFields {
+    param([System.Text.Json.JsonElement]$Element, [string[]]$Expected)
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+    $names = [System.Collections.Generic.List[string]]::new()
+    foreach ($property in $Element.EnumerateObject()) { $names.Add($property.Name) }
+    if ($names.Count -ne $Expected.Count) { return $false }
+    foreach ($name in $Expected) { if (-not $names.Contains($name)) { return $false } }
+    return $true
+}
+
+function Get-D32PowerShellAuthorityManifestData {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes, [Parameter(Mandatory = $true)][string]$ModuleName)
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes)
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -gt 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: invalid literal module manifest: $ModuleName" }
+    $tables = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.HashtableAst] }, $true))
+    if ($tables.Count -lt 1) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module manifest is not a literal data file: $ModuleName" }
+    $table = $tables[0]
+    $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pair in $table.KeyValuePairs) {
+        $key = $null
+        try { $key = [string]$pair.Item1.SafeGetValue() } catch { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: dynamic module manifest key: $ModuleName" }
+        if (-not $keys.Add($key)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate module manifest field: $ModuleName/$key" }
+    }
+    try { $data = $table.SafeGetValue() } catch { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: executable module manifest expression: $ModuleName" }
+    if ($data -isnot [System.Collections.IDictionary]) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module manifest root must be a literal hashtable: $ModuleName" }
+    if ($data.Contains('ModuleToProcess')) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module manifest alias ModuleToProcess is not accepted: $ModuleName" }
+    if ($data.Contains('Prefix') -and -not [String]::IsNullOrEmpty([string]$data['Prefix'])) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: manifest prefix is not accepted: $ModuleName" }
+    $root = if ($data.Contains('RootModule')) { [string]$data['RootModule'] } else { '' }
+    $nested = @(); if ($data.Contains('NestedModules')) { $nested = @($data['NestedModules']) }
+    $required = @(); if ($data.Contains('RequiredModules')) { $required = @($data['RequiredModules']) }
+    $scripts = @(); if ($data.Contains('ScriptsToProcess')) { $scripts = @($data['ScriptsToProcess']) }
+    $assemblies = @(); if ($data.Contains('RequiredAssemblies')) { $assemblies = @($data['RequiredAssemblies']) }
+    $types = @(); if ($data.Contains('TypesToProcess')) { $types = @($data['TypesToProcess']) }
+    $formats = @(); if ($data.Contains('FormatsToProcess')) { $formats = @($data['FormatsToProcess']) }
+    $moduleList = @(); if ($data.Contains('ModuleListToProcess')) { $moduleList = @($data['ModuleListToProcess']) }
+    foreach ($value in @($nested) + @($required) + @($scripts) + @($assemblies) + @($types) + @($formats) + @($moduleList)) {
+        if ($value -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$value) -or $value.Contains('*') -or $value.Contains('?') -or [IO.Path]::IsPathRooted([string]$value)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module manifest contains a non-literal or wildcard resolution: $ModuleName"
+        }
+    }
+    if (-not [String]::IsNullOrEmpty($root) -and ($root.Contains('*') -or $root.Contains('?') -or [IO.Path]::IsPathRooted($root))) {
+        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module manifest root module is not a relative exact name: $ModuleName"
+    }
+    return [PSCustomObject]@{ RootModule = $root; NestedModules = [string[]]$nested; RequiredModules = [object[]]$required; ScriptsToProcess = [string[]]$scripts; RequiredAssemblies = [string[]]$assemblies; TypesToProcess = [string[]]$types; FormatsToProcess = [string[]]$formats; ModuleListToProcess = [string[]]$moduleList }
+}
+
+function Get-D32PowerShellAuthorityFixedModuleRoles {
+    param([Parameter(Mandatory = $true)][string]$PowerShellRoot)
+    $moduleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($PowerShellRoot, 'Modules'))
+    return @(
+        [PSCustomObject]@{ Role = 'Management'; Name = 'Microsoft.PowerShell.Management'; Manifest = [IO.Path]::Combine($moduleRoot, 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Management.psd1'); Nested = @('Microsoft.PowerShell.Commands.Management.dll'); Root = ''; Assemblies = @(); Extra = @() },
+        [PSCustomObject]@{ Role = 'Utility'; Name = 'Microsoft.PowerShell.Utility'; Manifest = [IO.Path]::Combine($moduleRoot, 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1'); Nested = @('Microsoft.PowerShell.Commands.Utility.dll'); Root = ''; Assemblies = @(); Extra = @() },
+        [PSCustomObject]@{ Role = 'CimCmdlets'; Name = 'CimCmdlets'; Manifest = [IO.Path]::Combine($moduleRoot, 'CimCmdlets', 'CimCmdlets.psd1'); Nested = @(); Root = 'Microsoft.Management.Infrastructure.CimCmdlets'; Assemblies = @('Microsoft.Management.Infrastructure.CimCmdlets.dll', 'Microsoft.Management.Infrastructure.Dll'); Extra = @('microsoft.management.infrastructure.native.dll', 'microsoft.management.infrastructure.native.unmanaged.dll') }
+    )
+}
+
+function Get-D32PowerShellAuthorityFixedImportAssemblyPaths {
+    param([Parameter(Mandatory = $true)][string]$PowerShellRoot)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in (Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $PowerShellRoot)) {
+        $names = @($role.Nested) + @($role.Assemblies)
+        if (-not [String]::IsNullOrWhiteSpace([string]$role.Root)) { $names += ([string]$role.Root + '.dll') }
+        foreach ($name in $names) {
+            $path = [IO.Path]::GetFullPath([IO.Path]::Combine($PowerShellRoot, [string]$name))
+            if (-not $seen.Add($path)) { continue }
+            $paths.Add($path)
+        }
+    }
+    return [string[]]$paths.ToArray()
+}
+
+function Get-D32PowerShellAuthorityAllowedModulePaths {
+    param([Parameter(Mandatory = $true)][string]$PowerShellRoot, [Parameter(Mandatory = $true)][object]$Role)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $paths.Add([IO.Path]::GetFullPath([string]$Role.Manifest))
+    if (-not [String]::IsNullOrWhiteSpace([string]$Role.Root)) { $paths.Add([IO.Path]::GetFullPath([IO.Path]::Combine($PowerShellRoot, ([string]$Role.Root + '.dll')))) }
+    foreach ($nested in $Role.Nested) { $paths.Add([IO.Path]::GetFullPath([IO.Path]::Combine($PowerShellRoot, [string]$nested))) }
+    return [string[]]$paths.ToArray()
+}
+
+function Get-D32PowerShellAuthorityModuleTreePaths {
+    param([Parameter(Mandatory = $true)][string]$ModuleDirectory)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push([IO.Path]::GetFullPath($ModuleDirectory))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        Add-D32PowerShellAuthorityDirectoryChain -Directory $directory -Fences $script:D32PowerShellAdmissionDirectoryFences
+        if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $directory)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module directory tree contains a reparse path: $directory" }
+        foreach ($file in [IO.Directory]::GetFiles($directory)) { $paths.Add([IO.Path]::GetFullPath($file)) }
+        foreach ($child in [IO.Directory]::GetDirectories($directory)) {
+            $attributes = [IO.File]::GetAttributes($child)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module directory tree contains a reparse directory: $child" }
+            $pending.Push([IO.Path]::GetFullPath($child))
+        }
+    }
+    return [string[]]$paths.ToArray()
+}
+
+function Get-D32PowerShellAuthorityExpectedModuleFiles {
+    param([Parameter(Mandatory = $true)][string]$PowerShellRoot, [Parameter(Mandatory = $true)][object]$Role)
+    $moduleDirectory = [IO.Path]::GetDirectoryName([string]$Role.Manifest)
+    $manifestSnapshot = Open-D32PowerShellAuthorityFile -Path ([string]$Role.Manifest) -DirectoryFences $script:D32PowerShellAdmissionDirectoryFences
+    $semantics = Get-D32PowerShellAuthorityManifestData -Bytes ([byte[]]$manifestSnapshot.Bytes) -ModuleName ([string]$Role.Name)
+    if ($semantics.RootModule -cne [string]$Role.Root -or ($semantics.NestedModules -join "`n") -cne ([string[]]$Role.Nested -join "`n") -or
+        $semantics.RequiredAssemblies.Count -ne $Role.Assemblies.Count -or ($semantics.RequiredAssemblies -join "`n") -cne ([string[]]$Role.Assemblies -join "`n") -or
+        $semantics.RequiredModules.Count -ne 0 -or $semantics.ScriptsToProcess.Count -ne 0 -or $semantics.TypesToProcess.Count -ne 0 -or
+        $semantics.FormatsToProcess.Count -ne 0 -or $semantics.ModuleListToProcess.Count -ne 0) {
+        $manifestSnapshot.Stream.Dispose()
+        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: fixed role/import relationships changed: $($Role.Name)"
+    }
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $paths.Add([IO.Path]::GetFullPath([string]$Role.Manifest))
+    foreach ($file in (Get-D32PowerShellAuthorityModuleTreePaths -ModuleDirectory $moduleDirectory)) { if (-not $paths.Contains([string]$file)) { $paths.Add([string]$file) } }
+    $root = [IO.Path]::GetFullPath($PowerShellRoot)
+    $rootReferences = @($Role.Nested) + @($Role.Assemblies) + @($Role.Extra)
+    if (-not [String]::IsNullOrEmpty([string]$Role.Root)) { $rootReferences += ([string]$Role.Root + '.dll') }
+    foreach ($file in $rootReferences) {
+        $resolved = [IO.Path]::GetFullPath([IO.Path]::Combine($root, [string]$file))
+        if (-not $paths.Contains($resolved)) { $paths.Add($resolved) }
+    }
+    $unique = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $paths) {
+        if (-not $unique.Add($path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate module closure path: $path" }
+    }
+    return [PSCustomObject]@{ Paths = [string[]]$paths; Manifest = $manifestSnapshot; Semantics = $semantics; ModuleDirectory = $moduleDirectory }
+}
+
+function Get-D32PowerShellAuthorityInventoryDigest {
+    param([Parameter(Mandatory = $true)][string]$Role, [Parameter(Mandatory = $true)][object[]]$Files)
+    $builder = [Text.StringBuilder]::new()
+    $ordered = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $Files) {
+        $path = [string]$file.path
+        if ($ordered.ContainsKey($path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate path in module inventory: $path" }
+        $ordered.Add($path, $file)
+    }
+    foreach ($file in $ordered.Values) {
+        $entry = [string]$file.path
+        [void]$builder.Append($entry.Length).Append(':').Append($entry).Append('|').Append([Int64]$file.bytes).Append('|').Append([string]$file.sha256).Append('|').Append([string]$file.volume_serial_hex).Append('|').Append([string]$file.file_id_hex).Append("`n")
+    }
+    $data = [Text.UTF8Encoding]::new($false).GetBytes($Role + "`n" + $builder.ToString())
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($data)).ToLowerInvariant()
+}
+
+function Get-D32PowerShellAuthorityRuntimeInventoryDigest {
+    param([Parameter(Mandatory = $true)][object[]]$Directories, [Parameter(Mandatory = $true)][object[]]$Files, [Parameter(Mandatory = $true)][object[]]$Ancestors)
+    $builder = [Text.StringBuilder]::new()
+    $groups = @(
+        [PSCustomObject]@{ Kind = 'ancestor'; Items = $Ancestors },
+        [PSCustomObject]@{ Kind = 'directory'; Items = $Directories },
+        [PSCustomObject]@{ Kind = 'file'; Items = $Files }
+    )
+    foreach ($group in $groups) {
+        $ordered = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($item in $group.Items) {
+            $path = [string]$item.path
+            if ($ordered.ContainsKey($path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate path in full runtime distribution: $path" }
+            $ordered.Add($path, $item)
+        }
+        foreach ($item in $ordered.Values) {
+            $kind = [string]$item.kind
+            if ([string]::IsNullOrWhiteSpace($kind)) { $kind = [string]$group.Kind }
+            [void]$builder.Append($kind).Append('|').Append(([string]$item.path).Length).Append(':').Append([string]$item.path).Append('|')
+            if ($kind -ceq 'file') { [void]$builder.Append([Int64]$item.bytes).Append('|').Append([string]$item.sha256).Append('|') }
+            [void]$builder.Append([string]$item.volume_serial_hex).Append('|').Append([string]$item.file_id_hex).Append('|').Append([string]$item.owner_sid).Append('|').Append([string]$item.security_descriptor_sha256).Append("`n")
+        }
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($builder.ToString())
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-D32PowerShellAuthorityRuntimeDistributionSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$PowerShellRoot,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$OpenFiles
+    )
+    $root = [IO.Path]::GetFullPath($PowerShellRoot)
+    Add-D32PowerShellAuthorityDirectoryChain -Directory $root -Fences $DirectoryFences
+    $directories = [System.Collections.Generic.List[object]]::new()
+    $files = [System.Collections.Generic.List[object]]::new()
+    $identitySet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $directory = [IO.Path]::GetFullPath($pending.Pop())
+        $directoryKey = $directory.TrimEnd([char[]]@('\','/'))
+        if ($directoryKey.Length -eq 2 -and $directoryKey[1] -eq ':') { $directoryKey += [IO.Path]::DirectorySeparatorChar }
+        $fence = $DirectoryFences[$directoryKey]
+        if ($null -eq $fence -or -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$fence.Path, $directory)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: full distribution directory handle is missing: $directory" }
+        $dirIdentity = Get-D32PowerShellAuthorityHandleIdentity -Handle $fence.Handle
+        if (($dirIdentity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not $identitySet.Add(([string]$dirIdentity.VolumeSerialHex + ':' + [string]$dirIdentity.FileIdHex))) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution directory is reparsed or aliased: $directory" }
+        $directories.Add([ordered]@{ kind = 'directory'; path = $directory; volume_serial_hex = [string]$fence.VolumeSerialHex; file_id_hex = [string]$fence.FileIdHex; owner_sid = [string]$fence.OwnerSid; security_descriptor_sddl = [string]$fence.Sddl; security_descriptor_sha256 = [string]$fence.AclSha256 })
+        $entries = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($directory)) { $entries.Add([IO.Path]::GetFullPath([string]$entry)) }
+        $entryArray = $entries.ToArray()
+        [Array]::Sort($entryArray, [StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $entryArray) {
+            $attributes = [IO.File]::GetAttributes($entry)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution contains a reparse point: $entry" }
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                Add-D32PowerShellAuthorityDirectoryChain -Directory $entry -Fences $DirectoryFences
+                $pending.Push($entry)
+                continue
+            }
+            $snapshot = Open-D32PowerShellAuthorityFile -Path $entry -DirectoryFences $DirectoryFences
+            $OpenFiles.Add($snapshot)
+            $id = [string]$snapshot.Record.volume_serial_hex + ':' + [string]$snapshot.Record.file_id_hex
+            if (-not $identitySet.Add($id)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution has duplicate object identities: $entry" }
+            $files.Add([ordered]@{ kind = 'file'; path = [string]$snapshot.Record.path; bytes = [Int64]$snapshot.Record.bytes; sha256 = [string]$snapshot.Record.sha256; volume_serial_hex = [string]$snapshot.Record.volume_serial_hex; file_id_hex = [string]$snapshot.Record.file_id_hex; owner_sid = [string]$snapshot.Security.OwnerSid; security_descriptor_sddl = [string]$snapshot.Security.Sddl; security_descriptor_sha256 = [string]$snapshot.Security.AclSha256 })
+        }
+    }
+    $ancestorRecords = [System.Collections.Generic.List[object]]::new()
+    $ancestor = [IO.Path]::GetDirectoryName($root)
+    while (-not [String]::IsNullOrWhiteSpace($ancestor)) {
+        $ancestorFull = [IO.Path]::GetFullPath($ancestor)
+        $ancestorKey = $ancestorFull.TrimEnd([char[]]@('\','/'))
+        if ($ancestorKey.Length -eq 2 -and $ancestorKey[1] -eq ':') { $ancestorKey += [IO.Path]::DirectorySeparatorChar }
+        $fence = $DirectoryFences[$ancestorKey]
+        if ($null -eq $fence) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: protected runtime ancestor handle is missing: $ancestorFull" }
+        $ancestorRecords.Add([ordered]@{ kind = 'ancestor'; path = [string]$fence.Path; volume_serial_hex = [string]$fence.VolumeSerialHex; file_id_hex = [string]$fence.FileIdHex; owner_sid = [string]$fence.OwnerSid; security_descriptor_sddl = [string]$fence.Sddl; security_descriptor_sha256 = [string]$fence.AclSha256 })
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($ancestorFull, [IO.Path]::GetPathRoot($ancestorFull).TrimEnd([char[]]@('\','/')))) { break }
+        $ancestor = [IO.Path]::GetDirectoryName($ancestorFull)
+    }
+    $digest = Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories $directories.ToArray() -Files $files.ToArray() -Ancestors $ancestorRecords.ToArray()
+    return [ordered]@{ root_path = $root; inventory_sha256 = $digest; directories = $directories.ToArray(); files = $files.ToArray(); protected_ancestors = $ancestorRecords.ToArray(); trusted_writer_sids = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') }
+}
+
+function Get-D32PowerShellAuthorityResolverSnapshot {
+    param([AllowNull()][string[]]$NativeModulePaths, [AllowNull()][string[]]$ManagedAssemblyPaths, [switch]$ConfigureNativeSearch)
+    $powerShellRoot = [IO.Path]::GetFullPath([string]$PSHOME)
+    $windowsRoot = [IO.Path]::GetFullPath([string]$env:SystemRoot)
+    if ([String]::IsNullOrWhiteSpace($windowsRoot) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $windowsRoot)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: canonical Windows OS resolver root is unavailable' }
+    $blockers = [System.Collections.Generic.List[string]]::new()
+    $environmentNames = @('DOTNET_STARTUP_HOOKS','DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE','DOTNET_BUNDLE_EXTRACT_BASE_DIR','DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_ROOT_X86','DOTNET_MULTILEVEL_LOOKUP','CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH','CORECLR_PROFILER_PATH_32','CORECLR_PROFILER_PATH_64','COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH','COR_PROFILER_PATH_32','COR_PROFILER_PATH_64')
+    $activeEnvironment = [System.Collections.Generic.List[object]]::new()
+    $activeEnvironmentNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $environmentNames) {
+        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        if (-not [String]::IsNullOrWhiteSpace($value) -and $value -cne '0') { $blockers.Add("startup environment injection is active: $name"); $activeEnvironment.Add([ordered]@{ name = $name; value = [string]$value }); [void]$activeEnvironmentNames.Add($name) }
+    }
+    foreach ($entry in [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process).GetEnumerator()) {
+        $name = [string]$entry.Key
+        if ($name -match '^(?i:DOTNET_|CORECLR_|COR_|COMPlus_)' -and $name -cnotin @('DOTNET_MULTILEVEL_LOOKUP','DOTNET_CLI_TELEMETRY_OPTOUT','DOTNET_NOLOGO')) {
+            $value = [string]$entry.Value
+            if (-not [String]::IsNullOrWhiteSpace($value) -and $value -cne '0' -and $activeEnvironmentNames.Add($name)) {
+                $blockers.Add("unclassified runtime startup environment variable is active: $name")
+                $activeEnvironment.Add([ordered]@{ name = $name; value = $value })
+            }
+        }
+    }
+    $moduleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellRoot,'Modules'))
+    $moduleSearchPath = [Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$moduleSearchPath),$moduleRoot)) { $blockers.Add('process PSModulePath is not the exact pinned PSHOME Modules directory') }
+    $tpaText = [string][AppContext]::GetData('TRUSTED_PLATFORM_ASSEMBLIES')
+    $depsText = [string][AppContext]::GetData('APP_CONTEXT_DEPS_FILES')
+    $nativeDirsText = [string][AppContext]::GetData('NATIVE_DLL_SEARCH_DIRECTORIES')
+    if ([String]::IsNullOrWhiteSpace($tpaText) -or [String]::IsNullOrWhiteSpace($depsText) -or [String]::IsNullOrWhiteSpace($nativeDirsText)) { $blockers.Add('managed/native resolver inputs are not fully inspectable from module-free runtime metadata') }
+    $trustedPlatformPaths = [string[]]$tpaText.Split([IO.Path]::PathSeparator, [StringSplitOptions]::RemoveEmptyEntries)
+    $managedPaths = if ($null -ne $ManagedAssemblyPaths) { @($ManagedAssemblyPaths) } else { @($trustedPlatformPaths) }
+    $depsPaths = [string[]]$depsText.Split([IO.Path]::PathSeparator, [StringSplitOptions]::RemoveEmptyEntries)
+    $nativeDirs = [string[]]$nativeDirsText.Split([IO.Path]::PathSeparator, [StringSplitOptions]::RemoveEmptyEntries)
+    foreach ($path in @($managedPaths) + @($depsPaths)) {
+        if (-not [IO.Path]::IsPathRooted([string]$path) -or
+            (-not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $powerShellRoot) -and
+             -not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $windowsRoot))) {
+            $blockers.Add("managed assembly/deps resolver input escapes pinned PowerShell and Windows roots: $path")
+        }
+    }
+    foreach ($path in $nativeDirs) {
+        if (-not [IO.Path]::IsPathRooted([string]$path) -or
+            (-not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $powerShellRoot) -and
+             -not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $windowsRoot))) {
+            $blockers.Add("native resolver directory escapes pinned PowerShell and Windows roots: $path")
+        }
+    }
+    $nativePaths = if ($null -ne $NativeModulePaths) { @($NativeModulePaths) } else {
+        $process = [Diagnostics.Process]::GetCurrentProcess()
+        try {
+            $paths = [System.Collections.Generic.List[string]]::new()
+            foreach ($module in $process.Modules) { $paths.Add([IO.Path]::GetFullPath([string]$module.FileName)) }
+            $paths.ToArray()
+        }
+        finally { $process.Dispose() }
+    }
+    foreach ($path in $nativePaths) {
+        if (-not [IO.Path]::IsPathRooted([string]$path) -or
+            (-not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $powerShellRoot) -and
+             -not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $windowsRoot))) {
+            $blockers.Add("preloaded native module is outside the pinned distribution and trusted Windows OS: $path")
+        }
+    }
+    $loadedManagedPaths = if ($null -ne $ManagedAssemblyPaths) { @($ManagedAssemblyPaths) } else {
+        $paths = [System.Collections.Generic.List[string]]::new()
+        foreach ($assembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+            try { $location = [IO.Path]::GetFullPath([string]$assembly.Location); if (-not [String]::IsNullOrWhiteSpace($location)) { $paths.Add($location) } }
+            catch { }
+        }
+        $paths.ToArray()
+    }
+    foreach ($path in $loadedManagedPaths) {
+            if ((-not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $powerShellRoot) -and
+                 -not (Test-D32PowerShellAuthorityPathWithin -Child ([IO.Path]::GetFullPath([string]$path)) -Parent $windowsRoot))) {
+                $blockers.Add("loaded managed assembly is outside the pinned distribution and trusted Windows OS: $path")
+            }
+    }
+    $nativePolicy = 'UNCONFIGURED'
+    if ($ConfigureNativeSearch -and $blockers.Count -eq 0) {
+        Initialize-D32PowerShellAuthorityNativeApi
+        if (-not [D32PowerShellModuleNativeV2]::SetDllDirectoryW($null) -or
+            -not [D32PowerShellModuleNativeV2]::SetDefaultDllDirectories([uint32](0x00000200 -bor 0x00000800))) {
+            $blockers.Add('process-local safe DLL search policy could not be configured; machine policy is not substituted')
+        }
+        else {
+            $buffer = [Text.StringBuilder]::new(512)
+            $length = [D32PowerShellModuleNativeV2]::GetDllDirectoryW([uint32]$buffer.Capacity, $buffer)
+            if ($length -ne 0) { $blockers.Add('process-local DLL directory override remains active after safe-search configuration') }
+            else { $nativePolicy = 'LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32; SetDllDirectoryW(NULL); verified in current process' }
+        }
+    }
+    $sortUnique = { param([string[]]$values)
+        $unique = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $list = [System.Collections.Generic.List[string]]::new()
+        foreach ($value in $values) { if ($unique.Add([string]$value)) { $list.Add([string]$value) } }
+        $sorted = $list.ToArray(); [Array]::Sort($sorted, [StringComparer]::OrdinalIgnoreCase); return ,$sorted
+    }
+    $managedSorted = & $sortUnique ([string[]]$trustedPlatformPaths)
+    $loadedManagedSorted = & $sortUnique ([string[]]$loadedManagedPaths)
+    $depsSorted = & $sortUnique ([string[]]$depsPaths)
+    $nativeSorted = & $sortUnique ([string[]]$nativePaths)
+    $nativeDirsSorted = & $sortUnique ([string[]]$nativeDirs)
+    $materialList = [System.Collections.Generic.List[string]]::new()
+    $materialList.Add($moduleRoot)
+    foreach ($value in @($managedSorted) + @($depsSorted) + @($nativeDirsSorted)) { $materialList.Add([string]$value) }
+    foreach ($environmentRecord in $activeEnvironment) { $materialList.Add([string]$environmentRecord.name) }
+    $materialList.Add([string]$nativePolicy)
+    $material = $materialList.ToArray()
+    $digestText = [string]::Join("`n", [string[]]$material) + "`n"
+    $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($digestText))).ToLowerInvariant()
+    return [PSCustomObject]@{
+        Blockers = [string[]]$blockers.ToArray(); TrustedPlatformPaths = [string[]]$managedSorted; LoadedManagedAssemblyPaths = [string[]]$loadedManagedSorted; DepsPaths = [string[]]$depsSorted
+        NativeDirectories = [string[]]$nativeDirsSorted; NativeModulePaths = [string[]]$nativeSorted; ActiveEnvironment = $activeEnvironment.ToArray()
+        NativePolicy = $nativePolicy; ModuleSearchPath = [string]$moduleSearchPath; ResolverSha256 = $digest
+    }
+}
+
+function Assert-D32PowerShellAuthorityRuntimeDistributionRecord {
+    param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element, [Parameter(Mandatory = $true)][object]$Actual)
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $Element -Fields @('root_path','inventory_sha256','directories','files','protected_ancestors','trusted_writer_sids') -Name 'complete PowerShell distribution authority'
+    if ((Get-D32PowerShellAuthorityJsonString $Element 'root_path') -cne [string]$Actual.root_path -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'inventory_sha256') -cne [string]$Actual.inventory_sha256) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned complete PowerShell distribution root or digest mismatch' }
+    $specs = @(
+        [PSCustomObject]@{ Name = 'directories'; Items = @($Actual.directories); Fields = @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') },
+        [PSCustomObject]@{ Name = 'files'; Items = @($Actual.files); Fields = @('kind','path','bytes','sha256','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') },
+        [PSCustomObject]@{ Name = 'protected_ancestors'; Items = @($Actual.protected_ancestors); Fields = @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') }
+    )
+    foreach ($spec in $specs) {
+        $array = $Element.GetProperty([string]$spec.Name)
+        if ($array.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $array.GetArrayLength() -ne $spec.Items.Count) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: full runtime $($spec.Name) inventory is incomplete" }
+        $index = 0
+        foreach ($itemElement in $array.EnumerateArray()) {
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $itemElement -Fields $spec.Fields -Name "runtime $($spec.Name) entry"
+            $expected = $spec.Items[$index]
+            foreach ($field in $spec.Fields) {
+                $property = $itemElement.GetProperty([string]$field)
+                if ($field -ceq 'bytes') {
+                    if ($property.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $property.GetInt64() -ne [Int64]$expected.bytes) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution bytes differ: $($expected.path)" }
+                }
+                elseif ($property.ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $property.GetString() -cne [string]$expected.$field) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution content/ACL identity differs: $($expected.path)" }
+            }
+            $index++
+        }
+    }
+    $trusted = $Element.GetProperty('trusted_writer_sids')
+    $expectedTrust = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+    if ($trusted.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $trusted.GetArrayLength() -ne $expectedTrust.Count) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: protected namespace writer policy is missing or expanded' }
+    for ($index=0; $index -lt $expectedTrust.Count; $index++) { if ($trusted[$index].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $trusted[$index].GetString() -cne $expectedTrust[$index]) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: protected namespace trusted writer policy differs' } }
+}
+
+function Assert-D32PowerShellAuthorityResolverPolicyRecord {
+    param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element, [Parameter(Mandatory = $true)][string]$PowerShellRoot)
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $Element -Fields @('policy_id','managed_distribution_root','managed_os_root','native_application_root','native_system_root','native_search_flags','forbidden_sources') -Name 'PowerShell resolver policy'
+    $windowsRoot = [IO.Path]::GetFullPath([string]$env:SystemRoot)
+    if ((Get-D32PowerShellAuthorityJsonString $Element 'policy_id') -cne 'D32_POWERSHELL_RESOLVER_DOMAIN_V2' -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'managed_distribution_root') -cne [IO.Path]::GetFullPath($PowerShellRoot) -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'managed_os_root') -cne $windowsRoot -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'native_application_root') -cne [IO.Path]::GetFullPath($PowerShellRoot) -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'native_system_root') -cne $windowsRoot) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: external authority resolver roots do not bind this current runtime and OS' }
+    $expected = @(
+        [PSCustomObject]@{ Field = 'native_search_flags'; Values = @('LOAD_LIBRARY_SEARCH_APPLICATION_DIR','LOAD_LIBRARY_SEARCH_SYSTEM32') },
+        [PSCustomObject]@{ Field = 'forbidden_sources'; Values = @('CWD','PATH','USER_PSMODULEPATH','STARTUP_HOOKS','EXTERNAL_ASSEMBLIES','UNPINNED_DLL_DIRECTORIES') }
+    )
+    foreach ($item in $expected) {
+        $array = $Element.GetProperty([string]$item.Field)
+        if ($array.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $array.GetArrayLength() -ne $item.Values.Count) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver policy list differs: $($item.Field)" }
+        for ($index=0; $index -lt $item.Values.Count; $index++) { if ($array[$index].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $array[$index].GetString() -cne $item.Values[$index]) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver policy list differs: $($item.Field)" } }
+    }
+}
+
+function Assert-D32PowerShellAuthorityRuntimeSnapshotCurrent {
+    param([Parameter(Mandatory = $true)][object]$Snapshot, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences, [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$OpenFiles)
+    $expectedChildren = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($directory in @($Snapshot.directories)) { $expectedChildren[[string]$directory.path] = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
+    foreach ($item in @($Snapshot.directories) + @($Snapshot.files)) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$item.path,[string]$Snapshot.root_path)) { continue }
+        $parent = [IO.Path]::GetDirectoryName([string]$item.path)
+        if (-not $expectedChildren.ContainsKey($parent) -or -not $expectedChildren[$parent].Add([string]$item.path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: full runtime inventory parent or path alias is invalid: $($item.path)" }
+    }
+    foreach ($directory in @($Snapshot.directories) + @($Snapshot.protected_ancestors)) {
+        $path = [string]$directory.path
+        $key = $path.TrimEnd([char[]]@('\','/'))
+        if ($key.Length -eq 2 -and $key[1] -eq ':') { $key += [IO.Path]::DirectorySeparatorChar }
+        $fence = $DirectoryFences[$key]
+        if ($null -eq $fence -or $fence.Handle.IsClosed -or $fence.Handle.IsInvalid) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime directory handle is missing: $path" }
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $fence.Handle
+        if (($identity.Attributes -band [int][IO.FileAttributes]::Directory) -eq 0 -or ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $identity.VolumeSerialHex -cne [string]$directory.volume_serial_hex -or $identity.FileIdHex -cne [string]$directory.file_id_hex -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $fence.Handle), $path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime directory object/path changed before import: $path" }
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path $path -IsDirectory:$true -Handle $fence.Handle
+        $isProtectedAncestor = [string]$directory.kind -ceq 'ancestor'
+        if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true -IsProtectedAncestor:$isProtectedAncestor) -or
+            $security.OwnerSid -cne [string]$directory.owner_sid -or $security.AclSha256 -cne [string]$directory.security_descriptor_sha256) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime directory namespace protection changed before import: $path" }
+        if ($expectedChildren.ContainsKey($path)) {
+            $actualChildren = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($path)) {
+                $entryPath = [IO.Path]::GetFullPath([string]$entry)
+                if (-not $actualChildren.Add($entryPath) -or -not $expectedChildren[$path].Contains($entryPath)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unexpected or aliased runtime resolver entry appeared before import: $entryPath" }
+                if (([IO.File]::GetAttributes($entryPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime resolver entry became a reparse point: $entryPath" }
+            }
+            if ($actualChildren.Count -ne $expectedChildren[$path].Count) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: a runtime distribution entry disappeared before import: $path" }
+        }
+    }
+    foreach ($expected in @($Snapshot.files)) {
+        $fileSnapshot = $null
+        foreach ($candidate in $OpenFiles) { if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$candidate.Record.path,[string]$expected.path)) { $fileSnapshot = $candidate; break } }
+        if ($null -eq $fileSnapshot -or $null -eq $fileSnapshot.Stream -or $fileSnapshot.Stream.SafeFileHandle.IsClosed) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution content handle is missing: $($expected.path)" }
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $fileSnapshot.Stream.SafeFileHandle
+        if ($identity.VolumeSerialHex -cne [string]$expected.volume_serial_hex -or $identity.FileIdHex -cne [string]$expected.file_id_hex -or $identity.Bytes -ne [Int64]$expected.bytes -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $fileSnapshot.Stream.SafeFileHandle),[string]$expected.path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution file object/path changed before import: $($expected.path)" }
+        $fileSnapshot.Stream.Position = 0
+        $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($fileSnapshot.Stream)).ToLowerInvariant()
+        if ($sha -cne [string]$expected.sha256 -or $fileSnapshot.Stream.Length -ne [Int64]$expected.bytes) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime distribution file content changed before import: $($expected.path)" }
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path ([string]$expected.path) -IsDirectory:$false -Handle $fileSnapshot.Stream.SafeFileHandle -Stream $fileSnapshot.Stream
+        if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$false) -or
+            $security.OwnerSid -cne [string]$expected.owner_sid -or $security.AclSha256 -cne [string]$expected.security_descriptor_sha256) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime file namespace protection changed before import: $($expected.path)" }
+    }
+}
+
+function Assert-D32PowerShellAuthorityRuntimeEntriesCurrent {
+    param([Parameter(Mandatory = $true)][object]$Snapshot)
+    $expectedChildren = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($directory in @($Snapshot.directories)) { $expectedChildren[[string]$directory.path] = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
+    foreach ($item in @($Snapshot.directories) + @($Snapshot.files)) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$item.path,[string]$Snapshot.root_path)) { continue }
+        $parent = [IO.Path]::GetDirectoryName([string]$item.path)
+        if (-not $expectedChildren.ContainsKey($parent) -or -not $expectedChildren[$parent].Add([string]$item.path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime inventory parent changed or paths alias: $($item.path)" }
+    }
+    foreach ($directoryPath in $expectedChildren.Keys) {
+        $actualChildren = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries([string]$directoryPath)) {
+            $path = [IO.Path]::GetFullPath([string]$entry)
+            if (-not $actualChildren.Add($path) -or -not $expectedChildren[$directoryPath].Contains($path) -or
+                ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unpinned or redirected resolver candidate exists: $path" }
+        }
+        if ($actualChildren.Count -ne $expectedChildren[$directoryPath].Count) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runtime resolver candidate inventory changed: $directoryPath" }
+    }
+}
+
+function Assert-D32PowerShellAuthorityExactJsonRecord {
+    param([System.Text.Json.JsonElement]$Element, [string[]]$Fields, [string]$Name)
+    if (-not (Test-D32PowerShellAuthorityJsonFields -Element $Element -Expected $Fields)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: $Name has unknown, missing, or wrong property set" }
+}
+
+function Get-D32PowerShellAuthorityJsonString {
+    param([System.Text.Json.JsonElement]$Element, [string]$Name)
+    $property = $Element.GetProperty($Name)
+    if ($property.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: $Name must be a JSON string" }
+    return $property.GetString()
+}
+
+function Assert-D32PowerShellAuthorityFileRecord {
+    param([System.Text.Json.JsonElement]$Element, [object]$Actual, [string]$Name)
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $Element -Fields @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex') -Name $Name
+    if ($Element.GetProperty('path').GetString() -cne [string]$Actual.Record.path -or
+        $Element.GetProperty('bytes').ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $Element.GetProperty('bytes').GetInt64() -ne [Int64]$Actual.Record.bytes -or
+        $Element.GetProperty('sha256').GetString() -cne [string]$Actual.Record.sha256 -or
+        $Element.GetProperty('volume_serial_hex').GetString() -cne [string]$Actual.Record.volume_serial_hex -or
+        $Element.GetProperty('file_id_hex').GetString() -cne [string]$Actual.Record.file_id_hex) {
+        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: $Name differs from the independently pinned opened content identity"
+    }
+}
+
+function Assert-D32PowerShellAuthorityDirectoryRecord {
+    param([System.Text.Json.JsonElement]$Element, [object]$Actual, [string]$Name)
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $Element -Fields @('path', 'volume_serial_hex', 'file_id_hex') -Name $Name
+    if ($Element.GetProperty('path').GetString() -cne [string]$Actual.Path -or
+        $Element.GetProperty('volume_serial_hex').GetString() -cne [string]$Actual.VolumeSerialHex -or
+        $Element.GetProperty('file_id_hex').GetString() -cne [string]$Actual.FileIdHex) {
+        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: $Name differs from the opened directory identity"
+    }
+}
+
+function Test-D32PowerShellModuleAdmissionRecord {
+    param([AllowNull()][object]$Document, [AllowNull()][string]$CandidateSha, [AllowNull()][string]$Repository, [AllowNull()][object]$ExpectedContext)
+    $fields = @('record_type','schema_version','status','candidate_sha','source_repo','authority_reference','profile_reference','git_image','powershell_host','runner_process','startup','entry_script_path','entry_script','module_import_order','module_closure','resolver_admission','import_verification','import_attempts')
+    if ($null -eq $Document -or $Document -is [string] -or $Document -is [Array] -or $Document -is [ValueType]) { return $false }
+    $actual = [System.Collections.Generic.List[string]]::new()
+    if ($Document -is [System.Collections.IDictionary]) { foreach ($key in $Document.Keys) { $actual.Add([string]$key) } }
+    else { foreach ($property in $Document.PSObject.Properties) { $actual.Add([string]$property.Name) } }
+    if ($actual.Count -ne $fields.Count) { return $false }
+    foreach ($field in $fields) { if (-not $actual.Contains($field)) { return $false } }
+    $get = { param($object, $name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
+    $recordType = & $get $Document 'record_type'; $version = & $get $Document 'schema_version'; $status = & $get $Document 'status'
+    $candidate = & $get $Document 'candidate_sha'; $repository = & $get $Document 'source_repo'; $attempts = & $get $Document 'import_attempts'
+    $order = & $get $Document 'module_import_order'
+    if ($recordType -isnot [string] -or $recordType -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2' -or
+        -not ($version -is [byte] -or $version -is [int16] -or $version -is [uint16] -or $version -is [int32] -or $version -is [uint32] -or $version -is [int64] -or $version -is [uint64]) -or [Int64]$version -ne 2 -or
+        $status -isnot [string] -or $status -cne 'ADMITTED' -or $candidate -isnot [string] -or $candidate -cnotmatch '^[0-9a-f]{40}$' -or
+        (-not [String]::IsNullOrWhiteSpace($CandidateSha) -and $candidate -cne $CandidateSha) -or
+        $repository -isnot [string] -or (-not [String]::IsNullOrWhiteSpace($Repository) -and -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($repository), [IO.Path]::GetFullPath($Repository))) -or
+        -not ($attempts -is [byte] -or $attempts -is [int16] -or $attempts -is [uint16] -or $attempts -is [int32] -or $attempts -is [uint32] -or $attempts -is [int64] -or $attempts -is [uint64]) -or [Int64]$attempts -ne 3 -or
+        $order -isnot [Array] -or $order.Count -ne 3 -or ($order -join "`n") -cne "Microsoft.PowerShell.Management`nMicrosoft.PowerShell.Utility`nCimCmdlets") { return $false }
+    if ($repository -cne [IO.Path]::GetFullPath($repository) -or
+        -not [IO.Path]::IsPathRooted($repository) -or
+        -not (Test-D32PowerShellAuthorityPathWithin -Child ([string](& $get $Document 'entry_script_path')) -Parent $repository) -or
+        [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string](& $get $Document 'entry_script_path')), $repository)) { return $false }
+    $referenceFields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
+    foreach ($referenceName in @('authority_reference','profile_reference','git_image')) {
+        $reference = & $get $Document $referenceName
+        if ($null -eq $reference) { return $false }
+        $referenceNames = [System.Collections.Generic.List[string]]::new()
+        if ($reference -is [System.Collections.IDictionary]) { foreach ($key in $reference.Keys) { $referenceNames.Add([string]$key) } }
+        else { foreach ($property in $reference.PSObject.Properties) { $referenceNames.Add([string]$property.Name) } }
+        if ($referenceNames.Count -ne $referenceFields.Count) { return $false }
+        foreach ($field in $referenceFields) { if (-not $referenceNames.Contains($field)) { return $false } }
+        $path = & $get $reference 'path'; $sha = & $get $reference 'sha256'; $bytes = & $get $reference 'bytes'
+        $volume = & $get $reference 'volume_serial_hex'; $fileId = & $get $reference 'file_id_hex'
+        if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
+            $sha -isnot [string] -or $sha -cnotmatch '^[0-9a-f]{64}$' -or
+            -not ($bytes -is [int32] -or $bytes -is [int64] -or $bytes -is [uint32] -or $bytes -is [uint64]) -or [Int64]$bytes -le 0 -or
+            $volume -isnot [string] -or $volume -cnotmatch '^[0-9a-f]{16}$' -or $fileId -isnot [string] -or $fileId -cnotmatch '^[0-9a-f]{32}$') { return $false }
+        if ((Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $repository) -or
+            (Test-D32PowerShellAuthorityPathWithin -Child $repository -Parent $path)) { return $false }
+    }
+    $host = & $get $Document 'powershell_host'; $runner = & $get $Document 'runner_process'; $startup = & $get $Document 'startup'
+    $entry = & $get $Document 'entry_script_path'; $entryFile = & $get $Document 'entry_script'; $closure = & $get $Document 'module_closure'; $verification = & $get $Document 'import_verification'
+    if ($null -eq $host -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
+        -not [IO.Path]::IsPathRooted($entry) -or [IO.Path]::GetFullPath($entry) -cne $entry) { return $false }
+    $entryFileNames = [System.Collections.Generic.List[string]]::new()
+    if ($entryFile -is [System.Collections.IDictionary]) { foreach ($key in $entryFile.Keys) { $entryFileNames.Add([string]$key) } } else { foreach ($property in $entryFile.PSObject.Properties) { $entryFileNames.Add([string]$property.Name) } }
+    if ($entryFileNames.Count -ne 5) { return $false }
+    foreach ($field in $referenceFields) { if (-not $entryFileNames.Contains($field)) { return $false } }
+    if ((& $get $entryFile 'path') -cne $entry -or (& $get $entryFile 'sha256') -isnot [string] -or (& $get $entryFile 'sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        -not ((& $get $entryFile 'bytes') -is [int64] -or (& $get $entryFile 'bytes') -is [int32]) -or [Int64](& $get $entryFile 'bytes') -le 0 -or
+        (& $get $entryFile 'volume_serial_hex') -isnot [string] -or (& $get $entryFile 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+        (& $get $entryFile 'file_id_hex') -isnot [string] -or (& $get $entryFile 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    $entryCheckFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $entryCheckSnapshot = $null
+    try {
+        $entryCheckSnapshot = Open-D32PowerShellAuthorityFile -Path $entry -DirectoryFences $entryCheckFences
+        foreach ($field in @('path','sha256','bytes','volume_serial_hex','file_id_hex')) {
+            if ((& $get $entryFile $field) -cne $entryCheckSnapshot.Record[$field]) { return $false }
+        }
+    }
+    catch { return $false }
+    finally {
+        if ($null -ne $entryCheckSnapshot -and $null -ne $entryCheckSnapshot.Stream -and -not $entryCheckSnapshot.Stream.SafeFileHandle.IsClosed) { $entryCheckSnapshot.Stream.Dispose() }
+        foreach ($directoryFence in $entryCheckFences.Values) { if ($null -ne $directoryFence.Handle -and -not $directoryFence.Handle.IsClosed) { $directoryFence.Handle.Dispose() } }
+    }
+    $hostNames = [System.Collections.Generic.List[string]]::new()
+    if ($host -is [System.Collections.IDictionary]) { foreach ($key in $host.Keys) { $hostNames.Add([string]$key) } } else { foreach ($property in $host.PSObject.Properties) { $hostNames.Add([string]$property.Name) } }
+    if ($hostNames.Count -ne 6) { return $false }
+    foreach ($field in @('path','sha256','bytes','volume_serial_hex','file_id_hex','pshome')) { if (-not $hostNames.Contains($field)) { return $false } }
+    $hostPath = & $get $host 'path'; $pshome = & $get $host 'pshome'
+    if ($hostPath -isnot [string] -or -not [IO.Path]::IsPathRooted($hostPath) -or $hostPath -cne [IO.Path]::GetFullPath($hostPath) -or
+        $pshome -isnot [string] -or -not [IO.Path]::IsPathRooted($pshome) -or $pshome -cne [IO.Path]::GetFullPath($pshome) -or $hostPath -cne [IO.Path]::Combine($pshome, 'pwsh.exe') -or
+        (& $get $host 'sha256') -isnot [string] -or (& $get $host 'sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        (& $get $host 'bytes') -isnot [Int64] -or [Int64](& $get $host 'bytes') -le 0 -or
+        (& $get $host 'volume_serial_hex') -isnot [string] -or (& $get $host 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+        (& $get $host 'file_id_hex') -isnot [string] -or (& $get $host 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    $runnerNames = [System.Collections.Generic.List[string]]::new()
+    if ($runner -is [System.Collections.IDictionary]) { foreach ($key in $runner.Keys) { $runnerNames.Add([string]$key) } } else { foreach ($property in $runner.PSObject.Properties) { $runnerNames.Add([string]$property.Name) } }
+    if ($runnerNames.Count -ne 5) { return $false }
+    foreach ($field in @('process_id','start_time_utc_ticks','image_path','image_file_id_hex','token_state')) { if (-not $runnerNames.Contains($field)) { return $false } }
+    $processId = & $get $runner 'process_id'; $startTicks = & $get $runner 'start_time_utc_ticks'; $tokenState = & $get $runner 'token_state'
+    if (-not ($processId -is [int32] -or $processId -is [int64]) -or [Int64]$processId -le 0 -or -not ($startTicks -is [int64] -or $startTicks -is [int32]) -or [Int64]$startTicks -le 0 -or
+        (& $get $runner 'image_path') -cne $hostPath -or (& $get $runner 'image_file_id_hex') -cne (& $get $host 'file_id_hex') -or
+        -not (Test-D32PowerShellAuthorityTokenRecord -Token $tokenState)) { return $false }
+    $startupNames = [System.Collections.Generic.List[string]]::new()
+    if ($startup -is [System.Collections.IDictionary]) { foreach ($key in $startup.Keys) { $startupNames.Add([string]$key) } } else { foreach ($property in $startup.PSObject.Properties) { $startupNames.Add([string]$property.Name) } }
+    if ($startupNames.Count -ne 3) { return $false }
+    foreach ($field in @('file_operand','switches','startup_policy')) { if (-not $startupNames.Contains($field)) { return $false } }
+    $startupFile = & $get $startup 'file_operand'; $switches = & $get $startup 'switches'
+    if ($startupFile -cne $entry -or $switches -isnot [Array] -or $switches -cnotcontains '-NoProfile' -or (& $get $startup 'startup_policy') -cne 'DIRECT_NO_PROFILE_FILE_V1') { return $false }
+    $startupSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($switch in $switches) { if ([string]$switch -cnotin @('-NoLogo','-NoProfile','-NonInteractive') -or -not $startupSeen.Add([string]$switch)) { return $false } }
+    $closureNames = [System.Collections.Generic.List[string]]::new()
+    if ($closure -is [System.Collections.IDictionary]) { foreach ($key in $closure.Keys) { $closureNames.Add([string]$key) } } elseif ($null -ne $closure) { foreach ($property in $closure.PSObject.Properties) { $closureNames.Add([string]$property.Name) } }
+    if ($closureNames.Count -ne 8) { return $false }
+    foreach ($field in @('module_root','module_root_volume_serial_hex','module_root_file_id_hex','inventory_sha256','modules','runtime_distribution_sha256','protected_namespace_sha256','resolver_sha256')) { if (-not $closureNames.Contains($field)) { return $false } }
+    $moduleRoot = [string](& $get $closure 'module_root')
+    $expectedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($pshome, 'Modules'))
+    if (-not [IO.Path]::IsPathRooted($moduleRoot) -or $moduleRoot -cne $expectedModuleRoot -or
+        (& $get $closure 'module_root_volume_serial_hex') -isnot [string] -or (& $get $closure 'module_root_volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+        (& $get $closure 'module_root_file_id_hex') -isnot [string] -or (& $get $closure 'module_root_file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    $moduleRecords = & $get $closure 'modules'
+    if ($moduleRecords -isnot [Array] -or $moduleRecords.Count -ne 3 -or (& $get $closure 'inventory_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        (& $get $closure 'runtime_distribution_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        (& $get $closure 'protected_namespace_sha256') -cne (& $get $closure 'runtime_distribution_sha256') -or
+        (& $get $closure 'resolver_sha256') -isnot [string] -or (& $get $closure 'resolver_sha256') -cnotmatch '^[0-9a-f]{64}$') { return $false }
+    $expectedNames = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
+    $expectedRoles = @('Management','Utility','CimCmdlets')
+    $combinedInventory = [Text.StringBuilder]::new()
+    $allClosurePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $allClosureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $closureFileByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($index = 0; $index -lt 3; $index++) {
+        $record = $moduleRecords[$index]
+        $recordNames = [System.Collections.Generic.List[string]]::new()
+        if ($record -is [System.Collections.IDictionary]) { foreach ($key in $record.Keys) { $recordNames.Add([string]$key) } } else { foreach ($property in $record.PSObject.Properties) { $recordNames.Add([string]$property.Name) } }
+        if ($recordNames.Count -ne 5) { return $false }
+        foreach ($field in @('role','module_name','manifest_path','inventory_sha256','files')) { if (-not $recordNames.Contains($field)) { return $false } }
+        if ((& $get $record 'role') -cne $expectedRoles[$index] -or (& $get $record 'module_name') -cne $expectedNames[$index] -or
+            (& $get $record 'inventory_sha256') -cnotmatch '^[0-9a-f]{64}$' -or (& $get $record 'files') -isnot [Array] -or (& $get $record 'files').Count -eq 0) { return $false }
+        $manifestLeaf = if ($expectedNames[$index] -ceq 'CimCmdlets') { 'CimCmdlets.psd1' } else { $expectedNames[$index] + '.psd1' }
+        $expectedManifest = [IO.Path]::GetFullPath([IO.Path]::Combine($moduleRoot, $expectedNames[$index], $manifestLeaf))
+        if ((& $get $record 'manifest_path') -cne $expectedManifest) { return $false }
+        $listedFiles = [System.Collections.Generic.List[object]]::new()
+        $manifestIsInInventory = $false
+        foreach ($file in (& $get $record 'files')) {
+            $fileNames = [System.Collections.Generic.List[string]]::new()
+            if ($file -is [System.Collections.IDictionary]) { foreach ($key in $file.Keys) { $fileNames.Add([string]$key) } } else { foreach ($property in $file.PSObject.Properties) { $fileNames.Add([string]$property.Name) } }
+            if ($fileNames.Count -ne 5) { return $false }
+            foreach ($field in $referenceFields) { if (-not $fileNames.Contains($field)) { return $false } }
+            $filePath = & $get $file 'path'; $fileSha = & $get $file 'sha256'; $fileBytes = & $get $file 'bytes'
+            if ($filePath -isnot [string] -or -not [IO.Path]::IsPathRooted($filePath) -or [IO.Path]::GetFullPath($filePath) -cne $filePath -or
+                $fileSha -isnot [string] -or $fileSha -cnotmatch '^[0-9a-f]{64}$' -or
+                -not ($fileBytes -is [int32] -or $fileBytes -is [int64] -or $fileBytes -is [uint32] -or $fileBytes -is [uint64]) -or [Int64]$fileBytes -le 0 -or
+                (& $get $file 'volume_serial_hex') -isnot [string] -or (& $get $file 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+                (& $get $file 'file_id_hex') -isnot [string] -or (& $get $file 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
+            $allowedFileDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine($moduleRoot, $expectedNames[$index]))
+            $powerShellRoot = [IO.Path]::GetDirectoryName($moduleRoot)
+            $fixedRootFiles = @(Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot $powerShellRoot)
+            if (-not $allClosurePaths.Add($filePath) -or -not $allClosureIds.Add(([string](& $get $file 'volume_serial_hex') + ':' + [string](& $get $file 'file_id_hex'))) -or
+                (-not (Test-D32PowerShellAuthorityPathWithin -Child $filePath -Parent $allowedFileDirectory) -and $filePath -cnotin $fixedRootFiles)) { return $false }
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($filePath, $expectedManifest)) { $manifestIsInInventory = $true }
+            $listedFiles.Add([ordered]@{ path = $filePath; bytes = [Int64]$fileBytes; sha256 = $fileSha; volume_serial_hex = [string](& $get $file 'volume_serial_hex'); file_id_hex = [string](& $get $file 'file_id_hex') })
+            $closureFileByPath.Add($filePath, $file)
+        }
+        if (-not $manifestIsInInventory) { return $false }
+        if ((Get-D32PowerShellAuthorityInventoryDigest -Role $expectedRoles[$index] -Files $listedFiles.ToArray()) -cne (& $get $record 'inventory_sha256')) { return $false }
+        [void]$combinedInventory.Append($expectedRoles[$index]).Append('|').Append([string](& $get $record 'inventory_sha256')).Append("`n")
+    }
+    $expectedCombined = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($combinedInventory.ToString()))).ToLowerInvariant()
+    if ((& $get $closure 'inventory_sha256') -cne $expectedCombined) { return $false }
+    $resolver = & $get $Document 'resolver_admission'
+    $resolverNames = [System.Collections.Generic.List[string]]::new()
+    if ($resolver -is [System.Collections.IDictionary]) { foreach ($key in $resolver.Keys) { $resolverNames.Add([string]$key) } } elseif ($null -ne $resolver) { foreach ($property in $resolver.PSObject.Properties) { $resolverNames.Add([string]$property.Name) } }
+    $resolverFields = @('state','policy_id','resolver_sha256','native_policy','module_search_path','trusted_platform_paths','loaded_managed_assembly_paths','deps_paths','native_directories','native_module_paths','active_environment')
+    if ($resolverNames.Count -ne $resolverFields.Count) { return $false }
+    foreach ($field in $resolverFields) { if (-not $resolverNames.Contains($field)) { return $false } }
+    $resolverGet = { param($object,$name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
+    if ((& $resolverGet $resolver 'state') -cne 'VERIFIED' -or (& $resolverGet $resolver 'policy_id') -cne 'D32_POWERSHELL_RESOLVER_DOMAIN_V2' -or
+        (& $resolverGet $resolver 'native_policy') -cne 'LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32; SetDllDirectoryW(NULL); verified in current process' -or
+        (& $resolverGet $resolver 'module_search_path') -cne [IO.Path]::GetFullPath([IO.Path]::Combine($pshome,'Modules')) -or
+        (& $resolverGet $resolver 'resolver_sha256') -isnot [string] -or (& $resolverGet $resolver 'resolver_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        (& $resolverGet $resolver 'resolver_sha256') -cne (& $get $closure 'resolver_sha256')) { return $false }
+    $resolverMaterial = [System.Collections.Generic.List[string]]::new()
+    $resolverMaterial.Add([string](& $resolverGet $resolver 'module_search_path'))
+    foreach ($field in @('trusted_platform_paths','loaded_managed_assembly_paths','deps_paths','native_directories','native_module_paths')) {
+        $array = & $resolverGet $resolver $field
+        if ($array -isnot [Array] -or $array.Count -eq 0) { return $false }
+        $previous = ''
+        foreach ($path in $array) {
+            if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
+                (-not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $pshome) -and -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent ([string]$env:SystemRoot))) -or
+                ($previous.Length -gt 0 -and [StringComparer]::OrdinalIgnoreCase.Compare($previous,$path) -ge 0)) { return $false }
+            $previous = $path
+            if ($field -cne 'loaded_managed_assembly_paths' -and $field -cne 'native_module_paths') { $resolverMaterial.Add($path) }
+        }
+    }
+    $activeEnvironment = & $resolverGet $resolver 'active_environment'
+    if ($activeEnvironment -isnot [Array] -or $activeEnvironment.Count -ne 0) { return $false }
+    $resolverMaterial.Add([string](& $resolverGet $resolver 'native_policy'))
+    $resolverDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]::Join("`n",$resolverMaterial.ToArray()) + "`n"))).ToLowerInvariant()
+    if ($resolverDigest -cne [string](& $resolverGet $resolver 'resolver_sha256')) { return $false }
+    $verifyNames = [System.Collections.Generic.List[string]]::new()
+    if ($verification -is [System.Collections.IDictionary]) { foreach ($key in $verification.Keys) { $verifyNames.Add([string]$key) } } elseif ($null -ne $verification) { foreach ($property in $verification.PSObject.Properties) { $verifyNames.Add([string]$property.Name) } }
+    if ($verifyNames.Count -ne 6 -or -not $verifyNames.Contains('state') -or -not $verifyNames.Contains('verified_import_count') -or -not $verifyNames.Contains('modules') -or -not $verifyNames.Contains('assemblies') -or -not $verifyNames.Contains('commands') -or -not $verifyNames.Contains('native_modules') -or
+        (& $get $verification 'state') -cne 'VERIFIED' -or (& $get $verification 'verified_import_count') -ne 3 -or (& $get $verification 'modules') -isnot [Array] -or (& $get $verification 'modules').Count -ne 3 -or
+        (& $get $verification 'assemblies') -isnot [Array] -or (& $get $verification 'assemblies').Count -eq 0 -or (& $get $verification 'commands') -isnot [Array] -or (& $get $verification 'commands').Count -eq 0 -or
+        (& $get $verification 'native_modules') -isnot [Array] -or (& $get $verification 'native_modules').Count -eq 0) { return $false }
+    $observedModules = & $get $verification 'modules'
+    $allowedModulePaths = @{}
+    $roles = @(Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $powerShellRoot)
+    $observedModuleNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt 3; $index++) {
+        $allowedModulePaths[$expectedNames[$index]] = @(Get-D32PowerShellAuthorityAllowedModulePaths -PowerShellRoot $powerShellRoot -Role $roles[$index])
+    }
+    foreach ($module in $observedModules) {
+        $moduleFields = [System.Collections.Generic.List[string]]::new()
+        if ($module -is [System.Collections.IDictionary]) { foreach ($key in $module.Keys) { $moduleFields.Add([string]$key) } } else { foreach ($property in $module.PSObject.Properties) { $moduleFields.Add([string]$property.Name) } }
+        if ($moduleFields.Count -ne 3 -or -not $moduleFields.Contains('name') -or -not $moduleFields.Contains('path') -or -not $moduleFields.Contains('version')) { return $false }
+        $name = [string](& $get $module 'name'); $path = [string](& $get $module 'path'); $versionText = [string](& $get $module 'version')
+        if (-not $allowedModulePaths.ContainsKey($name) -or $path -cnotin $allowedModulePaths[$name] -or [String]::IsNullOrWhiteSpace($versionText) -or -not $observedModuleNames.Add($name)) { return $false }
+    }
+    $fileRecordsByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in $moduleRecords) { foreach ($file in (& $get $record 'files')) { $fileRecordsByPath[[string](& $get $file 'path')] = $file } }
+    $assemblyPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($assembly in (& $get $verification 'assemblies')) {
+        $assemblyFields = [System.Collections.Generic.List[string]]::new()
+        if ($assembly -is [System.Collections.IDictionary]) { foreach ($key in $assembly.Keys) { $assemblyFields.Add([string]$key) } } else { foreach ($property in $assembly.PSObject.Properties) { $assemblyFields.Add([string]$property.Name) } }
+        if ($assemblyFields.Count -ne 5) { return $false }
+        foreach ($field in $referenceFields) { if (-not $assemblyFields.Contains($field)) { return $false } }
+        $path = [string](& $get $assembly 'path')
+        if (-not $fileRecordsByPath.ContainsKey($path) -or -not $assemblyPaths.Add($path)) { return $false }
+        $file = $fileRecordsByPath[$path]
+        foreach ($field in $referenceFields) { if ((& $get $assembly $field) -cne (& $get $file $field)) { return $false } }
+    }
+    foreach ($requiredAssemblyPath in (Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot $powerShellRoot)) {
+        if (-not $assemblyPaths.Contains([IO.Path]::GetFullPath([string]$requiredAssemblyPath))) { return $false }
+    }
+    $nativeModulePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($nativeModule in (& $get $verification 'native_modules')) {
+        $nativeFields = [System.Collections.Generic.List[string]]::new()
+        if ($nativeModule -is [System.Collections.IDictionary]) { foreach ($key in $nativeModule.Keys) { $nativeFields.Add([string]$key) } } else { foreach ($property in $nativeModule.PSObject.Properties) { $nativeFields.Add([string]$property.Name) } }
+        if ($nativeFields.Count -ne 2 -or -not $nativeFields.Contains('path') -or -not $nativeFields.Contains('source')) { return $false }
+        $path = [string](& $get $nativeModule 'path'); $source = [string](& $get $nativeModule 'source')
+        if (-not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or -not $nativeModulePaths.Add($path)) { return $false }
+        if ($source -ceq 'PSHOME_DISTRIBUTION') { if (-not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $pshome)) { return $false } }
+        elseif ($source -ceq 'WINDOWS_OS') { if (-not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent ([string]$env:SystemRoot))) { return $false } }
+        else { return $false }
+    }
+    $commandKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($command in (& $get $verification 'commands')) {
+        $commandFields = [System.Collections.Generic.List[string]]::new()
+        if ($command -is [System.Collections.IDictionary]) { foreach ($key in $command.Keys) { $commandFields.Add([string]$key) } } else { foreach ($property in $command.PSObject.Properties) { $commandFields.Add([string]$property.Name) } }
+        if ($commandFields.Count -ne 5) { return $false }
+        foreach ($field in @('module_name','command_name','module_path','effective_module_name','effective_module_path')) { if (-not $commandFields.Contains($field)) { return $false } }
+        $moduleName = [string](& $get $command 'module_name'); $commandName = [string](& $get $command 'command_name'); $modulePath = [string](& $get $command 'module_path')
+        $effectiveName = [string](& $get $command 'effective_module_name'); $effectivePath = [string](& $get $command 'effective_module_path')
+        if (-not $allowedModulePaths.ContainsKey($moduleName) -or $modulePath -cnotin $allowedModulePaths[$moduleName] -or
+            -not $allowedModulePaths.ContainsKey($effectiveName) -or $effectivePath -cnotin $allowedModulePaths[$effectiveName] -or
+            [String]::IsNullOrWhiteSpace($commandName) -or -not $commandKeys.Add($moduleName + '|' + $commandName)) { return $false }
+    }
+    if ($null -ne $ExpectedContext) {
+        $expectedAuthority = & $get $ExpectedContext 'authority_reference'; $expectedGit = & $get $ExpectedContext 'git_image'; $expectedHost = & $get $ExpectedContext 'powershell_host'; $expectedClosure = & $get $ExpectedContext 'module_closure'
+        foreach ($pair in @(@('authority_reference',$expectedAuthority),@('git_image',$expectedGit),@('powershell_host',$expectedHost))) {
+            $actualReference = & $get $Document ([string]$pair[0])
+            if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $actualReference) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $pair[1])) { return $false }
+        }
+        if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $closure) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedClosure)) { return $false }
+    }
+    return $true
+}
+
+function Test-D32PowerShellModuleAdmissionProfileBinding {
+    param([AllowNull()][object]$Document, [AllowNull()][object]$ExpectedProfileReference)
+    try {
+        if ($null -eq $Document -or $null -eq $ExpectedProfileReference) { return $false }
+        $actual = $Document.profile_reference
+        $fields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
+        foreach ($reference in @($actual,$ExpectedProfileReference)) {
+            if ($null -eq $reference) { return $false }
+            $names = if ($reference -is [System.Collections.IDictionary]) { @($reference.Keys | ForEach-Object { [string]$_ }) } else { @($reference.PSObject.Properties | ForEach-Object { [string]$_.Name }) }
+            if ($names.Count -ne $fields.Count -or @($fields | Where-Object { $_ -cnotin $names }).Count -gt 0) { return $false }
+        }
+        foreach ($field in $fields) {
+            $left = if ($actual -is [System.Collections.IDictionary]) { $actual[$field] } else { $actual.PSObject.Properties[$field].Value }
+            $right = if ($ExpectedProfileReference -is [System.Collections.IDictionary]) { $ExpectedProfileReference[$field] } else { $ExpectedProfileReference.PSObject.Properties[$field].Value }
+            if ($field -ceq 'bytes') { if ([Int64]$left -ne [Int64]$right) { return $false } }
+            elseif ([string]$left -cne [string]$right) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-D32PowerShellModuleAdmissionProfileRecordBinding {
+    param([AllowNull()][object]$Document, [AllowNull()][object]$ProfileRecord)
+    try {
+        if ($null -eq $ProfileRecord) { return $false }
+        if ($null -ne $ProfileRecord.file_identity) {
+            $reference = [ordered]@{
+                path = [string]$ProfileRecord.path
+                sha256 = [string]$ProfileRecord.sha256
+                bytes = [Int64]$ProfileRecord.file_identity.bytes
+                volume_serial_hex = [string]$ProfileRecord.file_identity.volume_serial_hex
+                file_id_hex = [string]$ProfileRecord.file_identity.file_id_hex
+            }
+        }
+        else {
+            $reference = [ordered]@{
+                path = [string]$ProfileRecord.path
+                sha256 = [string]$ProfileRecord.sha256
+                bytes = [Int64]$ProfileRecord.bytes
+                volume_serial_hex = [string]$ProfileRecord.volume_serial_hex
+                file_id_hex = [string]$ProfileRecord.file_id_hex
+            }
+        }
+        return Test-D32PowerShellModuleAdmissionProfileBinding -Document $Document -ExpectedProfileReference $reference
+    }
+    catch { return $false }
+}
+
+function Test-D32PowerShellModuleAdmissionRunnerBinding {
+    param([AllowNull()][object]$Document, [Parameter(Mandatory = $true)][Int64]$ExpectedProcessId)
+    try {
+        return $null -ne $Document -and [Int64]$Document.runner_process.process_id -eq $ExpectedProcessId
+    }
+    catch { return $false }
+}
+
+function ConvertTo-D32PowerShellAuthorityJsonText {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return [System.Text.Json.JsonSerializer]::Serialize([string]$Value) }
+    if ($Value -is [bool]) { return ([string]$Value).ToLowerInvariant() }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64]) {
+        return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $Value.Keys) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$key) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $Value[$key]))) }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in $Value) { $parts.Add((ConvertTo-D32PowerShellAuthorityJsonText -Value $item)) }
+        return '[' + ($parts -join ',') + ']'
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($property in $Value.PSObject.Properties) { $parts.Add(([System.Text.Json.JsonSerializer]::Serialize([string]$property.Name) + ':' + (ConvertTo-D32PowerShellAuthorityJsonText -Value $property.Value))) }
+        return '{' + ($parts -join ',') + '}'
+    }
+    throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unsupported JSON candidate value type: $($Value.GetType().FullName)"
+}
+
+function Get-D32PowerShellAuthorityProcessStartup {
+    param([Parameter(Mandatory = $true)][string]$EntryScriptPath, [AllowNull()][string[]]$ArgumentVector)
+    $arguments = if ($null -eq $ArgumentVector) { [Environment]::GetCommandLineArgs() } else { [string[]]$ArgumentVector }
+    $fileIndex = -1
+    for ($index = 1; $index -lt $arguments.Length; $index++) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$arguments[$index], '-File')) { $fileIndex = $index; break }
+    }
+    if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $arguments.Length) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: direct -File startup is required; command, encoded, wrapper, and ambiguous modes are rejected' }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $noProfile = $false
+    for ($index = 1; $index -lt $fileIndex; $index++) {
+        $option = [string]$arguments[$index]
+        if ($option -cnotin @('-NoLogo', '-NoProfile', '-NonInteractive') -or -not $seen.Add($option)) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: startup switch is unknown, duplicated, or ambiguous'
+        }
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($option, '-NoProfile')) { $noProfile = $true }
+    }
+    if (-not $noProfile) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: exact direct runner startup requires -NoProfile before -File' }
+    $operand = [string]$arguments[$fileIndex + 1]
+    if (-not [IO.Path]::IsPathRooted($operand)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: -File operand must be absolute' }
+    $operand = [IO.Path]::GetFullPath($operand)
+    $expected = [IO.Path]::GetFullPath($EntryScriptPath)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($operand, $expected)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: actual -File operand does not name this runner' }
+    $switches = @()
+    if ($fileIndex -gt 1) { $switches = [string[]]$arguments[1..($fileIndex - 1)] }
+    return [PSCustomObject]@{ FileOperand = $operand; Switches = [string[]]$switches; ProcessArguments = [string[]]$arguments }
+}
+
+function Assert-D32PowerShellModuleAdmissionCurrent {
+    param([Parameter(Mandatory = $true)][object]$State)
     if ($PSModuleAutoLoadingPreference -cne 'None' -or
-        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$env:PSModulePath), $canonicalModuleRoot)) {
-        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: automatic import or ambient module search path was re-enabled'
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$PSHOME), [string]$State.PowerShellRoot) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$env:PSModulePath), [string]$State.ModuleRoot)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module autoload or module search policy changed after admission'
     }
-    $expected = @{
-        'Microsoft.PowerShell.Management' = [IO.Path]::GetFullPath([IO.Path]::Combine($canonicalModuleRoot, 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Management.psd1'))
-        'Microsoft.PowerShell.Utility' = [IO.Path]::GetFullPath([IO.Path]::Combine($canonicalModuleRoot, 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1'))
-        'CimCmdlets' = [IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::GetDirectoryName($canonicalModuleRoot), 'Microsoft.Management.Infrastructure.CimCmdlets.dll'))
+    $startup = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath ([string]$State.Startup.FileOperand)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($startup.FileOperand, [string]$State.Startup.FileOperand) -or
+        $startup.Switches.Count -ne $State.Startup.Switches.Count) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: runner startup binding changed' }
+    for ($index = 0; $index -lt $startup.Switches.Count; $index++) {
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$startup.Switches[$index], [string]$State.Startup.Switches[$index])) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: runner startup switch binding changed' }
     }
+    $currentToken = Get-D32PowerShellAuthorityCurrentToken
+    if (-not (Test-D32PowerShellAuthorityTokenRecord -Token $State.Admission.runner_process.token_state) -or
+        $currentToken.is_elevated -ne $State.Admission.runner_process.token_state.is_elevated -or
+        [Int64]$currentToken.integrity_rid -ne [Int64]$State.Admission.runner_process.token_state.integrity_rid -or
+        $currentToken.is_system -ne $State.Admission.runner_process.token_state.is_system -or
+        $currentToken.thread_impersonating -ne $State.Admission.runner_process.token_state.thread_impersonating) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process token trust state changed at admission reuse boundary'
+    }
+    foreach ($file in $State.OpenFiles) {
+        $stream = $file.Stream
+        if ($null -eq $stream -or $stream.SafeFileHandle.IsClosed -or $stream.SafeFileHandle.IsInvalid) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: a held admitted file handle was released' }
+        $before = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$stream.Name), [string]$file.Record.path) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $stream.SafeFileHandle), [string]$file.Record.path) -or
+            $before.Bytes -ne [Int64]$file.Record.bytes -or $before.VolumeSerialHex -cne [string]$file.Record.volume_serial_hex -or $before.FileIdHex -cne [string]$file.Record.file_id_hex) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: held file identity drifted: $($file.Record.path)"
+        }
+        $stream.Position = 0
+        $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        if ($sha -cne [string]$file.Record.sha256 -or $stream.Length -ne [Int64]$file.Record.bytes) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: held file content drifted: $($file.Record.path)" }
+        if (Test-D32PowerShellAuthorityPathWithin -Child ([string]$file.Record.path) -Parent ([string]$State.PowerShellRoot)) {
+            $security = Get-D32PowerShellAuthorityObjectSecurity -Path ([string]$file.Record.path) -IsDirectory:$false -Handle $stream.SafeFileHandle -Stream $stream
+            if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$false) -or
+                $security.OwnerSid -cne [string]$file.Security.OwnerSid -or $security.AclSha256 -cne [string]$file.Security.AclSha256) {
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: protected runtime file owner/ACL changed: $($file.Record.path)"
+            }
+        }
+    }
+    foreach ($directory in $State.DirectoryFences.Values) {
+        if ($directory.Handle.IsClosed -or $directory.Handle.IsInvalid) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: an admitted ancestor directory fence was released' }
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $directory.Handle
+        if (($identity.Attributes -band [int][IO.FileAttributes]::Directory) -eq 0 -or ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $directory.Handle), [string]$directory.Path) -or
+            $identity.VolumeSerialHex -cne [string]$directory.VolumeSerialHex -or $identity.FileIdHex -cne [string]$directory.FileIdHex) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: ancestor directory identity drifted: $($directory.Path)"
+        }
+        $isRuntimeDirectory = Test-D32PowerShellAuthorityPathWithin -Child ([string]$directory.Path) -Parent ([string]$State.PowerShellRoot)
+        $isRuntimeAncestor = -not $isRuntimeDirectory -and (Test-D32PowerShellAuthorityPathWithin -Child ([string]$State.PowerShellRoot) -Parent ([string]$directory.Path))
+        $isRuntimeNamespace = $isRuntimeDirectory -or $isRuntimeAncestor
+        if ($isRuntimeNamespace) {
+            $security = Get-D32PowerShellAuthorityObjectSecurity -Path ([string]$directory.Path) -IsDirectory:$true -Handle $directory.Handle
+            if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true -IsProtectedAncestor:$isRuntimeAncestor) -or
+                $security.OwnerSid -cne [string]$directory.OwnerSid -or $security.AclSha256 -cne [string]$directory.AclSha256) {
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: protected runtime directory owner/ACL changed: $($directory.Path)"
+            }
+        }
+    }
+    Assert-D32PowerShellAuthorityRuntimeEntriesCurrent -Snapshot $State.RuntimeDistribution
+    $process = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        if ($process.Id -ne [Int32]$State.Admission.runner_process.process_id -or
+            [Int64]$process.StartTime.ToUniversalTime().Ticks -ne [Int64]$State.Admission.runner_process.start_time_utc_ticks -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$process.MainModule.FileName), [string]$State.Admission.powershell_host.path)) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: current process identity differs from the admitted runner process'
+        }
+    }
+    finally { $process.Dispose() }
+    $resolver = Get-D32PowerShellAuthorityResolverSnapshot -ConfigureNativeSearch
+    if ($resolver.Blockers.Count -gt 0 -or $resolver.ResolverSha256 -cne [string]$State.Admission.resolver_admission.resolver_sha256) {
+        throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: current resolver domain drifted at reuse boundary: ' + ($resolver.Blockers -join '; '))
+    }
+    if ($State.ImportAttempts -lt 3 -or $State.Admission.record_type -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2') { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module admission did not complete the three fixed imports' }
     $moduleInfos = @(Microsoft.PowerShell.Core\Get-Module)
-    foreach ($moduleInfo in $moduleInfos) {
-        if ($moduleInfo.Name -ceq 'Microsoft.PowerShell.Core') { continue }
-        if (-not $expected.ContainsKey([string]$moduleInfo.Name)) {
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unapproved preloaded module: $($moduleInfo.Name)"
-        }
-        if ([String]::IsNullOrWhiteSpace([string]$moduleInfo.Path) -or
-            -not (Test-D32PowerShellAuthorityPathNoReparse -Path ([string]$moduleInfo.Path)) -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$moduleInfo.Path), [string]$expected[[string]$moduleInfo.Name])) {
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module path is outside its exact caller-pinned module root: $($moduleInfo.Name)"
+    foreach ($info in $moduleInfos) {
+        if ([string]$info.Name -ceq 'Microsoft.PowerShell.Core') { continue }
+        $expected = $State.ExpectedModuleManifestPaths[[string]$info.Name]
+        if ($null -eq $expected -or [string]$info.Path -cnotin $expected) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unexpected loaded module or module path: $($info.Name)"
         }
     }
-    foreach ($name in $expected.Keys) {
-        $matches = @(Microsoft.PowerShell.Core\Get-Module -Name $name)
-        if ($matches.Count -ne 1) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: exact trusted module is not uniquely loaded: $name" }
-        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$matches[0].Path), [string]$expected[$name])) {
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: loaded module path does not match its exact manifest: $name"
+    $commandOrigins = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($moduleName in $State.ImportOrder) {
+        $match = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in $moduleInfos) { if ([string]$candidate.Name -ceq $moduleName) { $match.Add($candidate) } }
+        if ($match.Count -ne 1 -or [string]$match[0].Path -cnotin $State.ExpectedModuleManifestPaths[$moduleName]) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: fixed module is not uniquely loaded from its pinned manifest: $moduleName"
+        }
+        foreach ($command in $match[0].ExportedCommands.Values) {
+            if ($null -eq $command.Module -or [string]$command.Module.Name -cne $moduleName -or [string]$command.Module.Path -cnotin $State.ExpectedModuleManifestPaths[$moduleName]) {
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: exported command origin differs from its pinned module: $($command.Name)"
+            }
+            $key = $moduleName + '|' + [string]$command.Name
+            $effectiveCommands = @(Microsoft.PowerShell.Core\Get-Command -Name ([string]$command.Name) -All -ErrorAction Stop)
+            if ($effectiveCommands.Count -eq 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: exported command is not discoverable after fixed imports: $($command.Name)" }
+            $effective = $effectiveCommands[0]
+            foreach ($candidateCommand in $effectiveCommands) {
+                if ($null -eq $candidateCommand.Module -or [string]$candidateCommand.Module.Name -cnotin $State.ImportOrder -or
+                    [string]$candidateCommand.Module.Path -cnotin $State.ExpectedModuleManifestPaths[[string]$candidateCommand.Module.Name]) {
+                    throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: effective command resolution found an unadmitted shadow or origin: $($command.Name)"
+                }
+            }
+            $commandOrigins[$key] = [ordered]@{
+                module_name = $moduleName; command_name = [string]$command.Name; module_path = [string]$command.Module.Path
+                effective_module_name = [string]$effective.Module.Name; effective_module_path = [string]$effective.Module.Path
+            }
         }
     }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $State.Admission -CandidateSha ([string]$State.Admission.candidate_sha) -Repository ([string]$State.Admission.source_repo))) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: stale, forged, or malformed shared admission context'
+    }
+    $State.Admission.import_verification.commands = @($commandOrigins.Values)
 }
 
 function Initialize-D32PowerShellModuleAuthority {
@@ -84,162 +1345,329 @@ function Initialize-D32PowerShellModuleAuthority {
     param(
         [AllowNull()][string]$CallerProfilePath,
         [AllowNull()][string]$CallerExpectedProfileSha256,
+        [AllowNull()][string]$CallerModuleAuthorityPath,
+        [AllowNull()][string]$CallerExpectedModuleAuthoritySha256,
+        [AllowNull()][string]$CallerCandidateSha,
+        [AllowNull()][string]$CallerRepository,
+        [AllowNull()][string]$CallerGitPath,
+        [AllowNull()][string]$CallerGitSha256,
+        [AllowNull()][string]$EntryScriptPath,
         [switch]$LocalSelfTestOnly
     )
-
-    $priorAutoLoadingPreference = [string]$PSModuleAutoLoadingPreference
-    $global:PSModuleAutoLoadingPreference = 'None'
-    $state = $global:D32PowerShellModuleAuthorityState
-    if ($null -ne $state) {
-        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$PSHOME), [string]$state.PowerShellRoot) -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$env:PSModulePath), [string]$state.ModuleRoot) -or
-            $priorAutoLoadingPreference -cne 'None') {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process module authority changed after initialization'
-        }
-        Assert-D32PowerShellAuthorityModuleInventory -ModuleRoot ([string]$state.ModuleRoot)
-        if (-not [String]::IsNullOrWhiteSpace($CallerExpectedProfileSha256) -and
-            $CallerExpectedProfileSha256 -cne [string]$state.ProfileSha256) {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: repeated loader supplied a different caller profile pin'
-        }
-        return $state
-    }
-
-    $loadedBeforeAdmission = @(Microsoft.PowerShell.Core\Get-Module)
-    if ($loadedBeforeAdmission.Count -gt 0) {
-        $loadedNames = [System.Collections.Generic.List[string]]::new()
-        foreach ($loadedModule in $loadedBeforeAdmission) { $loadedNames.Add([string]$loadedModule.Name) }
-        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: runner must start in a fresh PowerShell process with no imported modules (found: $($loadedNames -join ', '))"
-    }
-    $processArguments = [Environment]::GetCommandLineArgs()
-    $noProfileIndex = -1
-    $fileModeIndex = -1
-    $commandModeIndex = -1
-    for ($argumentIndex = 1; $argumentIndex -lt $processArguments.Length; $argumentIndex++) {
-        $processArgument = [string]$processArguments[$argumentIndex]
-        if ($noProfileIndex -lt 0 -and
-            ([StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-NoProfile') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-nop'))) {
-            $noProfileIndex = $argumentIndex
-        }
-        if ($fileModeIndex -lt 0 -and
-            ([StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-File') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-f'))) {
-            $fileModeIndex = $argumentIndex
-        }
-        if ($commandModeIndex -lt 0 -and
-            ([StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-Command') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-c') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-EncodedCommand') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-ec') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-CommandWithArgs') -or
-                [StringComparer]::OrdinalIgnoreCase.Equals($processArgument, '-cwa'))) {
-            $commandModeIndex = $argumentIndex
-        }
-    }
-    $noProfileWasPinned = $noProfileIndex -gt 0 -and $fileModeIndex -gt $noProfileIndex -and
-        ($commandModeIndex -lt 0 -or $fileModeIndex -lt $commandModeIndex)
-    if (-not $noProfileWasPinned) {
-        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: runner process must start with -NoProfile before PowerShell -File mode'
-    }
-
-    $powerShellRoot = [IO.Path]::GetFullPath([string]$PSHOME)
-    $profileSha256 = $null
-    if ([String]::IsNullOrWhiteSpace($CallerProfilePath) -or [String]::IsNullOrWhiteSpace($CallerExpectedProfileSha256)) {
-        # Only explicit no-Cargo selftests may start without an external Profile V2 pin.
-        # Library-only imports reuse an authority state already established by their caller.
-        if (-not $LocalSelfTestOnly) {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: a caller-pinned Profile V2 path and SHA are required before module loading'
-        }
-    }
-    else {
-        if ($CallerExpectedProfileSha256 -cnotmatch '^[0-9a-f]{64}$') {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 SHA must be exact lowercase SHA-256'
-        }
-        if (-not [IO.Path]::IsPathRooted($CallerProfilePath)) {
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 path must be absolute'
-        }
-        $profilePath = [IO.Path]::GetFullPath($CallerProfilePath)
-        $profileSnapshot = Get-D32PowerShellAuthorityOpenedBytes -Path $profilePath
-        $profileSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$profileSnapshot.Bytes)).ToLowerInvariant()
-        if ($profileSha256 -cne $CallerExpectedProfileSha256) {
-            $profileSnapshot.Stream.Dispose()
-            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 bytes do not match its pinned SHA'
-        }
-        $profileDocument = $null
+    $priorState = $global:D32PowerShellModuleAuthorityState
+    $global:D32PowerShellModuleImportAttempts = if ($null -eq $priorState) { 0 } else { [int]$priorState.ImportAttempts }
+    if ($null -ne $priorState) {
         try {
-            $profileText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$profileSnapshot.Bytes)
-            $profileDocument = [System.Text.Json.JsonDocument]::Parse([string]$profileText)
-            $profileObject = $profileDocument.RootElement
-            if ($profileObject.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
-                $profileObject.GetProperty('schema_version').GetInt32() -ne 2 -or
-                $profileObject.GetProperty('profile_type').GetString() -cne 'D32_BUILD_TOOLCHAIN_PROFILE_V2') {
-                throw 'caller Profile V2 type or version is invalid'
+            if ([String]::IsNullOrWhiteSpace($CallerModuleAuthorityPath) -or [String]::IsNullOrWhiteSpace($CallerExpectedModuleAuthoritySha256) -or
+                [String]::IsNullOrWhiteSpace($CallerProfilePath) -or [String]::IsNullOrWhiteSpace($CallerExpectedProfileSha256) -or
+                [String]::IsNullOrWhiteSpace($CallerCandidateSha) -or [String]::IsNullOrWhiteSpace($CallerRepository) -or
+                [String]::IsNullOrWhiteSpace($CallerGitPath) -or [String]::IsNullOrWhiteSpace($CallerGitSha256) -or [String]::IsNullOrWhiteSpace($EntryScriptPath)) {
+                throw 'all caller-owned authority, Profile, Git, candidate, repository, and library-entry pins are required for reuse'
             }
-            $profilePowerShellRoot = [IO.Path]::GetFullPath($profileObject.GetProperty('powershell_root').GetString())
-            $profilePowerShell = $profileObject.GetProperty('powershell')
-            $profilePowerShellPath = [IO.Path]::GetFullPath($profilePowerShell.GetProperty('path').GetString())
-            $profilePowerShellSha = $profilePowerShell.GetProperty('sha256').GetString()
-            $profilePowerShellBytes = $profilePowerShell.GetProperty('bytes').GetInt64()
-            $actualPowerShellPath = [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellRoot, 'pwsh.exe'))
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($profilePowerShellRoot, $powerShellRoot) -or
-                -not [StringComparer]::OrdinalIgnoreCase.Equals($profilePowerShellPath, $actualPowerShellPath)) {
-                throw 'caller-pinned PowerShell root or image path does not match this process'
+            foreach ($inputPath in @($CallerModuleAuthorityPath, $CallerProfilePath, $CallerGitPath, $CallerRepository, $EntryScriptPath)) {
+                if (-not [IO.Path]::IsPathRooted([string]$inputPath) -or [IO.Path]::GetFullPath([string]$inputPath) -cne [string]$inputPath -or
+                    -not (Test-D32PowerShellAuthorityPathNoReparse -Path ([string]$inputPath))) { throw 'a library-reuse caller path is not canonical and non-reparse' }
             }
-            $hostSnapshot = Get-D32PowerShellAuthorityOpenedBytes -Path $actualPowerShellPath
-            $hostSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$hostSnapshot.Bytes)).ToLowerInvariant()
-            if ($hostSnapshot.Bytes.LongLength -ne $profilePowerShellBytes -or $hostSha -cne $profilePowerShellSha) {
-                $hostSnapshot.Stream.Dispose()
-                throw 'running PowerShell image bytes or SHA differ from the caller-pinned Profile V2'
+            if ([IO.Path]::GetFullPath($CallerModuleAuthorityPath) -cne [string]$priorState.AuthorityReference.path -or $CallerExpectedModuleAuthoritySha256 -cne [string]$priorState.AuthorityReference.sha256 -or
+                [IO.Path]::GetFullPath($CallerProfilePath) -cne [string]$priorState.ProfileReference.path -or $CallerExpectedProfileSha256 -cne [string]$priorState.ProfileReference.sha256 -or
+                [IO.Path]::GetFullPath($CallerGitPath) -cne [string]$priorState.Admission.git_image.path -or $CallerGitSha256 -cne [string]$priorState.Admission.git_image.sha256 -or
+                $CallerCandidateSha -cne [string]$priorState.Admission.candidate_sha -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($CallerRepository), [string]$priorState.RepositoryRoot) -or
+                -not (Test-D32PowerShellAuthorityPathWithin -Child $EntryScriptPath -Parent ([string]$priorState.RepositoryRoot))) {
+                throw 'library-reuse authority pins, candidate, repository, or entry binding changed'
             }
-            $hostProcess = [Diagnostics.Process]::GetCurrentProcess()
-            try {
-                $mainModulePath = [IO.Path]::GetFullPath([string]$hostProcess.MainModule.FileName)
-                if (-not [StringComparer]::OrdinalIgnoreCase.Equals($mainModulePath, $actualPowerShellPath)) {
-                    $hostSnapshot.Stream.Dispose()
-                    throw 'current PowerShell process image path differs from the caller-pinned Profile V2'
-                }
+            if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $priorState.Admission -CandidateSha $CallerCandidateSha -Repository $CallerRepository -ExpectedContext $priorState.Admission)) {
+                throw 'library-reuse admission record is not a complete self-validating exact V2 record'
             }
-            finally { $hostProcess.Dispose() }
-            $powerShellRoot = $profilePowerShellRoot
-            $global:D32PowerShellModuleAuthorityHostStream = $hostSnapshot.Stream
+            Assert-D32PowerShellModuleAdmissionCurrent -State $priorState
         }
-        catch {
-            $profileSnapshot.Stream.Dispose()
-            if ($null -ne $profileDocument) { $profileDocument.Dispose() }
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 could not establish the PowerShell runtime root: $($_.Exception.Message)"
-        }
-        if ($null -ne $profileDocument) { $profileDocument.Dispose() }
-        $global:D32PowerShellModuleAuthorityProfileStream = $profileSnapshot.Stream
+        catch { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: forged, stale, or incomplete library-reuse context: $($_.Exception.Message)" }
+        return $priorState.Admission
     }
 
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$PSHOME), $powerShellRoot) -or
-        -not (Test-D32PowerShellAuthorityPathNoReparse -Path $powerShellRoot)) {
-        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: PowerShell root is not a canonical non-reparse directory'
+    $global:PSModuleAutoLoadingPreference = 'None'
+    $global:D32PowerShellModuleImportAttempts = 0
+    if ([String]::IsNullOrWhiteSpace($CallerModuleAuthorityPath) -or [String]::IsNullOrWhiteSpace($CallerExpectedModuleAuthoritySha256) -or
+        [String]::IsNullOrWhiteSpace($CallerProfilePath) -or [String]::IsNullOrWhiteSpace($CallerExpectedProfileSha256) -or
+        [String]::IsNullOrWhiteSpace($CallerCandidateSha) -or [String]::IsNullOrWhiteSpace($CallerRepository) -or
+        [String]::IsNullOrWhiteSpace($CallerGitPath) -or [String]::IsNullOrWhiteSpace($CallerGitSha256)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: no-pin startup, SelfTest, and LibraryOnly modes are limited to module-free negative/bootstrap work'
     }
+    if ($CallerCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $CallerExpectedProfileSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $CallerExpectedModuleAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or $CallerGitSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: candidate and all external content pins must be exact lowercase digests'
+    }
+    if ([String]::IsNullOrWhiteSpace($EntryScriptPath)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: exact runner path is required' }
+    $startup = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $EntryScriptPath
+    $repo = [IO.Path]::GetFullPath($CallerRepository)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($repo, $CallerRepository) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $repo)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: repository binding must be canonical and non-reparse'
+    }
+    $entryScript = [IO.Path]::GetFullPath($EntryScriptPath)
+    if (-not (Test-D32PowerShellAuthorityPathWithin -Child $entryScript -Parent $repo) -or [StringComparer]::OrdinalIgnoreCase.Equals($entryScript, $repo) -or
+        -not (Test-D32PowerShellAuthorityPathNoReparse -Path $entryScript)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: runner entrypoint is outside the canonical non-reparse candidate repository'
+    }
+    $powerShellRoot = [IO.Path]::GetFullPath([string]$PSHOME)
+    if ([string]$PSVersionTable.PSEdition -cne 'Core' -or [Version]$PSVersionTable.PSVersion -lt [Version]'7.5' -or
+        -not (Test-D32PowerShellAuthorityPathNoReparse -Path $powerShellRoot)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: unsupported PowerShell Core host or PSHOME' }
     $moduleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellRoot, 'Modules'))
-    if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $moduleRoot)) {
-        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: PowerShell module root is missing or reparse-backed'
-    }
+    $global:PSModuleAutoLoadingPreference = 'None'
     $env:PSModulePath = $moduleRoot
 
-    $moduleManifests = @(
-        [IO.Path]::Combine($moduleRoot, 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Management.psd1'),
-        [IO.Path]::Combine($moduleRoot, 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1'),
-        [IO.Path]::Combine($moduleRoot, 'CimCmdlets', 'CimCmdlets.psd1')
-    )
-    foreach ($manifestPath in $moduleManifests) {
-        $manifestPath = [IO.Path]::GetFullPath($manifestPath)
-        if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $manifestPath)) {
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: exact trusted module manifest is missing or reparse-backed: $manifestPath"
+    $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $script:D32PowerShellAdmissionDirectoryFences = $directoryFences
+    $openFiles = [System.Collections.Generic.List[object]]::new()
+    $moduleRecords = [System.Collections.Generic.List[object]]::new()
+    $importAttempts = 0
+    try {
+        foreach ($inputPath in @($CallerModuleAuthorityPath, $CallerProfilePath, $CallerGitPath)) {
+            if (-not [IO.Path]::IsPathRooted([string]$inputPath) -or [IO.Path]::GetFullPath([string]$inputPath) -cne [string]$inputPath -or
+                -not (Test-D32PowerShellAuthorityPathNoReparse -Path ([string]$inputPath))) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: authority/Profile/Git caller paths must be canonical absolute regular paths' }
         }
-        Microsoft.PowerShell.Core\Import-Module -Name $manifestPath -ErrorAction Stop
+        foreach ($inputPath in @($CallerModuleAuthorityPath, $CallerProfilePath, $CallerGitPath)) {
+            if ((Test-D32PowerShellAuthorityPathWithin -Child ([string]$inputPath) -Parent $repo) -or
+                (Test-D32PowerShellAuthorityPathWithin -Child $repo -Parent ([string]$inputPath))) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: external authority, Profile V2, and Git image must be outside and non-overlapping with the candidate repository'
+            }
+        }
+        $entrySnapshot = Open-D32PowerShellAuthorityFile -Path $entryScript -DirectoryFences $directoryFences
+        $openFiles.Add($entrySnapshot)
+        $authorityFile = Open-D32PowerShellAuthorityFile -Path ([IO.Path]::GetFullPath($CallerModuleAuthorityPath)) -DirectoryFences $directoryFences
+        $openFiles.Add($authorityFile)
+        $profileFile = Open-D32PowerShellAuthorityFile -Path ([IO.Path]::GetFullPath($CallerProfilePath)) -DirectoryFences $directoryFences
+        $openFiles.Add($profileFile)
+        $gitFile = Open-D32PowerShellAuthorityFile -Path ([IO.Path]::GetFullPath($CallerGitPath)) -DirectoryFences $directoryFences
+        $openFiles.Add($gitFile)
+        if ($profileFile.Record.sha256 -cne $CallerExpectedProfileSha256 -or $gitFile.Record.sha256 -cne $CallerGitSha256 -or
+            $authorityFile.Record.sha256 -cne $CallerExpectedModuleAuthoritySha256) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: external Profile, Git, or module-content caller pin mismatch'
+        }
+        $authorityText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$authorityFile.Bytes)
+        $authorityDocument = [System.Text.Json.JsonDocument]::Parse($authorityText)
+        try {
+            $authority = $authorityDocument.RootElement
+            if (Test-D32PowerShellAuthorityJsonDuplicates -Element $authority) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate JSON keys in module authority' }
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $authority -Fields @('schema_version','authority_type','status','gate_authority','candidate_sha','source_repo','profile','powershell_host','powershell_root','distribution','resolver_policy','modules') -Name 'module authority'
+            if ($authority.GetProperty('schema_version').ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $authority.GetProperty('schema_version').GetInt32() -ne 2 -or
+                (Get-D32PowerShellAuthorityJsonString $authority 'authority_type') -cne 'D32_POWERSHELL_MODULE_CONTENT_AUTHORITY_V2' -or
+                (Get-D32PowerShellAuthorityJsonString $authority 'status') -cne 'CANDIDATE_FOR_COORDINATOR_PIN' -or
+                (Get-D32PowerShellAuthorityJsonString $authority 'gate_authority') -cne 'NONE' -or
+                (Get-D32PowerShellAuthorityJsonString $authority 'candidate_sha') -cne $CallerCandidateSha) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module authority schema, candidate, or no-gate binding is invalid'
+            }
+            $authorityRepo = Get-D32PowerShellAuthorityJsonString $authority 'source_repo'
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($authorityRepo), $repo) -or $authorityRepo -cne [IO.Path]::GetFullPath($authorityRepo)) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module authority repository path is not the exact canonical caller repository'
+            }
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $authority.GetProperty('profile') -Fields @('path','bytes','sha256','volume_serial_hex','file_id_hex') -Name 'module authority Profile reference'
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $authority.GetProperty('powershell_host') -Fields @('path','bytes','sha256','volume_serial_hex','file_id_hex') -Name 'module authority PowerShell host'
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $authority.GetProperty('powershell_root') -Fields @('path','volume_serial_hex','file_id_hex') -Name 'module authority PSHOME identity'
+            Assert-D32PowerShellAuthorityFileRecord -Element $authority.GetProperty('profile') -Actual $profileFile -Name 'module authority Profile reference'
+            $profileData = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$profileFile.Bytes))
+            try {
+                if (Test-D32PowerShellAuthorityJsonDuplicates -Element $profileData.RootElement) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate keys in caller Profile V2' }
+                $profileElement = $profileData.RootElement
+                Assert-D32PowerShellAuthorityExactJsonRecord -Element $profileElement -Fields @('schema_version','profile_type','target_triple','system_root','powershell_root','powershell','rust_toolchain_root','toolchain','rust_toolchain_bin_images','native_roots','native','windows_child_images','fetch_manifests','fetch_git','env_policy','cargo_policy') -Name 'caller Profile V2'
+                if ($profileElement.GetProperty('schema_version').ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $profileElement.GetProperty('schema_version').GetInt32() -ne 2 -or
+                    $profileElement.GetProperty('profile_type').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $profileElement.GetProperty('profile_type').GetString() -cne 'D32_BUILD_TOOLCHAIN_PROFILE_V2' -or
+                    $profileElement.GetProperty('target_triple').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $profileElement.GetProperty('target_triple').GetString() -cne 'x86_64-pc-windows-msvc' -or
+                    $profileElement.GetProperty('env_policy').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $profileElement.GetProperty('env_policy').GetString() -cne 'D32_BUILD_ENV_V1' -or
+                    $profileElement.GetProperty('cargo_policy').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $profileElement.GetProperty('cargo_policy').GetString() -cne 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER') {
+                    throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 exact type/version/policy is invalid'
+                }
+                $profileRootValue = $profileElement.GetProperty('powershell_root')
+                if ($profileRootValue.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Profile V2 powershell_root must be a string' }
+                $profileRoot = [IO.Path]::GetFullPath($profileRootValue.GetString())
+                if ($profileRootValue.GetString() -cne $profileRoot) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Profile V2 powershell_root is not canonical' }
+                $hostEntry = $profileElement.GetProperty('powershell')
+                Assert-D32PowerShellAuthorityExactJsonRecord -Element $hostEntry -Fields @('name','path','sha256','bytes','volume_serial_hex','file_id_hex','reason') -Name 'Profile V2 PowerShell host identity'
+                if ($hostEntry.GetProperty('name').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $hostEntry.GetProperty('name').GetString() -cne 'pwsh.exe' -or
+                    $hostEntry.GetProperty('path').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $hostEntry.GetProperty('sha256').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+                    $hostEntry.GetProperty('bytes').ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $hostEntry.GetProperty('volume_serial_hex').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+                    $hostEntry.GetProperty('file_id_hex').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $hostEntry.GetProperty('reason').ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+                    throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Profile V2 PowerShell host identity types are invalid'
+                }
+                $hostPathValue = $hostEntry.GetProperty('path').GetString()
+                $hostPath = [IO.Path]::GetFullPath($hostPathValue)
+                if ($hostPathValue -cne $hostPath) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Profile V2 PowerShell host path is not canonical' }
+                $hostSha = $hostEntry.GetProperty('sha256').GetString()
+                $hostBytes = $hostEntry.GetProperty('bytes').GetInt64()
+                $hostVolume = $hostEntry.GetProperty('volume_serial_hex').GetString()
+                $hostFileId = $hostEntry.GetProperty('file_id_hex').GetString()
+            }
+            finally { $profileData.Dispose() }
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($profileRoot, $powerShellRoot) -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals($hostPath, [IO.Path]::Combine($powerShellRoot, 'pwsh.exe'))) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Profile V2 host/root does not bind this actual PowerShell process'
+            }
+            $hostFile = Open-D32PowerShellAuthorityFile -Path $hostPath -DirectoryFences $directoryFences
+            $openFiles.Add($hostFile)
+            Assert-D32PowerShellAuthorityFileRecord -Element $authority.GetProperty('powershell_host') -Actual $hostFile -Name 'module authority PowerShell host'
+            if ($hostFile.Record.sha256 -cne $hostSha -or [Int64]$hostFile.Record.bytes -ne [Int64]$hostBytes -or
+                $hostFile.Record.volume_serial_hex -cne $hostVolume -or $hostFile.Record.file_id_hex -cne $hostFileId) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: current PowerShell image differs from Profile V2 opened identity' }
+            $process = [Diagnostics.Process]::GetCurrentProcess()
+            try {
+                if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$process.MainModule.FileName), $hostPath)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: process image path differs from Profile V2' }
+                $processId = [int]$process.Id
+                $processStartTicks = [Int64]$process.StartTime.ToUniversalTime().Ticks
+            }
+            finally { $process.Dispose() }
+            $rootKey = $powerShellRoot.TrimEnd([char[]]@('\','/'))
+            if ($rootKey.Length -eq 2 -and $rootKey[1] -eq ':') { $rootKey += [IO.Path]::DirectorySeparatorChar }
+            $rootFence = $directoryFences[$rootKey]
+            Assert-D32PowerShellAuthorityDirectoryRecord -Element $authority.GetProperty('powershell_root') -Actual $rootFence -Name 'module authority PSHOME identity'
+            $resolverPolicy = $authority.GetProperty('resolver_policy')
+            Assert-D32PowerShellAuthorityResolverPolicyRecord -Element $resolverPolicy -PowerShellRoot $powerShellRoot
+            $runtimeDistribution = Get-D32PowerShellAuthorityRuntimeDistributionSnapshot -PowerShellRoot $powerShellRoot -DirectoryFences $directoryFences -OpenFiles $openFiles
+            Assert-D32PowerShellAuthorityRuntimeDistributionRecord -Element $authority.GetProperty('distribution') -Actual $runtimeDistribution
+
+            $moduleElements = $authority.GetProperty('modules')
+            if ($moduleElements.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $moduleElements.GetArrayLength() -ne 3) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: module authority must list exactly the three fixed module roles' }
+            $roles = @(Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $powerShellRoot)
+            $allFilePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $allFileIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            for ($roleIndex = 0; $roleIndex -lt $roles.Count; $roleIndex++) {
+                $role = $roles[$roleIndex]
+                $moduleElement = $moduleElements[$roleIndex]
+                Assert-D32PowerShellAuthorityExactJsonRecord -Element $moduleElement -Fields @('role','module_name','manifest_path','files','inventory_sha256') -Name "module entry $($role.Name)"
+                if ((Get-D32PowerShellAuthorityJsonString $moduleElement 'role') -cne [string]$role.Role -or
+                    (Get-D32PowerShellAuthorityJsonString $moduleElement 'module_name') -cne [string]$role.Name -or
+                    (Get-D32PowerShellAuthorityJsonString $moduleElement 'manifest_path') -cne [IO.Path]::GetFullPath([string]$role.Manifest)) {
+                    throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module authority entry differs from the fixed role/path: $($role.Name)"
+                }
+                $expectedFiles = Get-D32PowerShellAuthorityExpectedModuleFiles -PowerShellRoot $powerShellRoot -Role $role
+                $openFiles.Add($expectedFiles.Manifest)
+                $fileElements = $moduleElement.GetProperty('files')
+                if ($fileElements.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $fileElements.GetArrayLength() -ne $expectedFiles.Paths.Count) {
+                    throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module content closure is incomplete or has unknown files: $($role.Name)"
+                }
+                $declaredByPath = [System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($fileElement in $fileElements.EnumerateArray()) {
+                    Assert-D32PowerShellAuthorityExactJsonRecord -Element $fileElement -Fields @('path','bytes','sha256','volume_serial_hex','file_id_hex') -Name "module file $($role.Name)"
+                    $declaredPath = Get-D32PowerShellAuthorityJsonString $fileElement 'path'
+                    if (-not [IO.Path]::IsPathRooted($declaredPath) -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($declaredPath), $declaredPath) -or
+                        -not $declaredByPath.TryAdd($declaredPath, $fileElement)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate, relative, or noncanonical path in module closure: $declaredPath" }
+                }
+                $actualFileRecords = [System.Collections.Generic.List[object]]::new()
+                foreach ($path in $expectedFiles.Paths) {
+                    $snapshot = if ([StringComparer]::OrdinalIgnoreCase.Equals($path, [string]$expectedFiles.Manifest.Record.path)) { $expectedFiles.Manifest } else { Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $directoryFences }
+                    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($snapshot.Record.path), $path)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: module file path alias: $path" }
+                    if (-not $allFilePaths.Add([string]$snapshot.Record.path) -or -not $allFileIds.Add(([string]$snapshot.Record.volume_serial_hex + ':' + [string]$snapshot.Record.file_id_hex))) {
+                        throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate or aliased module content file: $path"
+                    }
+                    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path, [string]$expectedFiles.Manifest.Record.path)) { $openFiles.Add($snapshot) }
+                    $declared = $declaredByPath[[string]$snapshot.Record.path]
+                    Assert-D32PowerShellAuthorityFileRecord -Element $declared -Actual $snapshot -Name "module file $($role.Name)"
+                    $actualFileRecords.Add($snapshot.Record)
+                }
+                $inventory = Get-D32PowerShellAuthorityInventoryDigest -Role ([string]$role.Role) -Files $actualFileRecords.ToArray()
+                if ((Get-D32PowerShellAuthorityJsonString $moduleElement 'inventory_sha256') -cne $inventory) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: complete deterministic module inventory digest mismatch: $($role.Name)" }
+                $moduleRecords.Add([ordered]@{ role = [string]$role.Role; module_name = [string]$role.Name; manifest_path = [IO.Path]::GetFullPath([string]$role.Manifest); inventory_sha256 = $inventory; files = @($actualFileRecords.ToArray()) })
+            }
+        }
+        finally { $authorityDocument.Dispose() }
+
+        Assert-D32PowerShellAuthorityRuntimeSnapshotCurrent -Snapshot $runtimeDistribution -DirectoryFences $directoryFences -OpenFiles $openFiles
+        $resolverState = Get-D32PowerShellAuthorityResolverSnapshot -ConfigureNativeSearch
+        if ($resolverState.Blockers.Count -gt 0) { throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver admission failed before import; import_attempts=0; ' + ($resolverState.Blockers -join '; ')) }
+        Assert-D32PowerShellAuthorityRuntimeSnapshotCurrent -Snapshot $runtimeDistribution -DirectoryFences $directoryFences -OpenFiles $openFiles
+        $processToken = Get-D32PowerShellAuthorityCurrentToken
+        $roles = @(Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $powerShellRoot)
+        $expectedModulePaths = [System.Collections.Generic.Dictionary[string,string[]]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($role in $roles) { $expectedModulePaths[[string]$role.Name] = [string[]](Get-D32PowerShellAuthorityAllowedModulePaths -PowerShellRoot $powerShellRoot -Role $role) }
+        $importAttempts = 0
+        foreach ($role in $roles) {
+            $importAttempts++
+            $global:D32PowerShellModuleImportAttempts = $importAttempts
+            Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::GetFullPath([string]$role.Manifest)) -ErrorAction Stop
+        }
+        $postImportResolver = Get-D32PowerShellAuthorityResolverSnapshot -ConfigureNativeSearch
+        if ($postImportResolver.Blockers.Count -gt 0 -or $postImportResolver.ResolverSha256 -cne [string]$resolverState.ResolverSha256) {
+            throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: post-import resolver origin escaped or policy drifted: ' + ($postImportResolver.Blockers -join '; '))
+        }
+
+        $closureRecords = @($moduleRecords.ToArray())
+        $combined = [Text.StringBuilder]::new()
+        foreach ($record in $closureRecords) { [void]$combined.Append([string]$record.role).Append('|').Append([string]$record.inventory_sha256).Append("`n") }
+        $closureDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($combined.ToString()))).ToLowerInvariant()
+        $moduleRootIdentity = $directoryFences[$moduleRoot]
+        $admission = [PSCustomObject][ordered]@{
+            record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V2'
+            schema_version = 2
+            status = 'ADMITTED'
+            candidate_sha = $CallerCandidateSha
+            source_repo = $repo
+            authority_reference = [ordered]@{ path = [string]$authorityFile.Record.path; sha256 = [string]$authorityFile.Record.sha256; bytes = [Int64]$authorityFile.Record.bytes; volume_serial_hex = [string]$authorityFile.Record.volume_serial_hex; file_id_hex = [string]$authorityFile.Record.file_id_hex }
+            profile_reference = [ordered]@{ path = [string]$profileFile.Record.path; sha256 = [string]$profileFile.Record.sha256; bytes = [Int64]$profileFile.Record.bytes; volume_serial_hex = [string]$profileFile.Record.volume_serial_hex; file_id_hex = [string]$profileFile.Record.file_id_hex }
+            git_image = [ordered]@{ path = [string]$gitFile.Record.path; sha256 = [string]$gitFile.Record.sha256; bytes = [Int64]$gitFile.Record.bytes; volume_serial_hex = [string]$gitFile.Record.volume_serial_hex; file_id_hex = [string]$gitFile.Record.file_id_hex }
+            powershell_host = [ordered]@{ path = [string]$hostFile.Record.path; sha256 = [string]$hostFile.Record.sha256; bytes = [Int64]$hostFile.Record.bytes; volume_serial_hex = [string]$hostFile.Record.volume_serial_hex; file_id_hex = [string]$hostFile.Record.file_id_hex; pshome = $powerShellRoot }
+            runner_process = [ordered]@{ process_id = $processId; start_time_utc_ticks = $processStartTicks; image_path = [string]$hostFile.Record.path; image_file_id_hex = [string]$hostFile.Record.file_id_hex; token_state = $processToken }
+            startup = [ordered]@{ file_operand = [string]$startup.FileOperand; switches = @($startup.Switches); startup_policy = 'DIRECT_NO_PROFILE_FILE_V1' }
+            entry_script_path = $entryScript
+            module_import_order = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
+            module_closure = [ordered]@{ module_root = $moduleRoot; module_root_volume_serial_hex = [string]$moduleRootIdentity.VolumeSerialHex; module_root_file_id_hex = [string]$moduleRootIdentity.FileIdHex; inventory_sha256 = $closureDigest; modules = $closureRecords; runtime_distribution_sha256 = [string]$runtimeDistribution.inventory_sha256; protected_namespace_sha256 = [string]$runtimeDistribution.inventory_sha256; resolver_sha256 = [string]$resolverState.ResolverSha256 }
+            resolver_admission = [ordered]@{ state = 'VERIFIED'; policy_id = 'D32_POWERSHELL_RESOLVER_DOMAIN_V2'; resolver_sha256 = [string]$resolverState.ResolverSha256; native_policy = [string]$resolverState.NativePolicy; module_search_path = [string]$resolverState.ModuleSearchPath; trusted_platform_paths = @($resolverState.TrustedPlatformPaths); loaded_managed_assembly_paths = @($resolverState.LoadedManagedAssemblyPaths); deps_paths = @($resolverState.DepsPaths); native_directories = @($resolverState.NativeDirectories); native_module_paths = @($resolverState.NativeModulePaths); active_environment = @($resolverState.ActiveEnvironment) }
+            entry_script = [ordered]@{ path = [string]$entrySnapshot.Record.path; bytes = [Int64]$entrySnapshot.Record.bytes; sha256 = [string]$entrySnapshot.Record.sha256; volume_serial_hex = [string]$entrySnapshot.Record.volume_serial_hex; file_id_hex = [string]$entrySnapshot.Record.file_id_hex }
+            import_verification = [ordered]@{ state = 'VERIFIED'; verified_import_count = 3; modules = @(); assemblies = @(); commands = @(); native_modules = @() }
+            import_attempts = 3
+        }
+        $state = [PSCustomObject]@{
+            RepositoryRoot = $repo; PowerShellRoot = $powerShellRoot; ModuleRoot = $moduleRoot; ImportOrder = @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
+            ExpectedModuleManifestPaths = $expectedModulePaths; OpenFiles = $openFiles.ToArray(); DirectoryFences = $directoryFences; RuntimeDistribution = $runtimeDistribution; ImportAttempts = $importAttempts
+            AuthorityReference = $admission.authority_reference; ProfileReference = $admission.profile_reference; Admission = $admission; Startup = $admission.startup
+        }
+        $global:D32PowerShellModuleAuthorityState = $state
+        $moduleInfos = @(Microsoft.PowerShell.Core\Get-Module)
+        foreach ($role in $roles) {
+            $matches = @($moduleInfos | Where-Object { [string]$_.Name -ceq [string]$role.Name })
+            if ($matches.Count -ne 1 -or [string]$matches[0].Path -cnotin $expectedModulePaths[[string]$role.Name]) {
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: imported module identity is missing, duplicated, or not exact: $($role.Name)"
+            }
+            $admission.import_verification.modules += [ordered]@{ name = [string]$matches[0].Name; path = [IO.Path]::GetFullPath([string]$matches[0].Path); version = [string]$matches[0].Version }
+        }
+        $assemblies = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($assembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+            $location = ''
+            try { $location = [IO.Path]::GetFullPath([string]$assembly.Location) } catch { continue }
+            foreach ($moduleRecord in $closureRecords) {
+                foreach ($fileRecord in $moduleRecord.files) {
+                    if ([StringComparer]::OrdinalIgnoreCase.Equals($location, [string]$fileRecord.path)) {
+                        $assemblies[$location] = [ordered]@{ path = $location; sha256 = [string]$fileRecord.sha256; bytes = [Int64]$fileRecord.bytes; volume_serial_hex = [string]$fileRecord.volume_serial_hex; file_id_hex = [string]$fileRecord.file_id_hex }
+                    }
+                }
+            }
+        }
+        $admission.import_verification.assemblies = @($assemblies.Values)
+        foreach ($assemblyPath in (Get-D32PowerShellAuthorityFixedImportAssemblyPaths -PowerShellRoot $powerShellRoot)) {
+            if (-not $assemblies.ContainsKey([IO.Path]::GetFullPath([string]$assemblyPath))) {
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: a fixed RootModule/NestedModule/RequiredAssembly did not load from its admitted closure: $assemblyPath"
+            }
+        }
+        $nativeEvidence = [System.Collections.Generic.List[object]]::new()
+        $runtimeFilePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($runtimeFile in $runtimeDistribution.files) { [void]$runtimeFilePaths.Add([string]$runtimeFile.path) }
+        foreach ($nativePath in $postImportResolver.NativeModulePaths) {
+            if (Test-D32PowerShellAuthorityPathWithin -Child ([string]$nativePath) -Parent $powerShellRoot) {
+                if (-not $runtimeFilePaths.Contains([string]$nativePath)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: loaded native module is absent from pinned full distribution inventory: $nativePath" }
+                $nativeEvidence.Add([ordered]@{ path = [string]$nativePath; source = 'PSHOME_DISTRIBUTION' })
+            }
+            elseif (Test-D32PowerShellAuthorityPathWithin -Child ([string]$nativePath) -Parent ([string]$env:SystemRoot)) {
+                $nativeEvidence.Add([ordered]@{ path = [string]$nativePath; source = 'WINDOWS_OS' })
+            }
+            else { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: loaded native module escaped the admitted resolver domain: $nativePath" }
+        }
+        $admission.import_verification.native_modules = @($nativeEvidence.ToArray())
+        Assert-D32PowerShellModuleAdmissionCurrent -State $state
+        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $admission -CandidateSha $CallerCandidateSha -Repository $repo)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: generated shared module-admission record failed its strict self-validation' }
+        $global:D32PowerShellModuleImportAttempts = $importAttempts
+        return $admission
     }
-    Assert-D32PowerShellAuthorityModuleInventory -ModuleRoot $moduleRoot
-    $global:D32PowerShellModuleAuthorityState = [PSCustomObject]@{
-        PowerShellRoot = $powerShellRoot
-        ModuleRoot = $moduleRoot
-        ProfileSha256 = $profileSha256
-        ModuleNames = @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility', 'CimCmdlets')
+    catch {
+        $global:D32PowerShellModuleAuthorityState = $null
+        $global:D32PowerShellModuleImportAttempts = $importAttempts
+        foreach ($file in $openFiles) { if ($null -ne $file.Stream -and -not $file.Stream.SafeFileHandle.IsClosed) { $file.Stream.Dispose() } }
+        foreach ($directory in $directoryFences.Values) { if ($null -ne $directory.Handle -and -not $directory.Handle.IsClosed) { $directory.Handle.Dispose() } }
+        throw
     }
-    return $global:D32PowerShellModuleAuthorityState
 }

@@ -7,6 +7,8 @@ param(
     [Alias('ExpectedCandidateSha')][string]$Phase0ExpectedCandidateSha,
     [Alias('ToolchainProfilePath')][string]$Phase0ToolchainProfilePath,
     [Alias('ExpectedToolchainProfileSha256')][string]$Phase0ExpectedToolchainProfileSha256,
+    [string]$Phase0PowerShellModuleAuthorityPath,
+    [string]$Phase0ExpectedPowerShellModuleAuthoritySha256,
     [Alias('PinnedGitPath')][string]$Phase0PinnedGitPath,
     [Alias('PinnedGitSha256')][string]$Phase0PinnedGitSha256,
     [string]$Phase0VendoredProtocAuthorityPath,
@@ -26,7 +28,11 @@ param(
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
 $null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $Phase0ToolchainProfilePath `
     -CallerExpectedProfileSha256 $Phase0ExpectedToolchainProfileSha256 `
-    -LocalSelfTestOnly:$Phase0SelfTest
+    -CallerModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath `
+    -CallerExpectedModuleAuthoritySha256 $Phase0ExpectedPowerShellModuleAuthoritySha256 `
+    -CallerCandidateSha $Phase0ExpectedCandidateSha -CallerRepository $Phase0RepoRoot `
+    -CallerGitPath $Phase0PinnedGitPath -CallerGitSha256 $Phase0PinnedGitSha256 `
+    -EntryScriptPath $PSCommandPath -LocalSelfTestOnly:$Phase0SelfTest
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -38,8 +44,8 @@ $script:D32Phase0ScriptRoot = Split-Path -Parent $script:D32Phase0ScriptPath
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-h7c-git-child-authority.ps1')
 . (Join-Path $script:D32Phase0ScriptRoot 'd32-test-inventory-authority.ps1')
 
-$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V7'
-$script:D32Phase0SchemaVersion = 7
+$script:D32Phase0Type = 'D32_PHASE0_MATRIX_RECORD_V8'
+$script:D32Phase0SchemaVersion = 8
 $script:D32Phase0FixtureBuildJobs = 4
 $script:D32Phase0FixtureBuildTimeoutSeconds = 28800
 $script:D32Phase0RequiredCommandTimeoutSeconds = 14400
@@ -1605,9 +1611,9 @@ function Test-D32Phase0FixtureBuildProvenance {
     $raw = [IO.File]::ReadAllText($expectedSidecar, [Text.Encoding]::UTF8)
     if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar has duplicate or invalid JSON keys' }
     $document = $raw | ConvertFrom-D32Phase0Json
-    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
-    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 6 -or
-        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V6' -or
+    $topFields = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path', 'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex', 'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch', 'powershell_module_admission')
+    if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields) -or -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 7 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V7' -or
         $document.candidate_sha -isnot [string] -or $document.candidate_sha -cne $ExpectedCandidateSha -or
         $document.source_repo -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.source_repo -Right $Repository) -or
         $document.fixture_manifest_path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.fixture_manifest_path -Right $ManifestPath) -or
@@ -1615,6 +1621,9 @@ function Test-D32Phase0FixtureBuildProvenance {
         $document.fixture_manifest_volume_serial_hex -isnot [string] -or $document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $document.fixture_manifest_file_id_hex -isnot [string] -or $document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         -not (Test-D32Phase0Integer -Value $document.fixture_manifest_bytes -Positive)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar schema/candidate/source/manifest binding is invalid' }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission)) {
+        throw 'PHASE0_FIXTURE_BLOCKED: fixture provenance does not bind a current independently pinned PowerShell module admission'
+    }
     Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
     if ($null -ne $script:D32Phase0FixtureBuildCapacity -and
         (ConvertTo-Json -InputObject $document.fixture_build_budget -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $script:D32Phase0FixtureBuildCapacity -Depth 5 -Compress)) {
@@ -1650,6 +1659,12 @@ function Test-D32Phase0FixtureBuildProvenance {
     }
     if ($environment.run_id -cnotmatch '^[0-9a-f]{32}$') { throw 'PHASE0_FIXTURE_BLOCKED: fixture sidecar run_id must be a lowercase 32-hex fresh-run identifier' }
     if (-not (Test-D32ProfilePathEqual -Left $environment.toolchain_profile_path -Right $ValidatedProfile.ProfilePath) -or $environment.toolchain_profile_sha256 -cne $ValidatedProfile.Digest -or
+        -not (Test-D32PowerShellModuleAdmissionProfileBinding -Document $document.powershell_module_admission -ExpectedProfileReference ([ordered]@{
+                    path = [string]$ValidatedProfile.ProfilePath; sha256 = [string]$ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes
+                    volume_serial_hex = [string]$ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex
+                })) -or
+        -not (Test-D32ProfilePathEqual -Left $document.powershell_module_admission.profile_reference.path -Right $environment.toolchain_profile_path) -or
+        $document.powershell_module_admission.profile_reference.sha256 -cne $environment.toolchain_profile_sha256 -or
         $environment.target_triple -cne [string]$ValidatedProfile.Profile.target_triple -or $environment.env_policy -cne [string]$ValidatedProfile.Profile.env_policy -or
         $environment.cargo_policy -cne [string]$ValidatedProfile.Profile.cargo_policy -or $environment.offline_after_fetch -isnot [bool] -or -not $environment.offline_after_fetch) { throw 'PHASE0_FIXTURE_BLOCKED: fixture sidecar profile/target/policy binding differs from current caller-pinned profile' }
     foreach ($pathField in @('cargo_home', 'temp_root')) {
@@ -1947,11 +1962,11 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
     if (-not (Test-D32ProfileNoReparsePath -Path $root) -or (Test-D32ProfilePathWithin -Child $root -Parent $Repository) -or
         (Test-D32ProfilePathWithin -Child $Repository -Parent $root)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery EvidenceRoot must be external, canonical, and non-reparse' }
     $fields = @('schema_version', 'record_type', 'status', 'gate_authority', 'runner_process_id', 'candidate_sha', 'source_repo', 'evidence_root_identity', 'owner_marker',
-        'run_id', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc', 'storage', 'fetches', 'inventory_commands', 'test_inventory',
+        'run_id', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc', 'storage', 'fetches', 'inventory_commands', 'test_inventory', 'powershell_module_admission',
         'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean')
     if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $fields) -or
-        -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 1 -or
-        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_TEST_INVENTORY_DISCOVERY_V1' -or
+        -not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne 2 -or
+        $document.record_type -isnot [string] -or $document.record_type -cne 'D32_TEST_INVENTORY_DISCOVERY_V2' -or
         $document.status -isnot [string] -or $document.status -cne 'COMPLETE_FOR_COORDINATOR_REVIEW' -or
         $document.gate_authority -isnot [string] -or $document.gate_authority -cne 'NONE' -or
         -not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive) -or
@@ -1962,6 +1977,11 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
         $document.run_id -isnot [string] -or $document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
         $document.fetches -isnot [Array] -or $document.fetches.Count -ne 3 -or
         $document.inventory_commands -isnot [Array] -or $document.inventory_commands.Count -ne 6) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: strict V1 schema/status/candidate/process/list inventory mismatch' }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $document.powershell_module_admission -ExpectedProcessId ([Int64]$document.runner_process_id)) -or
+        -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $document.powershell_module_admission -ProfileRecord $document.toolchain_profile)) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery does not bind a current independently pinned PowerShell module admission'
+    }
     $discoveryStart = [DateTimeOffset]::MinValue
     $discoveryEnd = [DateTimeOffset]::MinValue
     if ($document.started_at_utc -isnot [string] -or -not [DateTimeOffset]::TryParse([string]$document.started_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$discoveryStart) -or
@@ -2186,10 +2206,15 @@ function Test-D32Phase0MatrixRecord {
         $raw = [IO.File]::ReadAllText($recordFull, [Text.Encoding]::UTF8)
         if (Test-D32Phase0JsonDuplicateKeys -Json $raw) { throw 'Phase0 record has duplicate object keys or invalid JSON structure' }
         $document = $raw | ConvertFrom-D32Phase0Json
-        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $topFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'powershell_module_admission', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
         if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw "Phase0 record schema_version must be the supported JSON integer version $($script:D32Phase0SchemaVersion)" }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
+        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+            [Int64]$document.powershell_module_admission.runner_process.process_id -ne [Int64]$document.runner_process_id -or
+            -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $document.powershell_module_admission -ProfileRecord $document.toolchain_profile)) {
+            throw 'Phase0 record must bind its actual runner process and exact caller-pinned PowerShell module admission'
+        }
         Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
         if (-not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive)) { throw 'Phase0 runner_process_id must be a positive JSON integer' }
         foreach ($name in @('candidate_sha', 'source_repo', 'output_root', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'phase0_scope')) { if ($document.$name -isnot [string]) { throw "Phase0 $name must be a JSON string" } }
@@ -2204,6 +2229,10 @@ function Test-D32Phase0MatrixRecord {
 
         $profile = Test-D32BuildToolchainProfile -ProfilePath $ToolchainProfilePath -ExpectedSha256 $ExpectedToolchainProfileSha256 -Repository $repo -EvidenceRoot $outputRoot
         if (-not $profile.IsValid) { throw "Phase0 pinned toolchain profile is not current: $($profile.Failure)" }
+        if (-not (Test-D32PowerShellModuleAdmissionProfileBinding -Document $document.powershell_module_admission -ExpectedProfileReference ([ordered]@{
+                    path = [string]$profile.ProfilePath; sha256 = [string]$profile.Digest; bytes = [Int64]$profile.Identity.Bytes
+                    volume_serial_hex = [string]$profile.Identity.VolumeSerialHex; file_id_hex = [string]$profile.Identity.FileIdHex
+                }))) { throw 'Phase0 producer admission Profile reference differs from the independently revalidated caller-pinned Profile V2 opened identity' }
         if (-not (Test-D32Phase0ExactProperties -Object $document.evidence_root_identity -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
             $document.evidence_root_identity.path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left $document.evidence_root_identity.path -Right $outputRoot) -or
             $document.evidence_root_identity.volume_serial_hex -isnot [string] -or $document.evidence_root_identity.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
@@ -3266,6 +3295,7 @@ function Invoke-D32Phase0Matrix {
         final_candidate_sha = $final.Head
         final_clean = $true
         powershell = $profile.Profile.powershell
+        powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
         toolchain_profile = [ordered]@{
             path = $profile.ProfilePath
             sha256 = $profile.Digest
@@ -4070,7 +4100,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
 
     & $add 'fixed inventories enumerate the approved ten D31 deferrals' ($script:D32Phase0DeferredVita.Count + $script:D32Phase0DeferredHost.Count -eq 10)
     & $add 'provider and hardware cases remain explicit not-run cases' ($script:D32Phase0IgnoredVita.Count -eq 4 -and $script:D32Phase0IgnoredHost.Count -eq 3)
-    & $add 'Phase0 record constants label local-only V7 evidence with independently pinned inventory and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V7' -and $script:D32Phase0SchemaVersion -eq 7 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
+    & $add 'Phase0 record constants label local-only V8 evidence with independently pinned inventory and pending bundle hashes' ($script:D32Phase0Type -ceq 'D32_PHASE0_MATRIX_RECORD_V8' -and $script:D32Phase0SchemaVersion -eq 8 -and $script:D32Phase0Scope -like 'local-fixture-and-test-matrix-only*' -and $script:D32Phase0BundleHashes -ceq 'PENDING')
 
     $inventoryPackages = @(Get-D32TestInventoryExpectedCommands -Profile ([PSCustomObject]@{
         target_triple = 'x86_64-pc-windows-msvc'
@@ -4720,9 +4750,9 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $compactDirectoryCollisionRejected = $true }
         & $add 'fixed compact Cargo-home child refuses an existing-directory collision' $compactDirectoryCollisionRejected
         $schemaRejectPath = Join-Path $selfTestRoot 'D32-PHASE0-MATRIX.json'
-        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
+        $phase0SchemaFields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'powershell_module_admission', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         foreach ($phase0SchemaCase in @(
-                [PSCustomObject]@{ Version = 6; Type = 'D32_PHASE0_MATRIX_RECORD_V6'; Name = 'prior V6' },
+                [PSCustomObject]@{ Version = 7; Type = 'D32_PHASE0_MATRIX_RECORD_V7'; Name = 'prior V7' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_PHASE0_MATRIX_RECORD_V99'; Name = 'unknown V99' }
             )) {
             $phase0SchemaDocument = [ordered]@{}
@@ -4732,7 +4762,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
             [IO.File]::WriteAllText($schemaRejectPath, (ConvertTo-Json -InputObject $phase0SchemaDocument -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
             $phase0SchemaDigest = Get-D32ProfileFileSnapshot -Path $schemaRejectPath
             $phase0SchemaResult = Test-D32Phase0MatrixRecord -RecordPath $schemaRejectPath -ExpectedRecordSha256 $phase0SchemaDigest.Sha256 -Repository $testRepository -ExpectedCandidateSha $candidate -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest -GitPath 'C:\d32-phase0-selftest\git.exe' -GitSha256 ('b' * 64)
-            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 7*')
+            & $add "Phase0 record reader rejects $($phase0SchemaCase.Name) before evidence parsing" (-not $phase0SchemaResult.IsValid -and $phase0SchemaResult.Failure -like '*schema_version must be the supported JSON integer version 8*')
         }
         [IO.File]::Delete($schemaRejectPath)
         $manifestPath = Join-Path $fixtureOutputRoot 'fixture-manifest.json'
@@ -4948,7 +4978,10 @@ function Test-D32Phase0MatrixRecordSelfTest {
         if (-not (Test-D32ProfileNoReparsePath -Path $tauriSourceAttesterPath)) { throw 'PHASE0_SELFTEST_BLOCKED: exact source-patch facts generator is missing or reparse-backed' }
         $tauriSourceAuthorityPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
         $tauriSourceFactsLines = @(& $tauriSourceAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $candidate `
-            -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest)
+            -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest `
+            -Repository $testRepository -PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath `
+            -ExpectedPowerShellModuleAuthoritySha256 $Phase0ExpectedPowerShellModuleAuthoritySha256 `
+            -PinnedGitPath $Phase0PinnedGitPath -PinnedGitSha256 $Phase0PinnedGitSha256)
         if ($tauriSourceFactsLines.Count -ne 1 -or $tauriSourceFactsLines[0] -isnot [string]) { throw 'PHASE0_SELFTEST_BLOCKED: source-patch facts generator did not emit exactly one JSON document' }
         $tauriSourceFacts = ConvertFrom-D32Phase0Json -Json ([string]$tauriSourceFactsLines[0])
         $tauriSourceAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts
@@ -5057,8 +5090,8 @@ function Test-D32Phase0MatrixRecordSelfTest {
             }
         }
         $sidecar = [ordered]@{
-            schema_version = 6
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
+            schema_version = 7
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V7'
             candidate_sha = $candidate
             source_repo = $testRepository
             fixture_manifest_path = $manifestSnapshot.Path
@@ -5096,14 +5129,15 @@ function Test-D32Phase0MatrixRecordSelfTest {
                 file_id_hex = ('0' * 32)
             }
             tauri_macros_source_patch = $tauriSourceAuthority.Reference
+            powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
         }
         $writeSidecar = { param($value) [IO.File]::WriteAllText($sidecarPath, (ConvertTo-Json -InputObject $value -Depth 12), [Text.UTF8Encoding]::new($false)) }.GetNewClosure()
         & $writeSidecar $sidecar
         try {
             $validSidecar = Test-D32Phase0FixtureBuildProvenance -SidecarPath $sidecarPath -ManifestPath $manifestPath -Repository $testRepository -OutputRoot $fixtureOutputRoot -ExpectedCandidateSha $candidate -ExpectedRunnerProcessId $PID -ValidatedProfile $fakeProfile
-            & $add 'fixture build provenance v6 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V6')
+            & $add 'fixture build provenance v7 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' ($validSidecar.Document.record_type -ceq 'D32_FIXTURE_BUILD_PROVENANCE_V7')
         }
-        catch { & $add 'fixture build provenance v6 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' $false $_.Exception.Message }
+        catch { & $add 'fixture build provenance v7 accepts exact owner-bound compact storage, budget, and manifest/profile/command/event evidence' $false $_.Exception.Message }
 
         $h7GitPath = 'E:\Program Files\Git\mingw64\bin\git.exe'
         $h7GitSnapshot = Get-D32ProfileFileSnapshot -Path $h7GitPath
@@ -5997,7 +6031,7 @@ if (-not $PSBoundParameters.ContainsKey('Phase0InventoryListTimeoutSeconds') -or
     exit 2
 }
 if ([String]::IsNullOrWhiteSpace($Phase0TestInventoryBaselinePath) -or $Phase0ExpectedTestInventoryBaselineSha256 -cnotmatch '^[0-9a-f]{64}$') {
-    Write-Output 'D32 Phase0: BLOCKED — formal caller must independently pin the external D32_TEST_INVENTORY_BASELINE_V1 path and SHA before EvidenceRoot claim'
+    Write-Output 'D32 Phase0: BLOCKED — formal caller must independently pin the external D32_TEST_INVENTORY_BASELINE_V2 path and SHA before EvidenceRoot claim'
     exit 2
 }
 try {

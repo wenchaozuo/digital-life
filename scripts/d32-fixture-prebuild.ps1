@@ -47,6 +47,8 @@ param(
     [string]$ExpectedCandidateSha,
     [string]$ToolchainProfilePath,
     [string]$ExpectedToolchainProfileSha256,
+    [string]$PowerShellModuleAuthorityPath,
+    [string]$ExpectedPowerShellModuleAuthoritySha256,
     [AllowNull()][object]$Phase0OwnerBinding,
     [string]$VendoredProtocAuthorityPath,
     [string]$ExpectedVendoredProtocAuthoritySha256,
@@ -63,6 +65,13 @@ param(
     [switch]$D32LauncherLibraryOnly,
     [switch]$SelfTest
 )
+
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+    -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -CallerCandidateSha $ExpectedCandidateSha -CallerRepository $RepoRoot -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
+    -EntryScriptPath $PSCommandPath -LocalSelfTestOnly:$SelfTest
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -6194,18 +6203,24 @@ function Assert-D32FixtureBuildProvenanceShape {
 
     $expected = @('schema_version', 'record_type', 'candidate_sha', 'source_repo', 'fixture_manifest_path',
         'fixture_manifest_sha256', 'fixture_manifest_bytes', 'fixture_manifest_volume_serial_hex',
-        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch')
+        'fixture_manifest_file_id_hex', 'environment', 'storage', 'process_traces', 'fixture_build_budget', 'vendored_protoc_run_grant', 'tauri_macros_source_patch', 'powershell_module_admission')
     $actual = @($Document.Keys | ForEach-Object { [string]$_ })
     if ($actual.Count -ne $expected.Count -or
         @($actual | Where-Object { $_ -notin $expected }).Count -ne 0 -or
         @($expected | Where-Object { $_ -notin $actual }).Count -ne 0 -or
-        [int]$Document.schema_version -ne 6 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V6' -or
+        [int]$Document.schema_version -ne 7 -or $Document.record_type -cne 'D32_FIXTURE_BUILD_PROVENANCE_V7' -or
         [string]$Document.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Document.fixture_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [uint64]$Document.fixture_manifest_bytes -le 0 -or
         [string]$Document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         [string]$Document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar schema, version, manifest hash, bytes, or identity is invalid'
+    }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.powershell_module_admission -CandidateSha ([string]$Document.candidate_sha) -Repository ([string]$Document.source_repo)) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.powershell_module_admission.entry_script_path) -Right ([IO.Path]::Combine([string]$Document.source_repo, 'scripts', 'd32-fixture-prebuild.ps1'))) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.powershell_module_admission.profile_reference.path) -Right ([string]$Document.environment.toolchain_profile_path)) -or
+        $Document.powershell_module_admission.profile_reference.sha256 -cne [string]$Document.environment.toolchain_profile_sha256) {
+        throw 'FIXTURE_PROVENANCE_INVALID: fixture provenance must embed a strict current D32 PowerShell module admission'
     }
     Assert-D32FixtureBuildBudgetRecord -Document $Document.fixture_build_budget -ExpectedPhase0TimeoutSeconds 14400
     $grant = $Document.vendored_protoc_run_grant
@@ -8400,9 +8415,12 @@ public static class D32DebugSelfTestLauncher
             })
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
+        $fixtureSyntheticAdmission = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($global:D32PowerShellModuleAuthorityState.Admission))
+        $fixtureSyntheticAdmission.candidate_sha = '0123456789abcdef0123456789abcdef01234567'
+        $fixtureSyntheticAdmission.source_repo = $fakeRepo
         $provenanceDocument = [ordered]@{
-            schema_version = 6
-            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
+            schema_version = 7
+            record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V7'
             candidate_sha = '0123456789abcdef0123456789abcdef01234567'
             source_repo = $fakeRepo
             fixture_manifest_path = $sample
@@ -8435,6 +8453,7 @@ public static class D32DebugSelfTestLauncher
                 volume_serial_hex = ('0' * 16)
                 file_id_hex = ('1' * 32)
             }
+            powershell_module_admission = $fixtureSyntheticAdmission
         }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
         $oldTraceProvenance = [ordered]@{}
@@ -8475,7 +8494,7 @@ public static class D32DebugSelfTestLauncher
         }
         catch { if ($_.Exception.Message -notlike 'FIXTURE_PROVENANCE_INVALID:*') { throw } }
         foreach ($oldProvenanceVersion in @(
-                [PSCustomObject]@{ Version = 5; Type = 'D32_FIXTURE_BUILD_PROVENANCE_V5'; Name = 'previous V5' },
+                [PSCustomObject]@{ Version = 6; Type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'; Name = 'previous V6' },
                 [PSCustomObject]@{ Version = 99; Type = 'D32_FIXTURE_BUILD_PROVENANCE_V99'; Name = 'unknown V99' }
             )) {
             $versionedProvenance = [ordered]@{}
@@ -9637,8 +9656,8 @@ $processTraceRecords = @($phaseEvidence | ForEach-Object {
     }
 })
 $fixtureBuildProvenance = [ordered]@{
-    schema_version = 6
-    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V6'
+    schema_version = 7
+    record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V7'
     candidate_sha = $candidateSha
     source_repo = $RepoRoot
     fixture_manifest_path = $ManifestPath
@@ -9652,6 +9671,7 @@ $fixtureBuildProvenance = [ordered]@{
     fixture_build_budget = $Phase0FixtureBuildCapacity
     vendored_protoc_run_grant = $script:D32VendoredProtocRunGrant.Reference
     tauri_macros_source_patch = $script:D32TauriMacrosSourcePatchAuthority.Reference
+    powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
 }
 $fixtureBuildProvenanceArtifact = $null
 if (Test-D32FixtureBuildModeEmitsPhase0Provenance -Mode $fixtureBuildMode) {

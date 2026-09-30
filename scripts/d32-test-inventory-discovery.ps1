@@ -5,6 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
     [Parameter(Mandatory = $true)][string]$ToolchainProfilePath,
     [Parameter(Mandatory = $true)][string]$ExpectedToolchainProfileSha256,
+    [Parameter(Mandatory = $true)][string]$PowerShellModuleAuthorityPath,
+    [Parameter(Mandatory = $true)][string]$ExpectedPowerShellModuleAuthoritySha256,
     [Parameter(Mandatory = $true)][string]$PinnedGitPath,
     [Parameter(Mandatory = $true)][string]$PinnedGitSha256,
     [Parameter(Mandatory = $true)][string]$TauriMacrosSourceAuthorityPath,
@@ -18,18 +20,27 @@ param(
 
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
 $null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
-    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 -LocalSelfTestOnly:$LoaderSelfTest
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+    -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -CallerCandidateSha $ExpectedCandidateSha -CallerRepository $Repository -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
+    -EntryScriptPath $PSCommandPath -LocalSelfTestOnly:$LoaderSelfTest
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact runner script location is required' }
 $scriptRoot = Split-Path -Parent ([IO.Path]::GetFullPath($PSCommandPath))
-. (Join-Path $scriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly
+. (Join-Path $scriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly `
+    -Phase0ToolchainProfilePath $ToolchainProfilePath -Phase0ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256 `
+    -Phase0PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -Phase0ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -Phase0ExpectedCandidateSha $ExpectedCandidateSha -Phase0RepoRoot $Repository -Phase0PinnedGitPath $PinnedGitPath -Phase0PinnedGitSha256 $PinnedGitSha256
 $preflightLibraryPath = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
 if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
     throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact d32-preflight.ps1 helper library is missing or reparse-backed'
 }
-. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly
+. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha `
+    -ToolchainProfilePath $ToolchainProfilePath -ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256 `
+    -PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -TrustedGitPath $PinnedGitPath -TrustedGitSha256 $PinnedGitSha256
 $preflightDependencyFailures = @(Get-D32Phase0PreflightDependencyFailures -PreflightLibraryPath $preflightLibraryPath)
 if ($preflightDependencyFailures.Count -gt 0) {
     throw "TEST_INVENTORY_DISCOVERY_BLOCKED: preflight helper library is incomplete or shadowed ($($preflightDependencyFailures -join ', '))"
@@ -313,8 +324,8 @@ $storage = [ordered]@{
 }
 $toolchainProfile = Get-D32TestInventoryProfileRecord -ValidatedProfile $profile
 $record = [ordered]@{
-    schema_version = 1
-    record_type = 'D32_TEST_INVENTORY_DISCOVERY_V1'
+    schema_version = 2
+    record_type = 'D32_TEST_INVENTORY_DISCOVERY_V2'
     status = 'COMPLETE_FOR_COORDINATOR_REVIEW'
     gate_authority = 'NONE'
     runner_process_id = [int]$PID
@@ -336,6 +347,7 @@ $record = [ordered]@{
         package_digests = @($packageDigests.ToArray())
         category_counts = $categoryCounts
     }
+    powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
     started_at_utc = $startedAtUtc
     completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
     final_candidate_sha = $final.Head

@@ -12,8 +12,32 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{64}$')]
-    [string]$ExpectedToolchainProfileSha256
+    [string]$ExpectedToolchainProfileSha256,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Repository,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PowerShellModuleAuthorityPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$ExpectedPowerShellModuleAuthoritySha256,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PinnedGitPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$PinnedGitSha256
 )
+
+. ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
+    -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
+    -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
+    -CallerCandidateSha $CandidateSha -CallerRepository $Repository -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
+    -EntryScriptPath $PSCommandPath
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

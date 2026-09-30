@@ -3,290 +3,192 @@
 param()
 
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
-$null = Initialize-D32PowerShellModuleAuthority -LocalSelfTestOnly
-
+$global:PSModuleAutoLoadingPreference = 'None'
+$env:PSModulePath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'Modules'))
+$global:D32PowerShellModuleImportAttempts = 0
+$global:D32PowerShellModuleAuthorityState = $null
+$runner = [IO.Path]::GetFullPath($PSCommandPath)
+$null = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $runner
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$scriptRoot = [IO.Path]::GetFullPath($PSScriptRoot)
-$repository = [IO.Path]::GetFullPath((Split-Path -Parent $scriptRoot))
-$phase0Script = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-phase0-matrix.ps1'))
-$preflightScript = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
-$discoveryScript = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-test-inventory-discovery.ps1'))
-$baselineScript = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-test-inventory-baseline.ps1'))
-$pwshImage = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
-foreach ($path in @($phase0Script, $preflightScript, $discoveryScript, $baselineScript, $pwshImage)) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "SELFTEST_BLOCKED: required PowerShell discovery loader image is missing: $path" }
+$testCount = 0
+$failures = [System.Collections.Generic.List[string]]::new()
+function Assert-D32ModuleFreeSelfTest {
+    param([bool]$Condition, [string]$Name)
+    $script:testCount++
+    if (-not $Condition) { $script:failures.Add($Name) }
+}
+function Get-D32ExpectedModuleFreeRejection {
+    param([scriptblock]$Action)
+    try { & $Action; return '' }
+    catch { return [string]$_.Exception.Message }
 }
 
-function Invoke-D32DiscoveryLoaderChild {
-    param(
-        [Parameter(Mandatory = $true)][string]$RunnerScript,
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$PSModulePathOverride,
-        [Parameter(Mandatory = $true)][string]$MarkerPath
-    )
+$validArguments = [string[]]@('pwsh.exe','-NoLogo','-NoProfile','-NonInteractive','-File',$runner)
+$startup = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $runner -ArgumentVector $validArguments
+Assert-D32ModuleFreeSelfTest -Condition ([StringComparer]::OrdinalIgnoreCase.Equals($startup.FileOperand, $runner) -and $startup.Switches.Count -eq 3) -Name 'finite direct NoProfile -File startup is accepted'
 
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $pwshImage
-    $startInfo.WorkingDirectory = $repository
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.Environment['PSModulePath'] = $PSModulePathOverride
-    $startInfo.Environment['D32_MODULE_AUTHORITY_SELFTEST_MARKER'] = $MarkerPath
-    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $RunnerScript) + $Arguments) {
-        [void]$startInfo.ArgumentList.Add([string]$argument)
-    }
-
-    $process = [Diagnostics.Process]::new()
-    try {
-        $process.StartInfo = $startInfo
-        if (-not $process.Start()) { throw 'SELFTEST_BLOCKED: fresh PowerShell child did not start' }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(60000)) {
-            try { $process.Kill() } catch { }
-            throw 'SELFTEST_FAILED: fresh PowerShell discovery loader exceeded 60 seconds'
-        }
-        $process.WaitForExit()
-        return [PSCustomObject]@{
-            ExitCode = [int]$process.ExitCode
-            StdOut = [string]$stdoutTask.GetAwaiter().GetResult()
-            StdErr = [string]$stderrTask.GetAwaiter().GetResult()
-        }
-    }
-    finally { $process.Dispose() }
+$badStartupCases = @(
+    [PSCustomObject]@{ Name = 'ConfigurationFile'; Args = [string[]]@('pwsh.exe','-NoProfile','-ConfigurationFile','evil.pssc','-File',$runner) },
+    [PSCustomObject]@{ Name = 'Command'; Args = [string[]]@('pwsh.exe','-NoProfile','-Command','Import-Module evil') },
+    [PSCustomObject]@{ Name = 'EncodedCommand'; Args = [string[]]@('pwsh.exe','-NoProfile','-EncodedCommand','SQBFAFgA') },
+    [PSCustomObject]@{ Name = 'CommandWithArgs'; Args = [string[]]@('pwsh.exe','-NoProfile','-CommandWithArgs','Import-Module evil') },
+    [PSCustomObject]@{ Name = 'ambiguous switch'; Args = [string[]]@('pwsh.exe','-NoProfile','-c','Import-Module evil','-File',$runner) },
+    [PSCustomObject]@{ Name = 'wrong File operand'; Args = [string[]]@('pwsh.exe','-NoProfile','-File',[IO.Path]::Combine($PSScriptRoot,'d32-preflight.ps1')) },
+    [PSCustomObject]@{ Name = 'missing NoProfile'; Args = [string[]]@('pwsh.exe','-File',$runner) },
+    [PSCustomObject]@{ Name = 'duplicate NoProfile'; Args = [string[]]@('pwsh.exe','-NoProfile','-NoProfile','-File',$runner) }
+)
+foreach ($case in $badStartupCases) {
+    $message = Get-D32ExpectedModuleFreeRejection { Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $runner -ArgumentVector $case.Args }
+    Assert-D32ModuleFreeSelfTest -Condition ($message -like 'POWERSHELL_MODULE_AUTHORITY_BLOCKED:*' -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name "startup rejects $($case.Name) before module import"
 }
 
-$tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
-$testRoot = [IO.Path]::GetFullPath((Join-Path $tempBase ('D32-inventory-module-authority-selftest-' + [Guid]::NewGuid().ToString('N'))))
-if (Test-Path -LiteralPath $testRoot) { throw 'SELFTEST_BLOCKED: generated temporary module-authority fixture path already exists' }
-[void][IO.Directory]::CreateDirectory($testRoot)
+$missingPinCases = @(
+    [PSCustomObject]@{ Name = 'ordinary runner'; SelfTest = $false },
+    [PSCustomObject]@{ Name = 'SelfTest'; SelfTest = $true },
+    [PSCustomObject]@{ Name = 'LoaderSelfTest'; SelfTest = $true },
+    [PSCustomObject]@{ Name = 'LibraryOnly'; SelfTest = $false }
+)
+foreach ($case in $missingPinCases) {
+    $global:D32PowerShellModuleImportAttempts = 0
+    $message = Get-D32ExpectedModuleFreeRejection {
+        Initialize-D32PowerShellModuleAuthority -EntryScriptPath $runner -LocalSelfTestOnly:$case.SelfTest
+    }
+    Assert-D32ModuleFreeSelfTest -Condition ($message -like 'POWERSHELL_MODULE_AUTHORITY_BLOCKED:*' -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name "$($case.Name) without independent pins records import_attempts=0"
+}
 
+$savedState = $global:D32PowerShellModuleAuthorityState
 try {
-    $ambientRoot = Join-Path $testRoot 'ambient-modules'
-    $utilityRoot = Join-Path $ambientRoot 'Microsoft.PowerShell.Utility'
-    $managementRoot = Join-Path $ambientRoot 'Microsoft.PowerShell.Management'
-    $coreRoot = Join-Path $ambientRoot 'Microsoft.PowerShell.Core'
-    $cimRoot = Join-Path $ambientRoot 'CimCmdlets'
-    [void][IO.Directory]::CreateDirectory($utilityRoot)
-    [void][IO.Directory]::CreateDirectory($managementRoot)
-    [void][IO.Directory]::CreateDirectory($coreRoot)
-    [void][IO.Directory]::CreateDirectory($cimRoot)
-    $utilityManifest = @'
-@{
-    RootModule = 'Microsoft.PowerShell.Utility.psm1'
-    ModuleVersion = '1.0.0'
-    GUID = 'd3200000-0000-4000-8000-000000000001'
-    FunctionsToExport = @('Select-Object')
-    CmdletsToExport = @()
-    AliasesToExport = @()
-    VariablesToExport = @()
+    $global:D32PowerShellModuleAuthorityState = [PSCustomObject]@{ Admission = [PSCustomObject]@{ candidate_sha = ('a' * 40) }; ImportAttempts = 0 }
+    $global:D32PowerShellModuleImportAttempts = 0
+    $message = Get-D32ExpectedModuleFreeRejection { Initialize-D32PowerShellModuleAuthority -EntryScriptPath $runner }
+    Assert-D32ModuleFreeSelfTest -Condition ($message -like 'POWERSHELL_MODULE_AUTHORITY_BLOCKED:*' -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'forged or stale global library-reuse state is rejected with zero imports'
 }
-'@
-    $managementManifest = @'
-@{
-    RootModule = 'Microsoft.PowerShell.Management.psm1'
-    ModuleVersion = '1.0.0'
-    GUID = 'd3200000-0000-4000-8000-000000000002'
-    FunctionsToExport = @('Split-Path')
-    CmdletsToExport = @()
-    AliasesToExport = @()
-    VariablesToExport = @()
+finally { $global:D32PowerShellModuleAuthorityState = $savedState }
+
+$duplicateJson = [System.Text.Json.JsonDocument]::Parse('{"schema_version":1,"schema_version":1}')
+try { $duplicateDetected = Test-D32PowerShellAuthorityJsonDuplicates -Element $duplicateJson.RootElement }
+finally { $duplicateJson.Dispose() }
+Assert-D32ModuleFreeSelfTest -Condition ($duplicateDetected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'module-free authority validator detects duplicate JSON keys'
+$exactFieldsJson = [System.Text.Json.JsonDocument]::Parse('{"a":1,"b":2}')
+$extraFieldsJson = [System.Text.Json.JsonDocument]::Parse('{"a":1,"b":2,"c":3}')
+$missingFieldsJson = [System.Text.Json.JsonDocument]::Parse('{"a":1}')
+try {
+    $exactFieldsAccepted = Test-D32PowerShellAuthorityJsonFields -Element $exactFieldsJson.RootElement -Expected @('a','b')
+    $extraFieldsRejected = -not (Test-D32PowerShellAuthorityJsonFields -Element $extraFieldsJson.RootElement -Expected @('a','b'))
+    $missingFieldsRejected = -not (Test-D32PowerShellAuthorityJsonFields -Element $missingFieldsJson.RootElement -Expected @('a','b'))
 }
-'@
-    $cimManifest = @'
-@{
-    RootModule = 'CimCmdlets.psm1'
-    ModuleVersion = '1.0.0'
-    GUID = 'd3200000-0000-4000-8000-000000000003'
-    FunctionsToExport = @('Get-CimInstance')
-    CmdletsToExport = @()
-    AliasesToExport = @()
-    VariablesToExport = @()
+finally { $exactFieldsJson.Dispose(); $extraFieldsJson.Dispose(); $missingFieldsJson.Dispose() }
+Assert-D32ModuleFreeSelfTest -Condition ($exactFieldsAccepted -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'strict JSON field validator accepts an exact record field set'
+Assert-D32ModuleFreeSelfTest -Condition ($extraFieldsRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'strict JSON field validator rejects unknown fields'
+Assert-D32ModuleFreeSelfTest -Condition ($missingFieldsRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'strict JSON field validator rejects missing fields'
+
+$manifestBytes = [Text.UTF8Encoding]::new($false).GetBytes("@{ RootModule = 'Exact.dll'; NestedModules = @('Nested.dll'); RequiredAssemblies = @('Required.dll') }")
+$manifest = Get-D32PowerShellAuthorityManifestData -Bytes $manifestBytes -ModuleName 'Synthetic'
+Assert-D32ModuleFreeSelfTest -Condition ($manifest.RootModule -ceq 'Exact.dll' -and $manifest.NestedModules.Count -eq 1 -and $manifest.RequiredAssemblies.Count -eq 1 -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'module-free literal-manifest parser binds exact root/nested/required-assembly relationships'
+$manifestNegativeCases = @(
+    [PSCustomObject]@{ Name = 'dynamic expression'; Text = "@{ RootModule = (Get-Date).ToString() }" },
+    [PSCustomObject]@{ Name = 'ModuleToProcess alias'; Text = "@{ ModuleToProcess = 'Legacy.psm1' }" },
+    [PSCustomObject]@{ Name = 'wildcard dependency'; Text = "@{ NestedModules = @('*.dll') }" },
+    [PSCustomObject]@{ Name = 'nonempty module prefix'; Text = "@{ Prefix = 'Shadow'; RootModule = 'Exact.dll' }" }
+)
+foreach ($case in $manifestNegativeCases) {
+    $manifestRejected = $false
+    try { $null = Get-D32PowerShellAuthorityManifestData -Bytes ([Text.UTF8Encoding]::new($false).GetBytes([string]$case.Text)) -ModuleName 'Synthetic' }
+    catch { $manifestRejected = $_.Exception.Message -like 'POWERSHELL_MODULE_AUTHORITY_BLOCKED:*' }
+    Assert-D32ModuleFreeSelfTest -Condition ($manifestRejected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name "module-free manifest parser rejects $($case.Name) before import"
 }
-'@
-    $coreManifest = @'
-@{
-    RootModule = 'Microsoft.PowerShell.Core.psm1'
-    ModuleVersion = '1.0.0'
-    GUID = 'd3200000-0000-4000-8000-000000000004'
-    FunctionsToExport = @('Get-Command', 'Get-Module', 'Import-Module')
-    CmdletsToExport = @()
-    AliasesToExport = @()
-    VariablesToExport = @()
+
+$legacyAdmission = [ordered]@{ record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V1'; schema_version = 1 }
+$v2MissingProofAdmission = [ordered]@{ record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V2'; schema_version = 2 }
+Assert-D32ModuleFreeSelfTest -Condition (-not (Test-D32PowerShellModuleAdmissionRecord -Document $legacyAdmission -CandidateSha ('a' * 40) -Repository $PSScriptRoot) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'prior shared admission V1 is rejected with zero imports'
+Assert-D32ModuleFreeSelfTest -Condition (-not (Test-D32PowerShellModuleAdmissionRecord -Document $v2MissingProofAdmission -CandidateSha ('a' * 40) -Repository $PSScriptRoot) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'V2 admission missing resolver/content fields is rejected with zero imports'
+$v2ExtraFieldAdmission = [ordered]@{ record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V2'; schema_version = 2; unrecognized = $true }
+$v2WrongVersionAdmission = [ordered]@{ record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V2'; schema_version = '2' }
+Assert-D32ModuleFreeSelfTest -Condition (-not (Test-D32PowerShellModuleAdmissionRecord -Document $v2ExtraFieldAdmission -CandidateSha ('a' * 40) -Repository $PSScriptRoot) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'V2 admission unknown fields are rejected with zero imports'
+Assert-D32ModuleFreeSelfTest -Condition (-not (Test-D32PowerShellModuleAdmissionRecord -Document $v2WrongVersionAdmission -CandidateSha ('a' * 40) -Repository $PSScriptRoot) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'V2 admission wrong schema-version type is rejected with zero imports'
+
+$safeTokenRecord = Get-D32PowerShellAuthorityCurrentToken
+Assert-D32ModuleFreeSelfTest -Condition ((Test-D32PowerShellAuthorityTokenRecord -Token $safeTokenRecord) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'current runner process token is non-elevated, non-system, below high integrity, and not impersonating'
+foreach ($unsafeToken in @(
+    [ordered]@{ is_elevated = $true; integrity_rid = 0x2000; is_system = $false; thread_impersonating = $false },
+    [ordered]@{ is_elevated = $false; integrity_rid = 0x3000; is_system = $false; thread_impersonating = $false },
+    [ordered]@{ is_elevated = $false; integrity_rid = 0x2000; is_system = $true; thread_impersonating = $false },
+    [ordered]@{ is_elevated = $false; integrity_rid = 0x2000; is_system = $false; thread_impersonating = $true }
+)) {
+    Assert-D32ModuleFreeSelfTest -Condition ((-not (Test-D32PowerShellAuthorityTokenRecord -Token $unsafeToken)) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic elevated/high-integrity/system/impersonated process token is rejected before import'
 }
-'@
-    $moduleBody = @'
-$marker = [Environment]::GetEnvironmentVariable('D32_MODULE_AUTHORITY_SELFTEST_MARKER')
-if (-not [String]::IsNullOrWhiteSpace($marker)) { [IO.File]::WriteAllText($marker, 'untrusted module initialization ran') }
-'@
-    $utilityBody = $moduleBody + "`nfunction Select-Object { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nExport-ModuleMember -Function Select-Object`n"
-    $managementBody = $moduleBody + "`nfunction Split-Path { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nExport-ModuleMember -Function Split-Path`n"
-    $cimBody = $moduleBody + "`nfunction Get-CimInstance { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nExport-ModuleMember -Function Get-CimInstance`n"
-    $coreBody = $moduleBody + "`nfunction Get-Command { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nfunction Get-Module { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nfunction Import-Module { throw 'D32_UNTRUSTED_MODULE_EXECUTED' }`nExport-ModuleMember -Function Get-Command,Get-Module,Import-Module`n"
-    [IO.File]::WriteAllText((Join-Path $utilityRoot 'Microsoft.PowerShell.Utility.psd1'), $utilityManifest, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $utilityRoot 'Microsoft.PowerShell.Utility.psm1'), $utilityBody, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $managementRoot 'Microsoft.PowerShell.Management.psd1'), $managementManifest, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $managementRoot 'Microsoft.PowerShell.Management.psm1'), $managementBody, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $cimRoot 'CimCmdlets.psd1'), $cimManifest, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $cimRoot 'CimCmdlets.psm1'), $cimBody, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $coreRoot 'Microsoft.PowerShell.Core.psd1'), $coreManifest, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $coreRoot 'Microsoft.PowerShell.Core.psm1'), $coreBody, [Text.UTF8Encoding]::new($false))
 
-    $pwshBytes = [IO.File]::ReadAllBytes($pwshImage)
-    $pwshSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($pwshBytes)).ToLowerInvariant()
-    $profileDocument = [ordered]@{
-        schema_version = 2
-        profile_type = 'D32_BUILD_TOOLCHAIN_PROFILE_V2'
-        powershell_root = [IO.Path]::GetFullPath($PSHOME)
-        powershell = [ordered]@{
-            name = 'pwsh.exe'
-            path = $pwshImage
-            sha256 = $pwshSha256
-            bytes = [Int64]$pwshBytes.LongLength
-        }
-    }
-    $profilePath = Join-Path $testRoot 'caller-profile-fixture.json'
-    $profileJson = ConvertTo-Json -InputObject $profileDocument -Depth 6 -Compress
-    $profileBytes = [Text.UTF8Encoding]::new($false).GetBytes($profileJson)
-    [IO.File]::WriteAllBytes($profilePath, $profileBytes)
-    $profileSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($profileBytes)).ToLowerInvariant()
-
-    $probeRoot = Join-Path $testRoot 'evidence-root-NOT-CREATED'
-    $zeroSha40 = '0' * 40
-    $zeroSha64 = '0' * 64
-    $dummyGit = Join-Path $testRoot 'git-NOT-CREATED.exe'
-    $dummyAuthority = Join-Path $testRoot 'authority-NOT-CREATED.json'
-    $requiredArguments = @(
-        '-Repository', $repository,
-        '-EvidenceRoot', $probeRoot,
-        '-ExpectedCandidateSha', $zeroSha40,
-        '-ToolchainProfilePath', $profilePath,
-        '-ExpectedToolchainProfileSha256', $profileSha256,
-        '-PinnedGitPath', $dummyGit,
-        '-PinnedGitSha256', $zeroSha64,
-        '-TauriMacrosSourceAuthorityPath', $dummyAuthority,
-        '-ExpectedTauriMacrosSourceAuthoritySha256', $zeroSha64,
-        '-VendoredProtocAuthorityPath', $dummyAuthority,
-        '-ExpectedVendoredProtocAuthoritySha256', $zeroSha64
-    )
-    $ambientModulePath = $ambientRoot + [IO.Path]::PathSeparator + [IO.Path]::Combine($PSHOME, 'Modules')
-    $loaderMarker = Join-Path $testRoot 'loader-marker-NOT-CREATED'
-    $discoveryMarker = Join-Path $testRoot 'discovery-marker-NOT-CREATED'
-    $badPinMarker = Join-Path $testRoot 'bad-pin-marker-NOT-CREATED'
-    $baselineMarker = Join-Path $testRoot 'baseline-marker-NOT-CREATED'
-    $phase0Marker = Join-Path $testRoot 'phase0-marker-NOT-CREATED'
-    $phase0LibraryMarker = Join-Path $testRoot 'phase0-library-marker-NOT-CREATED'
-    $preflightLibraryMarker = Join-Path $testRoot 'preflight-library-marker-NOT-CREATED'
-    $preflightMarker = Join-Path $testRoot 'preflight-marker-NOT-CREATED'
-
-    $loader = Invoke-D32DiscoveryLoaderChild -RunnerScript $discoveryScript -Arguments ($requiredArguments + @('-LoaderSelfTest')) `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $loaderMarker
-    $loaderOutput = $loader.StdOut + $loader.StdErr
-    if ($loader.ExitCode -ne 0 -or $loaderOutput -notmatch 'D32_TEST_INVENTORY_DISCOVERY_LOADER=PASS' -or
-        $loaderOutput -notmatch 'discovery_admission=PAST_IMPORT' -or
-        $loaderOutput -notmatch 'powershell_module_authority=EXACT_PSHOME_MODULES_NO_AUTOLOAD' -or
-        $loaderOutput -notmatch 'cargo_invocations=0' -or $loaderOutput -notmatch 'evidence_root_claimed=false' -or
-        (Test-Path -LiteralPath $loaderMarker)) {
-        throw "SELFTEST_FAILED: fresh loader did not isolate ambient modules (exit=$($loader.ExitCode), marker=$([IO.File]::Exists($loaderMarker))): $loaderOutput"
-    }
-
-    # This real runner path has a valid caller pin for the PowerShell runtime but
-    # intentionally omits required discovery timeouts; it must stop before root/Cargo.
-    $admission = Invoke-D32DiscoveryLoaderChild -RunnerScript $discoveryScript -Arguments $requiredArguments `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $discoveryMarker
-    $admissionOutput = $admission.StdOut + $admission.StdErr
-    if ($admission.ExitCode -eq 0 -or $admissionOutput -notmatch 'TEST_INVENTORY_DISCOVERY_BLOCKED: caller must explicitly pin -Phase0TimeoutSeconds' -or
-        (Test-Path -LiteralPath $discoveryMarker) -or (Test-Path -LiteralPath $probeRoot)) {
-        throw "SELFTEST_FAILED: discovery did not isolate modules and stop at caller-pin admission (exit=$($admission.ExitCode), marker=$([IO.File]::Exists($discoveryMarker))): $admissionOutput"
-    }
-
-    $badPinArguments = @($requiredArguments)
-    $shaIndex = [Array]::IndexOf([object[]]$badPinArguments, '-ExpectedToolchainProfileSha256')
-    if ($shaIndex -lt 0) { throw 'SELFTEST_BLOCKED: caller profile SHA argument was not found' }
-    $badPinArguments[$shaIndex + 1] = $zeroSha64
-    $badPin = Invoke-D32DiscoveryLoaderChild -RunnerScript $discoveryScript -Arguments $badPinArguments `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $badPinMarker
-    $badPinOutput = $badPin.StdOut + $badPin.StdErr
-    if ($badPin.ExitCode -eq 0 -or $badPinOutput -notmatch 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller Profile V2 bytes do not match its pinned SHA' -or
-        (Test-Path -LiteralPath $badPinMarker) -or (Test-Path -LiteralPath $probeRoot)) {
-        throw "SELFTEST_FAILED: invalid caller Profile V2 pin was not rejected before module initialization (exit=$($badPin.ExitCode), marker=$([IO.File]::Exists($badPinMarker))): $badPinOutput"
-    }
-
-    $baselineArguments = @(
-        '-Repository', $repository,
-        '-ExpectedCandidateSha', 'not-an-exact-sha',
-        '-DiscoveryPath', (Join-Path $testRoot 'discovery-NOT-CREATED.json'),
-        '-ExpectedDiscoverySha256', $zeroSha64,
-        '-ToolchainProfilePath', $profilePath,
-        '-ExpectedToolchainProfileSha256', $profileSha256,
-        '-PinnedGitPath', $dummyGit,
-        '-PinnedGitSha256', $zeroSha64,
-        '-BaselineOutputPath', (Join-Path $testRoot 'baseline-NOT-CREATED.json')
-    )
-    $baseline = Invoke-D32DiscoveryLoaderChild -RunnerScript $baselineScript -Arguments $baselineArguments `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $baselineMarker
-    $baselineOutput = $baseline.StdOut + $baseline.StdErr
-    if ($baseline.ExitCode -eq 0 -or $baselineOutput -notmatch 'TEST_INVENTORY_BASELINE_BLOCKED: exact lowercase candidate/Profile/Git/discovery caller pins are required' -or
-        (Test-Path -LiteralPath $baselineMarker) -or (Test-Path -LiteralPath (Join-Path $testRoot 'baseline-NOT-CREATED.json'))) {
-        throw "SELFTEST_FAILED: baseline builder did not isolate modules and stop at caller-pin admission (exit=$($baseline.ExitCode), marker=$([IO.File]::Exists($baselineMarker))): $baselineOutput"
-    }
-
-    $phase0Library = Invoke-D32DiscoveryLoaderChild -RunnerScript $phase0Script -Arguments @('-Phase0LibraryOnly') `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $phase0LibraryMarker
-    $phase0LibraryOutput = $phase0Library.StdOut + $phase0Library.StdErr
-    if ($phase0Library.ExitCode -eq 0 -or $phase0LibraryOutput -notmatch 'caller-pinned Profile V2 path and SHA are required before module loading' -or
-        (Test-Path -LiteralPath $phase0LibraryMarker)) {
-        throw "SELFTEST_FAILED: standalone Phase0 library-only mode bypassed caller Profile admission (exit=$($phase0Library.ExitCode), marker=$([IO.File]::Exists($phase0LibraryMarker))): $phase0LibraryOutput"
-    }
-
-    $preflightLibrary = Invoke-D32DiscoveryLoaderChild -RunnerScript $preflightScript -Arguments @('-LibraryOnly') `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $preflightLibraryMarker
-    $preflightLibraryOutput = $preflightLibrary.StdOut + $preflightLibrary.StdErr
-    if ($preflightLibrary.ExitCode -eq 0 -or $preflightLibraryOutput -notmatch 'caller-pinned Profile V2 path and SHA are required before module loading' -or
-        (Test-Path -LiteralPath $preflightLibraryMarker)) {
-        throw "SELFTEST_FAILED: standalone preflight library-only mode bypassed caller Profile admission (exit=$($preflightLibrary.ExitCode), marker=$([IO.File]::Exists($preflightLibraryMarker))): $preflightLibraryOutput"
-    }
-
-    $phase0 = Invoke-D32DiscoveryLoaderChild -RunnerScript $phase0Script -Arguments @('-Phase0SelfTest') `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $phase0Marker
-    $phase0Output = $phase0.StdOut + $phase0.StdErr
-    if ($phase0.ExitCode -ne 0 -or $phase0Output -notmatch 'D32 Phase0 runner SelfTest: PASS \(171 assertions\)' -or
-        (Test-Path -LiteralPath $phase0Marker)) {
-        throw "SELFTEST_FAILED: Phase0 preflight dependency path loaded an ambient module or its no-Cargo SelfTest failed (exit=$($phase0.ExitCode), marker=$([IO.File]::Exists($phase0Marker))): $phase0Output"
-    }
-
-    $preflight = Invoke-D32DiscoveryLoaderChild -RunnerScript $preflightScript -Arguments @('-SelfTest') `
-        -PSModulePathOverride $ambientModulePath -MarkerPath $preflightMarker
-    $preflightOutput = $preflight.StdOut + $preflight.StdErr
-    if ($preflight.ExitCode -ne 2 -or $preflightOutput -notmatch 'D32 preflight self-test: BLOCKED' -or
-        $preflightOutput -notmatch 'caller-pinned toolchain-profile path/SHA are mandatory' -or
-        (Test-Path -LiteralPath $preflightMarker)) {
-        throw "SELFTEST_FAILED: standalone preflight loader did not isolate ambient modules before the required caller-pin stop (exit=$($preflight.ExitCode), marker=$([IO.File]::Exists($preflightMarker))): $preflightOutput"
-    }
-
-    Write-Output 'D32 discovery loader self-test: PASS'
-    Write-Output 'ambient_module_name_spoofing=Microsoft.PowerShell.Core,Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,CimCmdlets; initialization=0'
-    Write-Output 'caller_profile_pin_checked_before_module_initialization=PASS'
-    Write-Output 'discovery_and_baseline_admission_after_pinned_import=PASS'
-    Write-Output 'standalone_library_only_modes_require_caller_profile=PASS (Phase0 and preflight; ambient marker=0)'
-    Write-Output 'phase0_preflight_dependency_guard=PASS (171 assertions; ambient marker=0)'
-    Write-Output 'standalone_preflight_loader=PASS (unavailable caller pins stopped self-test before authority use; ambient marker=0)'
-    Write-Output 'powershell_module_authority=EXACT_PSHOME_MODULES_NO_AUTOLOAD'
-    Write-Output 'cargo_invocations=0'
-    Write-Output 'evidence_root_claimed=false'
-    Write-Output "custom_function_dependencies=$(([regex]::Match($loaderOutput, 'custom_function_dependencies=(\d+)')).Groups[1].Value)"
-    Write-Output "cmdlet_modules=$(([regex]::Match($loaderOutput, 'cmdlet_modules=([^\r\n]*)')).Groups[1].Value)"
+$pshomeImage = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'pwsh.exe'))
+$safeSyntheticResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage) -ManagedAssemblyPaths @($pshomeImage)
+$safeConfiguredResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage) -ManagedAssemblyPaths @($pshomeImage) -ConfigureNativeSearch
+$unsafeNativeResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage, 'C:\Program Files (x86)\RivaTuner Statistics Server\RTSSHooks64.dll') -ManagedAssemblyPaths @($pshomeImage)
+$unsafeManagedResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage) -ManagedAssemblyPaths @($pshomeImage, 'C:\Users\Public\untrusted\resolver.dll')
+$nativeEscapeDetected = $false
+foreach ($blocker in $unsafeNativeResolver.Blockers) { if ($blocker -like '*preloaded native module is outside*RTSSHooks64.dll') { $nativeEscapeDetected = $true } }
+$managedEscapeDetected = $false
+foreach ($blocker in $unsafeManagedResolver.Blockers) { if ($blocker -like '*managed assembly/deps resolver input escapes*untrusted*') { $managedEscapeDetected = $true } }
+Assert-D32ModuleFreeSelfTest -Condition ($safeSyntheticResolver.Blockers.Count -eq 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic resolver domain accepts only pinned PSHOME entries before import'
+Assert-D32ModuleFreeSelfTest -Condition ($safeConfiguredResolver.Blockers.Count -eq 0 -and $safeConfiguredResolver.NativePolicy -ceq 'LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32; SetDllDirectoryW(NULL); verified in current process' -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'process-local DLL search is configured with documented application/System32 roots before import'
+Assert-D32ModuleFreeSelfTest -Condition ($nativeEscapeDetected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic third-party native preload blocks before import with zero attempts'
+Assert-D32ModuleFreeSelfTest -Condition ($managedEscapeDetected -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic external managed resolver path blocks before import with zero attempts'
+$savedModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', [EnvironmentVariableTarget]::Process)
+try {
+    [Environment]::SetEnvironmentVariable('PSModulePath', 'C:\Users\Public\untrusted-modules', [EnvironmentVariableTarget]::Process)
+    $ambientModuleResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage) -ManagedAssemblyPaths @($pshomeImage)
 }
-finally {
-    if (Test-Path -LiteralPath $testRoot) {
-        if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $testRoot) -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($testRoot)), $tempBase)) {
-            throw 'SELFTEST_BLOCKED: temporary module-authority cleanup target no longer resolves to its exact regular child'
-        }
-        [IO.Directory]::Delete($testRoot, $true)
-    }
+finally { [Environment]::SetEnvironmentVariable('PSModulePath', $savedModulePath, [EnvironmentVariableTarget]::Process) }
+Assert-D32ModuleFreeSelfTest -Condition (@($ambientModuleResolver.Blockers | Where-Object { $_ -ceq 'process PSModulePath is not the exact pinned PSHOME Modules directory' }).Count -eq 1 -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic ambient PSModulePath is rejected before import'
+$savedStartupHook = [Environment]::GetEnvironmentVariable('DOTNET_STARTUP_HOOKS', [EnvironmentVariableTarget]::Process)
+try {
+    [Environment]::SetEnvironmentVariable('DOTNET_STARTUP_HOOKS', 'C:\Users\Public\untrusted\hook.dll', [EnvironmentVariableTarget]::Process)
+    $startupInjectionResolver = Get-D32PowerShellAuthorityResolverSnapshot -NativeModulePaths @($pshomeImage) -ManagedAssemblyPaths @($pshomeImage)
 }
+finally { [Environment]::SetEnvironmentVariable('DOTNET_STARTUP_HOOKS', $savedStartupHook, [EnvironmentVariableTarget]::Process) }
+Assert-D32ModuleFreeSelfTest -Condition (@($startupInjectionResolver.Blockers | Where-Object { $_ -like '*startup environment injection is active: DOTNET_STARTUP_HOOKS*' }).Count -eq 1 -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic .NET startup-hook injection is rejected before import'
+
+$trustedSecurity = [Security.AccessControl.FileSecurity]::new()
+$trustedSecurity.SetSecurityDescriptorSddlForm('O:SYG:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)')
+$trustedAcl = [PSCustomObject]@{ OwnerSid = [string]$trustedSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value; Security = $trustedSecurity }
+$untrustedSecurity = [Security.AccessControl.FileSecurity]::new()
+$untrustedSecurity.SetSecurityDescriptorSddlForm('O:SYG:SYD:(A;;FA;;;WD)')
+$untrustedAcl = [PSCustomObject]@{ OwnerSid = [string]$untrustedSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value; Security = $untrustedSecurity }
+$untrustedOwnerSecurity = [Security.AccessControl.FileSecurity]::new()
+$untrustedOwnerSecurity.SetSecurityDescriptorSddlForm('O:WDG:SYD:(A;;FA;;;SY)')
+$untrustedOwnerAcl = [PSCustomObject]@{ OwnerSid = [string]$untrustedOwnerSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value; Security = $untrustedOwnerSecurity }
+Assert-D32ModuleFreeSelfTest -Condition ((Test-D32PowerShellAuthorityProtectedSecurity -Security $trustedAcl -IsDirectory:$false) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic protected ACL allows only trusted writer SIDs'
+Assert-D32ModuleFreeSelfTest -Condition ((-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $untrustedAcl -IsDirectory:$false)) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic untrusted write ACE fails closed'
+Assert-D32ModuleFreeSelfTest -Condition ((-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $untrustedOwnerAcl -IsDirectory:$false)) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'synthetic untrusted owner fails closed'
+$aclWriteRights = @(
+    [Security.AccessControl.FileSystemRights]::WriteData,
+    [Security.AccessControl.FileSystemRights]::AppendData,
+    [Security.AccessControl.FileSystemRights]::CreateDirectories,
+    [Security.AccessControl.FileSystemRights]::Delete,
+    [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+    [Security.AccessControl.FileSystemRights]::ChangePermissions,
+    [Security.AccessControl.FileSystemRights]::TakeOwnership
+)
+foreach ($rights in $aclWriteRights) {
+    $syntheticSecurity = [Security.AccessControl.FileSecurity]::new()
+    $syntheticSecurity.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18'))
+    $syntheticSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'), [Security.AccessControl.FileSystemRights]$rights, [Security.AccessControl.AccessControlType]::Allow))
+    $syntheticAcl = [PSCustomObject]@{ OwnerSid = [string]$syntheticSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value; Security = $syntheticSecurity }
+    Assert-D32ModuleFreeSelfTest -Condition ((-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $syntheticAcl -IsDirectory:$true)) -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name "synthetic untrusted namespace write right $rights is rejected"
+}
+
+$liveResolver = Get-D32PowerShellAuthorityResolverSnapshot
+Assert-D32ModuleFreeSelfTest -Condition ($global:D32PowerShellModuleImportAttempts -eq 0) -Name 'live resolver census is module-free and records zero import attempts'
+if ($liveResolver.Blockers.Count -gt 0) {
+    [Console]::WriteLine(('MODULE_FREE_RESOLVER_CENSUS BLOCKED before imports: {0}' -f ($liveResolver.Blockers -join '; ')))
+}
+else {
+    [Console]::WriteLine('MODULE_FREE_RESOLVER_CENSUS contains no observed escape; this is not a module-admission result')
+}
+
+if ($failures.Count -gt 0) {
+    [Console]::Error.WriteLine(('D32 discovery loader selftest FAILED: {0} failures; import_attempts={1}' -f $failures.Count, $global:D32PowerShellModuleImportAttempts))
+    foreach ($failure in $failures) { [Console]::Error.WriteLine(('SELFTEST FAIL: ' + $failure)) }
+    exit 1
+}
+[Console]::WriteLine(('D32 discovery loader selftest PASS: {0} checks; import_attempts={1}; Cargo=0; root=false' -f $testCount, $global:D32PowerShellModuleImportAttempts))

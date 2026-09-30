@@ -405,8 +405,8 @@ function New-D32TestInventoryBaselineDocument {
         })
     }
     return [ordered]@{
-        schema_version = 1
-        record_type = 'D32_TEST_INVENTORY_BASELINE_V1'
+        schema_version = 2
+        record_type = 'D32_TEST_INVENTORY_BASELINE_V2'
         status = 'AWAITING_COORDINATOR_PIN'
         gate_authority = 'NONE'
         candidate_sha = [string]$Discovery.candidate_sha
@@ -423,6 +423,8 @@ function New-D32TestInventoryBaselineDocument {
         lock_inputs = @($Discovery.lock_inputs)
         source_patch_authority = $Discovery.source_patch_authority
         protoc_discovery_authority = $Discovery.protoc.authority
+        discovery_module_admission = $Discovery.powershell_module_admission
+        powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
         discovery = [ordered]@{
             reference = $DiscoveryReference
             candidate_sha = [string]$Discovery.candidate_sha
@@ -504,10 +506,10 @@ function Test-D32TestInventoryBaselineDocument {
         [Parameter(Mandatory = $true)][object[]]$ExpectedCommands
     )
     $fields = @('schema_version', 'record_type', 'status', 'gate_authority', 'candidate_sha', 'source_repo', 'target_triple', 'toolchain_profile', 'lock_inputs',
-        'source_patch_authority', 'protoc_discovery_authority', 'discovery', 'commands', 'entries', 'package_digests', 'combined_digest', 'category_counts', 'generated_at_utc')
+        'source_patch_authority', 'protoc_discovery_authority', 'discovery_module_admission', 'powershell_module_admission', 'discovery', 'commands', 'entries', 'package_digests', 'combined_digest', 'category_counts', 'generated_at_utc')
     if (-not (Test-D32Phase0ExactProperties -Object $Document -Expected $fields) -or
-        -not (Test-D32Phase0Integer -Value $Document.schema_version) -or [Int64]$Document.schema_version -ne 1 -or
-        $Document.record_type -isnot [string] -or $Document.record_type -cne 'D32_TEST_INVENTORY_BASELINE_V1' -or
+        -not (Test-D32Phase0Integer -Value $Document.schema_version) -or [Int64]$Document.schema_version -ne 2 -or
+        $Document.record_type -isnot [string] -or $Document.record_type -cne 'D32_TEST_INVENTORY_BASELINE_V2' -or
         $Document.status -isnot [string] -or $Document.status -cne 'AWAITING_COORDINATOR_PIN' -or
         $Document.gate_authority -isnot [string] -or $Document.gate_authority -cne 'NONE' -or
         $Document.candidate_sha -isnot [string] -or $Document.candidate_sha -cne $ExpectedCandidateSha -or
@@ -519,7 +521,13 @@ function Test-D32TestInventoryBaselineDocument {
         $Document.package_digests -isnot [Array] -or $Document.package_digests.Count -ne 3 -or
         ($Document.category_counts -isnot [System.Management.Automation.PSCustomObject] -and $Document.category_counts -isnot [System.Collections.IDictionary]) -or
         -not (Test-D32Phase0ExactProperties -Object $Document.category_counts -Expected @('protocol', 'vita', 'host'))) {
-        throw 'TEST_INVENTORY_BASELINE_BLOCKED: record must be exact V1 awaiting independent Coordinator pin, candidate-bound, and non-authoritative'
+        throw 'TEST_INVENTORY_BASELINE_BLOCKED: record must be exact V2 awaiting independent Coordinator pin, candidate-bound, and non-authoritative'
+    }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.discovery_module_admission -CandidateSha $ExpectedCandidateSha -Repository $Repository -ExpectedContext $Discovery.powershell_module_admission) -or
+        -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.discovery_module_admission -ProfileRecord $Discovery.toolchain_profile) -or
+        -not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.powershell_module_admission -ProfileRecord $Document.toolchain_profile)) {
+        throw 'TEST_INVENTORY_BASELINE_BLOCKED: baseline must carry the validated discovery admission and its own producer admission'
     }
     $targetTriple = [string]$Profile.Profile.target_triple
     $expectedProfile = [ordered]@{

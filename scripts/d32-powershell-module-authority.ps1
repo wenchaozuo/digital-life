@@ -1921,9 +1921,9 @@ function Test-D32PowerShellModuleAdmissionRecord {
         if ((Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $repository) -or
             (Test-D32PowerShellAuthorityPathWithin -Child $repository -Parent $path)) { return $false }
     }
-    $host = & $get $Document 'powershell_host'; $runner = & $get $Document 'runner_process'; $startup = & $get $Document 'startup'
+    $hostRecord = & $get $Document 'powershell_host'; $runner = & $get $Document 'runner_process'; $startup = & $get $Document 'startup'
     $entry = & $get $Document 'entry_script_path'; $entryFile = & $get $Document 'entry_script'; $closure = & $get $Document 'module_closure'; $verification = & $get $Document 'import_verification'
-    if ($null -eq $host -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
+    if ($null -eq $hostRecord -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
         -not [IO.Path]::IsPathRooted($entry) -or [IO.Path]::GetFullPath($entry) -cne $entry) { return $false }
     $verifyNames = [System.Collections.Generic.List[string]]::new()
     if ($verification -is [System.Collections.IDictionary]) { foreach ($key in $verification.Keys) { $verifyNames.Add([string]$key) } } elseif ($null -ne $verification) { foreach ($property in $verification.PSObject.Properties) { $verifyNames.Add([string]$property.Name) } }
@@ -1953,23 +1953,23 @@ function Test-D32PowerShellModuleAdmissionRecord {
         foreach ($directoryFence in $entryCheckFences.Values) { if ($null -ne $directoryFence.Handle -and -not $directoryFence.Handle.IsClosed) { $directoryFence.Handle.Dispose() } }
     }
     $hostNames = [System.Collections.Generic.List[string]]::new()
-    if ($host -is [System.Collections.IDictionary]) { foreach ($key in $host.Keys) { $hostNames.Add([string]$key) } } else { foreach ($property in $host.PSObject.Properties) { $hostNames.Add([string]$property.Name) } }
+    if ($hostRecord -is [System.Collections.IDictionary]) { foreach ($key in $hostRecord.Keys) { $hostNames.Add([string]$key) } } else { foreach ($property in $hostRecord.PSObject.Properties) { $hostNames.Add([string]$property.Name) } }
     if ($hostNames.Count -ne 6) { return $false }
     foreach ($field in @('path','sha256','bytes','volume_serial_hex','file_id_hex','pshome')) { if (-not $hostNames.Contains($field)) { return $false } }
-    $hostPath = & $get $host 'path'; $pshome = & $get $host 'pshome'
+    $hostPath = & $get $hostRecord 'path'; $powerShellHome = & $get $hostRecord 'pshome'
     if ($hostPath -isnot [string] -or -not [IO.Path]::IsPathRooted($hostPath) -or $hostPath -cne [IO.Path]::GetFullPath($hostPath) -or
-        $pshome -isnot [string] -or -not [IO.Path]::IsPathRooted($pshome) -or $pshome -cne [IO.Path]::GetFullPath($pshome) -or $hostPath -cne [IO.Path]::Combine($pshome, 'pwsh.exe') -or
-        (& $get $host 'sha256') -isnot [string] -or (& $get $host 'sha256') -cnotmatch '^[0-9a-f]{64}$' -or
-        (& $get $host 'bytes') -isnot [Int64] -or [Int64](& $get $host 'bytes') -le 0 -or
-        (& $get $host 'volume_serial_hex') -isnot [string] -or (& $get $host 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
-        (& $get $host 'file_id_hex') -isnot [string] -or (& $get $host 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
+        $powerShellHome -isnot [string] -or -not [IO.Path]::IsPathRooted($powerShellHome) -or $powerShellHome -cne [IO.Path]::GetFullPath($powerShellHome) -or $hostPath -cne [IO.Path]::Combine($powerShellHome, 'pwsh.exe') -or
+        (& $get $hostRecord 'sha256') -isnot [string] -or (& $get $hostRecord 'sha256') -cnotmatch '^[0-9a-f]{64}$' -or
+        (& $get $hostRecord 'bytes') -isnot [Int64] -or [Int64](& $get $hostRecord 'bytes') -le 0 -or
+        (& $get $hostRecord 'volume_serial_hex') -isnot [string] -or (& $get $hostRecord 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+        (& $get $hostRecord 'file_id_hex') -isnot [string] -or (& $get $hostRecord 'file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
     $runnerNames = [System.Collections.Generic.List[string]]::new()
     if ($runner -is [System.Collections.IDictionary]) { foreach ($key in $runner.Keys) { $runnerNames.Add([string]$key) } } else { foreach ($property in $runner.PSObject.Properties) { $runnerNames.Add([string]$property.Name) } }
     if ($runnerNames.Count -ne 5) { return $false }
     foreach ($field in @('process_id','start_time_utc_ticks','image_path','image_file_id_hex','token_state')) { if (-not $runnerNames.Contains($field)) { return $false } }
     $processId = & $get $runner 'process_id'; $startTicks = & $get $runner 'start_time_utc_ticks'; $tokenState = & $get $runner 'token_state'
     if (-not ($processId -is [int32] -or $processId -is [int64]) -or [Int64]$processId -le 0 -or -not ($startTicks -is [int64] -or $startTicks -is [int32]) -or [Int64]$startTicks -le 0 -or
-        (& $get $runner 'image_path') -cne $hostPath -or (& $get $runner 'image_file_id_hex') -cne (& $get $host 'file_id_hex') -or
+        (& $get $runner 'image_path') -cne $hostPath -or (& $get $runner 'image_file_id_hex') -cne (& $get $hostRecord 'file_id_hex') -or
         -not (Test-D32PowerShellAuthorityTokenRecord -Token $tokenState)) { return $false }
     $startupNames = [System.Collections.Generic.List[string]]::new()
     if ($startup -is [System.Collections.IDictionary]) { foreach ($key in $startup.Keys) { $startupNames.Add([string]$key) } } else { foreach ($property in $startup.PSObject.Properties) { $startupNames.Add([string]$property.Name) } }
@@ -1984,7 +1984,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
     if ($closureNames.Count -ne 8) { return $false }
     foreach ($field in @('module_root','module_root_volume_serial_hex','module_root_file_id_hex','inventory_sha256','modules','runtime_distribution_sha256','protected_namespace_sha256','resolver_sha256')) { if (-not $closureNames.Contains($field)) { return $false } }
     $moduleRoot = [string](& $get $closure 'module_root')
-    $expectedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($pshome, 'Modules'))
+    $expectedModuleRoot = [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellHome, 'Modules'))
     if (-not [IO.Path]::IsPathRooted($moduleRoot) -or $moduleRoot -cne $expectedModuleRoot -or
         (& $get $closure 'module_root_volume_serial_hex') -isnot [string] -or (& $get $closure 'module_root_volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
         (& $get $closure 'module_root_file_id_hex') -isnot [string] -or (& $get $closure 'module_root_file_id_hex') -cnotmatch '^[0-9a-f]{32}$') { return $false }
@@ -2047,7 +2047,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
     $resolverGet = { param($object,$name) if ($object -is [System.Collections.IDictionary]) { return $object[$name] } return $object.PSObject.Properties[$name].Value }
     if ((& $resolverGet $resolver 'state') -cne 'VERIFIED' -or (& $resolverGet $resolver 'policy_id') -cne 'D32_POWERSHELL_RESOLVER_DOMAIN_V2' -or
         (& $resolverGet $resolver 'native_policy') -cne 'LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32; SetDllDirectoryW(NULL); verified in current process' -or
-        (& $resolverGet $resolver 'module_search_path') -cne [IO.Path]::GetFullPath([IO.Path]::Combine($pshome,'Modules')) -or
+        (& $resolverGet $resolver 'module_search_path') -cne [IO.Path]::GetFullPath([IO.Path]::Combine($powerShellHome,'Modules')) -or
         (& $resolverGet $resolver 'os_security_inventory_sha256') -isnot [string] -or (& $resolverGet $resolver 'os_security_inventory_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
         (& $resolverGet $resolver 'resolver_sha256') -isnot [string] -or (& $resolverGet $resolver 'resolver_sha256') -cnotmatch '^[0-9a-f]{64}$' -or
         (& $resolverGet $resolver 'resolver_sha256') -cne (& $get $closure 'resolver_sha256')) { return $false }
@@ -2058,7 +2058,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
         if ($array -isnot [Array] -or $array.Count -eq 0) { return $false }
         $previous = ''
         foreach ($path in $array) {
-            $underPowerShell = $path -is [string] -and (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $pshome)
+            $underPowerShell = $path -is [string] -and (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $powerShellHome)
             $underWindows = $path -is [string] -and (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $windowsRoot)
             $underDefender = $field -ceq 'native_module_paths' -and $path -is [string] -and (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $defenderPlatformRoot)
             $validDomain = if ($field -ceq 'native_module_paths') { $underPowerShell -or $underWindows -or $underDefender } else { $underPowerShell -or $underWindows }
@@ -2141,7 +2141,7 @@ function Test-D32PowerShellModuleAdmissionRecord {
             $sha -cnotmatch '^[0-9a-f]{64}$' -or $volume -cnotmatch '^[0-9a-f]{16}$' -or $fileId -cnotmatch '^[0-9a-f]{32}$' -or
             $owner -cnotin $trustedWriterSids -or $aclHash -cnotmatch '^[0-9a-f]{64}$') { return $false }
         if ($source -ceq 'PSHOME_DISTRIBUTION') {
-            if ($componentType -cne 'POWERSHELL_DISTRIBUTION' -or -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $pshome)) { return $false }
+            if ($componentType -cne 'POWERSHELL_DISTRIBUTION' -or -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $powerShellHome)) { return $false }
         }
         elseif ($source -ceq 'WINDOWS_OS_COMPONENT') {
             if ($componentType -cne 'MICROSOFT_WINDOWS_OS_INSTALLATION' -or -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $windowsRoot)) { return $false }

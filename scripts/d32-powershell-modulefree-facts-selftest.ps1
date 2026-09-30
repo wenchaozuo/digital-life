@@ -199,6 +199,17 @@ try {
         -not $reuseCurrentBody.Contains('$currentOs.')
     Add-D32FactsSelfTestCase 'reuse resolver transition and native-origin reconciliation use current admitted roots and pinned OS components' `
         $reuseResolverRootsBound 'AssertCurrent must use its locally revalidated pinned Windows/Defender roots and admitted component records; no unbound currentOs variable may enter the fixed resolver proof.'
+    $admissionValidatorStart = $helperText.IndexOf('function Test-D32PowerShellModuleAdmissionRecord', [StringComparison]::Ordinal)
+    $admissionValidatorEnd = $helperText.IndexOf('function Test-D32PowerShellModuleAdmissionProducerBinding', $admissionValidatorStart, [StringComparison]::Ordinal)
+    $admissionValidatorBody = if ($admissionValidatorEnd -gt $admissionValidatorStart) { $helperText.Substring($admissionValidatorStart, $admissionValidatorEnd - $admissionValidatorStart) } else { '' }
+    $admissionValidatorSafeLocals = $admissionValidatorBody.Contains("`$hostRecord = & `$get `$Document 'powershell_host'") -and
+        $admissionValidatorBody.Contains("`$powerShellHome = & `$get `$hostRecord 'pshome'") -and
+        -not [regex]::IsMatch($admissionValidatorBody, '(?i)\$(?:host|pshome)\b') -and
+        $admissionValidatorBody.Contains("Combine(`$powerShellHome, 'Modules')") -and
+        $admissionValidatorBody.Contains('-Parent $powerShellHome') -and
+        $admissionValidatorBody.Contains("`$hostRecord 'file_id_hex'")
+    Add-D32FactsSelfTestCase 'strict admission validator reads runner fields without assigning constant automatic variables' `
+        $admissionValidatorSafeLocals 'The powershell_host record and its pshome field use ordinary local names; $Host and $PSHOME are constant automatic variables.'
     $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and
         $reuseCurrentBody.Contains('-OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256)') -and
         $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents') -and

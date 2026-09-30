@@ -233,6 +233,11 @@ try {
         $admissionValidatorBody.Contains('Get-D32PowerShellModuleAdmissionField')
     Add-D32FactsSelfTestCase 'strict admission validator reads runner fields without assigning constant automatic variables' `
         $admissionValidatorSafeLocals 'The powershell_host record and its pshome field use ordinary local names; $Host and $PSHOME are constant automatic variables.'
+    $validatorContextDiagnostics = $admissionValidatorBody.Contains("`$script:D32PowerShellModuleAdmissionValidationContext = 'record.resolver-active-environment-empty-array'") -and
+        $admissionValidatorBody.Contains("`$script:D32PowerShellModuleAdmissionValidationContext = 'record.actual-command-origin'") -and
+        $helperText.Contains('validator_context=$script:D32PowerShellModuleAdmissionValidationContext')
+    Add-D32FactsSelfTestCase 'strict admission self-validation reports the failing record section without changing its fail-closed decision' `
+        $validatorContextDiagnostics 'The shared-record validator keeps a non-authoritative section diagnostic for the exact strict predicate group that rejects a positive context.'
     $reuseUsesPinnedOsComponents = $reuseCurrentBody.Contains('-OsSecurityComponents $State.OsSecurityComponents') -and
         $reuseCurrentBody.Contains('-OsSecurityInventorySha256 ([string]$State.OsSecurityInventorySha256)') -and
         $reuseCurrentBody.Contains('Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $State.OsSecurityComponents') -and

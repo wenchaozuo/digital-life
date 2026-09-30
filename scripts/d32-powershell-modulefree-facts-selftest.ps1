@@ -409,6 +409,24 @@ try {
         $preflightText.Contains('param([string]$FixtureLauncherPath, [System.Collections.IDictionary]$AdmissionPins)') -and
         $preflightText.Contains('. $FixtureLauncherPath -D32LauncherLibraryOnly @AdmissionPins')
     $phase0Text = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-phase0-matrix.ps1'), [Text.UTF8Encoding]::new($false, $true))
+    $preflightTauriReuseOffset = $preflightText.IndexOf('$tauriSourceFactsLines = @(& $tauriAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $ModuleAuthorityCandidateSha', [StringComparison]::Ordinal)
+    $preflightTauriFixtureRebindOffset = if ($preflightTauriReuseOffset -ge 0) { $preflightText.IndexOf('$tauriSourceFacts.candidate_sha = $head', $preflightTauriReuseOffset, [StringComparison]::Ordinal) } else { -1 }
+    $preflightTauriAuthorityWriteOffset = if ($preflightTauriFixtureRebindOffset -ge 0) { $preflightText.IndexOf('Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts', $preflightTauriFixtureRebindOffset, [StringComparison]::Ordinal) } else { -1 }
+    $preflightTauriLibraryReuseBound = $preflightTauriReuseOffset -ge 0 -and
+        $preflightText.Contains('-ToolchainProfilePath $ToolchainProfilePath -ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256') -and
+        $preflightText.Contains('-Repository $RepoRoot -PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath') -and
+        $preflightText.Contains('-ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256') -and
+        $preflightText.Contains('-PinnedGitPath $trustedGitPath -PinnedGitSha256 $trustedGitSha256') -and
+        $preflightTauriFixtureRebindOffset -gt $preflightTauriReuseOffset -and $preflightTauriAuthorityWriteOffset -gt $preflightTauriFixtureRebindOffset
+    $phase0TauriReuseOffset = $phase0Text.IndexOf('$tauriSourceFactsLines = @(& $tauriSourceAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $Phase0ExpectedCandidateSha', [StringComparison]::Ordinal)
+    $phase0TauriFixtureRebindOffset = if ($phase0TauriReuseOffset -ge 0) { $phase0Text.IndexOf('$tauriSourceFacts.candidate_sha = $candidate', $phase0TauriReuseOffset, [StringComparison]::Ordinal) } else { -1 }
+    $phase0TauriAuthorityWriteOffset = if ($phase0TauriFixtureRebindOffset -ge 0) { $phase0Text.IndexOf('Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts', $phase0TauriFixtureRebindOffset, [StringComparison]::Ordinal) } else { -1 }
+    $phase0TauriLibraryReuseBound = $phase0TauriReuseOffset -ge 0 -and
+        $phase0Text.Contains('-ToolchainProfilePath $Phase0ToolchainProfilePath -ExpectedToolchainProfileSha256 $Phase0ExpectedToolchainProfileSha256') -and
+        $phase0Text.Contains('-Repository $Phase0RepoRoot -PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath') -and
+        $phase0Text.Contains('-ExpectedPowerShellModuleAuthoritySha256 $Phase0ExpectedPowerShellModuleAuthoritySha256') -and
+        $phase0Text.Contains('-PinnedGitPath $Phase0PinnedGitPath -PinnedGitSha256 $Phase0PinnedGitSha256') -and
+        $phase0TauriFixtureRebindOffset -gt $phase0TauriReuseOffset -and $phase0TauriAuthorityWriteOffset -gt $phase0TauriFixtureRebindOffset
     $phase0PinForwarding = $phase0Text.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly') -and
         $phase0Text.Contains('-RepoRoot $Phase0RepoRoot -ModuleAuthorityCandidateSha $Phase0ExpectedCandidateSha') -and
         $phase0Text.Contains('-ToolchainProfilePath $Phase0ToolchainProfilePath -ExpectedToolchainProfileSha256 $Phase0ExpectedToolchainProfileSha256') -and
@@ -450,6 +468,9 @@ try {
         ($preflightPinFactoryComplete -and $preflightGitModuleReuseBound -and $preflightReleaseLauncherReuseBound -and
             $phase0PinForwarding -and $phase0StartupReuseBound -and $debugLoaderReuseBound -and $inventoryHelpersReuseBound -and $reuseSourcesParse -and $global:D32PowerShellModuleImportAttempts -eq 0) `
         ("preflight_factory=$preflightPinFactoryComplete; git_capture=$preflightGitModuleReuseBound; release_launcher=$preflightReleaseLauncherReuseBound; phase0_dependency=$phase0PinForwarding; phase0_startup_selftest=$phase0StartupReuseBound; debug_loader=$debugLoaderReuseBound; inventory_helpers=$inventoryHelpersReuseBound; parse_failures=$($reuseSourceParseFailures -join ','); import_attempts=$global:D32PowerShellModuleImportAttempts")
+    Add-D32FactsSelfTestCase 'preflight and Phase0 source-authority selftests reuse exact live pins before rebinding synthetic fixture records' `
+        ($preflightTauriLibraryReuseBound -and $phase0TauriLibraryReuseBound -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        ("preflight_live_reuse=$preflightTauriLibraryReuseBound; preflight_rebind_after_reuse=$($preflightTauriFixtureRebindOffset -gt $preflightTauriReuseOffset); phase0_live_reuse=$phase0TauriLibraryReuseBound; phase0_rebind_after_reuse=$($phase0TauriFixtureRebindOffset -gt $phase0TauriReuseOffset); import_attempts=$global:D32PowerShellModuleImportAttempts")
     $closureFilePredicateContexts = $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionClosureFileRecord') -and
         $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionAssemblyOriginRecord') -and
         $admissionValidatorBody.Contains('Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and

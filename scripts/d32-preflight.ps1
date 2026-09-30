@@ -5855,15 +5855,36 @@ function Invoke-D32SelfTest {
         if ([String]::IsNullOrWhiteSpace($tauriArchivePath) -or -not (Test-D32ProfileNoReparsePath -Path $tauriAttesterPath)) {
             throw 'self-test requires the read-only exact tauri-macros archive and source-patch facts generator'
         }
-        $tauriSourceFactsLines = @(& $tauriAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $head `
-            -ToolchainProfilePath $phase0ProfileValidation.ProfilePath -ExpectedToolchainProfileSha256 $phase0ProfileValidation.Digest `
-            -Repository $fixture -PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath `
+        # Re-enter the code-owned attester using this process's actual caller
+        # pins. The fixture binding below is synthetic and must not be passed
+        # as if it were the admitted runner's candidate/profile/repository.
+        $tauriSourceFactsLines = @(& $tauriAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $ModuleAuthorityCandidateSha `
+            -ToolchainProfilePath $ToolchainProfilePath -ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256 `
+            -Repository $RepoRoot -PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath `
             -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
             -PinnedGitPath $trustedGitPath -PinnedGitSha256 $trustedGitSha256)
         if ($tauriSourceFactsLines.Count -ne 1 -or $tauriSourceFactsLines[0] -isnot [string]) {
             throw 'self-test source-patch facts generator did not emit exactly one JSON document'
         }
         $tauriSourceFacts = ConvertFrom-D32Phase0Json -Json ([string]$tauriSourceFactsLines[0])
+        $liveToolchainProfileSnapshot = Get-D32ProfileFileSnapshot -Path $ToolchainProfilePath
+        if ($tauriSourceFacts.candidate_sha -cne $ModuleAuthorityCandidateSha -or
+            $tauriSourceFacts.toolchain_profile.path -cne $ToolchainProfilePath -or
+            $tauriSourceFacts.toolchain_profile.sha256 -cne $ExpectedToolchainProfileSha256 -or
+            [Int64]$tauriSourceFacts.toolchain_profile.bytes -ne [Int64]$liveToolchainProfileSnapshot.Bytes) {
+            throw 'self-test source-patch facts did not retain the exact admitted caller candidate/Profile bindings before fixture rebinding'
+        }
+        $fixtureToolchainProfileSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$phase0ProfileValidation.ProfilePath)
+        $tauriSourceFacts.candidate_sha = $head
+        $tauriSourceFacts.toolchain_profile.path = [string]$phase0ProfileValidation.ProfilePath
+        $tauriSourceFacts.toolchain_profile.sha256 = [string]$phase0ProfileValidation.Digest
+        $tauriSourceFacts.toolchain_profile.bytes = [Int64]$fixtureToolchainProfileSnapshot.Bytes
+        Assert-D32SelfTest -Condition (
+            $tauriSourceFacts.candidate_sha -ceq $head -and
+            $tauriSourceFacts.toolchain_profile.path -ceq [string]$phase0ProfileValidation.ProfilePath -and
+            $tauriSourceFacts.toolchain_profile.sha256 -ceq [string]$phase0ProfileValidation.Digest -and
+            [Int64]$tauriSourceFacts.toolchain_profile.bytes -eq [Int64]$fixtureToolchainProfileSnapshot.Bytes
+        ) -Name 'synthetic source-patch facts are rebound only after exact live caller pins pass admitted library reuse' -Failures $failures
         $tauriSourceAuthorityPath = Join-Path $root 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
         $tauriSourceAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts
         $sourcePatchAuthority = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath `

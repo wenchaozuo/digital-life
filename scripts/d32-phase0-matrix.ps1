@@ -5026,13 +5026,28 @@ function Test-D32Phase0MatrixRecordSelfTest {
         $tauriSourceAttesterPath = Join-Path $script:D32Phase0ScriptRoot 'd32-tauri-macros-source-attestation.ps1'
         if (-not (Test-D32ProfileNoReparsePath -Path $tauriSourceAttesterPath)) { throw 'PHASE0_SELFTEST_BLOCKED: exact source-patch facts generator is missing or reparse-backed' }
         $tauriSourceAuthorityPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY.json'
-        $tauriSourceFactsLines = @(& $tauriSourceAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $candidate `
-            -ToolchainProfilePath $fakeProfile.ProfilePath -ExpectedToolchainProfileSha256 $fakeProfile.Digest `
-            -Repository $testRepository -PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath `
+        # This is a same-process library re-entry. Keep its authority pins
+        # identical to the admitted runner; synthetic fixture bindings are
+        # applied to the returned test record only after reuse succeeds.
+        $tauriSourceFactsLines = @(& $tauriSourceAttesterPath -ArchivePath $tauriArchivePath -CandidateSha $Phase0ExpectedCandidateSha `
+            -ToolchainProfilePath $Phase0ToolchainProfilePath -ExpectedToolchainProfileSha256 $Phase0ExpectedToolchainProfileSha256 `
+            -Repository $Phase0RepoRoot -PowerShellModuleAuthorityPath $Phase0PowerShellModuleAuthorityPath `
             -ExpectedPowerShellModuleAuthoritySha256 $Phase0ExpectedPowerShellModuleAuthoritySha256 `
             -PinnedGitPath $Phase0PinnedGitPath -PinnedGitSha256 $Phase0PinnedGitSha256)
         if ($tauriSourceFactsLines.Count -ne 1 -or $tauriSourceFactsLines[0] -isnot [string]) { throw 'PHASE0_SELFTEST_BLOCKED: source-patch facts generator did not emit exactly one JSON document' }
         $tauriSourceFacts = ConvertFrom-D32Phase0Json -Json ([string]$tauriSourceFactsLines[0])
+        $liveToolchainProfileSnapshot = Get-D32ProfileFileSnapshot -Path $Phase0ToolchainProfilePath
+        if ($tauriSourceFacts.candidate_sha -cne $Phase0ExpectedCandidateSha -or
+            $tauriSourceFacts.toolchain_profile.path -cne $Phase0ToolchainProfilePath -or
+            $tauriSourceFacts.toolchain_profile.sha256 -cne $Phase0ExpectedToolchainProfileSha256 -or
+            [Int64]$tauriSourceFacts.toolchain_profile.bytes -ne [Int64]$liveToolchainProfileSnapshot.Bytes) {
+            throw 'PHASE0_SELFTEST_BLOCKED: source-patch facts did not retain the exact admitted caller candidate/Profile bindings before fixture rebinding'
+        }
+        $fixtureToolchainProfileSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$fakeProfile.ProfilePath)
+        $tauriSourceFacts.candidate_sha = $candidate
+        $tauriSourceFacts.toolchain_profile.path = [string]$fakeProfile.ProfilePath
+        $tauriSourceFacts.toolchain_profile.sha256 = [string]$fakeProfile.Digest
+        $tauriSourceFacts.toolchain_profile.bytes = [Int64]$fixtureToolchainProfileSnapshot.Bytes
         $tauriSourceAuthorityReference = Write-D32VendoredProtocAuthorityCreateNew -Path $tauriSourceAuthorityPath -Document $tauriSourceFacts
         $tauriSourceAuthority = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath `
             -ExpectedAuthoritySha256 $tauriSourceAuthorityReference.sha256 -Repository $testRepository -CandidateSha $candidate `
@@ -5043,6 +5058,11 @@ function Test-D32Phase0MatrixRecordSelfTest {
             ($tauriSourceAuthority.Reference.sha256 -ceq $tauriSourceAuthorityReference.sha256 -and
                 $tauriSourceFacts.record_type -ceq 'D32_TAURI_MACROS_SOURCE_PATCH_V1' -and
                 $tauriSourceFacts.changed_files.Count -eq 1 -and $tauriSourceFacts.changed_files[0] -ceq 'src/command/wrapper.rs')
+        & $add 'synthetic source-patch facts are rebound only after exact live caller pins pass admitted library reuse' `
+            ($tauriSourceFacts.candidate_sha -ceq $candidate -and
+                $tauriSourceFacts.toolchain_profile.path -ceq [string]$fakeProfile.ProfilePath -and
+                $tauriSourceFacts.toolchain_profile.sha256 -ceq [string]$fakeProfile.Digest -and
+                [Int64]$tauriSourceFacts.toolchain_profile.bytes -eq [Int64]$fixtureToolchainProfileSnapshot.Bytes)
         $wrongSourceAuthorityShaRejected = $false
         try {
             $null = Test-D32TauriMacrosSourcePatchAuthority -AuthorityPath $tauriSourceAuthorityPath -ExpectedAuthoritySha256 ('0' * 64) `

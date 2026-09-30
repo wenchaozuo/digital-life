@@ -56,8 +56,8 @@ try {
     if ($rootKey.Length -eq 2 -and $rootKey[1] -eq ':') { $rootKey += [IO.Path]::DirectorySeparatorChar }
     $root = $directoryFences[$rootKey]
     $distribution = Get-D32PowerShellAuthorityRuntimeDistributionSnapshot -PowerShellRoot $powerShellRoot -DirectoryFences $directoryFences -OpenFiles $openFiles
-    $windowsRoot = [IO.Path]::GetFullPath([string]$env:SystemRoot)
-    if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $windowsRoot)) { throw 'MODULE_AUTHORITY_CREATE_BLOCKED: Windows OS resolver root is absent, noncanonical, or reparsed' }
+    $osSecurity = Get-D32PowerShellAuthorityCurrentOsSecurityComponents -ExpectedDefenderRoot '' -DirectoryFences $directoryFences -OpenFiles $openFiles
+    $windowsRoot = [string]$osSecurity.WindowsRoot
     $resolverPolicy = [ordered]@{
         policy_id = 'D32_POWERSHELL_RESOLVER_DOMAIN_V2'
         managed_distribution_root = $powerShellRoot
@@ -66,6 +66,7 @@ try {
         native_system_root = $windowsRoot
         native_search_flags = @('LOAD_LIBRARY_SEARCH_APPLICATION_DIR','LOAD_LIBRARY_SEARCH_SYSTEM32')
         forbidden_sources = @('CWD','PATH','USER_PSMODULEPATH','STARTUP_HOOKS','EXTERNAL_ASSEMBLIES','UNPINNED_DLL_DIRECTORIES')
+        os_security_components = @($osSecurity.Components)
     }
     $modules = [System.Collections.Generic.List[object]]::new()
     $globalIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)

@@ -6216,7 +6216,7 @@ function Assert-D32FixtureBuildProvenanceShape {
         [string]$Document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: sidecar schema, version, manifest hash, bytes, or identity is invalid'
     }
-    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.powershell_module_admission -CandidateSha ([string]$Document.candidate_sha) -Repository ([string]$Document.source_repo)) -or
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.powershell_module_admission -CandidateSha ([string]$Document.candidate_sha) -Repository ([string]$Document.source_repo) -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
         -not (Test-D32ProfilePathEqual -Left ([string]$Document.powershell_module_admission.entry_script_path) -Right ([IO.Path]::Combine([string]$Document.source_repo, 'scripts', 'd32-fixture-prebuild.ps1'))) -or
         -not (Test-D32ProfilePathEqual -Left ([string]$Document.powershell_module_admission.profile_reference.path) -Right ([string]$Document.environment.toolchain_profile_path)) -or
         $Document.powershell_module_admission.profile_reference.sha256 -cne [string]$Document.environment.toolchain_profile_sha256) {

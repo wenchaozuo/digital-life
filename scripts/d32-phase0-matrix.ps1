@@ -169,13 +169,42 @@ function Get-D32Phase0TargetWriterDescriptions {
         $nameProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['Name'] }
         $processIdProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['ProcessId'] }
         if ($null -eq $nameProperty -or $null -eq $processIdProperty -or $nameProperty.Value -isnot [string] -or
-            [String]::IsNullOrWhiteSpace([string]$nameProperty.Value) -or -not (Test-D32Phase0Integer -Value $processIdProperty.Value) -or
-            [Int64]$processIdProperty.Value -le 0) {
+            [String]::IsNullOrWhiteSpace([string]$nameProperty.Value) -or -not (Test-D32Phase0Integer -Value $processIdProperty.Value)) {
             throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: target-writer census contains an incomplete process identity'
         }
         $processName = [string]$nameProperty.Value
+        $processId = [Int64]$processIdProperty.Value
+
+        # Win32_Process includes the non-launchable Windows idle pseudo-process as PID 0.
+        # Exclude only its exact reserved identity; a zero/negative PID or a row that merely
+        # borrows this name remains an unverifiable census and blocks admission.
+        if ($processId -eq 0 -or $processName -ceq 'System Idle Process') {
+            $parentProcessIdProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['ParentProcessId'] }
+            if ($processId -ne 0 -or $processName -cne 'System Idle Process' -or $null -eq $parentProcessIdProperty -or
+                -not (Test-D32Phase0Integer -Value $parentProcessIdProperty.Value) -or [Int64]$parentProcessIdProperty.Value -ne 0) {
+                throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: PID-zero row is not the exact Windows System Idle Process identity'
+            }
+            continue
+        }
+
+        # PID 4 is the reserved Windows System kernel process. Validate its exact CIM
+        # parent/name tuple instead of treating a conflicting PID/name as an ordinary row.
+        # Other positive-PID system rows (for example Registry or Memory Compression) stay
+        # in the normal census and are not exempted from writer-name checks.
+        if ($processId -eq 4 -or $processName -ceq 'System') {
+            $parentProcessIdProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['ParentProcessId'] }
+            if ($processId -ne 4 -or $processName -cne 'System' -or $null -eq $parentProcessIdProperty -or
+                -not (Test-D32Phase0Integer -Value $parentProcessIdProperty.Value) -or [Int64]$parentProcessIdProperty.Value -ne 0) {
+                throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: PID-four row is not the exact Windows System process identity'
+            }
+            continue
+        }
+
+        if ($processId -le 0) {
+            throw 'PHASE0_FIXTURE_BUILD_CAPACITY_BLOCKED: target-writer census contains an incomplete process identity'
+        }
         if ($processName -notin $writerNames) { continue }
-        $targetWriters.Add("$processName PID=$($processIdProperty.Value): active build-class process cannot be excluded from candidate target trees")
+        $targetWriters.Add("$processName PID=${processId}: active build-class process cannot be excluded from candidate target trees")
     }
     return @($targetWriters.ToArray())
 }
@@ -3503,6 +3532,69 @@ function Test-D32Phase0MatrixRecordSelfTest {
     $writerAdmissionFailuresValid = @($writerAdmissionFailures | Where-Object { -not $_.Blocked -or $_.RootClaims -ne 0 -or $_.PostAdmission -ne 0 }).Count -eq 0
     & $add 'each active Cargo/rustc/MSVC/build-script writer class stops before owner-root claim or post-admission Cargo boundary' `
         ($writerAdmissionFailures.Count -eq $targetWriterNames.Count -and $writerAdmissionFailuresValid) "writer_classes=$($targetWriterNames -join ',')"
+
+    $knownWindowsPseudoRows = @(
+        [PSCustomObject]@{ Name = 'System Idle Process'; ProcessId = [uint32]0; ParentProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'System'; ProcessId = [uint32]4; ParentProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'Secure System'; ProcessId = [uint32]236; ParentProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'Registry'; ProcessId = [uint32]280; ParentProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'Memory Compression'; ProcessId = [uint32]5128; ParentProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'powershell.exe'; ProcessId = [uint32]9001; ParentProcessId = [uint32]9000 }
+    )
+    $capacityBeforePseudoAdmissionTest = $script:D32Phase0FixtureBuildCapacity
+    $knownWindowsPseudoProbe = { return $knownWindowsPseudoRows }.GetNewClosure()
+    $knownWindowsPseudoAdmission = & $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes $knownWindowsPseudoProbe
+    $script:D32Phase0FixtureBuildCapacity = $capacityBeforePseudoAdmissionTest
+    & $add 'exact Windows PID-zero Idle and PID-four System rows do not block; positive-PID kernel rows remain in the normal census' `
+        (-not $knownWindowsPseudoAdmission.Blocked -and $knownWindowsPseudoAdmission.RootClaims -eq 1 -and $knownWindowsPseudoAdmission.PostAdmission -eq 1) `
+        "blocked=$($knownWindowsPseudoAdmission.Blocked) root_claims=$($knownWindowsPseudoAdmission.RootClaims) post_admission=$($knownWindowsPseudoAdmission.PostAdmission)"
+
+    $malformedKernelRows = @(
+        [PSCustomObject]@{ Name = 'Other'; ProcessId = [uint32]0; ParentProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'System Idle Process'; ProcessId = [uint32]0; ParentProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'System Idle Process'; ProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'System Idle Process'; ProcessId = [uint32]9010; ParentProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'System'; ProcessId = [uint32]4; ParentProcessId = [uint32]1 },
+        [PSCustomObject]@{ Name = 'System'; ProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'Not System'; ProcessId = [uint32]4; ParentProcessId = [uint32]0 },
+        [PSCustomObject]@{ Name = 'System'; ProcessId = [uint32]9011; ParentProcessId = [uint32]0 }
+    )
+    $malformedKernelAdmissionFailures = [System.Collections.Generic.List[object]]::new()
+    foreach ($malformedKernelRow in $malformedKernelRows) {
+        $capturedKernelRow = $malformedKernelRow
+        $malformedKernelProbe = { return $capturedKernelRow }.GetNewClosure()
+        $malformedKernelAdmissionFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes $malformedKernelProbe))
+    }
+    $malformedKernelRowsBlockedBeforeClaim = @($malformedKernelAdmissionFailures | Where-Object { -not $_.Blocked -or $_.RootClaims -ne 0 -or $_.PostAdmission -ne 0 }).Count -eq 0
+    & $add 'unknown or mismatched PID-zero/PID-four pseudo rows fail closed before root claim' `
+        ($malformedKernelAdmissionFailures.Count -eq $malformedKernelRows.Count -and $malformedKernelRowsBlockedBeforeClaim) `
+        "cases=$($malformedKernelRows.Count)"
+
+    $positivePidMissingIdentityRows = @(
+        [PSCustomObject]@{ ProcessId = [uint32]9012; ParentProcessId = [uint32]4 },
+        [PSCustomObject]@{ Name = 'cargo.exe'; ParentProcessId = [uint32]4 }
+    )
+    $positivePidIdentityFailures = [System.Collections.Generic.List[object]]::new()
+    foreach ($incompleteProcessRow in $positivePidMissingIdentityRows) {
+        $capturedIncompleteProcessRow = $incompleteProcessRow
+        $incompleteProcessProbe = { return $capturedIncompleteProcessRow }.GetNewClosure()
+        $positivePidIdentityFailures.Add((& $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes $incompleteProcessProbe))
+    }
+    $positivePidMissingIdentityBlocked = @($positivePidIdentityFailures | Where-Object { -not $_.Blocked -or $_.RootClaims -ne 0 -or $_.PostAdmission -ne 0 }).Count -eq 0
+    & $add 'positive-PID rows missing Name or ProcessId fail closed before root claim' `
+        ($positivePidIdentityFailures.Count -eq $positivePidMissingIdentityRows.Count -and $positivePidMissingIdentityBlocked) `
+        "cases=$($positivePidMissingIdentityRows.Count)"
+
+    $idleAndActiveWriterProbe = {
+        return @(
+            [PSCustomObject]@{ Name = 'System Idle Process'; ProcessId = [uint32]0; ParentProcessId = [uint32]0 },
+            [PSCustomObject]@{ Name = 'cargo.exe'; ProcessId = [uint32]9013; ParentProcessId = [uint32]9000 }
+        )
+    }
+    $idleAndActiveWriterAdmission = & $runCapacityAdmissionNegative -Cim $healthyCapacityCimProbe -Drive $healthyCapacityDriveProbe -Processes $idleAndActiveWriterProbe
+    & $add 'filtering the exact PID-zero pseudo row does not hide a concurrent active Cargo writer' `
+        ($idleAndActiveWriterAdmission.Blocked -and $idleAndActiveWriterAdmission.RootClaims -eq 0 -and $idleAndActiveWriterAdmission.PostAdmission -eq 0) `
+        "blocked=$($idleAndActiveWriterAdmission.Blocked) root_claims=$($idleAndActiveWriterAdmission.RootClaims) post_admission=$($idleAndActiveWriterAdmission.PostAdmission)"
 
     $phase0SourceForAdmission = [IO.File]::ReadAllText($script:D32Phase0ScriptPath)
     $phase0FunctionStart = $phase0SourceForAdmission.IndexOf('function Invoke-D32Phase0Matrix', [StringComparison]::Ordinal)

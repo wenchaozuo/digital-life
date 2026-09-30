@@ -300,6 +300,8 @@ try {
 
     $helperPath = [IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1')
     $helperText = [IO.File]::ReadAllText($helperPath, [Text.UTF8Encoding]::new($false, $true))
+    $preflightPath = [IO.Path]::Combine($PSScriptRoot, 'd32-preflight.ps1')
+    $preflightText = [IO.File]::ReadAllText($preflightPath, [Text.UTF8Encoding]::new($false, $true))
     $assertStart = $helperText.IndexOf('function Assert-D32PowerShellModuleAdmissionCurrent', [StringComparison]::Ordinal)
     $helperInitializeStart = $helperText.IndexOf('function Initialize-D32PowerShellModuleAuthority', [StringComparison]::Ordinal)
     $helperFirstImport = $helperText.IndexOf('Import-Module', $helperInitializeStart, [StringComparison]::Ordinal)
@@ -367,6 +369,23 @@ try {
         $helperText.Contains('validator_context=$script:D32PowerShellModuleAdmissionValidationContext')
     Add-D32FactsSelfTestCase 'strict admission self-validation reports the failing record section without changing its fail-closed decision' `
         $validatorContextDiagnostics 'The shared-record validator keeps non-authoritative predicate diagnostics, including individual actual-assembly-origin closure-reference fields.'
+    $gitSetupDiagnosticStart = $preflightText.IndexOf('function Assert-D32PreflightSelfTestGitSetupResult', [StringComparison]::Ordinal)
+    $gitSetupDiagnosticEnd = $preflightText.IndexOf('function Invoke-D32PreflightGitProcessSelfTest', $gitSetupDiagnosticStart, [StringComparison]::Ordinal)
+    $gitSetupDiagnosticBody = if ($gitSetupDiagnosticEnd -gt $gitSetupDiagnosticStart) { $preflightText.Substring($gitSetupDiagnosticStart, $gitSetupDiagnosticEnd - $gitSetupDiagnosticStart) } else { '' }
+    $mainSelfTestStart = $preflightText.IndexOf('function Invoke-D32SelfTest', [StringComparison]::Ordinal)
+    $mainSelfTestEnd = $preflightText.IndexOf('if ($LibraryOnly)', $mainSelfTestStart, [StringComparison]::Ordinal)
+    $mainSelfTestBody = if ($mainSelfTestEnd -gt $mainSelfTestStart) { $preflightText.Substring($mainSelfTestStart, $mainSelfTestEnd - $mainSelfTestStart) } else { '' }
+    $gitSetupDiagnosticsBound = $gitSetupDiagnosticBody.Contains('Format-D32PreflightGitSelfTestFailureEvidence') -and
+        $gitSetupDiagnosticBody.Contains('$script:D32LastPreflightGitProcessCapture') -and
+        $gitSetupDiagnosticBody.Contains('$script:D32LastPreflightGitCaptureFailure') -and
+        $gitSetupDiagnosticBody.Contains('Assert-D32PreflightGitCaptureAttempt') -and
+        $mainSelfTestBody.Contains("Assert-D32PreflightSelfTestGitSetupResult -Name 'init' -Result `$git") -and
+        $mainSelfTestBody.Contains("Assert-D32PreflightSelfTestGitSetupResult -Name 'add' -Result `$git") -and
+        $mainSelfTestBody.Contains("Assert-D32PreflightSelfTestGitSetupResult -Name 'commit' -Result `$git") -and
+        $preflightText.Contains('function Protect-D32PreflightSelfTestDiagnosticText') -and
+        $global:D32PowerShellModuleImportAttempts -eq 0
+    Add-D32FactsSelfTestCase 'main preflight Git setup failures retain bounded sanitized V2 process evidence' `
+        $gitSetupDiagnosticsBound 'The code-owned init/add/commit path keeps exit, capture, raw-output digest/excerpt, process trace and cleanup context; temporary selftest paths and credential-like text are sanitized.'
     $closureFilePredicateContexts = $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionClosureFileRecord') -and
         $admissionValidatorBody.Contains('Test-D32PowerShellModuleAdmissionAssemblyOriginRecord') -and
         $admissionValidatorBody.Contains('Get-D32PowerShellAuthorityFixedModuleClosureRootPaths') -and

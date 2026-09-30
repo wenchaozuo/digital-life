@@ -1683,6 +1683,38 @@ function Assert-D32PreflightGitCaptureAttempt {
     }
 }
 
+function Assert-D32PreflightSelfTestGitSetupResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][object]$Result,
+        [Parameter(Mandatory = $true)][string]$OwnedRoot,
+        [Parameter(Mandatory = $true)][string]$FixtureRepository
+    )
+
+    $attempt = $script:D32LastPreflightGitCapture
+    $attemptValidationFailure = $null
+    if ($null -eq $attempt) {
+        $attemptValidationFailure = 'V2 attempt trace was unavailable; no process identity or cleanup proof can be asserted'
+    }
+    else {
+        try { Assert-D32PreflightGitCaptureAttempt -Attempt $attempt -Name "fixture-$Name" }
+        catch { $attemptValidationFailure = $_.Exception.Message }
+    }
+    if ([int]$Result.ExitCode -ne 0 -or $null -ne $Result.Failure -or
+        $null -eq $attempt -or $null -ne $attemptValidationFailure) {
+        $failureEvidence = Format-D32PreflightGitSelfTestFailureEvidence `
+            -Name "fixture-$Name" `
+            -Result $Result `
+            -RawCapture $script:D32LastPreflightGitProcessCapture `
+            -Attempt $attempt `
+            -CaptureFailure $script:D32LastPreflightGitCaptureFailure `
+            -AttemptValidationFailure $attemptValidationFailure `
+            -OwnedRoot $OwnedRoot `
+            -FixtureRepository $FixtureRepository
+        throw "PREFLIGHT_SELFTEST_GIT_SETUP_BLOCKED: marker-owned fixture setup lacked successful, fully validated Git execution; $failureEvidence"
+    }
+}
+
 function Invoke-D32PreflightGitProcessSelfTest {
     param(
         [Parameter(Mandatory = $true)][string]$Repository,
@@ -5646,11 +5678,11 @@ function Invoke-D32SelfTest {
         $staleOutputRecords = Get-D32FreshReleaseOutputRecords -Repository $fixture -Findings $staleOutputFindings
         Assert-D32SelfTest -Condition ($staleOutputRecords.Count -lt 3 -and @($staleOutputFindings | Where-Object { $_.Check -like 'bundle.build.fresh-output.*' -and $_.Severity -eq 'ERROR' }).Count -eq 3) -Name 'any pre-existing exact release artifact fails fresh-output preflight' -Failures $failures
         $git = Invoke-D32Git -Repository $fixture -Arguments @('init', '-q') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
-        if ($git.ExitCode -ne 0) { throw 'trusted Git init failed' }
+        Assert-D32PreflightSelfTestGitSetupResult -Name 'init' -Result $git -OwnedRoot $root -FixtureRepository $fixture
         $git = Invoke-D32Git -Repository $fixture -Arguments @('add', '.') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
-        if ($git.ExitCode -ne 0) { throw 'trusted Git add failed' }
+        Assert-D32PreflightSelfTestGitSetupResult -Name 'add' -Result $git -OwnedRoot $root -FixtureRepository $fixture
         $git = Invoke-D32Git -Repository $fixture -Arguments @('commit', '-q', '-m', 'selftest fixture') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
-        if ($git.ExitCode -ne 0) { throw 'trusted Git commit failed' }
+        Assert-D32PreflightSelfTestGitSetupResult -Name 'commit' -Result $git -OwnedRoot $root -FixtureRepository $fixture
         $head = (Invoke-D32Git -Repository $fixture -Arguments @('rev-parse', '--verify', 'HEAD') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash).Text.Trim()
         foreach ($fixtureSpec in $script:D32FixtureSpecs) {
             $fixtureManifestPath = [System.IO.Path]::GetFullPath((Join-Path $fixture $fixtureSpec.manifest))

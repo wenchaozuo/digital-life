@@ -1492,7 +1492,12 @@ function Test-D32PowerShellAuthorityResolverSnapshotTransition {
     $managedDelta = Get-D32PowerShellAuthorityResolverPathDelta -Before ([string[]]@($Before.LoadedManagedAssemblyPaths)) -After ([string[]]@($After.LoadedManagedAssemblyPaths))
     if ($nativeDelta.DuplicateBefore -or $nativeDelta.DuplicateAfter) { $issues.Add('native origin inventory contains duplicate path aliases') }
     if ($managedDelta.DuplicateBefore -or $managedDelta.DuplicateAfter) { $issues.Add('loaded managed assembly inventory contains duplicate path aliases') }
-    if ($nativeDelta.Removed.Count -gt 0) { $issues.Add('pre-import native image disappeared before admission completed') }
+    # Native loader snapshots may include pinned OS images that were loaded by
+    # earlier, module-free trust validation and are no longer resident after
+    # the fixed imports.  Each before/after image is still checked against the
+    # caller-pinned content inventory below; the post-import set is the one
+    # persisted as the admitted origin set.  Managed assemblies remain
+    # monotonic because they cannot be unloaded from this process context.
     if ($nativeDelta.CaseChanges.Count -gt 0) { $issues.Add('native image path casing changed across imports') }
     if ($nativeDelta.CommonOrderChanged) { $issues.Add('native image order changed across imports') }
     if ($managedDelta.Removed.Count -gt 0) { $issues.Add('pre-import managed assembly disappeared before admission completed') }
@@ -1554,7 +1559,11 @@ function Test-D32PowerShellAuthorityResolverSnapshotTransition {
         $nativeAddedReferences.Add((Get-D32PowerShellAuthorityResolverReferenceDiagnostic -Path $path -ReferenceMap $nativeReferences -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
     }
     $nativeRemovedLabels = [System.Collections.Generic.List[object]]::new()
-    foreach ($path in $nativeDelta.Removed) { $nativeRemovedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot)) }
+    $nativeRemovedReferences = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $nativeDelta.Removed) {
+        $nativeRemovedLabels.Add((Get-D32PowerShellAuthorityResolverDiagnosticPath -Path $path -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+        $nativeRemovedReferences.Add((Get-D32PowerShellAuthorityResolverReferenceDiagnostic -Path $path -ReferenceMap $nativeReferences -PowerShellRoot $PowerShellRoot -WindowsRoot $WindowsRoot -DefenderRoot $DefenderRoot))
+    }
     $nativeCaseChangeLabels = [System.Collections.Generic.List[object]]::new()
     foreach ($change in $nativeDelta.CaseChanges) {
         $nativeCaseChangeLabels.Add([PSCustomObject]@{
@@ -1599,7 +1608,7 @@ function Test-D32PowerShellAuthorityResolverSnapshotTransition {
         active_environment = [ordered]@{ before_names = $beforeEnvironmentNames.ToArray(); after_names = $afterEnvironmentNames.ToArray(); values_omitted = $true }
         native_component_role_differences = $nativeRoleDrift.ToArray()
         managed_domain_differences = $managedDomainDrift.ToArray()
-        native_images = [ordered]@{ pre_count = $nativeDelta.BeforeCount; post_count = $nativeDelta.AfterCount; added = $nativeAddedLabels.ToArray(); added_content_refs = $nativeAddedReferences.ToArray(); removed = $nativeRemovedLabels.ToArray(); case_changes = $nativeCaseChangeLabels.ToArray(); common_order_changed = [bool]$nativeDelta.CommonOrderChanged; unpinned = $nativeUnpinnedLabels.ToArray() }
+        native_images = [ordered]@{ pre_count = $nativeDelta.BeforeCount; post_count = $nativeDelta.AfterCount; added = $nativeAddedLabels.ToArray(); added_content_refs = $nativeAddedReferences.ToArray(); removed = $nativeRemovedLabels.ToArray(); removed_content_refs = $nativeRemovedReferences.ToArray(); case_changes = $nativeCaseChangeLabels.ToArray(); common_order_changed = [bool]$nativeDelta.CommonOrderChanged; unpinned = $nativeUnpinnedLabels.ToArray() }
         managed_assemblies = [ordered]@{ pre_count = $managedDelta.BeforeCount; post_count = $managedDelta.AfterCount; added = $managedAddedLabels.ToArray(); added_content_refs = $managedAddedReferences.ToArray(); removed = $managedRemovedLabels.ToArray(); case_changes = $managedCaseChangeLabels.ToArray(); common_order_changed = [bool]$managedDelta.CommonOrderChanged; unpinned = $managedUnpinnedLabels.ToArray() }
         issues = $issues.ToArray()
     }

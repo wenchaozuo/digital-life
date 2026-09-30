@@ -438,7 +438,7 @@ try {
     $postResolverDigests = Get-D32PowerShellAuthorityResolverDigestSet -ModuleSearchPath $resolverPostImport.ModuleSearchPath -OsSecurityInventorySha256 $resolverPostImport.OsSecurityInventorySha256 `
         -TrustedPlatformPaths $resolverPostImport.TrustedPlatformPaths -DepsPaths $resolverPostImport.DepsPaths -NativeDirectories $resolverPostImport.NativeDirectories `
         -NativeModulePaths $resolverPostImport.NativeModulePaths -ActiveEnvironment $resolverPostImport.ActiveEnvironment -NativePolicy $resolverPostImport.NativePolicy -NativeFileComponents $resolverPostImport.NativeFileComponents
-    Add-D32FactsSelfTestCase 'authorized post-import native and managed origins are admitted only as monotonic exact caller-pinned additions, and V2 resolver digest recomputes with component roles' `
+    Add-D32FactsSelfTestCase 'authorized post-import native and managed origins are admitted only as exact caller-pinned additions, and V2 resolver digest recomputes with component roles' `
         ($positiveTransition.Passed -and $resolverPositive.ResolverSha256 -cne $resolverPostImport.ResolverSha256 -and
          $resolverPositive.PolicySha256 -ceq $resolverPostImport.PolicySha256 -and
          $preResolverDigests.ResolverSha256 -ceq $resolverPositive.ResolverSha256 -and $postResolverDigests.ResolverSha256 -ceq $resolverPostImport.ResolverSha256 -and
@@ -468,15 +468,27 @@ try {
         (-not $unknownManagedTransition.Passed -and @($unknownManagedTransition.Diagnostic.issues | Where-Object { $_ -match 'managed assembly' }).Count -gt 0 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
         (ConvertTo-D32PowerShellAuthorityJsonText -Value $unknownManagedTransition.Diagnostic)
 
-    $resolverRemovedParameters = $resolverPostParameters.Clone()
-    $resolverRemovedParameters.NativeModulePaths = @($resolverPostParameters.NativeModulePaths | Where-Object { $_ -cne $kernelBasePath })
-    $resolverRemovedParameters.ManagedAssemblyPaths = @($resolverPostParameters.ManagedAssemblyPaths | Where-Object { $_ -cne $kernelBasePath })
-    $resolverRemoved = Get-D32PowerShellAuthorityResolverSnapshot @resolverRemovedParameters
-    $removedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverRemoved `
+    $resolverNativeRemovedParameters = $resolverPostParameters.Clone()
+    $resolverNativeRemovedParameters.NativeModulePaths = @($resolverPostParameters.NativeModulePaths | Where-Object { $_ -cne $kernelBasePath })
+    $resolverNativeRemoved = Get-D32PowerShellAuthorityResolverSnapshot @resolverNativeRemovedParameters
+    $nativeRemovedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverNativeRemoved `
         -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
-    Add-D32FactsSelfTestCase 'native and managed origin disappearance across the fixed imports is denied' `
-        (-not $removedTransition.Passed -and @($removedTransition.Diagnostic.issues | Where-Object { $_ -match 'disappeared' }).Count -eq 2 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
-        (ConvertTo-D32PowerShellAuthorityJsonText -Value $removedTransition.Diagnostic)
+    Add-D32FactsSelfTestCase 'a removed native loader snapshot entry is accepted only with an exact caller-pinned content reference' `
+        ($nativeRemovedTransition.Passed -and $nativeRemovedTransition.Diagnostic.native_images.removed_content_refs.Count -eq 1 -and
+         $nativeRemovedTransition.Diagnostic.native_images.removed_content_refs[0].caller_pinned -and
+         $nativeRemovedTransition.Diagnostic.native_images.removed_content_refs[0].location.domain -ceq 'WINDOWS_OS' -and
+         $nativeRemovedTransition.Diagnostic.native_images.removed_content_refs[0].sha256 -ceq $kernelBaseReference.sha256 -and
+         $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $nativeRemovedTransition.Diagnostic)
+
+    $resolverManagedRemovedParameters = $resolverPostParameters.Clone()
+    $resolverManagedRemovedParameters.ManagedAssemblyPaths = @($resolverPostParameters.ManagedAssemblyPaths | Where-Object { $_ -cne $kernelBasePath })
+    $resolverManagedRemoved = Get-D32PowerShellAuthorityResolverSnapshot @resolverManagedRemovedParameters
+    $managedRemovedTransition = Test-D32PowerShellAuthorityResolverSnapshotTransition -Before $resolverPositive -After $resolverManagedRemoved `
+        -PinnedNativeFiles $pinnedNativeRefs -PinnedManagedFiles $pinnedManagedRefs -PowerShellRoot ([string]$PSHOME) -WindowsRoot $windowsRoot -DefenderRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform'
+    Add-D32FactsSelfTestCase 'managed assembly disappearance remains denied across the fixed imports' `
+        (-not $managedRemovedTransition.Passed -and @($managedRemovedTransition.Diagnostic.issues | Where-Object { $_ -match 'managed assembly disappeared' }).Count -eq 1 -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $managedRemovedTransition.Diagnostic)
 
     $resolverPolicyDriftParameters = $resolverParameters.Clone()
     $resolverPolicyDriftParameters.TrustedPlatformAssemblyPaths = @($trustedPlatformFile, $rootSibling)

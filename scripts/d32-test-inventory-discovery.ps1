@@ -353,6 +353,12 @@ $record = [ordered]@{
     final_candidate_sha = $final.Head
     final_clean = $true
 }
+if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $record.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
+        -Repository $repo -ProducerRole inventory_discovery -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+        -ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+    -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $record.powershell_module_admission -ExpectedProcessId ([Int64]$record.runner_process_id))) {
+    throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery writer admission is not the current direct discovery producer context'
+}
 $recordPath = Join-Path $output 'D32-TEST-INVENTORY-DISCOVERY.json'
 if (Test-Path -LiteralPath $recordPath) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: refusing to overwrite existing discovery record' }
 $json = ConvertTo-Json -InputObject $record -Depth 40 -Compress

@@ -11,6 +11,12 @@ $runner = [IO.Path]::GetFullPath($PSCommandPath)
 $null = Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $runner
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+trap {
+    [Console]::Error.WriteLine([string]$_.Exception.Message)
+    [Console]::Error.WriteLine([string]$_.InvocationInfo.PositionMessage)
+    [Console]::Error.WriteLine([string]$_.ScriptStackTrace)
+    break
+}
 
 $testCount = 0
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -48,11 +54,11 @@ $fixtureSource = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-f
 $fixtureTokens = $null
 $fixtureParseErrors = $null
 $fixtureAst = [System.Management.Automation.Language.Parser]::ParseInput($fixtureSource, [ref]$fixtureTokens, [ref]$fixtureParseErrors)
-$fixtureAdmissionCalls = @($fixtureAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Test-D32PowerShellModuleAdmissionRecord' }, $true))
+$fixtureAdmissionCalls = @($fixtureAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Test-D32PowerShellModuleAdmissionProducerBinding' }, $true))
 $fixtureProducerAdmissionBound = $false
 foreach ($call in $fixtureAdmissionCalls) {
     $elements = @($call.CommandElements | ForEach-Object { $_.Extent.Text })
-    if ($elements -contains '-ExpectedContext' -and ($elements -join ' ') -match '\$global:D32PowerShellModuleAuthorityState\.Admission') {
+    if ($elements -contains '-ExpectedProducerContext' -and ($elements -join ' ') -match '\$global:D32PowerShellModuleAuthorityState\.Admission') {
         $fixtureProducerAdmissionBound = $true
         break
     }
@@ -155,7 +161,12 @@ $syntheticOsComponents = @(
     [ordered]@{ component_type = 'MICROSOFT_WINDOWS_OS_INSTALLATION'; inventory_sha256 = ('a' * 64); native_files = @(); distribution = [ordered]@{ directories = @() } },
     [ordered]@{ component_type = 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM'; inventory_sha256 = ('b' * 64); native_files = @(); distribution = [ordered]@{ directories = @() } }
 )
-$syntheticOsDigest = Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $syntheticOsComponents
+$syntheticOsDigestValues = @(Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $syntheticOsComponents)
+if ($syntheticOsDigestValues.Count -ne 1 -or $syntheticOsDigestValues[0] -isnot [string] -or [string]$syntheticOsDigestValues[0] -cnotmatch '^[0-9a-f]{64}$') {
+    throw ('D32 discovery loader selftest setup failed: expected exactly one lowercase OS digest result; count={0}; types={1}; values={2}' -f
+        $syntheticOsDigestValues.Count, (($syntheticOsDigestValues | ForEach-Object { $_.GetType().FullName }) -join ','), (($syntheticOsDigestValues | ForEach-Object { [string]$_ }) -join ','))
+}
+$syntheticOsDigest = [string]$syntheticOsDigestValues[0]
 Assert-D32ModuleFreeSelfTest -Condition ($syntheticOsDigest -match '^[0-9a-f]{64}$' -and $global:D32PowerShellModuleImportAttempts -eq 0) -Name 'fixed OS and Defender component inventory digest is deterministic-shape and module-free'
 $reorderedOsComponents = @($syntheticOsComponents[1], $syntheticOsComponents[0])
 $missingOsComponentRejected = $false
@@ -276,6 +287,9 @@ foreach ($rights in $aclWriteRights) {
 
 $liveResolver = Get-D32PowerShellAuthorityResolverSnapshot
 Assert-D32ModuleFreeSelfTest -Condition ($global:D32PowerShellModuleImportAttempts -eq 0) -Name 'live resolver census is module-free and records zero import attempts'
+Assert-D32ModuleFreeSelfTest -Condition (@($liveResolver.Blockers | Where-Object { $_ -ceq 'independently pinned Windows OS and Defender security-component inventories are not admitted' }).Count -eq 1 -and
+    $liveResolver.ResolverSha256 -cmatch '^[0-9a-f]{64}$' -and $liveResolver.PolicySha256 -cmatch '^[0-9a-f]{64}$' -and $global:D32PowerShellModuleImportAttempts -eq 0) `
+    -Name 'no-pin resolver census returns a deterministic blocked diagnostic with zero imports'
 if ($liveResolver.Blockers.Count -gt 0) {
     [Console]::WriteLine(('MODULE_FREE_RESOLVER_CENSUS BLOCKED before imports: {0}' -f ($liveResolver.Blockers -join '; ')))
 }

@@ -198,12 +198,12 @@ try {
         $producerPath = [IO.Path]::Combine($PSScriptRoot, $producerName)
         if (-not [IO.File]::Exists($producerPath) -or -not [IO.File]::ReadAllText($producerPath, [Text.UTF8Encoding]::new($false, $true)).Contains('Initialize-D32PowerShellModuleAuthority')) { $producersBound = $false }
     }
-    $consumerFiles = @('d32-preflight.ps1','d32-phase0-matrix.ps1','d32-fixture-prebuild.ps1','d32-test-inventory-authority.ps1')
+    $consumerFiles = @('d32-preflight.ps1','d32-phase0-matrix.ps1','d32-fixture-prebuild.ps1','d32-test-inventory-authority.ps1','d32-test-inventory-baseline.ps1','d32-test-inventory-discovery.ps1')
     $consumersBound = $true
     foreach ($consumerName in $consumerFiles) {
         $consumerPath = [IO.Path]::Combine($PSScriptRoot, $consumerName)
         $consumerText = if ([IO.File]::Exists($consumerPath)) { [IO.File]::ReadAllText($consumerPath, [Text.UTF8Encoding]::new($false, $true)) } else { '' }
-        if (-not $consumerText.Contains('Test-D32PowerShellModuleAdmissionRecord') -or -not $consumerText.Contains('-ExpectedContext')) { $consumersBound = $false }
+        if (-not $consumerText.Contains('Test-D32PowerShellModuleAdmissionProducerBinding')) { $consumersBound = $false }
     }
     $runnerConsumersBound = $true
     foreach ($consumerName in @('d32-preflight.ps1','d32-phase0-matrix.ps1')) {

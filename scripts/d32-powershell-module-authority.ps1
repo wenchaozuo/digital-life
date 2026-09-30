@@ -1123,7 +1123,7 @@ function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
 function Get-D32PowerShellAuthorityResolverDigestSet {
     param(
         [Parameter(Mandatory = $true)][string]$ModuleSearchPath,
-        [Parameter(Mandatory = $true)][string]$OsSecurityInventorySha256,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$OsSecurityInventorySha256,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$TrustedPlatformPaths,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$DepsPaths,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$NativeDirectories,
@@ -2126,6 +2126,84 @@ function Test-D32PowerShellModuleAdmissionRecord {
         }
     }
     return $true
+}
+
+function Get-D32PowerShellModuleProducerEntryPaths {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('fixture_provenance','inventory_discovery','inventory_baseline','phase0_matrix','release_attestation','post_bundle_aggregate')]
+        [string]$ProducerRole
+    )
+    $repo = [IO.Path]::GetFullPath($Repository)
+    $scripts = [IO.Path]::Combine($repo, 'scripts')
+    $names = switch ($ProducerRole) {
+        'fixture_provenance' { @('d32-fixture-prebuild.ps1','d32-phase0-matrix.ps1','d32-preflight.ps1') }
+        'inventory_discovery' { @('d32-test-inventory-discovery.ps1','d32-preflight.ps1') }
+        'inventory_baseline' { @('d32-test-inventory-baseline.ps1','d32-preflight.ps1') }
+        'phase0_matrix' { @('d32-phase0-matrix.ps1','d32-preflight.ps1') }
+        'release_attestation' { @('d32-preflight.ps1') }
+        'post_bundle_aggregate' { @('d32-preflight.ps1') }
+    }
+    return @($names | ForEach-Object { [IO.Path]::GetFullPath([IO.Path]::Combine($scripts, [string]$_)) })
+}
+
+function Test-D32PowerShellModuleProducerContextEqual {
+    param([AllowNull()][object]$Document, [AllowNull()][object]$ExpectedContext)
+    try {
+        if ($null -eq $Document -or $null -eq $ExpectedContext) { return $false }
+        foreach ($field in @('runner_process','startup','entry_script_path','entry_script')) {
+            $actualValue = if ($Document -is [System.Collections.IDictionary]) { $Document[$field] } else { $Document.PSObject.Properties[$field].Value }
+            $expectedValue = if ($ExpectedContext -is [System.Collections.IDictionary]) { $ExpectedContext[$field] } else { $ExpectedContext.PSObject.Properties[$field].Value }
+            if ($null -eq $actualValue -or $null -eq $expectedValue -or
+                (ConvertTo-D32PowerShellAuthorityJsonText -Value $actualValue) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedValue)) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-D32PowerShellModuleProducerProcessDistinct {
+    param([AllowNull()][object]$Document, [AllowNull()][object]$OtherAdmission)
+    try {
+        if ($null -eq $Document -or $null -eq $OtherAdmission) { return $false }
+        $left = if ($Document -is [System.Collections.IDictionary]) { $Document['runner_process'] } else { $Document.PSObject.Properties['runner_process'].Value }
+        $right = if ($OtherAdmission -is [System.Collections.IDictionary]) { $OtherAdmission['runner_process'] } else { $OtherAdmission.PSObject.Properties['runner_process'].Value }
+        if ($null -eq $left -or $null -eq $right) { return $false }
+        return ([Int64]$left.process_id -ne [Int64]$right.process_id) -or ([Int64]$left.start_time_utc_ticks -ne [Int64]$right.start_time_utc_ticks)
+    }
+    catch { return $false }
+}
+
+function Test-D32PowerShellModuleAdmissionProducerBinding {
+    param(
+        [AllowNull()][object]$Document,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('fixture_provenance','inventory_discovery','inventory_baseline','phase0_matrix','release_attestation','post_bundle_aggregate')]
+        [string]$ProducerRole,
+        [AllowNull()][object]$ExpectedAdmissionContext,
+        [AllowNull()][object]$ExpectedProducerContext,
+        [AllowNull()][object]$ExactLinkedAdmission,
+        [AllowNull()][object]$DistinctFromAdmission
+    )
+    try {
+        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $ExpectedAdmissionContext)) { return $false }
+        $entryPath = [string]$Document.entry_script_path
+        $rolePaths = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $Repository -ProducerRole $ProducerRole)
+        $roleMatch = $false
+        foreach ($path in $rolePaths) {
+            if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($entryPath), [IO.Path]::GetFullPath([string]$path))) { $roleMatch = $true; break }
+        }
+        if (-not $roleMatch -or -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Document.startup.file_operand, $entryPath)) { return $false }
+        if ($null -ne $ExpectedProducerContext -and -not (Test-D32PowerShellModuleProducerContextEqual -Document $Document -ExpectedContext $ExpectedProducerContext)) { return $false }
+        if ($null -ne $ExactLinkedAdmission -and
+            (ConvertTo-D32PowerShellAuthorityJsonText -Value $Document) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $ExactLinkedAdmission)) { return $false }
+        if ($null -ne $DistinctFromAdmission -and -not (Test-D32PowerShellModuleProducerProcessDistinct -Document $Document -OtherAdmission $DistinctFromAdmission)) { return $false }
+        return $true
+    }
+    catch { return $false }
 }
 
 function Test-D32PowerShellModuleAdmissionProfileBinding {

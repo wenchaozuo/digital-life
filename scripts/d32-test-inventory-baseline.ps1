@@ -54,13 +54,19 @@ $discoveryReference = Get-D32Phase0FileReference -Path $DiscoveryPath
 if ($discoveryReference.sha256 -cne $ExpectedDiscoverySha256) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: discovery bytes differ from the independent caller SHA' }
 $discovery = Test-D32Phase0TestInventoryDiscoveryRecord -Reference $discoveryReference -ExpectedSha256 $ExpectedDiscoverySha256 `
     -Repository $repo -CandidateSha $ExpectedCandidateSha -Profile $profile -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256
+if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $global:D32PowerShellModuleAuthorityState.Admission -CandidateSha $ExpectedCandidateSha `
+        -Repository $repo -ProducerRole inventory_baseline -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+        -ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission)) {
+    throw 'TEST_INVENTORY_BASELINE_BLOCKED: baseline generation requires the current direct baseline producer startup and entry context'
+}
 $document = New-D32TestInventoryBaselineDocument -Discovery $discovery.Document -DiscoveryReference $discovery.Reference `
-    -PackageInventories $discovery.PackageInventories -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
+    -PackageInventories $discovery.PackageInventories -ProducerAdmission $global:D32PowerShellModuleAuthorityState.Admission `
+    -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
 $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $profile.Profile)
 $null = Test-D32TestInventoryBaselineDocument -Document $document -Discovery $discovery.Document -DiscoveryReference $discovery.Reference `
     -ExpectedCandidateSha $ExpectedCandidateSha -Repository $repo -Profile $profile -LockInputs $discovery.LockInputs `
     -SourcePatchAuthorityReference $discovery.Document.source_patch_authority -ProtocAuthorityReference $discovery.Document.protoc.authority `
-    -ExpectedCommands $expectedCommands
+    -ExpectedCommands $expectedCommands -ExpectedProducerAdmission $global:D32PowerShellModuleAuthorityState.Admission
 $reference = Write-D32TestInventoryJsonCreateNew -Path $BaselineOutputPath -Document $document -Repository $repo -DiscoveryRoot $discovery.Root
 Write-Output 'inventory_baseline_status=AWAITING_COORDINATOR_PIN'
 Write-Output 'inventory_baseline_gate_authority=NONE'

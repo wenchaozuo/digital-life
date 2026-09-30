@@ -2694,6 +2694,7 @@ function Test-D32PreflightPhase0VendoredProtocBinding {
         -ExpectedCandidateSha $CandidateSha `
         -ExpectedRunnerProcessId ([int]$Phase0Document.runner_process_id) `
         -ValidatedProfile $ValidatedProfile `
+        -ExpectedProducerAdmission $Phase0Document.powershell_module_admission `
         -VendoredAuthorityPath ([string]$authorityReference.path) `
         -ExpectedVendoredAuthoritySha256 ([string]$authorityReference.sha256) `
         -ValidatedVendoredGrant $grant `
@@ -2836,10 +2837,11 @@ function Test-D32ReleaseEvidenceBundle {
 
     $candidate = Get-D32JsonProperty -Object $Bundle -Name 'candidate_sha'
     $attestedCandidate = Get-D32JsonProperty -Object $Attestation -Name 'candidate_sha'
-    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Attestation.powershell_module_admission -CandidateSha ([string]$candidate) -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $Attestation.powershell_module_admission -CandidateSha ([string]$candidate) -Repository $Repository `
+            -ProducerRole release_attestation -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
         -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $Attestation.powershell_module_admission -ExpectedProcessId ([Int64]$Attestation.runner_process_id)) -or
         -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Attestation.powershell_module_admission -ProfileRecord $Attestation.toolchain_profile)) {
-        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'attestation.module-admission' -Message 'release attestation lacks the exact caller-pinned D32 PowerShell module admission'
+        Add-D32Finding -Findings $Findings -Severity ERROR -Check 'attestation.module-admission' -Message 'release attestation lacks its strict direct preflight producer process/startup/entry and caller-pinned D32 PowerShell module admission'
     }
     if (-not (Test-D32Sha40 -Value $candidate) -or $null -ne $Head -and $candidate -cne $Head -or $attestedCandidate -cne $candidate) {
         Add-D32Finding -Findings $Findings -Severity ERROR -Check 'bundle.candidate_sha' -Message 'bundle and attestation candidate SHA must both equal the exact current HEAD'
@@ -2985,7 +2987,8 @@ function Test-D32ReleaseEvidenceBundle {
         $phase0Document = $phase0Read.Value
         $phase0Fields = @('schema_version', 'record_type', 'runner_process_id', 'candidate_sha', 'source_repo', 'output_root', 'evidence_root_identity', 'owner_marker', 'vendored_protoc', 'tauri_macros_source_patch', 'h7c_git_child_authority', 'h7c_git_child_attestation', 'test_inventory_authority', 'powershell_module_admission', 'status', 'bundle_hashes', 'started_at_utc', 'completed_at_utc', 'final_candidate_sha', 'final_clean', 'powershell', 'toolchain_profile', 'cargo_home', 'fixture_build_budget', 'fetches', 'fixture', 'commands', 'test_inventory', 'local_suites', 'focused_tests', 'deferred_d31_tests', 'deferred_d29g2_provider_tests', 'not_run_capture_tests', 'governance_inputs', 'phase0_scope')
         if (-not (Test-D32Phase0ExactProperties -Object $phase0Document -Expected $phase0Fields) -or -not (Test-D32Phase0Integer -Value $phase0Document.schema_version) -or [Int64]$phase0Document.schema_version -ne 8 -or $phase0Document.record_type -cne 'D32_PHASE0_MATRIX_RECORD_V8' -or $phase0Document.candidate_sha -cne $candidate -or $phase0Document.final_candidate_sha -cne $candidate -or $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'referenced Phase0 matrix has unsupported schema, candidate, status, clean state, or bundle-hash status' }
-        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $phase0Document.powershell_module_admission -CandidateSha $candidate -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $phase0Document.powershell_module_admission -CandidateSha $candidate -Repository $Repository `
+                -ProducerRole phase0_matrix -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
             -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $phase0Document.powershell_module_admission -ExpectedProcessId ([Int64]$phase0Document.runner_process_id)) -or
             -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $phase0Document.powershell_module_admission -ProfileRecord $phase0Document.toolchain_profile)) { throw 'referenced Phase0 matrix does not bind a current caller-pinned module admission to its producer process/Profile' }
         Assert-D32Phase0FixtureSummarySchema -Fixture $phase0Document.fixture
@@ -3649,7 +3652,8 @@ function Assert-D32PreflightTestInventoryBinding {
         $discovery.fetches -isnot [Array] -or $discovery.fetches.Count -ne 3) {
         throw 'D32_TEST_INVENTORY_DISCOVERY_V2 is incomplete, non-current, or not candidate-bound'
     }
-    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $discovery.powershell_module_admission -CandidateSha ([string]$Phase0Document.candidate_sha) -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $discovery.powershell_module_admission -CandidateSha ([string]$Phase0Document.candidate_sha) -Repository $Repository `
+            -ProducerRole inventory_discovery -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
         -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $discovery.powershell_module_admission -ExpectedProcessId ([Int64]$discovery.runner_process_id)) -or
         -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $discovery.powershell_module_admission -ProfileRecord $discovery.toolchain_profile)) {
         throw 'D32_TEST_INVENTORY_DISCOVERY_V2 is not bound to the current caller-pinned PowerShell module closure'
@@ -3935,12 +3939,18 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     $discoveryPre = Get-D32Phase0GitState -Repository $Repository -GitPath $PinnedGitPath -GitSha256 $PinnedGitSha256
     if ($discoveryPre.Head -cne $CandidateSha -or -not $discoveryPre.Clean) { throw 'preflight self-test inventory fixture must start at its exact clean candidate' }
     $toolchainProfile = Get-D32TestInventoryProfileRecord -ValidatedProfile $ValidatedProfile
+    $syntheticDiscoveryAdmission = [System.Management.Automation.PSSerializer]::Deserialize(
+        [System.Management.Automation.PSSerializer]::Serialize($global:D32PowerShellModuleAuthorityState.Admission))
+    $syntheticDiscoveryAdmission.runner_process.start_time_utc_ticks = [Int64]$syntheticDiscoveryAdmission.runner_process.start_time_utc_ticks - 10000000L
+    if ([Int64]$syntheticDiscoveryAdmission.runner_process.start_time_utc_ticks -le 0) {
+        throw 'preflight self-test synthetic discovery producer epoch is invalid'
+    }
     $discovery = [ordered]@{
         schema_version = 2
         record_type = 'D32_TEST_INVENTORY_DISCOVERY_V2'
         status = 'COMPLETE_FOR_COORDINATOR_REVIEW'
         gate_authority = 'NONE'
-        runner_process_id = [int]$PID
+        runner_process_id = [int]$syntheticDiscoveryAdmission.runner_process.process_id
         candidate_sha = $CandidateSha
         source_repo = [IO.Path]::GetFullPath($Repository)
         evidence_root_identity = [ordered]@{ path = [string]$owner.RootIdentity.Path; volume_serial_hex = [string]$owner.RootIdentity.VolumeSerialHex; file_id_hex = [string]$owner.RootIdentity.FileIdHex }
@@ -3963,7 +3973,7 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
             package_digests = @($packageDigests.ToArray())
             category_counts = $categoryCounts
         }
-        powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
+        powershell_module_admission = $syntheticDiscoveryAdmission
         started_at_utc = $inventoryTimelineStart.AddSeconds(-10).ToString('o')
         completed_at_utc = $inventoryTimelineStart.AddSeconds(50).ToString('o')
         final_candidate_sha = $CandidateSha
@@ -4097,11 +4107,13 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     }
     catch { $protocolProtocTraceRejectedWithoutGrant = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
     $baseline = New-D32TestInventoryBaselineDocument -Discovery $validatedDiscovery.Document -DiscoveryReference $validatedDiscovery.Reference `
-        -PackageInventories $validatedDiscovery.PackageInventories -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
+        -PackageInventories $validatedDiscovery.PackageInventories -ProducerAdmission $global:D32PowerShellModuleAuthorityState.Admission `
+        -GeneratedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
     $expectedCommands = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)
     $null = Test-D32TestInventoryBaselineDocument -Document $baseline -Discovery $validatedDiscovery.Document -DiscoveryReference $validatedDiscovery.Reference `
         -ExpectedCandidateSha $CandidateSha -Repository $Repository -Profile $ValidatedProfile -LockInputs $lockInputs `
-        -SourcePatchAuthorityReference $SourcePatchAuthority.Reference -ProtocAuthorityReference $authorityReference -ExpectedCommands $expectedCommands
+        -SourcePatchAuthorityReference $SourcePatchAuthority.Reference -ProtocAuthorityReference $authorityReference -ExpectedCommands $expectedCommands `
+        -ExpectedProducerAdmission $global:D32PowerShellModuleAuthorityState.Admission
     $baselinePath = Join-Path $Root 'D32-TEST-INVENTORY-BASELINE.json'
     $baselineReference = Write-D32TestInventoryJsonCreateNew -Path $baselinePath -Document $baseline -Repository $Repository -DiscoveryRoot $discoveryRoot
     $validatedAuthority = Test-D32Phase0TestInventoryAuthority -BaselinePath $baselinePath -BaselineSha256 ([string]$baselineReference.sha256 `
@@ -4331,9 +4343,10 @@ function Test-D32PostBundleAggregateRecord {
             $record.status -isnot [string] -or $record.status -cne 'PRE_DOWNSTREAM_AGGREGATE_PASS' -or
             $record.bundle_hashes -isnot [string] -or $record.bundle_hashes -cne 'VERIFIED' -or
             $record.downstream_gates -isnot [string] -or $record.downstream_gates -cne 'NOT RUN') { throw 'aggregate record version/type/scope/candidate/repository/evidence-root/status/bundle/downstream binding is invalid' }
-        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $record.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $record.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo `
+                -ProducerRole post_bundle_aggregate -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
             -not (Test-D32PowerShellModuleAdmissionProfileBinding -Document $record.powershell_module_admission -ExpectedProfileReference $global:D32PowerShellModuleAuthorityState.Admission.profile_reference)) {
-            throw 'aggregate record does not bind the current caller-pinned PowerShell module authority and producer admission'
+            throw 'aggregate record does not bind a strict historical aggregate producer process/startup/entry and caller-pinned module authority'
         }
         $expectedBundleManifest = Join-Path (Join-Path $evidence $script:D32BundleDirectoryName) $script:D32BundleManifestName
         $expectedAttestation = Join-Path $evidence $script:D32AttestationName
@@ -4404,7 +4417,8 @@ function Test-D32PostBundleAggregateRecord {
             $phase0Document.final_candidate_sha -isnot [string] -or $phase0Document.final_candidate_sha -cne $ExpectedCandidateSha -or
             $phase0Document.status -cne 'PASS' -or $phase0Document.bundle_hashes -cne 'PENDING' -or
             $phase0Document.final_clean -isnot [bool] -or -not $phase0Document.final_clean) { throw 'aggregate-referenced Phase0 matrix is not the supported exact V8 local PASS schema' }
-        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $phase0Document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $phase0Document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo `
+                -ProducerRole phase0_matrix -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
             -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $phase0Document.powershell_module_admission -ExpectedProcessId ([Int64]$phase0Document.runner_process_id)) -or
             -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $phase0Document.powershell_module_admission -ProfileRecord $phase0Document.toolchain_profile)) { throw 'aggregate-referenced Phase0 module admission is missing, stale or cross-bound' }
         if (-not (Test-D32Phase0ExactProperties -Object $phase0Document.test_inventory_authority -Expected @('baseline', 'discovery')) -or
@@ -4919,6 +4933,11 @@ function Invoke-D32GeneratePostBundleAggregateRecord {
             references = $references
             powershell_module_admission = $global:D32PowerShellModuleAuthorityState.Admission
         }
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
+                -Repository $repo -ProducerRole post_bundle_aggregate -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+                -ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission)) {
+            throw 'aggregate writer admission is not the current direct preflight producer process/startup/entry context'
+        }
         Write-D32JsonCreateNew -Path $expectedRecord -Value $document
         $recordDigest = Get-D32EvidenceFileDigest -Path $expectedRecord
         if ($null -eq $recordDigest) { throw 'created post-bundle aggregate record is not a stable regular external file' }
@@ -5309,6 +5328,12 @@ function Invoke-D32GenerateBundle {
             fresh_outputs = @($freshOutputRecords)
             commands = @($commandRecords)
             artifacts = @($artifactRecords)
+        }
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $attestationDocument.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
+                -Repository $repoCanonical -ProducerRole release_attestation -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+                -ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+            -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $attestationDocument.powershell_module_admission -ExpectedProcessId ([Int64]$attestationDocument.runner_process_id))) {
+            throw 'release attestation writer admission is not the current direct preflight producer process/startup/entry context'
         }
         Write-D32JsonCreateNew -Path $attestationPath -Value $attestationDocument
         $attestationDigest = Get-D32EvidenceFileDigest -Path $attestationPath

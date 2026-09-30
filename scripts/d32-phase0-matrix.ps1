@@ -1599,6 +1599,7 @@ function Test-D32Phase0FixtureBuildProvenance {
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][int]$ExpectedRunnerProcessId,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [AllowNull()][object]$ExpectedProducerAdmission,
         [AllowNull()][string]$VendoredAuthorityPath,
         [AllowNull()][string]$ExpectedVendoredAuthoritySha256,
         [AllowNull()][object]$ValidatedVendoredGrant,
@@ -1621,8 +1622,12 @@ function Test-D32Phase0FixtureBuildProvenance {
         $document.fixture_manifest_volume_serial_hex -isnot [string] -or $document.fixture_manifest_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
         $document.fixture_manifest_file_id_hex -isnot [string] -or $document.fixture_manifest_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         -not (Test-D32Phase0Integer -Value $document.fixture_manifest_bytes -Positive)) { throw 'PHASE0_FIXTURE_BLOCKED: fixture build provenance sidecar schema/candidate/source/manifest binding is invalid' }
-    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission)) {
-        throw 'PHASE0_FIXTURE_BLOCKED: fixture provenance does not bind a current independently pinned PowerShell module admission'
+    $expectedProducerAdmission = if ($null -ne $ExpectedProducerAdmission) { $ExpectedProducerAdmission } else { $global:D32PowerShellModuleAuthorityState.Admission }
+    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
+            -Repository $Repository -ProducerRole fixture_provenance -ExpectedAdmissionContext $expectedProducerAdmission `
+            -ExpectedProducerContext $expectedProducerAdmission) -or
+        -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $document.powershell_module_admission -ExpectedProcessId $ExpectedRunnerProcessId)) {
+        throw 'PHASE0_FIXTURE_BLOCKED: fixture provenance does not bind the exact linked Phase0 producer process/startup/entry and caller-pinned module admission'
     }
     Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
     if ($null -ne $script:D32Phase0FixtureBuildCapacity -and
@@ -1977,10 +1982,11 @@ function Test-D32Phase0TestInventoryDiscoveryRecord {
         $document.run_id -isnot [string] -or $document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
         $document.fetches -isnot [Array] -or $document.fetches.Count -ne 3 -or
         $document.inventory_commands -isnot [Array] -or $document.inventory_commands.Count -ne 6) { throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: strict V1 schema/status/candidate/process/list inventory mismatch' }
-    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $document.powershell_module_admission -CandidateSha $CandidateSha -Repository $Repository `
+            -ProducerRole inventory_discovery -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
         -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $document.powershell_module_admission -ExpectedProcessId ([Int64]$document.runner_process_id)) -or
         -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $document.powershell_module_admission -ProfileRecord $document.toolchain_profile)) {
-        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery does not bind a current independently pinned PowerShell module admission'
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: discovery does not bind its admitted producer process/startup/entry, caller-pinned module closure, and profile'
     }
     $discoveryStart = [DateTimeOffset]::MinValue
     $discoveryEnd = [DateTimeOffset]::MinValue
@@ -2152,7 +2158,7 @@ function Test-D32Phase0TestInventoryAuthority {
         (Test-D32ProfilePathWithin -Child $BaselinePath -Parent $EvidenceRoot)) { throw 'TEST_INVENTORY_BASELINE_BLOCKED: caller must pin an external canonical baseline before root claim' }
     $baselineReference = if ($null -ne $ExpectedBaselineReference) { $ExpectedBaselineReference } else { Get-D32Phase0FileReference -Path $BaselinePath }
     $baselineRead = Read-D32TestInventoryJsonReference -Reference $baselineReference -ExpectedPath $BaselinePath -ExpectedSha256 $BaselineSha256 -Repository $Repository
-    if (-not (Test-D32Phase0ExactProperties -Object $baselineRead.Document -Expected @('schema_version', 'record_type', 'status', 'gate_authority', 'candidate_sha', 'source_repo', 'target_triple', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc_discovery_authority', 'discovery', 'commands', 'entries', 'package_digests', 'combined_digest', 'category_counts', 'generated_at_utc'))) {
+    if (-not (Test-D32Phase0ExactProperties -Object $baselineRead.Document -Expected @('schema_version', 'record_type', 'status', 'gate_authority', 'candidate_sha', 'source_repo', 'target_triple', 'toolchain_profile', 'lock_inputs', 'source_patch_authority', 'protoc_discovery_authority', 'discovery_module_admission', 'powershell_module_admission', 'discovery', 'commands', 'entries', 'package_digests', 'combined_digest', 'category_counts', 'generated_at_utc'))) {
         throw 'TEST_INVENTORY_BASELINE_BLOCKED: missing/legacy/unknown baseline schema'
     }
     $discoveryReference = $baselineRead.Document.discovery.reference
@@ -2210,10 +2216,11 @@ function Test-D32Phase0MatrixRecord {
         if (-not (Test-D32Phase0ExactProperties -Object $document -Expected $topFields)) { throw 'Phase0 record top-level schema has missing or extra fields' }
         if (-not (Test-D32Phase0Integer -Value $document.schema_version) -or [Int64]$document.schema_version -ne $script:D32Phase0SchemaVersion) { throw "Phase0 record schema_version must be the supported JSON integer version $($script:D32Phase0SchemaVersion)" }
         if ($document.record_type -isnot [string] -or $document.record_type -cne $script:D32Phase0Type) { throw 'Phase0 record_type is unsupported' }
-        if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo -ExpectedContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $document.powershell_module_admission -CandidateSha $ExpectedCandidateSha -Repository $repo `
+                -ProducerRole phase0_matrix -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission) -or
             [Int64]$document.powershell_module_admission.runner_process.process_id -ne [Int64]$document.runner_process_id -or
             -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $document.powershell_module_admission -ProfileRecord $document.toolchain_profile)) {
-            throw 'Phase0 record must bind its actual runner process and exact caller-pinned PowerShell module admission'
+            throw 'Phase0 record must bind its direct producer process/startup/entry and exact caller-pinned PowerShell module admission'
         }
         Assert-D32Phase0FixtureBuildBudgetRecord -Document $document.fixture_build_budget -ExpectedPhase0TimeoutSeconds $script:D32Phase0RequiredCommandTimeoutSeconds
         if (-not (Test-D32Phase0Integer -Value $document.runner_process_id -Positive)) { throw 'Phase0 runner_process_id must be a positive JSON integer' }
@@ -2354,7 +2361,7 @@ function Test-D32Phase0MatrixRecord {
             throw 'Phase0 fixture manifest does not carry the exact owner-bound five-build jobs-4/28800-second policy'
         }
         if ([IO.Path]::GetFileName($fixtureProvenanceRef.Path) -cne 'fixture-build-provenance.json') { throw 'Phase0 fixture build provenance path is not fixed' }
-        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant -TauriMacrosSourceAuthorityPath ([string]$document.tauri_macros_source_patch.path) -ExpectedTauriMacrosSourceAuthoritySha256 ([string]$document.tauri_macros_source_patch.sha256)
+        $fixtureProvenance = Test-D32Phase0FixtureBuildProvenance -SidecarPath $fixtureProvenanceRef.Path -ManifestPath $fixturePath -Repository $repo -OutputRoot $outputRoot -ExpectedCandidateSha $ExpectedCandidateSha -ExpectedRunnerProcessId ([int]$document.runner_process_id) -ValidatedProfile $profile -ExpectedProducerAdmission $document.powershell_module_admission -VendoredAuthorityPath $authorityPath -ExpectedVendoredAuthoritySha256 $authoritySha -ValidatedVendoredGrant $vendoredGrant -TauriMacrosSourceAuthorityPath ([string]$document.tauri_macros_source_patch.path) -ExpectedTauriMacrosSourceAuthoritySha256 ([string]$document.tauri_macros_source_patch.sha256)
         if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.fixture_build_budget -Depth 5 -Compress) -cne
             (ConvertTo-Json -InputObject $document.fixture_build_budget -Depth 5 -Compress)) { throw 'Phase0 matrix build budget differs from the exact fixture provenance budget snapshot' }
         if ((ConvertTo-Json -InputObject $fixtureProvenance.Document.vendored_protoc_run_grant -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $document.vendored_protoc.run_grant -Depth 5 -Compress)) { throw 'Phase0 fixture provenance grant reference differs from matrix run grant reference' }
@@ -3340,6 +3347,12 @@ function Invoke-D32Phase0Matrix {
         not_run_capture_tests = @($capture.ToArray())
         governance_inputs = @($governance.ToArray())
         phase0_scope = $script:D32Phase0Scope
+    }
+    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $recordDocument.powershell_module_admission -CandidateSha $ExpectedSha `
+            -Repository $repo -ProducerRole phase0_matrix -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+            -ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission) -or
+        -not (Test-D32PowerShellModuleAdmissionRunnerBinding -Document $recordDocument.powershell_module_admission -ExpectedProcessId ([Int64]$recordDocument.runner_process_id))) {
+        throw 'PHASE0_RECORD_BLOCKED: writer admission is not the current direct runner/library producer context'
     }
     $recordPath = Join-Path $output 'D32-PHASE0-MATRIX.json'
     if (Test-Path -LiteralPath $recordPath) { throw 'PHASE0_RECORD_BLOCKED: refusing to overwrite existing record' }

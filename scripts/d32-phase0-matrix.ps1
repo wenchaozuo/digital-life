@@ -625,6 +625,99 @@ function ConvertFrom-D32Phase0DebugProcess {
     return $proxy
 }
 
+function ConvertTo-D32Phase0ExpectedRootIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object]$Identity,
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPath
+    )
+
+    if ($Identity -is [string] -or $Identity -is [Array] -or $Identity -is [ValueType] -or
+        -not (Test-D32ProfileCanonicalPathString -Path $ExpectedRootPath)) {
+        throw 'PROCESS_TRACE_BLOCKED: caller root identity or expected root path is not a canonical object binding'
+    }
+    if ($Identity -is [System.Collections.IDictionary]) {
+        $actualNames = @($Identity.Keys | ForEach-Object { [string]$_ })
+    }
+    else {
+        $actualNames = @($Identity.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    }
+    $profileWireNames = @('name', 'path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'reason')
+    $snapshotNames = @('Path', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex', 'Attributes')
+    $snapshotNamesWithTimes = @($snapshotNames + @('CreationTimeUtcTicks', 'LastWriteTimeUtcTicks'))
+    $isProfileWire = $actualNames.Count -eq $profileWireNames.Count -and
+        @($profileWireNames | Where-Object { $actualNames -cnotcontains $_ }).Count -eq 0
+    $isSnapshot = ($actualNames.Count -eq $snapshotNames.Count -and
+        @($snapshotNames | Where-Object { $actualNames -cnotcontains $_ }).Count -eq 0) -or
+        ($actualNames.Count -eq $snapshotNamesWithTimes.Count -and
+            @($snapshotNamesWithTimes | Where-Object { $actualNames -cnotcontains $_ }).Count -eq 0)
+    if (-not $isProfileWire -and -not $isSnapshot) {
+        throw 'PROCESS_TRACE_BLOCKED: caller root identity has a missing, extra, aliased, or unknown field'
+    }
+
+    $getExact = {
+        param([object]$Object, [string]$Name)
+        if ($Object -is [System.Collections.IDictionary]) {
+            foreach ($key in $Object.Keys) { if ([string]$key -ceq $Name) { return $Object[$key] } }
+        }
+        else {
+            foreach ($property in $Object.PSObject.Properties) { if ([string]$property.Name -ceq $Name) { return $property.Value } }
+        }
+        return $null
+    }.GetNewClosure()
+
+    if ($isProfileWire) {
+        $path = & $getExact $Identity 'path'
+        $bytes = & $getExact $Identity 'bytes'
+        $sha256 = & $getExact $Identity 'sha256'
+        $volume = & $getExact $Identity 'volume_serial_hex'
+        $fileId = & $getExact $Identity 'file_id_hex'
+        $name = & $getExact $Identity 'name'
+        $reason = & $getExact $Identity 'reason'
+        if ($name -isnot [string] -or [String]::IsNullOrWhiteSpace($name) -or
+            $reason -isnot [string] -or [String]::IsNullOrWhiteSpace($reason)) {
+            throw 'PROCESS_TRACE_BLOCKED: caller profile root identity name or reason is malformed'
+        }
+    }
+    else {
+        $path = & $getExact $Identity 'Path'
+        $bytes = & $getExact $Identity 'Bytes'
+        $sha256 = & $getExact $Identity 'Sha256'
+        $volume = & $getExact $Identity 'VolumeSerialHex'
+        $fileId = & $getExact $Identity 'FileIdHex'
+        $attributes = & $getExact $Identity 'Attributes'
+        $integerTypes = @([byte], [sbyte], [uint16], [int16], [uint32], [int32], [uint64], [int64])
+        if ($null -eq $attributes -or $integerTypes -notcontains $attributes.GetType() -or [Int64]$attributes -lt 0) {
+            throw 'PROCESS_TRACE_BLOCKED: opened-handle snapshot attributes are not a nonnegative integer'
+        }
+        if ($actualNames.Count -eq $snapshotNamesWithTimes.Count) {
+            foreach ($timeName in @('CreationTimeUtcTicks', 'LastWriteTimeUtcTicks')) {
+                $ticks = & $getExact $Identity $timeName
+                if ($null -eq $ticks -or $integerTypes -notcontains $ticks.GetType() -or [Int64]$ticks -lt 0) {
+                    throw "PROCESS_TRACE_BLOCKED: opened-handle snapshot $timeName is not a nonnegative integer"
+                }
+            }
+        }
+    }
+
+    $integerTypes = @([byte], [sbyte], [uint16], [int16], [uint32], [int32], [uint64], [int64])
+    if ($path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $path) -or
+        -not (Test-D32ProfilePathEqual -Left $path -Right $ExpectedRootPath) -or
+        $null -eq $bytes -or $integerTypes -notcontains $bytes.GetType() -or [Int64]$bytes -le 0 -or
+        $sha256 -isnot [string] -or $sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $volume -isnot [string] -or $volume -cnotmatch '^[0-9a-f]{16}$' -or
+        $fileId -isnot [string] -or $fileId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'PROCESS_TRACE_BLOCKED: caller root identity path/hash/bytes/volume/file-ID fields are malformed or differ from the fixed root path'
+    }
+
+    return [ordered]@{
+        path = [string]$path
+        bytes = [Int64]$bytes
+        sha256 = [string]$sha256
+        volume_serial_hex = [string]$volume
+        file_id_hex = [string]$fileId
+    }
+}
+
 function Test-D32Phase0DebugProcessTrace {
     param(
         [Parameter(Mandatory = $true)][object]$Trace,
@@ -638,6 +731,7 @@ function Test-D32Phase0DebugProcessTrace {
         [AllowNull()][object]$H7CGitRunGrant
     )
 
+    $expectedRootIdentity = ConvertTo-D32Phase0ExpectedRootIdentity -Identity $ExpectedRootIdentity -ExpectedRootPath $ExpectedRootPath
     $fields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id', 'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id',
         'dedicated_debugger_thread', 'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit', 'debugger_thread_exited', 'debugger_thread_joined',
         'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent', 'debugger_creation_filetime',
@@ -772,8 +866,8 @@ function Test-D32Phase0DebugProcessTrace {
     if (-not $byIdentity.ContainsKey($rootKey)) { throw 'PROCESS_TRACE_BLOCKED: root process identity is absent from process table' }
     $root = $byIdentity[$rootKey]
     if (-not (Test-D32ProfilePathEqual -Left $root.image_path -Right $ExpectedRootPath) -or
-        $root.sha256 -cne [string]$ExpectedRootIdentity.sha256 -or [Int64]$root.bytes -ne [Int64]$ExpectedRootIdentity.bytes -or
-        $root.volume_serial_hex -cne [string]$ExpectedRootIdentity.volume_serial_hex -or $root.file_id_hex -cne [string]$ExpectedRootIdentity.file_id_hex -or
+        $root.sha256 -cne [string]$expectedRootIdentity.sha256 -or [Int64]$root.bytes -ne [Int64]$expectedRootIdentity.bytes -or
+        $root.volume_serial_hex -cne [string]$expectedRootIdentity.volume_serial_hex -or $root.file_id_hex -cne [string]$expectedRootIdentity.file_id_hex -or
         $root.allowed_image_reason -cne 'exact-caller-pinned-fixed-root-image') { throw 'PROCESS_TRACE_BLOCKED: root image path/hash/bytes/file identity differs from the fixed caller pin' }
     foreach ($record in $Trace.processes) {
         $identity = "$($record.process_id)|$($record.creation_filetime)"

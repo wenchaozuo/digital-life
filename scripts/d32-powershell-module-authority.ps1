@@ -843,6 +843,261 @@ function Get-D32PowerShellAuthorityOsSecurityInventoryDigest {
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($builder.ToString()))).ToLowerInvariant()
 }
 
+function Assert-D32PowerShellAuthorityPinnedWindowsComponentShape {
+    param(
+        [Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element,
+        [Parameter(Mandatory = $true)][string]$ExpectedWindowsRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedSystemRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedOsVersion
+    )
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $Element -Fields @('component_type','version','root_path','root_volume_serial_hex','root_file_id_hex','inventory_sha256','source_proof','distribution','native_files') -Name 'pinned Windows OS component'
+    $windowsRoot = [IO.Path]::GetFullPath($ExpectedWindowsRoot)
+    $systemRoot = [IO.Path]::GetFullPath($ExpectedSystemRoot)
+    if ([IO.Path]::GetFullPath($windowsRoot) -cne $windowsRoot -or [IO.Path]::GetFullPath($systemRoot) -cne $systemRoot -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'component_type') -cne 'MICROSOFT_WINDOWS_OS_INSTALLATION' -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'version') -cne $ExpectedOsVersion -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'root_path') -cne $windowsRoot -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'root_volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'root_file_id_hex') -cnotmatch '^[0-9a-f]{32}$' -or
+        (Get-D32PowerShellAuthorityJsonString $Element 'inventory_sha256') -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS component role, root, version, or identity shape is invalid'
+    }
+    $proofElement = $Element.GetProperty('source_proof')
+    $expectedProof = [ordered]@{
+        proof_type = 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1'
+        api_path = $windowsRoot
+        environment_system_root = $systemRoot
+        os_version = $ExpectedOsVersion
+    }
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $proofElement -Fields @('proof_type','api_path','environment_system_root','os_version') -Name 'pinned Windows OS source proof'
+    if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $proofElement -Value $expectedProof)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS source proof differs from the opened live root/version'
+    }
+
+    $distributionElement = $Element.GetProperty('distribution')
+    Assert-D32PowerShellAuthorityExactJsonRecord -Element $distributionElement -Fields @('root_path','inventory_sha256','directories','files','protected_ancestors','trusted_writer_sids') -Name 'pinned Windows OS finite distribution'
+    if ((Get-D32PowerShellAuthorityJsonString $distributionElement 'root_path') -cne $windowsRoot -or
+        (Get-D32PowerShellAuthorityJsonString $distributionElement 'inventory_sha256') -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS finite distribution root or digest is invalid'
+    }
+    $trustedWriters = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+    $trustedElement = $distributionElement.GetProperty('trusted_writer_sids')
+    if ($trustedElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $trustedElement.GetArrayLength() -ne $trustedWriters.Count) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS trusted-writer list is missing or expanded'
+    }
+    for ($index = 0; $index -lt $trustedWriters.Count; $index++) {
+        if ($trustedElement[$index].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $trustedElement[$index].GetString() -cne $trustedWriters[$index]) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS trusted-writer list changed or reordered'
+        }
+    }
+
+    $directoryElement = $distributionElement.GetProperty('directories')
+    $fileElement = $distributionElement.GetProperty('files')
+    $ancestorElement = $distributionElement.GetProperty('protected_ancestors')
+    $nativeElement = $Element.GetProperty('native_files')
+    if ($directoryElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $directoryElement.GetArrayLength() -eq 0 -or
+        $fileElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $fileElement.GetArrayLength() -eq 0 -or
+        $ancestorElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or
+        $nativeElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $nativeElement.GetArrayLength() -ne $fileElement.GetArrayLength()) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS finite file/directory/ancestor arrays are missing or inconsistent'
+    }
+    $component = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $Element
+    $directoryPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $directoryIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $previousPath = ''
+    $rootDirectorySeen = $false
+    foreach ($recordElement in $directoryElement.EnumerateArray()) {
+        Assert-D32PowerShellAuthorityExactJsonRecord -Element $recordElement -Fields @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') -Name 'pinned Windows OS directory'
+        $record = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $recordElement
+        $path = [string]$record.path
+        if ($record.kind -cne 'directory' -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
+            -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $windowsRoot) -or
+            [StringComparer]::OrdinalIgnoreCase.Compare($previousPath, $path) -ge 0 -or -not $directoryPaths.Add($path) -or
+            [string]$record.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$record.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$record.owner_sid -cnotin $trustedWriters -or [string]::IsNullOrWhiteSpace([string]$record.security_descriptor_sddl) -or
+            [string]$record.security_descriptor_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $record.security_descriptor_sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$record.security_descriptor_sddl))).ToLowerInvariant() -or
+            -not $directoryIds.Add(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex))) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS directory path, order, alias, or security descriptor is invalid: $path"
+        }
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($path, $windowsRoot)) { $rootDirectorySeen = $true }
+        $previousPath = $path
+    }
+    if (-not $rootDirectorySeen) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS namespace does not include its opened root directory' }
+    foreach ($path in $directoryPaths) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($path, $windowsRoot)) { continue }
+        if (-not $directoryPaths.Contains([IO.Path]::GetDirectoryName($path))) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS directory parent is absent: $path" }
+    }
+
+    $expectedAncestors = [System.Collections.Generic.List[string]]::new()
+    $ancestorPath = [IO.Path]::GetDirectoryName($windowsRoot)
+    while (-not [String]::IsNullOrWhiteSpace($ancestorPath)) {
+        $ancestorPath = [IO.Path]::GetFullPath($ancestorPath)
+        $expectedAncestors.Add($ancestorPath)
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($ancestorPath, [IO.Path]::GetPathRoot($ancestorPath))) { break }
+        $ancestorPath = [IO.Path]::GetDirectoryName($ancestorPath)
+    }
+    $expectedAncestorArray = $expectedAncestors.ToArray()
+    [Array]::Sort($expectedAncestorArray, [StringComparer]::OrdinalIgnoreCase)
+    if ($ancestorElement.GetArrayLength() -ne $expectedAncestorArray.Count) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS ancestor chain is incomplete or expanded' }
+    $ancestorIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($index = 0; $index -lt $expectedAncestorArray.Count; $index++) {
+        $recordElement = $ancestorElement[$index]
+        Assert-D32PowerShellAuthorityExactJsonRecord -Element $recordElement -Fields @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') -Name 'pinned Windows OS protected ancestor'
+        $record = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $recordElement
+        if ($record.kind -cne 'ancestor' -or [string]$record.path -cne $expectedAncestorArray[$index] -or
+            [string]$record.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$record.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$record.owner_sid -cnotin $trustedWriters -or [string]::IsNullOrWhiteSpace([string]$record.security_descriptor_sddl) -or
+            [string]$record.security_descriptor_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $record.security_descriptor_sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$record.security_descriptor_sddl))).ToLowerInvariant() -or
+            -not $ancestorIds.Add(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex)) -or
+            $directoryIds.Contains(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex))) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS protected ancestor path, order, alias, or security descriptor is invalid: $($record.path)"
+        }
+    }
+
+    $filePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $fileIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $previousPath = ''
+    for ($index = 0; $index -lt $fileElement.GetArrayLength(); $index++) {
+        $recordElement = $fileElement[$index]
+        Assert-D32PowerShellAuthorityExactJsonRecord -Element $recordElement -Fields @('kind','path','bytes','sha256','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256') -Name 'pinned Windows OS resolver file'
+        $record = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $recordElement
+        $path = [string]$record.path
+        if ($record.kind -cne 'file' -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
+            -not (Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $windowsRoot) -or
+            -not $directoryPaths.Contains([IO.Path]::GetDirectoryName($path)) -or
+            [StringComparer]::OrdinalIgnoreCase.Compare($previousPath, $path) -ge 0 -or -not $filePaths.Add($path) -or
+            [Int64]$record.bytes -le 0 -or [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$record.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$record.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$record.owner_sid -cnotin $trustedWriters -or [string]::IsNullOrWhiteSpace([string]$record.security_descriptor_sddl) -or
+            [string]$record.security_descriptor_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $record.security_descriptor_sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$record.security_descriptor_sddl))).ToLowerInvariant() -or
+            -not $fileIds.Add(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex)) -or
+            $directoryIds.Contains(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex)) -or
+            $ancestorIds.Contains(([string]$record.volume_serial_hex + ':' + [string]$record.file_id_hex))) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS resolver file path, order, alias, content, or security descriptor is invalid: $path"
+        }
+        if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $nativeElement[$index] -Value $record)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS native source list differs from its static file inventory: $path"
+        }
+        $previousPath = $path
+    }
+
+    $distributionDigest = Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories ([object[]]$component.distribution.directories) `
+        -Files ([object[]]$component.distribution.files) -Ancestors ([object[]]$component.distribution.protected_ancestors)
+    if ($distributionDigest -cne [string]$component.distribution.inventory_sha256) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS finite distribution digest is invalid' }
+    $componentDigestMaterial = [string]$distributionDigest + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $expectedProof) + "`n"
+    $componentDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($componentDigestMaterial))).ToLowerInvariant()
+    if ($componentDigest -cne [string]$component.inventory_sha256) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS component digest is invalid' }
+    return ,$component
+}
+
+function Get-D32PowerShellAuthorityPinnedWindowsComponentSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$OpenFiles
+    )
+    $windowsRoot = Get-D32PowerShellAuthorityWindowsRootPath
+    $systemRoot = [IO.Path]::GetFullPath([string]$env:SystemRoot)
+    $osVersion = [Environment]::OSVersion.VersionString
+    $pinned = Assert-D32PowerShellAuthorityPinnedWindowsComponentShape -Element $Element -ExpectedWindowsRoot $windowsRoot -ExpectedSystemRoot $systemRoot -ExpectedOsVersion $osVersion
+    Add-D32PowerShellAuthorityDirectoryChain -Directory $windowsRoot -Fences $DirectoryFences
+    foreach ($directory in @($pinned.distribution.directories)) { Add-D32PowerShellAuthorityDirectoryChain -Directory ([string]$directory.path) -Fences $DirectoryFences }
+    foreach ($ancestor in @($pinned.distribution.protected_ancestors)) { Add-D32PowerShellAuthorityDirectoryChain -Directory ([string]$ancestor.path) -Fences $DirectoryFences }
+
+    $liveDirectories = [System.Collections.Generic.List[object]]::new()
+    $directoryArray = $Element.GetProperty('distribution').GetProperty('directories')
+    for ($index = 0; $index -lt $directoryArray.GetArrayLength(); $index++) {
+        $expected = $pinned.distribution.directories[$index]
+        $path = [string]$expected.path
+        $key = $path.TrimEnd([char[]]@('\','/'))
+        if ($key.Length -eq 2 -and $key[1] -eq ':') { $key += [IO.Path]::DirectorySeparatorChar }
+        $fence = $DirectoryFences[$key]
+        if ($null -eq $fence -or $fence.Handle.IsClosed -or $fence.Handle.IsInvalid -or [string]$fence.Path -cne $path) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS directory fence is missing or aliased: $path" }
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $fence.Handle
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path $path -IsDirectory:$true -Handle $fence.Handle
+        if (($identity.Attributes -band [int][IO.FileAttributes]::Directory) -eq 0 -or ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $fence.Handle), $path) -or
+            $identity.VolumeSerialHex -cne [string]$expected.volume_serial_hex -or $identity.FileIdHex -cne [string]$expected.file_id_hex -or
+            -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true) -or
+            $security.OwnerSid -cne [string]$expected.owner_sid -or $security.Sddl -cne [string]$expected.security_descriptor_sddl -or
+            $security.AclSha256 -cne [string]$expected.security_descriptor_sha256) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS directory identity/security changed: $path" }
+        $actual = [ordered]@{ kind = 'directory'; path = [string]$fence.Path; volume_serial_hex = [string]$identity.VolumeSerialHex; file_id_hex = [string]$identity.FileIdHex; owner_sid = [string]$security.OwnerSid; security_descriptor_sddl = [string]$security.Sddl; security_descriptor_sha256 = [string]$security.AclSha256 }
+        if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $directoryArray[$index] -Value $actual)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: reopened Windows OS directory differs from its exact caller pin: $path" }
+        $liveDirectories.Add($actual)
+    }
+
+    $liveAncestors = [System.Collections.Generic.List[object]]::new()
+    $ancestorArray = $Element.GetProperty('distribution').GetProperty('protected_ancestors')
+    for ($index = 0; $index -lt $ancestorArray.GetArrayLength(); $index++) {
+        $expected = $pinned.distribution.protected_ancestors[$index]
+        $path = [string]$expected.path
+        $key = $path.TrimEnd([char[]]@('\','/'))
+        if ($key.Length -eq 2 -and $key[1] -eq ':') { $key += [IO.Path]::DirectorySeparatorChar }
+        $fence = $DirectoryFences[$key]
+        if ($null -eq $fence -or $fence.Handle.IsClosed -or $fence.Handle.IsInvalid -or [string]$fence.Path -cne $path) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS ancestor fence is missing or aliased: $path" }
+        $identity = Get-D32PowerShellAuthorityHandleIdentity -Handle $fence.Handle
+        $security = Get-D32PowerShellAuthorityObjectSecurity -Path $path -IsDirectory:$true -Handle $fence.Handle
+        if (($identity.Attributes -band [int][IO.FileAttributes]::Directory) -eq 0 -or ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $fence.Handle), $path) -or
+            $identity.VolumeSerialHex -cne [string]$expected.volume_serial_hex -or $identity.FileIdHex -cne [string]$expected.file_id_hex -or
+            -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true -IsProtectedAncestor) -or
+            $security.OwnerSid -cne [string]$expected.owner_sid -or $security.Sddl -cne [string]$expected.security_descriptor_sddl -or
+            $security.AclSha256 -cne [string]$expected.security_descriptor_sha256) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS ancestor identity/security changed: $path" }
+        $actual = [ordered]@{ kind = 'ancestor'; path = [string]$fence.Path; volume_serial_hex = [string]$identity.VolumeSerialHex; file_id_hex = [string]$identity.FileIdHex; owner_sid = [string]$security.OwnerSid; security_descriptor_sddl = [string]$security.Sddl; security_descriptor_sha256 = [string]$security.AclSha256 }
+        if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $ancestorArray[$index] -Value $actual)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: reopened Windows OS ancestor differs from its exact caller pin: $path" }
+        $liveAncestors.Add($actual)
+    }
+
+    $liveFiles = [System.Collections.Generic.List[object]]::new()
+    $fileArray = $Element.GetProperty('distribution').GetProperty('files')
+    for ($index = 0; $index -lt $fileArray.GetArrayLength(); $index++) {
+        $expected = $pinned.distribution.files[$index]
+        $snapshot = Open-D32PowerShellAuthorityFile -Path ([string]$expected.path) -DirectoryFences $DirectoryFences
+        $OpenFiles.Add($snapshot)
+        if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $snapshot.Security -IsDirectory:$false)) {
+            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: pinned Windows OS file namespace is not protected: $($expected.path)"
+        }
+        $actual = [ordered]@{ kind = 'file'; path = [string]$snapshot.Record.path; bytes = [Int64]$snapshot.Record.bytes; sha256 = [string]$snapshot.Record.sha256; volume_serial_hex = [string]$snapshot.Record.volume_serial_hex; file_id_hex = [string]$snapshot.Record.file_id_hex; owner_sid = [string]$snapshot.Security.OwnerSid; security_descriptor_sddl = [string]$snapshot.Security.Sddl; security_descriptor_sha256 = [string]$snapshot.Security.AclSha256 }
+        if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $fileArray[$index] -Value $actual)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: reopened Windows OS resolver file differs from its exact caller pin: $($expected.path)" }
+        $liveFiles.Add($actual)
+    }
+
+    $distribution = [ordered]@{
+        root_path = [string]$pinned.distribution.root_path
+        inventory_sha256 = ''
+        directories = $liveDirectories.ToArray()
+        files = $liveFiles.ToArray()
+        protected_ancestors = $liveAncestors.ToArray()
+        trusted_writer_sids = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+    }
+    $distribution.inventory_sha256 = Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories $distribution.directories -Files $distribution.files -Ancestors $distribution.protected_ancestors
+    $sourceProof = [ordered]@{ proof_type = 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1'; api_path = $windowsRoot; environment_system_root = $systemRoot; os_version = $osVersion }
+    $digestMaterial = [string]$distribution.inventory_sha256 + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProof) + "`n"
+    $componentDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($digestMaterial))).ToLowerInvariant()
+    $rootKey = $windowsRoot.TrimEnd([char[]]@('\','/'))
+    if ($rootKey.Length -eq 2 -and $rootKey[1] -eq ':') { $rootKey += [IO.Path]::DirectorySeparatorChar }
+    $rootFence = $DirectoryFences[$rootKey]
+    if ($null -eq $rootFence) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows OS root identity is absent from opened directory fences' }
+    $actualComponent = [ordered]@{
+        component_type = 'MICROSOFT_WINDOWS_OS_INSTALLATION'
+        version = $osVersion
+        root_path = $windowsRoot
+        root_volume_serial_hex = [string]$rootFence.VolumeSerialHex
+        root_file_id_hex = [string]$rootFence.FileIdHex
+        inventory_sha256 = $componentDigest
+        source_proof = $sourceProof
+        distribution = $distribution
+        native_files = $liveFiles.ToArray()
+    }
+    if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $Element -Value $actualComponent)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: independently pinned Windows OS static authority changed during exact live re-open'
+    }
+    return [PSCustomObject]@{ Component = $actualComponent; OpenFiles = $OpenFiles; DirectoryFences = $DirectoryFences }
+}
+
 function Get-D32PowerShellAuthorityRuntimeDistributionSnapshot {
     param(
         [Parameter(Mandatory = $true)][string]$PowerShellRoot,
@@ -1030,7 +1285,8 @@ function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
     param(
         [AllowEmptyString()][string]$ExpectedDefenderRoot,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$OpenFiles
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$OpenFiles,
+        [AllowNull()][object]$PinnedWindowsComponentElement
     )
     $windowsRoot = Get-D32PowerShellAuthorityWindowsRootPath
     Add-D32PowerShellAuthorityDirectoryChain -Directory $windowsRoot -Fences $DirectoryFences
@@ -1145,14 +1401,16 @@ function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
         if (-not $managedPaths.Add($path)) { continue }
     }
     $systemFilesByPath = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in $managedPaths) {
-        $file = Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $DirectoryFences
-        if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $file.Security -IsDirectory:$false)) {
-            $file.Stream.Dispose()
-            throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows OS native/managed image namespace is not protected: $path"
+    if ($null -eq $PinnedWindowsComponentElement) {
+        foreach ($path in $managedPaths) {
+            $file = Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $DirectoryFences
+            if (-not (Test-D32PowerShellAuthorityProtectedSecurity -Security $file.Security -IsDirectory:$false)) {
+                $file.Stream.Dispose()
+                throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows OS native/managed image namespace is not protected: $path"
+            }
+            $OpenFiles.Add($file)
+            $systemFilesByPath.Add([string]$file.Record.path, [ordered]@{ kind = 'file'; path = [string]$file.Record.path; bytes = [Int64]$file.Record.bytes; sha256 = [string]$file.Record.sha256; volume_serial_hex = [string]$file.Record.volume_serial_hex; file_id_hex = [string]$file.Record.file_id_hex; owner_sid = [string]$file.Security.OwnerSid; security_descriptor_sddl = [string]$file.Security.Sddl; security_descriptor_sha256 = [string]$file.Security.AclSha256 })
         }
-        $OpenFiles.Add($file)
-        $systemFilesByPath.Add([string]$file.Record.path, [ordered]@{ kind = 'file'; path = [string]$file.Record.path; bytes = [Int64]$file.Record.bytes; sha256 = [string]$file.Record.sha256; volume_serial_hex = [string]$file.Record.volume_serial_hex; file_id_hex = [string]$file.Record.file_id_hex; owner_sid = [string]$file.Security.OwnerSid; security_descriptor_sddl = [string]$file.Security.Sddl; security_descriptor_sha256 = [string]$file.Security.AclSha256 })
     }
     $nativeDirsText = [string][AppContext]::GetData('NATIVE_DLL_SEARCH_DIRECTORIES')
     foreach ($nativeDirectory in $nativeDirsText.Split([IO.Path]::PathSeparator, [StringSplitOptions]::RemoveEmptyEntries)) {
@@ -1177,36 +1435,86 @@ function Get-D32PowerShellAuthorityCurrentOsSecurityComponents {
     }
     $windowsRootKey = $windowsRoot.TrimEnd([char[]]@('\','/'))
     $windowsRootFence = $DirectoryFences[$windowsRootKey]
-    $osDistribution = [ordered]@{
-        root_path = $windowsRoot
-        inventory_sha256 = ''
-        directories = @($osDirectoryRecords.Values)
-        files = @($systemFilesByPath.Values)
-        protected_ancestors = @($osAncestorRecords.Values)
-        trusted_writer_sids = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+    if ($null -ne $PinnedWindowsComponentElement) {
+        if ($PinnedWindowsComponentElement -isnot [System.Text.Json.JsonElement]) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: caller-pinned Windows component must be a strict JSON record' }
+        # The caller's finite Windows inventory is static content authority. Reopen
+        # every pinned ref (including unloaded files) and keep the current loader
+        # set separate for exact-origin checks in the resolver snapshot below.
+        $pinnedWindowsSnapshot = Get-D32PowerShellAuthorityPinnedWindowsComponentSnapshot -Element $PinnedWindowsComponentElement `
+            -DirectoryFences $DirectoryFences -OpenFiles $OpenFiles
+        $windowsComponent = $pinnedWindowsSnapshot.Component
     }
-    $osDistribution.inventory_sha256 = Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories $osDistribution.directories -Files $osDistribution.files -Ancestors $osDistribution.protected_ancestors
-    if ($osDistribution.files.Count -eq 0 -or $osDistribution.directories.Count -eq 0) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows OS component identity has no opened resolver image or protected namespace' }
-    $osVersion = [Environment]::OSVersion.VersionString
-    $osSourceProof = [ordered]@{ proof_type = 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1'; api_path = $windowsRoot; environment_system_root = [IO.Path]::GetFullPath([string]$env:SystemRoot); os_version = $osVersion }
-    $osDigestMaterial = [string]$osDistribution.inventory_sha256 + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $osSourceProof) + "`n"
-    $osDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($osDigestMaterial))).ToLowerInvariant()
-    $windowsComponent = [ordered]@{
-        component_type = 'MICROSOFT_WINDOWS_OS_INSTALLATION'
-        version = [string]$osVersion
-        root_path = $windowsRoot
-        root_volume_serial_hex = [string]$windowsRootFence.VolumeSerialHex
-        root_file_id_hex = [string]$windowsRootFence.FileIdHex
-        inventory_sha256 = $osDigest
-        source_proof = $osSourceProof
-        distribution = $osDistribution
-        native_files = @($systemFilesByPath.Values)
+    else {
+        $osDistribution = [ordered]@{
+            root_path = $windowsRoot
+            inventory_sha256 = ''
+            directories = @($osDirectoryRecords.Values)
+            files = @($systemFilesByPath.Values)
+            protected_ancestors = @($osAncestorRecords.Values)
+            trusted_writer_sids = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+        }
+        $osDistribution.inventory_sha256 = Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories $osDistribution.directories -Files $osDistribution.files -Ancestors $osDistribution.protected_ancestors
+        if ($osDistribution.files.Count -eq 0 -or $osDistribution.directories.Count -eq 0) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: Windows OS component identity has no opened resolver image or protected namespace' }
+        $osVersion = [Environment]::OSVersion.VersionString
+        $osSourceProof = [ordered]@{ proof_type = 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1'; api_path = $windowsRoot; environment_system_root = [IO.Path]::GetFullPath([string]$env:SystemRoot); os_version = $osVersion }
+        $osDigestMaterial = [string]$osDistribution.inventory_sha256 + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $osSourceProof) + "`n"
+        $osDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($osDigestMaterial))).ToLowerInvariant()
+        $windowsComponent = [ordered]@{
+            component_type = 'MICROSOFT_WINDOWS_OS_INSTALLATION'
+            version = [string]$osVersion
+            root_path = $windowsRoot
+            root_volume_serial_hex = [string]$windowsRootFence.VolumeSerialHex
+            root_file_id_hex = [string]$windowsRootFence.FileIdHex
+            inventory_sha256 = $osDigest
+            source_proof = $osSourceProof
+            distribution = $osDistribution
+            native_files = @($systemFilesByPath.Values)
+        }
     }
     $components = @($windowsComponent, $defenderComponent)
     $combined = [Text.StringBuilder]::new()
     foreach ($component in $components) { [void]$combined.Append([string]$component.component_type).Append('|').Append([string]$component.inventory_sha256).Append("`n") }
     $overall = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($combined.ToString()))).ToLowerInvariant()
     return [PSCustomObject]@{ Components = $components; InventorySha256 = $overall; WindowsRoot = $windowsRoot; DefenderRoot = [string]$defender.root_path; OpenFiles = $OpenFiles; DirectoryFences = $DirectoryFences }
+}
+
+function Assert-D32PowerShellAuthorityOsSecurityComponentsCurrent {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Components,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences
+    )
+    if ($Components.Count -ne 2 -or [string]$Components[0].component_type -cne 'MICROSOFT_WINDOWS_OS_INSTALLATION' -or
+        [string]$Components[1].component_type -cne 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM') {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: pre-import static OS/Defender authority roles are missing or reordered'
+    }
+    $pinnedWindowsJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $Components[0]
+    $pinnedWindowsDocument = [System.Text.Json.JsonDocument]::Parse($pinnedWindowsJson)
+    $verificationFiles = [System.Collections.Generic.List[object]]::new()
+    try {
+        $current = Get-D32PowerShellAuthorityCurrentOsSecurityComponents `
+            -ExpectedDefenderRoot ([string]$Components[1].root_path) -DirectoryFences $DirectoryFences `
+            -OpenFiles $verificationFiles -PinnedWindowsComponentElement $pinnedWindowsDocument.RootElement
+        if ($current.Components.Count -ne 2 -or
+            -not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $pinnedWindowsDocument.RootElement -Value $current.Components[0])) {
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: full Windows OS caller pin changed during immediate pre-import reopen'
+        }
+        $pinnedDefenderJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $Components[1]
+        $pinnedDefenderDocument = [System.Text.Json.JsonDocument]::Parse($pinnedDefenderJson)
+        try {
+            if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $pinnedDefenderDocument.RootElement -Value $current.Components[1])) {
+                throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: complete Defender distribution or signature source proof changed immediately before import'
+            }
+        }
+        finally { $pinnedDefenderDocument.Dispose() }
+        $expectedDigest = Get-D32PowerShellAuthorityOsSecurityInventoryDigest -Components $Components
+        if ([string]$current.InventorySha256 -cne $expectedDigest) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: static OS inventory digest changed immediately before import' }
+    }
+    finally {
+        foreach ($file in $verificationFiles) {
+            if ($null -ne $file.Stream -and -not $file.Stream.SafeFileHandle.IsClosed) { $file.Stream.Dispose() }
+        }
+        $pinnedWindowsDocument.Dispose()
+    }
 }
 
 function Get-D32PowerShellAuthorityResolverDigestSet {
@@ -1767,7 +2075,8 @@ function Assert-D32PowerShellAuthorityResolverPolicyRecord {
         throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver policy lacks the two fixed Windows OS security-component roles'
     }
     $defenderRoot = Get-D32PowerShellAuthorityJsonString $componentElements[1] 'root_path'
-    $components = Get-D32PowerShellAuthorityCurrentOsSecurityComponents -ExpectedDefenderRoot $defenderRoot -DirectoryFences $DirectoryFences -OpenFiles $OpenFiles
+    $components = Get-D32PowerShellAuthorityCurrentOsSecurityComponents -ExpectedDefenderRoot $defenderRoot -DirectoryFences $DirectoryFences `
+        -OpenFiles $OpenFiles -PinnedWindowsComponentElement $componentElements[0]
     for ($index = 0; $index -lt 2; $index++) {
         if (-not (Test-D32PowerShellAuthorityJsonMatchesObject -Element $componentElements[$index] -Value $components.Components[$index])) {
             throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: independently pinned OS security component content, source or opened identity differs: $index"
@@ -3276,6 +3585,7 @@ function Initialize-D32PowerShellModuleAuthority {
         $resolverState = Get-D32PowerShellAuthorityResolverSnapshot -OsSecurityComponents $osSecurity.Components -OsSecurityInventorySha256 $osSecurity.InventorySha256 -ConfigureNativeSearch
         if ($resolverState.Blockers.Count -gt 0) { throw ('POWERSHELL_MODULE_AUTHORITY_BLOCKED: resolver admission failed before import; import_attempts=0; ' + ($resolverState.Blockers -join '; ')) }
         Assert-D32PowerShellAuthorityRuntimeSnapshotCurrent -Snapshot $runtimeDistribution -DirectoryFences $directoryFences -OpenFiles $openFiles
+        Assert-D32PowerShellAuthorityOsSecurityComponentsCurrent -Components $osSecurity.Components -DirectoryFences $directoryFences
         $processToken = Get-D32PowerShellAuthorityCurrentToken
         $roles = @(Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $powerShellRoot)
         $expectedModulePaths = [System.Collections.Generic.Dictionary[string,string[]]]::new([StringComparer]::OrdinalIgnoreCase)

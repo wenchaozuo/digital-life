@@ -6528,8 +6528,7 @@ function Invoke-D32SelfTest {
     if ($null -eq $moduleAdmissionState -or $null -eq $moduleAdmissionState.Admission) {
         throw 'fixture prebuild SelfTest requires the already-admitted caller module context'
     }
-    $moduleAdmissionForRestore = $moduleAdmissionState.Admission
-    $syntheticModuleAdmissionActive = $false
+    $syntheticModuleAdmissionLease = New-D32PowerShellModuleSelfTestAdmissionLease -State $moduleAdmissionState
     try {
         Assert-D32FixtureTimeoutScope -TimeoutSeconds 3600 -OwnerBinding $null -BuildD31RecoverySeeder $false
         try {
@@ -8509,8 +8508,7 @@ public static class D32DebugSelfTestLauncher
             }
             powershell_module_admission = $fixtureSyntheticAdmission
         }
-        $moduleAdmissionState.Admission = $fixtureSyntheticAdmission
-        $syntheticModuleAdmissionActive = $true
+        Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $fixtureSyntheticAdmission
         try {
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
         $oldTraceProvenance = [ordered]@{}
@@ -8623,10 +8621,7 @@ public static class D32DebugSelfTestLauncher
         $passed++
         }
         finally {
-            if ($syntheticModuleAdmissionActive) {
-                $moduleAdmissionState.Admission = $moduleAdmissionForRestore
-                $syntheticModuleAdmissionActive = $false
-            }
+            Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease
         }
 
         $ambientHandle = [IntPtr]::Zero
@@ -8849,10 +8844,7 @@ public static class D32DebugSelfTestLauncher
         Write-Host "D32_FIXTURE_PREBUILD_SELFTEST PASS ($passed checks)"
     }
     finally {
-        if ($syntheticModuleAdmissionActive) {
-            $moduleAdmissionState.Admission = $moduleAdmissionForRestore
-            $syntheticModuleAdmissionActive = $false
-        }
+        Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease
         if ($owned -and (Test-Path -LiteralPath $root)) {
             Remove-D32OwnedDirectory $root
         }

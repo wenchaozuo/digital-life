@@ -525,16 +525,24 @@ function Test-D32TestInventoryBaselineDocument {
         -not (Test-D32Phase0ExactProperties -Object $Document.category_counts -Expected @('protocol', 'vita', 'host'))) {
         throw 'TEST_INVENTORY_BASELINE_BLOCKED: record must be exact V2 awaiting independent Coordinator pin, candidate-bound, and non-authoritative'
     }
-    if (-not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $Document.discovery_module_admission -CandidateSha $ExpectedCandidateSha `
-            -Repository $Repository -ProducerRole inventory_discovery -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
-            -ExactLinkedAdmission $Discovery.powershell_module_admission) -or
-        -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.discovery_module_admission -ProfileRecord $Discovery.toolchain_profile) -or
-        -not (Test-D32PowerShellModuleAdmissionProducerBinding -Document $Document.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
-            -Repository $Repository -ProducerRole inventory_baseline -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
-            -ExpectedProducerContext $ExpectedProducerAdmission `
-            -DistinctFromAdmission $Document.discovery_module_admission) -or
-        -not (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.powershell_module_admission -ProfileRecord $Document.toolchain_profile)) {
-        throw 'TEST_INVENTORY_BASELINE_BLOCKED: baseline must bind the exact linked discovery producer and a distinct baseline producer process/startup/entry'
+    $discoveryProducerBound = Test-D32PowerShellModuleAdmissionProducerBinding -Document $Document.discovery_module_admission -CandidateSha $ExpectedCandidateSha `
+        -Repository $Repository -ProducerRole inventory_discovery -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+        -ExactLinkedAdmission $Discovery.powershell_module_admission
+    $discoveryProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
+    $discoveryProfileBound = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.discovery_module_admission -ProfileRecord $Discovery.toolchain_profile
+    $baselineProducerBound = Test-D32PowerShellModuleAdmissionProducerBinding -Document $Document.powershell_module_admission -CandidateSha $ExpectedCandidateSha `
+        -Repository $Repository -ProducerRole inventory_baseline -ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission `
+        -ExpectedProducerContext $ExpectedProducerAdmission `
+        -DistinctFromAdmission $Document.discovery_module_admission
+    $baselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
+    $baselineProfileBound = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.powershell_module_admission -ProfileRecord $Document.toolchain_profile
+    $failedAdmissionBindings = [System.Collections.Generic.List[string]]::new()
+    if (-not $discoveryProducerBound) { $failedAdmissionBindings.Add("discovery_producer:$discoveryProducerContext") }
+    if (-not $discoveryProfileBound) { $failedAdmissionBindings.Add('discovery_profile') }
+    if (-not $baselineProducerBound) { $failedAdmissionBindings.Add("baseline_producer:$baselineProducerContext") }
+    if (-not $baselineProfileBound) { $failedAdmissionBindings.Add('baseline_profile') }
+    if ($failedAdmissionBindings.Count -gt 0) {
+        throw "TEST_INVENTORY_BASELINE_BLOCKED: producer/module-admission bindings failed ($($failedAdmissionBindings -join ', ')); expected an exact linked discovery producer and distinct baseline producer process/startup/entry"
     }
     $targetTriple = [string]$Profile.Profile.target_triple
     $expectedProfile = [ordered]@{

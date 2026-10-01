@@ -2403,18 +2403,32 @@ function Test-D32PowerShellModuleAdmissionProducerBinding {
         [AllowNull()][object]$DistinctFromAdmission
     )
     try {
+        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.admission-record'
         if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $ExpectedAdmissionContext)) { return $false }
         $entryPath = [string]$Document.entry_script_path
         $rolePaths = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $Repository -ProducerRole $ProducerRole)
+        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.role-entry-path'
         $roleMatch = $false
         foreach ($path in $rolePaths) {
             if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($entryPath), [IO.Path]::GetFullPath([string]$path))) { $roleMatch = $true; break }
         }
-        if (-not $roleMatch -or -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Document.startup.file_operand, $entryPath)) { return $false }
-        if ($null -ne $ExpectedProducerContext -and -not (Test-D32PowerShellModuleProducerContextEqual -Document $Document -ExpectedContext $ExpectedProducerContext)) { return $false }
+        if (-not $roleMatch) { return $false }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.startup-file-operand'
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Document.startup.file_operand, $entryPath)) { return $false }
+        if ($null -ne $ExpectedProducerContext) {
+            $script:D32PowerShellModuleAdmissionValidationContext = 'producer.expected-process-startup-entry-context'
+            if (-not (Test-D32PowerShellModuleProducerContextEqual -Document $Document -ExpectedContext $ExpectedProducerContext)) { return $false }
+        }
         if ($null -ne $ExactLinkedAdmission -and
-            (ConvertTo-D32PowerShellAuthorityJsonText -Value $Document) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $ExactLinkedAdmission)) { return $false }
-        if ($null -ne $DistinctFromAdmission -and -not (Test-D32PowerShellModuleProducerProcessDistinct -Document $Document -OtherAdmission $DistinctFromAdmission)) { return $false }
+            (ConvertTo-D32PowerShellAuthorityJsonText -Value $Document) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $ExactLinkedAdmission)) {
+            $script:D32PowerShellModuleAdmissionValidationContext = 'producer.exact-linked-admission'
+            return $false
+        }
+        if ($null -ne $DistinctFromAdmission) {
+            $script:D32PowerShellModuleAdmissionValidationContext = 'producer.distinct-process-identity'
+            if (-not (Test-D32PowerShellModuleProducerProcessDistinct -Document $Document -OtherAdmission $DistinctFromAdmission)) { return $false }
+        }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.verified'
         return $true
     }
     catch { return $false }
@@ -2475,6 +2489,71 @@ function Test-D32PowerShellModuleAdmissionRunnerBinding {
         return $null -ne $Document -and [Int64]$Document.runner_process.process_id -eq $ExpectedProcessId
     }
     catch { return $false }
+}
+
+function Get-D32PowerShellModuleAdmissionValidationContext {
+    return [string]$script:D32PowerShellModuleAdmissionValidationContext
+}
+
+function New-D32PowerShellModuleSelfTestAdmissionLease {
+    param([Parameter(Mandatory = $true)][object]$State)
+    if ($null -eq $State -or $null -eq $State.Admission) {
+        throw 'POWERSHELL_MODULE_SELFTEST_CONTEXT_BLOCKED: an admitted state is required before installing a synthetic context'
+    }
+    return [PSCustomObject]@{
+        State = $State
+        PreviousAdmission = $State.Admission
+        Active = $false
+    }
+}
+
+function Set-D32PowerShellModuleSelfTestAdmission {
+    param(
+        [Parameter(Mandatory = $true)][object]$Lease,
+        [Parameter(Mandatory = $true)][object]$Admission
+    )
+    if ($null -eq $Lease.State -or $null -eq $Lease.PreviousAdmission -or $Lease.Active -isnot [bool] -or $Lease.Active) {
+        throw 'POWERSHELL_MODULE_SELFTEST_CONTEXT_BLOCKED: synthetic admission lease is malformed or already active'
+    }
+    # Mark the lease before changing shared state so a terminating interruption
+    # between these operations still takes the normal restoration path.
+    $Lease.Active = $true
+    $Lease.State.Admission = $Admission
+}
+
+function Restore-D32PowerShellModuleSelfTestAdmission {
+    param([Parameter(Mandatory = $true)][object]$Lease)
+    if ($null -eq $Lease.State -or $null -eq $Lease.PreviousAdmission -or $Lease.Active -isnot [bool]) {
+        throw 'POWERSHELL_MODULE_SELFTEST_CONTEXT_BLOCKED: synthetic admission lease cannot be restored'
+    }
+    if ($Lease.Active) {
+        $Lease.State.Admission = $Lease.PreviousAdmission
+        $Lease.Active = $false
+    }
+}
+
+function Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery {
+    param(
+        [Parameter(Mandatory = $true)][object]$PriorAdmission,
+        [Parameter(Mandatory = $true)][object]$SyntheticAdmission
+    )
+    $probeState = [PSCustomObject]@{ Admission = $PriorAdmission }
+    $lease = New-D32PowerShellModuleSelfTestAdmissionLease -State $probeState
+    $expectedFailureObserved = $false
+    $syntheticInstalledBeforeFailure = $false
+    try {
+        Set-D32PowerShellModuleSelfTestAdmission -Lease $lease -Admission $SyntheticAdmission
+        $syntheticInstalledBeforeFailure = [object]::ReferenceEquals($probeState.Admission, $SyntheticAdmission)
+        throw 'D32_SELFTEST_EXPECTED_SYNTHETIC_CONTEXT_FAILURE'
+    }
+    catch {
+        $expectedFailureObserved = $_.Exception.Message -ceq 'D32_SELFTEST_EXPECTED_SYNTHETIC_CONTEXT_FAILURE'
+    }
+    finally {
+        Restore-D32PowerShellModuleSelfTestAdmission -Lease $lease
+    }
+    return $expectedFailureObserved -and $syntheticInstalledBeforeFailure -and -not $lease.Active -and
+        [object]::ReferenceEquals($probeState.Admission, $PriorAdmission)
 }
 
 function ConvertTo-D32PowerShellAuthorityJsonText {

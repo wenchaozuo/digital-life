@@ -49,6 +49,7 @@ Add-D32ProducerBindingCase 'fixture provenance rejects substituting the helper s
 
 $discoveryAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-discovery.ps1' -ProcessId 3201 -StartTicks 638949002000000000
 $baselineAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-baseline.ps1' -ProcessId 3202 -StartTicks 638949003000000000
+$phase0MatrixAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-phase0-matrix.ps1' -ProcessId 3203 -StartTicks 638949003500000000
 $baselineOwnPositive = (Test-D32PowerShellModuleProducerContextEqual -Document $baselineAdmission -ExpectedContext $baselineAdmission) -and
     (Test-D32ProducerEntryRoleFixture -Admission $baselineAdmission -Role inventory_baseline) -and
     (Test-D32PowerShellModuleProducerProcessDistinct -Document $baselineAdmission -OtherAdmission $discoveryAdmission)
@@ -67,6 +68,18 @@ Add-D32ProducerBindingCase 'baseline own producer is role-correct and process-di
 Add-D32ProducerBindingCase 'baseline rejects discovery admission copied into its own producer slot' ($baselineOwnCopyRejected -and $baselineDiscoveryCopiedAsOwnRejected)
 Add-D32ProducerBindingCase 'baseline writer context rejects a prior same-role producer process' $baselineOldProducerRejected
 Add-D32ProducerBindingCase 'baseline discovery slot remains exactly linked to its opened discovery producer admission' ($baselineDiscoveryLinkPositive -and $baselineDiscoveryTamperRejected)
+Add-D32ProducerBindingCase 'discovery, baseline, and Phase0 shape-only producers use their exact role entries and distinct process identities' `
+    ((Test-D32ProducerEntryRoleFixture -Admission $discoveryAdmission -Role inventory_discovery) -and
+        (Test-D32ProducerEntryRoleFixture -Admission $baselineAdmission -Role inventory_baseline) -and
+        (Test-D32ProducerEntryRoleFixture -Admission $phase0MatrixAdmission -Role phase0_matrix) -and
+        (Test-D32PowerShellModuleProducerProcessDistinct -Document $phase0MatrixAdmission -OtherAdmission $baselineAdmission) -and
+        (Test-D32PowerShellModuleProducerProcessDistinct -Document $phase0MatrixAdmission -OtherAdmission $discoveryAdmission))
+
+$leasePriorAdmission = [PSCustomObject]@{ marker = 'prior-shape-only' }
+$leaseSyntheticAdmission = [PSCustomObject]@{ marker = 'synthetic-shape-only' }
+$immediateFailureLeaseRecovery = Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery `
+    -PriorAdmission $leasePriorAdmission -SyntheticAdmission $leaseSyntheticAdmission
+Add-D32ProducerBindingCase 'synthetic admission lease restores state after failure immediately following the switch' $immediateFailureLeaseRecovery
 
 $aggregateAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-preflight.ps1' -ProcessId 3301 -StartTicks 638949004000000000
 $historicalReaderAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-preflight.ps1' -ProcessId 3302 -StartTicks 638949005000000000
@@ -138,10 +151,17 @@ $mainSelfTestText = ''
 $mainSelfTestAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32SelfTest' }, $true)
 if ($null -ne $mainSelfTestAst) { $mainSelfTestText = $mainSelfTestAst.Extent.Text }
 $syntheticAdmissionLifecycleBound = $mainSelfTestText.Contains('-DiscoveryProducerAdmission $syntheticDiscoveryAdmission') -and
-    $mainSelfTestText.Contains('-BaselineProducerAdmission $syntheticPreflightAdmission') -and
-    $mainSelfTestText.Contains('$actualModuleAdmissionState.Admission = $syntheticPreflightAdmission') -and
-    $mainSelfTestText.Contains('$actualModuleAdmissionState.Admission = $actualModuleAdmissionForRestore') -and
-    $mainSelfTestText.Contains('owned SelfTest-only producer contexts bind the fixture candidate/Profile/entry')
+    $mainSelfTestText.Contains('-BaselineProducerAdmission $syntheticBaselineAdmission') -and
+    $mainSelfTestText.Contains("-EntryScriptPath `$syntheticDiscoveryEntryPath") -and
+    $mainSelfTestText.Contains("-EntryScriptPath `$syntheticBaselineEntryPath") -and
+    $mainSelfTestText.Contains("Join-Path `$fixture 'scripts\d32-phase0-matrix.ps1'") -and
+    $mainSelfTestText.Contains('preflight SelfTest synthetic role-entry placeholder path must be absent') -and
+    $mainSelfTestText.Contains('never executed and not an actual admitted -File launch or module-admission proof') -and
+    $mainSelfTestText.Contains('Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery') -and
+    $mainSelfTestText.Contains('Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $syntheticPreflightAdmission') -and
+    $mainSelfTestText.Contains('Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease') -and
+    $mainSelfTestText.Contains('syntheticPhase0Admission.runner_process.process_id') -and
+    $mainSelfTestText.Contains('role-specific discovery/baseline/Phase0 entry and process identities')
 $syntheticAdmissionBuilderComplete = $syntheticAdmissionBuilderText.Contains('This shape-only context is confined to the owned temporary SelfTest') -and
     $syntheticAdmissionBuilderText.Contains('$admission.candidate_sha = $CandidateSha') -and
     $syntheticAdmissionBuilderText.Contains('$admission.source_repo = $repo') -and
@@ -159,11 +179,16 @@ $fixturePrebuildSelfTestText = if ($null -ne $fixturePrebuildSelfTestAst) { $fix
 $fixtureSyntheticAdmissionClosure = $fixturePrebuildSelfTestText.Contains('$fixtureSyntheticAdmission.entry_script_path = $syntheticEntryScriptPath') -and
     $fixturePrebuildSelfTestText.Contains('$fixtureSyntheticAdmission.runner_process.process_id = [int]$syntheticRunnerProcessId') -and
     $fixturePrebuildSelfTestText.Contains('powershell_module_admission = $fixtureSyntheticAdmission') -and
-    $fixturePrebuildSelfTestText.Contains('$moduleAdmissionState.Admission = $fixtureSyntheticAdmission') -and
-    $fixturePrebuildSelfTestText.Contains('$moduleAdmissionState.Admission = $moduleAdmissionForRestore')
+    $fixturePrebuildSelfTestText.Contains('Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $fixtureSyntheticAdmission') -and
+    $fixturePrebuildSelfTestText.Contains('Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease')
+$baselineDiagnosticsBound = $sourceFiles.inventory.Contains('failedAdmissionBindings') -and
+    $sourceFiles.inventory.Contains("discoveryProducerContext = Get-D32PowerShellModuleAdmissionValidationContext") -and
+    $sourceFiles.inventory.Contains("baselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext") -and
+    $sourceFiles.helper.Contains('producer.role-entry-path') -and $sourceFiles.helper.Contains('producer.exact-linked-admission') -and
+    $sourceFiles.helper.Contains('producer.distinct-process-identity')
 Add-D32ProducerBindingCase 'source lifecycle parses and binds fixture/discovery/baseline/Phase0/release/aggregate producer contexts' `
-    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure) `
-    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure"
+    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure -and $baselineDiagnosticsBound) `
+    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure; baseline_diagnostics=$baselineDiagnosticsBound"
 
 Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedAtStart
 $passed = $cases.Where({ $_.passed }).Count

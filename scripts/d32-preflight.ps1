@@ -5633,9 +5633,11 @@ function Invoke-D32SelfTest {
         throw 'preflight SelfTest requires the already-admitted caller module context'
     }
     $actualModuleAdmissionForRestore = $actualModuleAdmissionState.Admission
-    $syntheticModuleAdmissionActive = $false
+    $syntheticModuleAdmissionLease = New-D32PowerShellModuleSelfTestAdmissionLease -State $actualModuleAdmissionState
     $syntheticPreflightAdmission = $null
     $syntheticDiscoveryAdmission = $null
+    $syntheticBaselineAdmission = $null
+    $syntheticPhase0Admission = $null
     try {
         Assert-D32SelfTest -Condition (Test-D32SupportedPowerShellVersion -Version $PSVersionTable.PSVersion) -Name 'supported PowerShell version is accepted' -Failures $failures
         Assert-D32SelfTest -Condition (-not (Test-D32SupportedPowerShellVersion -Version ([Version]'7.4.99'))) -Name 'PowerShell versions before 7.5 are rejected' -Failures $failures
@@ -6004,6 +6006,22 @@ function Invoke-D32SelfTest {
         finally { $syntheticAdmissionReferenceStream.Dispose() }
         $syntheticAdmissionReference = Get-D32Phase0FileReference -Path $syntheticAdmissionReferencePath
         $syntheticAdmissionEntryPath = Join-Path $fixture 'scripts\d32-preflight.ps1'
+        $syntheticDiscoveryEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-discovery.ps1'
+        $syntheticBaselineEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-baseline.ps1'
+        foreach ($entrySpec in @(
+                [PSCustomObject]@{ Path = $syntheticDiscoveryEntryPath; Role = 'inventory-discovery' },
+                [PSCustomObject]@{ Path = $syntheticBaselineEntryPath; Role = 'inventory-baseline' },
+                [PSCustomObject]@{ Path = (Join-Path $fixture 'scripts\d32-phase0-matrix.ps1'); Role = 'phase0-matrix' }
+            )) {
+            if ([IO.File]::Exists([string]$entrySpec.Path) -or [IO.Directory]::Exists([string]$entrySpec.Path)) {
+                throw 'preflight SelfTest synthetic role-entry placeholder path must be absent'
+            }
+            $entryBytes = [Text.UTF8Encoding]::new($false).GetBytes(
+                "# D32 SelfTest-only $($entrySpec.Role) entry placeholder; never executed and not an actual admitted -File launch or module-admission proof.`n")
+            $entryStream = [IO.File]::Open([string]$entrySpec.Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $entryStream.Write($entryBytes, 0, $entryBytes.Length); $entryStream.Flush($true) }
+            finally { $entryStream.Dispose() }
+        }
         $syntheticPreflightAdmission = New-D32PreflightSelfTestSyntheticModuleAdmission `
             -TemplateAdmission $actualModuleAdmissionForRestore -SelfTestRoot $root -Repository $fixture -CandidateSha $head `
             -ValidatedProfile $phase0ProfileValidation -EntryScriptPath $syntheticAdmissionEntryPath `
@@ -6011,33 +6029,54 @@ function Invoke-D32SelfTest {
             -SyntheticStartTimeUtcTicks 638949001000000000L
         $syntheticDiscoveryAdmission = New-D32PreflightSelfTestSyntheticModuleAdmission `
             -TemplateAdmission $actualModuleAdmissionForRestore -SelfTestRoot $root -Repository $fixture -CandidateSha $head `
-            -ValidatedProfile $phase0ProfileValidation -EntryScriptPath $syntheticAdmissionEntryPath `
+            -ValidatedProfile $phase0ProfileValidation -EntryScriptPath $syntheticDiscoveryEntryPath `
             -SyntheticAuthorityReference $syntheticAdmissionReference -SyntheticProcessId 2000000001 `
             -SyntheticStartTimeUtcTicks 638949001010000000L
+        $syntheticBaselineAdmission = New-D32PreflightSelfTestSyntheticModuleAdmission `
+            -TemplateAdmission $actualModuleAdmissionForRestore -SelfTestRoot $root -Repository $fixture -CandidateSha $head `
+            -ValidatedProfile $phase0ProfileValidation -EntryScriptPath $syntheticBaselineEntryPath `
+            -SyntheticAuthorityReference $syntheticAdmissionReference -SyntheticProcessId 2000000002 `
+            -SyntheticStartTimeUtcTicks 638949001020000000L
+        $syntheticPhase0Admission = New-D32PreflightSelfTestSyntheticModuleAdmission `
+            -TemplateAdmission $actualModuleAdmissionForRestore -SelfTestRoot $root -Repository $fixture -CandidateSha $head `
+            -ValidatedProfile $phase0ProfileValidation -EntryScriptPath (Join-Path $fixture 'scripts\d32-phase0-matrix.ps1') `
+            -SyntheticAuthorityReference $syntheticAdmissionReference -SyntheticProcessId 2000000003 `
+            -SyntheticStartTimeUtcTicks 638949001030000000L
         $syntheticDiscoveryProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticDiscoveryAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_discovery `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticDiscoveryAdmission
         $syntheticBaselineProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
-            -Document $syntheticPreflightAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
-            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticPreflightAdmission `
+            -Document $syntheticBaselineAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
+            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticDiscoveryAdmission
         $syntheticCopiedDiscoveryRejectedAsBaseline = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticDiscoveryAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
-            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticPreflightAdmission `
+            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticDiscoveryAdmission)
+        $syntheticBaselineSameProcessRejected = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
+            -Document $syntheticBaselineAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
+            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
+            -DistinctFromAdmission $syntheticBaselineAdmission)
+        $syntheticPhase0ProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
+            -Document $syntheticPhase0Admission -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
+            -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticPhase0Admission
         $actualCallerRejectedAsFixtureProducer = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $actualModuleAdmissionForRestore -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
             -ExpectedAdmissionContext $syntheticPreflightAdmission)
+        $immediateSyntheticFailureRestored = Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery `
+            -PriorAdmission $actualModuleAdmissionForRestore -SyntheticAdmission $syntheticPreflightAdmission
         Assert-D32SelfTest -Condition ($syntheticDiscoveryProducerAccepted -and $syntheticBaselineProducerAccepted -and
-            $syntheticCopiedDiscoveryRejectedAsBaseline -and $actualCallerRejectedAsFixtureProducer) `
-            -Name 'owned SelfTest-only producer contexts bind the fixture candidate/Profile/entry, keep discovery and baseline processes distinct, and do not substitute the real caller admission' `
+            $syntheticCopiedDiscoveryRejectedAsBaseline -and $syntheticBaselineSameProcessRejected -and $syntheticPhase0ProducerAccepted -and
+            $actualCallerRejectedAsFixtureProducer) `
+            -Name 'owned SelfTest-only producer contexts bind role-specific discovery/baseline/Phase0 entry and process identities and reject copied contexts' `
             -Failures $failures
-        $actualModuleAdmissionState.Admission = $syntheticPreflightAdmission
-        $syntheticModuleAdmissionActive = $true
+        Assert-D32SelfTest -Condition $immediateSyntheticFailureRestored `
+            -Name 'synthetic admission state restores after a terminating failure immediately after the context switch' -Failures $failures
+        Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $syntheticPreflightAdmission
         $inventoryArtifacts = New-D32PreflightSelfTestInventoryAuthorityArtifacts -Root $root -Repository $fixture -CandidateSha $head `
             -ValidatedProfile $phase0ProfileValidation -PinnedGitPath $trustedGitPath -PinnedGitSha256 $trustedGitHash `
             -ArchiveSourcePath $archiveSourcePath -SourcePatchAuthority $sourcePatchAuthority `
-            -DiscoveryProducerAdmission $syntheticDiscoveryAdmission -BaselineProducerAdmission $syntheticPreflightAdmission
+            -DiscoveryProducerAdmission $syntheticDiscoveryAdmission -BaselineProducerAdmission $syntheticBaselineAdmission
         $discoverySchemaMutationFailures = @($inventoryArtifacts.DiscoverySchemaMutationResults | Where-Object { -not $_.Rejected })
         Assert-D32SelfTest -Condition ($inventoryArtifacts.DiscoverySchemaMutationResults.Count -eq 2 -and $discoverySchemaMutationFailures.Count -eq 0) `
             -Name 'discovery reader rejects prior and unknown schema versions even when each mutated record is correctly rehashed' -Failures $failures
@@ -6065,7 +6104,7 @@ function Invoke-D32SelfTest {
         [IO.File]::WriteAllLines($h7SuiteStdoutPath, $h7SuiteLines.ToArray(), [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($h7SuiteStderrPath, '', [Text.UTF8Encoding]::new($false))
         $h7SuiteArgs = @(Get-D32Phase0TestCommand -Package 'vita' -Kind 'suite')
-        $h7SuiteTrace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPreflightAdmission.runner_process.process_id) -RootProcessId 30099
+        $h7SuiteTrace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPhase0Admission.runner_process.process_id) -RootProcessId 30099
         $h7SuiteRootTrace = @($h7SuiteTrace.processes | Where-Object { $_.create_sequence -eq 1 })[0]
         $h7SuiteCommandLine = ConvertTo-D32Phase0CommandLine -Arguments (@([string]$phase0ProfileValidation.Profile.toolchain.cargo.path) + $h7SuiteArgs)
         $h7SuiteRootProxy = [PSCustomObject]@{
@@ -6123,7 +6162,7 @@ function Invoke-D32SelfTest {
             clean_after = $true
         }
         $null = Test-D32Phase0DebugProcessTrace -Trace $h7SuiteTrace -ExpectedRootPath ([string]$phase0ProfileValidation.Profile.toolchain.cargo.path) `
-            -ExpectedRootIdentity $phase0ProfileValidation.Profile.toolchain.cargo -ExpectedParentProcessId ([int]$syntheticPreflightAdmission.runner_process.process_id) `
+            -ExpectedRootIdentity $phase0ProfileValidation.Profile.toolchain.cargo -ExpectedParentProcessId ([int]$syntheticPhase0Admission.runner_process.process_id) `
             -ValidatedProfile $phase0ProfileValidation -Repository $fixture -VendoredProtocGrant $phase0VendoredGrant `
             -H7CGitAuthority $h7Authority -H7CGitRunGrant $h7RunGrant
         $h7Attestation = New-D32H7CGitChildAttestation -Authority $h7Authority -RunGrant $h7RunGrant -OwnerBinding $h7OwnerBinding `
@@ -6177,7 +6216,7 @@ function Invoke-D32SelfTest {
             $traceName = 'fixture-{0:D2}-fetch' -f $phase0TraceIndex
             $rootProcessId = 30000 + $phase0TraceIndex
             $arguments = @('fetch', '--locked', '--manifest-path', [string]$lockInput.ManifestFullPath, '--target', [string]$phase0ProfileValidation.Profile.target_triple)
-            $trace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPreflightAdmission.runner_process.process_id) -RootProcessId $rootProcessId
+            $trace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPhase0Admission.runner_process.process_id) -RootProcessId $rootProcessId
             $rootProcess = $trace.processes[0]
             $commandLine = ConvertTo-D32Phase0CommandLine -Arguments (@([string]$fakeCargo) + $arguments)
             $phase0TraceEntries.Add([ordered]@{
@@ -6196,7 +6235,7 @@ function Invoke-D32SelfTest {
                     exit_code = 0
                     process_identity = [ordered]@{
                         process_id = $rootProcessId
-                        parent_process_id = [int]$syntheticPreflightAdmission.runner_process.process_id
+                        parent_process_id = [int]$syntheticPhase0Admission.runner_process.process_id
                         name = 'cargo.exe'
                         image_path = [string]$fakeCargo
                         creation_date = [DateTime]::FromFileTimeUtc([Int64]$rootProcess.creation_filetime).ToString('o')
@@ -6213,7 +6252,7 @@ function Invoke-D32SelfTest {
             $arguments = @('build', '--quiet', '--locked', '--manifest-path', $manifestPath, '--bin', [string]$fixtureSpec.binary)
             if (@($fixtureSpec.features).Count -gt 0) { $arguments += @('--features', (@($fixtureSpec.features) -join ' ')) }
             $arguments += @('--jobs', '4')
-            $trace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPreflightAdmission.runner_process.process_id) -RootProcessId $rootProcessId
+            $trace = New-D32Phase0SelfTestDebugTrace -Profile $phase0ProfileValidation -RunnerProcessId ([int]$syntheticPhase0Admission.runner_process.process_id) -RootProcessId $rootProcessId
             $phase0TraceEntries.Add([ordered]@{
                     name = [string]$fixtureSpec.name
                     executable = [string]$fakeCargo
@@ -6275,7 +6314,7 @@ function Invoke-D32SelfTest {
             fixture_build_budget = $phase0FixtureBuildBudget
             vendored_protoc_run_grant = $phase0VendoredGrant.Reference
             tauri_macros_source_patch = $sourcePatchAuthority.Reference
-            powershell_module_admission = $syntheticPreflightAdmission
+            powershell_module_admission = $syntheticPhase0Admission
         }
         Write-D32JsonCreateNew -Path $phase0FixtureProvenancePath -Value $phase0FixtureProvenanceDocument
         $phase0TranscriptPath = Join-Path $phase0Root 'fixture-prebuild.log'
@@ -6349,7 +6388,7 @@ function Invoke-D32SelfTest {
                     -ValidatedProfile $phase0ProfileValidation -LogRoot $phase0LogRoot -LogStem ('phase0-command-{0:D2}-{1}' -f ($commandIndex + 1), $expectedCommand.name) `
                     -Arguments @($expectedCommand.arguments) -TimeoutSeconds ([int]$expectedCommand.timeout_seconds) -StdoutLines @($stdoutLines.ToArray()) `
                     -Tool $(if (Test-D32ProfilePathEqual -Left $expectedCommand.executable -Right $phase0ProfileValidation.Profile.toolchain.rustc.path) { 'rustc' } else { 'cargo' }) `
-                    -RootProcessId (43000 + $commandIndex) -RunnerProcessId ([int]$syntheticPreflightAdmission.runner_process.process_id)
+                    -RootProcessId (43000 + $commandIndex) -RunnerProcessId ([int]$syntheticPhase0Admission.runner_process.process_id)
                 if ($expectedCommand.name -match '^(protocol|host)-full-local-suite$') { $suiteLines = @($stdoutLines.ToArray()) }
             }
             $phase0Commands.Add($commandRecord)
@@ -6379,7 +6418,7 @@ function Invoke-D32SelfTest {
         $phase0Document = [ordered]@{
             schema_version = 8
             record_type = 'D32_PHASE0_MATRIX_RECORD_V8'
-            runner_process_id = [int]$syntheticPreflightAdmission.runner_process.process_id
+            runner_process_id = [int]$syntheticPhase0Admission.runner_process.process_id
             candidate_sha = $head
             source_repo = [IO.Path]::GetFullPath($fixture)
             output_root = [IO.Path]::GetFullPath($phase0Root)
@@ -6393,7 +6432,7 @@ function Invoke-D32SelfTest {
             h7c_git_child_authority = $h7Authority.Reference
             h7c_git_child_attestation = $h7Attestation.Reference
             test_inventory_authority = [ordered]@{ baseline = $inventoryArtifacts.BaselineReference; discovery = $inventoryArtifacts.DiscoveryReference }
-            powershell_module_admission = $syntheticPreflightAdmission
+            powershell_module_admission = $syntheticPhase0Admission
             status = 'PASS'
             bundle_hashes = 'PENDING'
             started_at_utc = $phase0Started
@@ -7517,10 +7556,7 @@ function Invoke-D32SelfTest {
         [void]$failures.Add('setup or assertion failed')
     }
     finally {
-        if ($syntheticModuleAdmissionActive -and $null -ne $actualModuleAdmissionState) {
-            $actualModuleAdmissionState.Admission = $actualModuleAdmissionForRestore
-            $syntheticModuleAdmissionActive = $false
-        }
+        if ($null -ne $syntheticModuleAdmissionLease) { Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease }
         if ($rootOwned -and -not (Remove-D32OwnedTempRoot -Root $root -Marker $rootMarker -Token $rootToken)) {
             Write-Host 'SELFTEST ERROR: owned temp root failed exact-marker/reparse cleanup'
             [void]$failures.Add('owned temp root cleanup failed')

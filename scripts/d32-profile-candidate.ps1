@@ -28,39 +28,44 @@ $requiredFacts = @(
 $optionalFacts = @('vc_tools_redist_dir','vs_install_dir','visual_studio_version','vscmd_version')
 $facts = Read-D32PowerShellAuthorityFactsRequest -Path $FactsRequestPath -ExpectedRecordType 'D32_BUILD_TOOLCHAIN_PROFILE_FACTS_REQUEST_V1' `
     -RequiredFields $requiredFacts -OptionalFields $optionalFacts
+function Get-D32ProfileCandidateFactValue {
+    param([Parameter(Mandatory = $true)][object]$Record, [Parameter(Mandatory = $true)][string]$Name)
+    return Get-D32PowerShellModuleAdmissionField -Record $Record -Name $Name
+}
 foreach ($field in @('repository','rust_toolchain_root','msvc_root','windows_sdk_root','vc_tools_version','windows_sdk_version')) {
-    $value = $facts.PSObject.Properties[$field].Value
+    $value = Get-D32ProfileCandidateFactValue -Record $facts -Name $field
     if ($value -isnot [string] -or [String]::IsNullOrWhiteSpace($value)) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' must be a nonempty string" }
 }
 foreach ($field in @('msvc_path_entries','windows_sdk_path_entries','msvc_include_directories','windows_sdk_include_directories','msvc_lib_directories','windows_sdk_lib_directories','msvc_libpath_directories','windows_sdk_libpath_directories')) {
-    $value = $facts.PSObject.Properties[$field].Value
+    $value = Get-D32ProfileCandidateFactValue -Record $facts -Name $field
     if ($value -isnot [Array] -or $value.Count -eq 0) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' must be a nonempty JSON array" }
     foreach ($item in $value) { if ($item -isnot [string] -or [String]::IsNullOrWhiteSpace($item)) { throw "PROFILE_CANDIDATE_BLOCKED: facts request field '$field' contains a non-string or empty value" } }
 }
 foreach ($field in $optionalFacts) {
-    $property = $facts.PSObject.Properties[$field]
-    if ($null -ne $property -and ($property.Value -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$property.Value))) {
+    $present = if ($facts -is [System.Collections.IDictionary]) { $facts.Contains($field) } else { $null -ne $facts.PSObject.Properties[$field] }
+    $value = if ($present) { Get-D32ProfileCandidateFactValue -Record $facts -Name $field } else { $null }
+    if ($present -and ($value -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$value))) {
         throw "PROFILE_CANDIDATE_BLOCKED: optional facts request field '$field' must be a nonempty string when present"
     }
 }
-$Repository = [string]$facts.repository
-$RustToolchainRoot = [string]$facts.rust_toolchain_root
-$MsvcRoot = [string]$facts.msvc_root
-$WindowsSdkRoot = [string]$facts.windows_sdk_root
-$MsvcPathEntry = [string[]]$facts.msvc_path_entries
-$WindowsSdkPathEntry = [string[]]$facts.windows_sdk_path_entries
-$MsvcIncludeDirectory = [string[]]$facts.msvc_include_directories
-$WindowsSdkIncludeDirectory = [string[]]$facts.windows_sdk_include_directories
-$MsvcLibDirectory = [string[]]$facts.msvc_lib_directories
-$WindowsSdkLibDirectory = [string[]]$facts.windows_sdk_lib_directories
-$MsvcLibPathDirectory = [string[]]$facts.msvc_libpath_directories
-$WindowsSdkLibPathDirectory = [string[]]$facts.windows_sdk_libpath_directories
-$VCToolsVersion = [string]$facts.vc_tools_version
-$WindowsSDKVersion = [string]$facts.windows_sdk_version
-$VCToolsRedistDir = if ($null -ne $facts.PSObject.Properties['vc_tools_redist_dir']) { [string]$facts.vc_tools_redist_dir } else { $null }
-$VSInstallDir = if ($null -ne $facts.PSObject.Properties['vs_install_dir']) { [string]$facts.vs_install_dir } else { $null }
-$VisualStudioVersion = if ($null -ne $facts.PSObject.Properties['visual_studio_version']) { [string]$facts.visual_studio_version } else { $null }
-$VscmdVersion = if ($null -ne $facts.PSObject.Properties['vscmd_version']) { [string]$facts.vscmd_version } else { $null }
+$Repository = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'repository')
+$RustToolchainRoot = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'rust_toolchain_root')
+$MsvcRoot = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'msvc_root')
+$WindowsSdkRoot = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_root')
+$MsvcPathEntry = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'msvc_path_entries')
+$WindowsSdkPathEntry = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_path_entries')
+$MsvcIncludeDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'msvc_include_directories')
+$WindowsSdkIncludeDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_include_directories')
+$MsvcLibDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'msvc_lib_directories')
+$WindowsSdkLibDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_lib_directories')
+$MsvcLibPathDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'msvc_libpath_directories')
+$WindowsSdkLibPathDirectory = [string[]](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_libpath_directories')
+$VCToolsVersion = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'vc_tools_version')
+$WindowsSDKVersion = [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'windows_sdk_version')
+$VCToolsRedistDir = if ($facts.Contains('vc_tools_redist_dir')) { [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'vc_tools_redist_dir') } else { $null }
+$VSInstallDir = if ($facts.Contains('vs_install_dir')) { [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'vs_install_dir') } else { $null }
+$VisualStudioVersion = if ($facts.Contains('visual_studio_version')) { [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'visual_studio_version') } else { $null }
+$VscmdVersion = if ($facts.Contains('vscmd_version')) { [string](Get-D32ProfileCandidateFactValue -Record $facts -Name 'vscmd_version') } else { $null }
 
 $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
 $openedFiles = [System.Collections.Generic.List[object]]::new()

@@ -536,11 +536,16 @@ function Test-D32TestInventoryBaselineDocument {
         -DistinctFromAdmission $Document.discovery_module_admission
     $baselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
     $baselineProfileBound = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $Document.powershell_module_admission -ProfileRecord $Document.toolchain_profile
+    $baselineProfileContext = Get-D32PowerShellModuleAdmissionValidationContext
+    $baselineProfileDetail = Get-D32PowerShellModuleAdmissionValidationDetail
     $failedAdmissionBindings = [System.Collections.Generic.List[string]]::new()
     if (-not $discoveryProducerBound) { $failedAdmissionBindings.Add("discovery_producer:$discoveryProducerContext") }
     if (-not $discoveryProfileBound) { $failedAdmissionBindings.Add('discovery_profile') }
     if (-not $baselineProducerBound) { $failedAdmissionBindings.Add("baseline_producer:$baselineProducerContext") }
-    if (-not $baselineProfileBound) { $failedAdmissionBindings.Add('baseline_profile') }
+    if (-not $baselineProfileBound) {
+        $baselineProfileDetailJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $baselineProfileDetail
+        $failedAdmissionBindings.Add("baseline_profile:$($baselineProfileContext):$baselineProfileDetailJson")
+    }
     if ($failedAdmissionBindings.Count -gt 0) {
         throw "TEST_INVENTORY_BASELINE_BLOCKED: producer/module-admission bindings failed ($($failedAdmissionBindings -join ', ')); expected an exact linked discovery producer and distinct baseline producer process/startup/entry"
     }

@@ -4252,7 +4252,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         [PSCustomObject]@{ Field = 'package'; Value = 'vita' },
         [PSCustomObject]@{ Field = 'executable_sha256'; Value = ('f' * 64) }
     )) {
-        $variant = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($syntheticListRecord))
+        $variant = Copy-D32PowerShellAuthorityJsonShape -Value $syntheticListRecord
         $variant.([string]$mutation.Field) = $mutation.Value
         $rejected = $false
         try { Assert-D32TestInventoryExpectedCommand -Actual $variant -Expected $firstExpectedList -DiscoveryCommand $syntheticDiscoveryCommand -Index 0 -CandidateSha ('c' * 40) -Repository 'C:\candidate' -Profile $planProfile }
@@ -4262,7 +4262,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
     & $add "pinned baseline command validator rejects wrong jobs argv, timeout, features, target, candidate, package, and toolchain identity ($syntheticListError)" `
         ($syntheticListAccepted -and $inventoryCommandMutantsRejected.Count -eq 7 -and @($inventoryCommandMutantsRejected | Where-Object { -not $_ }).Count -eq 0)
     $emptyIgnoredExpected = $inventoryPackages[1]
-    $emptyIgnoredCommand = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($syntheticListRecord))
+    $emptyIgnoredCommand = Copy-D32PowerShellAuthorityJsonShape -Value $syntheticListRecord
     $emptyIgnoredCommand.command_index = [Int64]1
     $emptyIgnoredCommand.package = $emptyIgnoredExpected.package
     $emptyIgnoredCommand.listing_kind = $emptyIgnoredExpected.listing_kind
@@ -5077,7 +5077,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         catch { $wrongSourceCandidateRejected = $_.Exception.Message -like '*source-patch schema/candidate/profile*' }
         & $add 'source-patch reader rejects a stale/wrong candidate binding' $wrongSourceCandidateRejected
-        $wrongSourceWrapperFacts = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($tauriSourceFacts))
+        $wrongSourceWrapperFacts = Copy-D32PowerShellAuthorityJsonShape -Value $tauriSourceFacts
         $wrongSourceWrapperFacts.source_wrapper_sha256 = '0' * 64
         $wrongSourceWrapperPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY-WRONG-WRAPPER.json'
         $wrongSourceWrapperReference = Write-D32VendoredProtocAuthorityCreateNew -Path $wrongSourceWrapperPath -Document $wrongSourceWrapperFacts
@@ -5088,7 +5088,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         catch { $wrongSourceWrapperRejected = $_.Exception.Message -like '*source_wrapper_sha256 is not the exact wrapper extracted*' }
         & $add 'source-patch authority rejects a mutated archived-wrapper SHA even with a freshly pinned authority file' $wrongSourceWrapperRejected
-        $wrongPatchDescriptorFacts = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($tauriSourceFacts))
+        $wrongPatchDescriptorFacts = Copy-D32PowerShellAuthorityJsonShape -Value $tauriSourceFacts
         $wrongPatchDescriptorFacts.patch_sha256 = '0' * 64
         $wrongPatchDescriptorPath = Join-Path $profileSelfTestRoot 'D32-TAURI-MACROS-SOURCE-PATCH-AUTHORITY-WRONG-DESCRIPTOR.json'
         $wrongPatchDescriptorReference = Write-D32VendoredProtocAuthorityCreateNew -Path $wrongPatchDescriptorPath -Document $wrongPatchDescriptorFacts
@@ -5812,7 +5812,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         }
         & $add 'V2 trace rejects a VCTIP opened file-ID mismatch before evidence acceptance' $driftedVctipTraceRejected ([string]$driftedVctipTraceFailure)
 
-        $unclassifiedEventTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $unclassifiedEventTrace = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $unclassifiedEventTrace.process_traces[0].process_trace.debug_event_count++
         & $writeSidecar $unclassifiedEventTrace
         $unclassifiedEventRejected = $false
@@ -5820,7 +5820,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $unclassifiedEventRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'debug event total rejects unclassified or missing event records' $unclassifiedEventRejected
 
-        $stringProcessEventCount = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $stringProcessEventCount = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $stringProcessEventCount.process_traces[0].process_trace.process_event_count = '2'
         & $writeSidecar $stringProcessEventCount
         $stringProcessEventCountRejected = $false
@@ -5828,7 +5828,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $stringProcessEventCountRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'debug process event count rejects numeric string coercion' $stringProcessEventCountRejected
 
-        $oldTraceRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $oldTraceRecord = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $oldTrace = $oldTraceRecord.process_traces[0].process_trace
         $oldTrace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
         $oldTrace.schema_version = 2
@@ -5842,7 +5842,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $oldTraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'previous synchronous process trace V2 shape is rejected under approved dedicated-thread trace V2 contract' $oldTraceRejected
 
-        $v1TraceRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $v1TraceRecord = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $v1TraceRecord.process_traces[0].process_trace.record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V1'
         $v1TraceRecord.process_traces[0].process_trace.schema_version = 1
         & $writeSidecar $v1TraceRecord
@@ -5851,7 +5851,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $v1TraceRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'previous process trace V1 is rejected' $v1TraceRejected
 
-        $missingThreadProof = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $missingThreadProof = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $missingThreadProof.process_traces[0].process_trace.debugger_kill_on_exit_enabled = $false
         & $writeSidecar $missingThreadProof
         $missingThreadProofRejected = $false
@@ -5859,7 +5859,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $missingThreadProofRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'process trace rejects a missing debugger kill-on-exit proof' $missingThreadProofRejected
 
-        $missingExitTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $missingExitTrace = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $missingExitTrace.process_traces[0].process_trace.process_events = @($missingExitTrace.process_traces[0].process_trace.process_events[0])
         & $writeSidecar $missingExitTrace
         $missingExitRejected = $false
@@ -5867,16 +5867,16 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $missingExitRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'missing debug EXIT event is rejected' $missingExitRejected
 
-        $reusedPidTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $reusedPidTrace = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $reuseTrace = $reusedPidTrace.process_traces[0].process_trace
-        $createAgain = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($reuseTrace.process_events[0]))
+        $createAgain = Copy-D32PowerShellAuthorityJsonShape -Value $reuseTrace.process_events[0]
         $createAgain.sequence = 2
-        $exitAgain = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($reuseTrace.process_events[1]))
+        $exitAgain = Copy-D32PowerShellAuthorityJsonShape -Value $reuseTrace.process_events[1]
         $exitAgain.sequence = 4
-        $firstExit = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($reuseTrace.process_events[1]))
+        $firstExit = Copy-D32PowerShellAuthorityJsonShape -Value $reuseTrace.process_events[1]
         $firstExit.sequence = 3
         $reuseTrace.process_events = @($reuseTrace.process_events[0], $createAgain, $firstExit, $exitAgain)
-        $reuseTrace.processes = @($reuseTrace.processes[0], [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($reuseTrace.processes[0])))
+        $reuseTrace.processes = @($reuseTrace.processes[0], (Copy-D32PowerShellAuthorityJsonShape -Value $reuseTrace.processes[0]))
         $reuseTrace.processes[1].create_sequence = 2
         $reuseTrace.processes[1].exit_sequence = 4
         $reuseTrace.process_create_event_count = 2
@@ -5890,7 +5890,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $pidReuseRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'overlapping PID reuse without a distinct live identity is rejected' $pidReuseRejected
 
-        $ambiguousParentTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $ambiguousParentTrace = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $ambiguousParentTrace.process_traces[0].process_trace.process_events[0].parent_process_id = $PID + 1
         & $writeSidecar $ambiguousParentTrace
         $ambiguousParentRejected = $false
@@ -5898,7 +5898,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $ambiguousParentRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'unknown root parent identity is rejected' $ambiguousParentRejected
 
-        $interruptedTrace = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $interruptedTrace = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $interruptedTrace.process_traces[0].process_trace.injected_interruption = $true
         & $writeSidecar $interruptedTrace
         $interruptionRejected = $false
@@ -5906,7 +5906,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $interruptionRejected = $_.Exception.Message -like '*PROCESS_TRACE_BLOCKED*' }
         & $add 'debug-chain interruption is rejected' $interruptionRejected
 
-        $oldV2Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $oldV2Provenance = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $oldV2Provenance.schema_version = 2
         $oldV2Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V2'
         & $writeSidecar $oldV2Provenance
@@ -5915,7 +5915,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $oldV2ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
         & $add 'fixture provenance rejects prior V2 compact-layout schema even with a fresh exact file' $oldV2ProvenanceRejected
 
-        $oldV3Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $oldV3Provenance = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $oldV3Provenance.schema_version = 4
         $oldV3Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V4'
         & $writeSidecar $oldV3Provenance
@@ -5924,7 +5924,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $oldV4ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
         & $add 'fixture provenance rejects prior V4 after the source-patch authority migration' $oldV4ProvenanceRejected
 
-        $unknownV4Provenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $unknownV4Provenance = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $unknownV4Provenance.schema_version = 99
         $unknownV4Provenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V99'
         & $writeSidecar $unknownV4Provenance
@@ -5933,7 +5933,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $unknownV4ProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
         & $add 'fixture provenance rejects unknown future version instead of guessing its layout' $unknownV4ProvenanceRejected
 
-        $oldProvenance = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $oldProvenance = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $oldProvenance.schema_version = 1
         $oldProvenance.record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V1'
         $oldProvenance.Remove('process_traces')
@@ -5943,7 +5943,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $oldProvenanceRejected = $_.Exception.Message -like '*schema/candidate/source/manifest binding is invalid*' }
         & $add 'fixture provenance V1 without synchronized process traces is rejected' $oldProvenanceRejected
 
-        $missingEnvironmentField = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $missingEnvironmentField = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $missingEnvironmentField.environment.Remove('run_id')
         & $writeSidecar $missingEnvironmentField
         $missingRejected = $false
@@ -5952,7 +5952,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $missingRejected = $_.Exception.Message -like '*missing or extra fields*'; if (-not $missingRejected) { $missingFailure = $_.Exception.Message } }
         & $add 'fixture provenance rejects a missing environment field' $missingRejected $missingFailure
 
-        $extraEnvironmentField = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $extraEnvironmentField = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $extraEnvironmentField.environment.extra = 'unapproved'
         & $writeSidecar $extraEnvironmentField
         $extraRejected = $false
@@ -5961,7 +5961,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $extraRejected = $_.Exception.Message -like '*missing or extra fields*'; if (-not $extraRejected) { $extraFailure = $_.Exception.Message } }
         & $add 'fixture provenance rejects an extra environment field' $extraRejected $extraFailure
 
-        $missingFetchField = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $missingFetchField = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $missingFetchField.environment.fetch_manifests[0].Remove('process_identity')
         & $writeSidecar $missingFetchField
         $fetchFieldRejected = $false
@@ -5969,7 +5969,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $fetchFieldRejected = $_.Exception.Message -like '*fixed locked fetch record is invalid*' }
         & $add 'fixture provenance rejects a missing nested locked-fetch evidence field' $fetchFieldRejected
 
-        $wrongFetchArgv = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $wrongFetchArgv = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $wrongFetchArgv.environment.fetch_manifests[0].command[1] = '--offline'
         & $writeSidecar $wrongFetchArgv
         $fetchArgvRejected = $false
@@ -5977,7 +5977,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $fetchArgvRejected = $_.Exception.Message -like '*fixed locked fetch argv mismatch*' }
         & $add 'fixture provenance rejects altered locked-fetch argv' $fetchArgvRejected
 
-        $wrongFetchParent = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $wrongFetchParent = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $wrongFetchParent.environment.fetch_manifests[0].process_identity.parent_process_id = $PID + 1
         & $writeSidecar $wrongFetchParent
         $fetchParentRejected = $false
@@ -5985,7 +5985,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
         catch { $fetchParentRejected = $_.Exception.Message -like '*Cargo process identity evidence is invalid*' }
         & $add 'fixture provenance requires fetch Cargo to be parented by the pinned Phase0 process' $fetchParentRejected
 
-        $wrongManifestIdentity = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($sidecar))
+        $wrongManifestIdentity = Copy-D32PowerShellAuthorityJsonShape -Value $sidecar
         $wrongManifestIdentity.fixture_manifest_file_id_hex = '0' * 32
         & $writeSidecar $wrongManifestIdentity
         $identityRejected = $false

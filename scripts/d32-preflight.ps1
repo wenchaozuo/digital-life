@@ -3921,8 +3921,7 @@ function New-D32PreflightSelfTestSyntheticModuleAdmission {
         file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex
     }
     $entryReference = Get-D32Phase0FileReference -Path $entry
-    $admission = [System.Management.Automation.PSSerializer]::Deserialize(
-        [System.Management.Automation.PSSerializer]::Serialize($TemplateAdmission))
+    $admission = Copy-D32PowerShellAuthorityJsonShape -Value $TemplateAdmission
     $admission.candidate_sha = $CandidateSha
     $admission.source_repo = $repo
     $admission.authority_reference = $SyntheticAuthorityReference
@@ -4195,8 +4194,7 @@ function New-D32PreflightSelfTestInventoryAuthorityArtifacts {
     $protocolProtocTraceAcceptedWithGrant = $false
     $protocolProtocTraceRejectedWithoutGrant = $false
     $protocolListExpected = @(Get-D32TestInventoryExpectedCommands -Profile $ValidatedProfile.Profile)[0]
-    $protocolListCommand = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize(
-        $validatedDiscovery.Document.inventory_commands[0].command))
+    $protocolListCommand = Copy-D32PowerShellAuthorityJsonShape -Value $validatedDiscovery.Document.inventory_commands[0].command
     $protocolTrace = $protocolListCommand.process_trace
     $rootTraceProcess = $protocolTrace.processes[0]
     $childPid = [int]$rootTraceProcess.process_id + 1
@@ -6074,24 +6072,29 @@ function Invoke-D32SelfTest {
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticDiscoveryAdmission)
         $syntheticCopiedDiscoveryValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
+        $syntheticCopiedDiscoveryRejectedForRole = $syntheticCopiedDiscoveryRejectedAsBaseline -and
+            $syntheticCopiedDiscoveryValidationContext -ceq 'producer.role-entry-path'
         $syntheticBaselineSameProcessRejected = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticBaselineAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticBaselineAdmission)
         $syntheticBaselineSameProcessValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
+        $syntheticBaselineSameProcessRejectedForIdentity = $syntheticBaselineSameProcessRejected -and
+            $syntheticBaselineSameProcessValidationContext -ceq 'producer.distinct-process-identity'
         $syntheticPhase0ProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticPhase0Admission -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticPhase0Admission
         $syntheticPhase0ProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
-        $actualCallerRejectedAsFixtureProducer = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
-            -Document $actualModuleAdmissionForRestore -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
-            -ExpectedAdmissionContext $syntheticPreflightAdmission)
+        $actualCallerRejectedAsFixtureProducer = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding `
+            -Document $actualModuleAdmissionForRestore -Repository $fixture -ProducerRole phase0_matrix `
+            -ExpectedProducerContext $syntheticPhase0Admission)
         $actualCallerFixtureProducerValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
         $immediateSyntheticFailureRestored = Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery `
             -PriorAdmission $actualModuleAdmissionForRestore -SyntheticAdmission $syntheticPreflightAdmission
         $producerBindingCondition = $syntheticDiscoveryProducerAccepted -and $syntheticBaselineProducerAccepted -and
-            $syntheticCopiedDiscoveryRejectedAsBaseline -and $syntheticBaselineSameProcessRejected -and $syntheticPhase0ProducerAccepted -and
-            $actualCallerRejectedAsFixtureProducer
+            $syntheticCopiedDiscoveryRejectedForRole -and $syntheticBaselineSameProcessRejectedForIdentity -and
+            $syntheticPhase0ProducerAccepted -and $actualCallerRejectedAsFixtureProducer -and
+            ($actualCallerFixtureProducerValidationContext -ceq 'producer.role-entry-path')
         if (-not $producerBindingCondition) {
             $producerBindingDiagnostic = [ordered]@{
                 discovery = [ordered]@{
@@ -6111,6 +6114,7 @@ function Invoke-D32SelfTest {
                 }
                 copied_discovery_rejected_as_baseline = [ordered]@{
                     rejected = [bool]$syntheticCopiedDiscoveryRejectedAsBaseline
+                    rejected_for_expected_predicate = [bool]$syntheticCopiedDiscoveryRejectedForRole
                     validator_context = [string]$syntheticCopiedDiscoveryValidationContext
                     actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
                     expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
@@ -6119,6 +6123,7 @@ function Invoke-D32SelfTest {
                 }
                 same_process_baseline_rejected = [ordered]@{
                     rejected = [bool]$syntheticBaselineSameProcessRejected
+                    rejected_for_expected_predicate = [bool]$syntheticBaselineSameProcessRejectedForIdentity
                     validator_context = [string]$syntheticBaselineSameProcessValidationContext
                     actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
                     expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
@@ -6136,7 +6141,7 @@ function Invoke-D32SelfTest {
                     rejected = [bool]$actualCallerRejectedAsFixtureProducer
                     validator_context = [string]$actualCallerFixtureProducerValidationContext
                     actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $actualModuleAdmissionForRestore
-                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPhase0Admission
                 }
             }
             Write-Host ("SELFTEST DETAIL: synthetic producer-binding predicate diagnostics: " + (ConvertTo-D32PowerShellAuthorityJsonText -Value $producerBindingDiagnostic))
@@ -6799,7 +6804,7 @@ function Invoke-D32SelfTest {
         Assert-D32SelfTest -Condition (@($strictStandaloneFindings | Where-Object { $_.Check -eq 'fixture-manifest.policy' -and $_.Severity -eq 'ERROR' }).Count -gt 0) `
             -Name 'standalone jobs=1/600-second fixture manifest is not Phase0 evidence' -Failures $failures
 
-        $standaloneAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $standaloneAggregateRecord = Copy-D32PowerShellAuthorityJsonShape -Value $aggregateRecordDocument
         $standaloneAggregateRecord.references.fixture_manifest = New-D32PostBundleAggregateFileReference -Path $standaloneAggregateManifestPath -Repository $fixture
         Write-D32Json -Path $aggregateRecordPath -Value $standaloneAggregateRecord
         $standaloneAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
@@ -6810,7 +6815,7 @@ function Invoke-D32SelfTest {
 
         $copiedPhase0ManifestPath = Join-Path $root 'copied-phase0-fixture-manifest.json'
         [IO.File]::Copy($phase0FixtureManifestPath, $copiedPhase0ManifestPath)
-        $copiedManifestAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $copiedManifestAggregateRecord = Copy-D32PowerShellAuthorityJsonShape -Value $aggregateRecordDocument
         $copiedManifestAggregateRecord.references.fixture_manifest = New-D32PostBundleAggregateFileReference -Path $copiedPhase0ManifestPath -Repository $fixture
         Write-D32Json -Path $aggregateRecordPath -Value $copiedManifestAggregateRecord
         $copiedManifestAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
@@ -6820,7 +6825,7 @@ function Invoke-D32SelfTest {
             -Name 'aggregate reader rejects a byte-identical manifest copy with a different opened path and file identity' -Failures $failures
 
         foreach ($manifestIdentityField in @('sha256', 'file_id_hex')) {
-            $staleManifestAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+            $staleManifestAggregateRecord = Copy-D32PowerShellAuthorityJsonShape -Value $aggregateRecordDocument
             $staleManifestAggregateRecord.references.fixture_manifest.$manifestIdentityField = '0' * $(if ($manifestIdentityField -ceq 'sha256') { 64 } else { 32 })
             Write-D32Json -Path $aggregateRecordPath -Value $staleManifestAggregateRecord
             $staleManifestAggregateDigest = Get-D32EvidenceFileDigest -Path $aggregateRecordPath
@@ -6843,7 +6848,7 @@ function Invoke-D32SelfTest {
                 $phase0Variant.record_type = [string]$phase0SchemaCase.Type
                 Write-D32Json -Path $phase0RecordPath -Value $phase0Variant
                 $phase0VariantSnapshot = Get-D32ProfileFileSnapshot -Path $phase0RecordPath
-                $aggregateVariant = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+                $aggregateVariant = Copy-D32PowerShellAuthorityJsonShape -Value $aggregateRecordDocument
                 $aggregateVariant.references.phase0_matrix.sha256 = [string]$phase0VariantSnapshot.Sha256
                 $aggregateVariant.references.phase0_matrix.bytes = [Int64]$phase0VariantSnapshot.Bytes
                 $aggregateVariant.references.phase0_matrix.volume_serial_hex = [string]$phase0VariantSnapshot.VolumeSerialHex
@@ -6867,7 +6872,7 @@ function Invoke-D32SelfTest {
         $legacyAggregateFindings = New-D32FindingList
         $legacyAggregateValidation = Test-D32PostBundleAggregateRecord -RecordPath $aggregateRecordPath -ExpectedRecordSha256 $legacyAggregateDigest.Hash -Repository $fixture -ExpectedCandidateSha $head -ValidatedPhase0Snapshot $phase0Snapshot -EvidenceRoot $evidenceRoot -Phase0RecordPath $phase0RecordPath -ToolchainProfilePath $profilePath -FixtureManifestPath $phase0FixtureManifestPath -ManifestPath $provenance -BundleManifestPath $bundleManifest -AttestationPath $attestationPath -TrustedGitPath $trustedGitPath -Findings $legacyAggregateFindings
         Assert-D32SelfTest -Condition (-not $legacyAggregateValidation.IsValid -and @($legacyAggregateFindings | Where-Object { $_.Check -eq 'aggregate.record' -and $_.Severity -eq 'ERROR' }).Count -eq 1) -Name 'aggregate record rejects prior V7 after module-admission migration' -Failures $failures
-        $unknownAggregateRecord = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($aggregateRecordDocument))
+        $unknownAggregateRecord = Copy-D32PowerShellAuthorityJsonShape -Value $aggregateRecordDocument
         $unknownAggregateRecord.schema_version = 99
         $unknownAggregateRecord.record_type = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V99'
         Write-D32Json -Path $aggregateRecordPath -Value $unknownAggregateRecord
@@ -6926,7 +6931,7 @@ function Invoke-D32SelfTest {
         $legacyAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V8'
         $legacyAttestationFindings = Get-D32ReleaseBundleSelfTestFindings -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleManifest $bundleManifest -Attestation $legacyAttestationObject -AttestationPath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture
         Assert-D32SelfTest -Condition (@($legacyAttestationFindings | Where-Object { $_.Check -eq 'attestation.schema' -and $_.Severity -eq 'ERROR' }).Count -gt 0) -Name 'release attestation rejects prior V8 after module-admission migration' -Failures $failures
-        $unknownAttestationObject = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($validAttestationObject))
+        $unknownAttestationObject = Copy-D32PowerShellAuthorityJsonShape -Value $validAttestationObject
         $unknownAttestationObject.schema_version = 99
         $unknownAttestationObject.attestation_type = 'D32_RELEASE_BUILD_ATTESTATION_V99'
         $unknownAttestationFindings = Get-D32ReleaseBundleSelfTestFindings -Bundle ($validBundleJson | ConvertFrom-D32Json) -BundleManifest $bundleManifest -Attestation $unknownAttestationObject -AttestationPath $attestationPath -AttestationSha256 $attestationSha -Head $head -Repository $fixture

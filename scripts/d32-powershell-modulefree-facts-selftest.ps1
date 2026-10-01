@@ -989,7 +989,7 @@ try {
     foreach ($field in @('msvc_path_entries','windows_sdk_path_entries','msvc_include_directories','windows_sdk_include_directories',`
         'msvc_lib_directories','windows_sdk_lib_directories','msvc_libpath_directories','windows_sdk_libpath_directories')) {
         $expectedArray = [string[]]$facts[$field]
-        $actualArray = [string[]]$decodedFacts.PSObject.Properties[$field].Value
+        $actualArray = [string[]](Get-D32PowerShellModuleAdmissionField -Record $decodedFacts -Name $field)
         if ($expectedArray.Count -ne $actualArray.Count -or ($expectedArray -join "`0") -cne ($actualArray -join "`0")) { $arrayRoundTrip = $false }
     }
     Add-D32FactsSelfTestCase 'strict facts request round-trips every array entry and preserves group/order' $arrayRoundTrip

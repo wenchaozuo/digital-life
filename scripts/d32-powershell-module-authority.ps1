@@ -2459,29 +2459,64 @@ function Test-D32PowerShellModuleAdmissionProducerContextBinding {
 function Test-D32PowerShellModuleAdmissionProfileBinding {
     param([AllowNull()][object]$Document, [AllowNull()][object]$ExpectedProfileReference)
     try {
-        if ($null -eq $Document -or $null -eq $ExpectedProfileReference) { return $false }
+        $script:D32PowerShellModuleAdmissionValidationDetail = $null
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.document'
+        if ($null -eq $Document -or $null -eq $ExpectedProfileReference) {
+            $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ actual_is_null = ($null -eq $Document); expected_is_null = ($null -eq $ExpectedProfileReference) }
+            return $false
+        }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.actual-reference'
         $actual = $Document.profile_reference
         $fields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
-        foreach ($reference in @($actual,$ExpectedProfileReference)) {
-            if ($null -eq $reference) { return $false }
+        foreach ($referenceIndex in 0..1) {
+            $referenceKind = if ($referenceIndex -eq 0) { 'actual' } else { 'expected' }
+            $reference = if ($referenceIndex -eq 0) { $actual } else { $ExpectedProfileReference }
+            $script:D32PowerShellModuleAdmissionValidationContext = "profile.$referenceKind-reference-shape"
+            if ($null -eq $reference) {
+                $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ reference = $referenceKind; is_null = $true; expected_fields = $fields }
+                return $false
+            }
             $names = if ($reference -is [System.Collections.IDictionary]) { @($reference.Keys | ForEach-Object { [string]$_ }) } else { @($reference.PSObject.Properties | ForEach-Object { [string]$_.Name }) }
-            if ($names.Count -ne $fields.Count -or @($fields | Where-Object { $_ -cnotin $names }).Count -gt 0) { return $false }
+            if ($names.Count -ne $fields.Count -or @($fields | Where-Object { $_ -cnotin $names }).Count -gt 0) {
+                $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ reference = $referenceKind; actual_fields = @($names); expected_fields = $fields }
+                return $false
+            }
         }
         foreach ($field in $fields) {
+            $script:D32PowerShellModuleAdmissionValidationContext = "profile.reference.$field"
             $left = if ($actual -is [System.Collections.IDictionary]) { $actual[$field] } else { $actual.PSObject.Properties[$field].Value }
             $right = if ($ExpectedProfileReference -is [System.Collections.IDictionary]) { $ExpectedProfileReference[$field] } else { $ExpectedProfileReference.PSObject.Properties[$field].Value }
-            if ($field -ceq 'bytes') { if ([Int64]$left -ne [Int64]$right) { return $false } }
-            elseif ([string]$left -cne [string]$right) { return $false }
+            $matches = if ($field -ceq 'bytes') { [Int64]$left -eq [Int64]$right } else { [string]$left -ceq [string]$right }
+            if (-not $matches) {
+                $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{
+                    field = $field
+                    actual_type = if ($null -eq $left) { '<null>' } else { $left.GetType().FullName }
+                    actual_value = $left
+                    expected_type = if ($null -eq $right) { '<null>' } else { $right.GetType().FullName }
+                    expected_value = $right
+                }
+                return $false
+            }
         }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.verified'
         return $true
     }
-    catch { return $false }
+    catch {
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.exception'
+        $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ exception_type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+        return $false
+    }
 }
 
 function Test-D32PowerShellModuleAdmissionProfileRecordBinding {
     param([AllowNull()][object]$Document, [AllowNull()][object]$ProfileRecord)
     try {
-        if ($null -eq $ProfileRecord) { return $false }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.profile-record'
+        $script:D32PowerShellModuleAdmissionValidationDetail = $null
+        if ($null -eq $ProfileRecord) {
+            $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ profile_record_is_null = $true }
+            return $false
+        }
         if ($null -ne $ProfileRecord.file_identity) {
             $reference = [ordered]@{
                 path = [string]$ProfileRecord.path
@@ -2500,9 +2535,19 @@ function Test-D32PowerShellModuleAdmissionProfileRecordBinding {
                 file_id_hex = [string]$ProfileRecord.file_id_hex
             }
         }
-        return Test-D32PowerShellModuleAdmissionProfileBinding -Document $Document -ExpectedProfileReference $reference
+        $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{
+            profile_record_shape = if ($null -ne $ProfileRecord.file_identity) { 'nested-file-identity' } else { 'flattened-file-identity' }
+            profile_record_reference = $reference
+        }
+        $isBound = Test-D32PowerShellModuleAdmissionProfileBinding -Document $Document -ExpectedProfileReference $reference
+        if ($isBound) { $script:D32PowerShellModuleAdmissionValidationDetail = $null }
+        return $isBound
     }
-    catch { return $false }
+    catch {
+        $script:D32PowerShellModuleAdmissionValidationContext = 'profile.profile-record-exception'
+        $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ exception_type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+        return $false
+    }
 }
 
 function Test-D32PowerShellModuleAdmissionRunnerBinding {
@@ -2515,6 +2560,11 @@ function Test-D32PowerShellModuleAdmissionRunnerBinding {
 
 function Get-D32PowerShellModuleAdmissionValidationContext {
     return [string]$script:D32PowerShellModuleAdmissionValidationContext
+}
+
+function Get-D32PowerShellModuleAdmissionValidationDetail {
+    if ($null -eq $script:D32PowerShellModuleAdmissionValidationDetail) { return $null }
+    return $script:D32PowerShellModuleAdmissionValidationDetail
 }
 
 function New-D32PowerShellModuleSelfTestAdmissionLease {
@@ -2602,6 +2652,53 @@ function ConvertTo-D32PowerShellAuthorityJsonText {
         return '{' + ($parts -join ',') + '}'
     }
     throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: unsupported JSON candidate value type: $($Value.GetType().FullName)"
+}
+
+function Copy-D32PowerShellAuthorityJsonShape {
+    param([Parameter(Mandatory = $true)][object]$Value)
+
+    # SelfTest mutations must preserve the JSON wire types consumed by strict
+    # readers. PSSerializer round-trips a one-item array as ArrayList, which is
+    # not the JSON array type required by the module-admission validator. Keep
+    # this clone module-free: ConvertFrom-Json would autoload Utility here.
+    $json = ConvertTo-D32PowerShellAuthorityJsonText -Value $Value
+    $jsonDocument = [System.Text.Json.JsonDocument]::Parse($json)
+    try { $copy = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $jsonDocument.RootElement }
+    finally { $jsonDocument.Dispose() }
+    if ($null -eq $copy) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: JSON-shape copy unexpectedly decoded as null' }
+    return ,$copy
+}
+
+function ConvertFrom-D32PowerShellAuthorityJsonElement {
+    param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element)
+
+    switch ($Element.ValueKind) {
+        ([System.Text.Json.JsonValueKind]::Object) {
+            $record = [ordered]@{}
+            foreach ($property in $Element.EnumerateObject()) {
+                if ($record.Contains($property.Name)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate JSON property in SelfTest shape copy' }
+                $record[$property.Name] = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $property.Value
+            }
+            return ,$record
+        }
+        ([System.Text.Json.JsonValueKind]::Array) {
+            $items = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $Element.EnumerateArray()) { $items.Add((ConvertFrom-D32PowerShellAuthorityJsonElement -Element $item)) }
+            return ,$items.ToArray()
+        }
+        ([System.Text.Json.JsonValueKind]::String) { return $Element.GetString() }
+        ([System.Text.Json.JsonValueKind]::Number) {
+            [Int64]$signed = 0
+            if ($Element.TryGetInt64([ref]$signed)) { return $signed }
+            [UInt64]$unsigned = 0
+            if ($Element.TryGetUInt64([ref]$unsigned)) { return $unsigned }
+            throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: nonintegral JSON numbers are unsupported in SelfTest shape copies'
+        }
+        ([System.Text.Json.JsonValueKind]::True) { return $true }
+        ([System.Text.Json.JsonValueKind]::False) { return $false }
+        ([System.Text.Json.JsonValueKind]::Null) { return $null }
+        default { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: unsupported JSON token in SelfTest shape copy' }
+    }
 }
 
 function Get-D32PowerShellAuthorityProcessStartup {

@@ -8326,8 +8326,7 @@ public static class D32DebugSelfTestLauncher
         $syntheticProfileArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticProfilePath
         $syntheticAuthorityArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticAuthorityPath
         $syntheticEntryArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticEntryScriptPath
-        $fixtureSyntheticAdmission = [System.Management.Automation.PSSerializer]::Deserialize(
-            [System.Management.Automation.PSSerializer]::Serialize($global:D32PowerShellModuleAuthorityState.Admission))
+        $fixtureSyntheticAdmission = Copy-D32PowerShellAuthorityJsonShape -Value $global:D32PowerShellModuleAuthorityState.Admission
         $fixtureSyntheticAdmission.candidate_sha = '0123456789abcdef0123456789abcdef01234567'
         $fixtureSyntheticAdmission.source_repo = Get-D32FullPath $fakeRepo
         $fixtureSyntheticAdmission.authority_reference = [ordered]@{

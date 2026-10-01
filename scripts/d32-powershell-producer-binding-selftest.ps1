@@ -17,6 +17,80 @@ function Add-D32ProducerBindingCase {
     $script:cases.Add([PSCustomObject]@{ name = $Name; passed = $Passed; detail = $Detail })
     if (-not $Passed) { $script:failures.Add($Name) }
 }
+$jsonShapeInput = [ordered]@{
+    resolver_admission = [ordered]@{
+        deps_paths = [string[]]@('C:\Program Files\PowerShell\7\pwsh.deps.json')
+        active_environment = [object[]]@()
+    }
+}
+$jsonShapeCopy = Copy-D32PowerShellAuthorityJsonShape -Value $jsonShapeInput
+$jsonShapeClonePreservesArrays =
+    ($jsonShapeCopy.resolver_admission.deps_paths -is [Array]) -and
+    ($jsonShapeCopy.resolver_admission.deps_paths.Count -eq 1) -and
+    ($jsonShapeCopy.resolver_admission.deps_paths[0] -ceq $jsonShapeInput.resolver_admission.deps_paths[0]) -and
+    ($jsonShapeCopy.resolver_admission.active_environment -is [Array]) -and
+    ($jsonShapeCopy.resolver_admission.active_environment.Count -eq 0) -and
+    ((ConvertTo-D32PowerShellAuthorityJsonText -Value $jsonShapeCopy) -ceq (ConvertTo-D32PowerShellAuthorityJsonText -Value $jsonShapeInput))
+Add-D32ProducerBindingCase 'SelfTest JSON-shape copies preserve singleton and empty resolver arrays exactly as strict readers consume them' $jsonShapeClonePreservesArrays
+
+$profileReferenceFixture = [ordered]@{
+    path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'd32-profile-shape-fixture.json'))
+    sha256 = 'a' * 64
+    bytes = [Int64]39018
+    volume_serial_hex = '0000000000000001'
+    file_id_hex = '1' * 32
+}
+$profileAdmissionFixture = [ordered]@{ profile_reference = $profileReferenceFixture }
+$profileRecordFlatFixture = [ordered]@{
+    path = $profileReferenceFixture.path
+    sha256 = $profileReferenceFixture.sha256
+    bytes = $profileReferenceFixture.bytes
+    volume_serial_hex = $profileReferenceFixture.volume_serial_hex
+    file_id_hex = $profileReferenceFixture.file_id_hex
+    target_triple = 'x86_64-pc-windows-msvc'
+}
+$profileRecordNestedFixture = [ordered]@{
+    path = $profileReferenceFixture.path
+    sha256 = $profileReferenceFixture.sha256
+    file_identity = [ordered]@{
+        bytes = $profileReferenceFixture.bytes
+        volume_serial_hex = $profileReferenceFixture.volume_serial_hex
+        file_id_hex = $profileReferenceFixture.file_id_hex
+    }
+    target_triple = 'x86_64-pc-windows-msvc'
+}
+$profileRecordFormsAccepted =
+    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $profileRecordFlatFixture) -and
+    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $profileRecordNestedFixture)
+Add-D32ProducerBindingCase 'module admission profile binding accepts discovery nested and baseline flattened profile identity layouts' $profileRecordFormsAccepted
+$profileBindingMismatchCases = [System.Collections.Generic.List[object]]::new()
+foreach ($profileField in @('path','sha256','bytes','volume_serial_hex','file_id_hex')) {
+    $mutatedProfileAdmission = Copy-D32PowerShellAuthorityJsonShape -Value $profileAdmissionFixture
+    switch ($profileField) {
+        'path' { $mutatedProfileAdmission.profile_reference.path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'd32-other-profile-fixture.json')) }
+        'sha256' { $mutatedProfileAdmission.profile_reference.sha256 = 'b' * 64 }
+        'bytes' { $mutatedProfileAdmission.profile_reference.bytes = [Int64]39019 }
+        'volume_serial_hex' { $mutatedProfileAdmission.profile_reference.volume_serial_hex = '0000000000000002' }
+        'file_id_hex' { $mutatedProfileAdmission.profile_reference.file_id_hex = '2' * 32 }
+    }
+    $acceptedMutation = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $mutatedProfileAdmission -ProfileRecord $profileRecordFlatFixture
+    $mutationContext = Get-D32PowerShellModuleAdmissionValidationContext
+    $mutationDetail = Get-D32PowerShellModuleAdmissionValidationDetail
+    $detailExact = $null -ne $mutationDetail -and [string]$mutationDetail.field -ceq $profileField -and
+        $null -ne $mutationDetail.actual_value -and $null -ne $mutationDetail.expected_value
+    $profileBindingMismatchCases.Add([PSCustomObject]@{
+        field = $profileField
+        rejected = -not $acceptedMutation
+        exact_context = $mutationContext -ceq "profile.reference.$profileField"
+        exact_values_reported = $detailExact
+    })
+}
+$allProfileMismatchesPrecise = $profileBindingMismatchCases.Count -eq 5 -and
+    @($profileBindingMismatchCases | Where-Object { -not $_.rejected -or -not $_.exact_context -or -not $_.exact_values_reported }).Count -eq 0
+Add-D32ProducerBindingCase 'flattened baseline profile binding rejects each profile-reference field at its exact predicate with expected and actual diagnostics' `
+    $allProfileMismatchesPrecise `
+    (ConvertTo-D32PowerShellAuthorityJsonText -Value @($profileBindingMismatchCases.ToArray()))
+
 function New-D32ProducerBindingAdmissionFixture {
     param([string]$EntryName, [int]$ProcessId, [Int64]$StartTicks)
     $entry = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'scripts', $EntryName))
@@ -151,6 +225,13 @@ $sourceFiles = @{
     baseline = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-baseline.ps1'), [Text.UTF8Encoding]::new($false, $true))
     inventory = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-authority.ps1'), [Text.UTF8Encoding]::new($false, $true))
 }
+$strictSelfTestJsonCopiesUseWireShape =
+    $sourceFiles.preflight.Contains('Copy-D32PowerShellAuthorityJsonShape -Value $TemplateAdmission') -and
+    $sourceFiles.fixture.Contains('Copy-D32PowerShellAuthorityJsonShape -Value $global:D32PowerShellModuleAuthorityState.Admission') -and
+    $sourceFiles.phase0.Contains('Copy-D32PowerShellAuthorityJsonShape -Value $sidecar') -and
+    $sourceFiles.phase0.Contains('Copy-D32PowerShellAuthorityJsonShape -Value $syntheticListRecord') -and
+    -not $sourceFiles.phase0.Contains('PSSerializer')
+Add-D32ProducerBindingCase 'strict D32 SelfTest record mutations clone the JSON wire shape without PSSerializer array coercion' $strictSelfTestJsonCopiesUseWireShape
 $sourceParseErrors = [System.Collections.Generic.List[string]]::new()
 foreach ($name in $sourceFiles.Keys) {
     $tokens = $null; $parseErrors = $null
@@ -247,6 +328,9 @@ $fixtureSyntheticAdmissionClosure = $fixturePrebuildSelfTestText.Contains('$fixt
 $baselineDiagnosticsBound = $sourceFiles.inventory.Contains('failedAdmissionBindings') -and
     $sourceFiles.inventory.Contains("discoveryProducerContext = Get-D32PowerShellModuleAdmissionValidationContext") -and
     $sourceFiles.inventory.Contains("baselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext") -and
+    $sourceFiles.inventory.Contains("baselineProfileContext = Get-D32PowerShellModuleAdmissionValidationContext") -and
+    $sourceFiles.inventory.Contains("baselineProfileDetail = Get-D32PowerShellModuleAdmissionValidationDetail") -and
+    $sourceFiles.inventory.Contains('baseline_profile:$($baselineProfileContext):$baselineProfileDetailJson') -and
     $sourceFiles.helper.Contains('producer.role-entry-path') -and $sourceFiles.helper.Contains('producer.exact-linked-admission') -and
     $sourceFiles.helper.Contains('producer.distinct-process-identity')
 Add-D32ProducerBindingCase 'source lifecycle parses and binds fixture/discovery/baseline/Phase0/release/aggregate producer contexts' `

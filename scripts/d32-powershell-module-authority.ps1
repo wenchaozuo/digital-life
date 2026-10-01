@@ -2517,26 +2517,44 @@ function Test-D32PowerShellModuleAdmissionProfileRecordBinding {
             $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ profile_record_is_null = $true }
             return $false
         }
-        if ($null -ne $ProfileRecord.file_identity) {
+        # Profile-bearing records have two frozen wire shapes: discovery and
+        # Phase0/release keep the full profile with nested file_identity, while
+        # the baseline intentionally carries a compact flattened reference.
+        # Under StrictMode, probing a missing PSCustomObject/IDictionary member
+        # with dot notation throws before the flattened case can be selected.
+        $hasNestedFileIdentity = $false
+        if ($ProfileRecord -is [System.Collections.IDictionary]) {
+            $hasNestedFileIdentity = $ProfileRecord.Contains('file_identity')
+        }
+        else {
+            $hasNestedFileIdentity = $null -ne $ProfileRecord.PSObject.Properties['file_identity']
+        }
+        if ($hasNestedFileIdentity) {
+            $identity = Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'file_identity'
+            if ($null -eq $identity) {
+                $script:D32PowerShellModuleAdmissionValidationContext = 'profile.profile-record.nested-identity'
+                $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{ profile_record_shape = 'nested-file-identity'; file_identity_is_null = $true }
+                return $false
+            }
             $reference = [ordered]@{
-                path = [string]$ProfileRecord.path
-                sha256 = [string]$ProfileRecord.sha256
-                bytes = [Int64]$ProfileRecord.file_identity.bytes
-                volume_serial_hex = [string]$ProfileRecord.file_identity.volume_serial_hex
-                file_id_hex = [string]$ProfileRecord.file_identity.file_id_hex
+                path = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'path')
+                sha256 = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'sha256')
+                bytes = [Int64](Get-D32PowerShellModuleAdmissionField -Record $identity -Name 'bytes')
+                volume_serial_hex = [string](Get-D32PowerShellModuleAdmissionField -Record $identity -Name 'volume_serial_hex')
+                file_id_hex = [string](Get-D32PowerShellModuleAdmissionField -Record $identity -Name 'file_id_hex')
             }
         }
         else {
             $reference = [ordered]@{
-                path = [string]$ProfileRecord.path
-                sha256 = [string]$ProfileRecord.sha256
-                bytes = [Int64]$ProfileRecord.bytes
-                volume_serial_hex = [string]$ProfileRecord.volume_serial_hex
-                file_id_hex = [string]$ProfileRecord.file_id_hex
+                path = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'path')
+                sha256 = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'sha256')
+                bytes = [Int64](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'bytes')
+                volume_serial_hex = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'volume_serial_hex')
+                file_id_hex = [string](Get-D32PowerShellModuleAdmissionField -Record $ProfileRecord -Name 'file_id_hex')
             }
         }
         $script:D32PowerShellModuleAdmissionValidationDetail = [ordered]@{
-            profile_record_shape = if ($null -ne $ProfileRecord.file_identity) { 'nested-file-identity' } else { 'flattened-file-identity' }
+            profile_record_shape = if ($hasNestedFileIdentity) { 'nested-file-identity' } else { 'flattened-file-identity' }
             profile_record_reference = $reference
         }
         $isBound = Test-D32PowerShellModuleAdmissionProfileBinding -Document $Document -ExpectedProfileReference $reference

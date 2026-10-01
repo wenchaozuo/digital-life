@@ -59,37 +59,69 @@ $profileRecordNestedFixture = [ordered]@{
     }
     target_triple = 'x86_64-pc-windows-msvc'
 }
-$profileRecordFormsAccepted =
+$profileRecordFormsAccepted = & {
+    # The baseline validator runs under StrictMode. Keep the producer-context
+    # test aligned so a missing flattened file_identity member cannot pass by
+    # being read as null only in this focused harness.
+    Set-StrictMode -Version Latest
+    $flatObjectFixture = [PSCustomObject]$profileRecordFlatFixture
+    $nestedObjectFixture = [PSCustomObject]$profileRecordNestedFixture
     (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $profileRecordFlatFixture) -and
-    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $profileRecordNestedFixture)
-Add-D32ProducerBindingCase 'module admission profile binding accepts discovery nested and baseline flattened profile identity layouts' $profileRecordFormsAccepted
-$profileBindingMismatchCases = [System.Collections.Generic.List[object]]::new()
-foreach ($profileField in @('path','sha256','bytes','volume_serial_hex','file_id_hex')) {
-    $mutatedProfileAdmission = Copy-D32PowerShellAuthorityJsonShape -Value $profileAdmissionFixture
-    switch ($profileField) {
-        'path' { $mutatedProfileAdmission.profile_reference.path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'd32-other-profile-fixture.json')) }
-        'sha256' { $mutatedProfileAdmission.profile_reference.sha256 = 'b' * 64 }
-        'bytes' { $mutatedProfileAdmission.profile_reference.bytes = [Int64]39019 }
-        'volume_serial_hex' { $mutatedProfileAdmission.profile_reference.volume_serial_hex = '0000000000000002' }
-        'file_id_hex' { $mutatedProfileAdmission.profile_reference.file_id_hex = '2' * 32 }
+    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $profileRecordNestedFixture) -and
+    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $flatObjectFixture) -and
+    (Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $nestedObjectFixture)
+}
+Add-D32ProducerBindingCase 'module admission profile binding accepts discovery nested and baseline flattened profile identity layouts under StrictMode for dictionary and parsed object records' $profileRecordFormsAccepted
+$profileBindingMismatchCases = & {
+    Set-StrictMode -Version Latest
+    $mismatches = [System.Collections.Generic.List[object]]::new()
+    foreach ($profileField in @('path','sha256','bytes','volume_serial_hex','file_id_hex')) {
+        $mutatedProfileAdmission = Copy-D32PowerShellAuthorityJsonShape -Value $profileAdmissionFixture
+        switch ($profileField) {
+            'path' { $mutatedProfileAdmission.profile_reference.path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'd32-other-profile-fixture.json')) }
+            'sha256' { $mutatedProfileAdmission.profile_reference.sha256 = 'b' * 64 }
+            'bytes' { $mutatedProfileAdmission.profile_reference.bytes = [Int64]39019 }
+            'volume_serial_hex' { $mutatedProfileAdmission.profile_reference.volume_serial_hex = '0000000000000002' }
+            'file_id_hex' { $mutatedProfileAdmission.profile_reference.file_id_hex = '2' * 32 }
+        }
+        $acceptedMutation = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $mutatedProfileAdmission -ProfileRecord $profileRecordFlatFixture
+        $mutationContext = Get-D32PowerShellModuleAdmissionValidationContext
+        $mutationDetail = Get-D32PowerShellModuleAdmissionValidationDetail
+        $detailExact = $null -ne $mutationDetail -and [string]$mutationDetail.field -ceq $profileField -and
+            $null -ne $mutationDetail.actual_value -and $null -ne $mutationDetail.expected_value
+        $mismatches.Add([PSCustomObject]@{
+            field = $profileField
+            rejected = -not $acceptedMutation
+            exact_context = $mutationContext -ceq "profile.reference.$profileField"
+            exact_values_reported = $detailExact
+        })
     }
-    $acceptedMutation = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $mutatedProfileAdmission -ProfileRecord $profileRecordFlatFixture
-    $mutationContext = Get-D32PowerShellModuleAdmissionValidationContext
-    $mutationDetail = Get-D32PowerShellModuleAdmissionValidationDetail
-    $detailExact = $null -ne $mutationDetail -and [string]$mutationDetail.field -ceq $profileField -and
-        $null -ne $mutationDetail.actual_value -and $null -ne $mutationDetail.expected_value
-    $profileBindingMismatchCases.Add([PSCustomObject]@{
-        field = $profileField
-        rejected = -not $acceptedMutation
-        exact_context = $mutationContext -ceq "profile.reference.$profileField"
-        exact_values_reported = $detailExact
-    })
+    $mismatches.ToArray()
 }
 $allProfileMismatchesPrecise = $profileBindingMismatchCases.Count -eq 5 -and
     @($profileBindingMismatchCases | Where-Object { -not $_.rejected -or -not $_.exact_context -or -not $_.exact_values_reported }).Count -eq 0
 Add-D32ProducerBindingCase 'flattened baseline profile binding rejects each profile-reference field at its exact predicate with expected and actual diagnostics' `
     $allProfileMismatchesPrecise `
-    (ConvertTo-D32PowerShellAuthorityJsonText -Value @($profileBindingMismatchCases.ToArray()))
+    (ConvertTo-D32PowerShellAuthorityJsonText -Value @($profileBindingMismatchCases))
+$flatMissingFieldRejected = & {
+    Set-StrictMode -Version Latest
+    $missing = Copy-D32PowerShellAuthorityJsonShape -Value $profileRecordFlatFixture
+    [void]$missing.Remove('file_id_hex')
+    $accepted = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $missing
+    $context = Get-D32PowerShellModuleAdmissionValidationContext
+    (-not $accepted) -and $context -ceq 'profile.reference.file_id_hex'
+}
+$nestedNullIdentityRejected = & {
+    Set-StrictMode -Version Latest
+    $missing = Copy-D32PowerShellAuthorityJsonShape -Value $profileRecordNestedFixture
+    $missing.file_identity = $null
+    $accepted = Test-D32PowerShellModuleAdmissionProfileRecordBinding -Document $profileAdmissionFixture -ProfileRecord $missing
+    $context = Get-D32PowerShellModuleAdmissionValidationContext
+    (-not $accepted) -and $context -ceq 'profile.profile-record.nested-identity'
+}
+Add-D32ProducerBindingCase 'profile admission binding rejects malformed flattened and nested identity shapes under StrictMode with exact context' `
+    ($flatMissingFieldRejected -and $nestedNullIdentityRejected) `
+    'Missing flattened file IDs are rejected at their field predicate; a present-but-null nested identity fails closed as a malformed nested profile record.'
 
 function New-D32ProducerBindingAdmissionFixture {
     param([string]$EntryName, [int]$ProcessId, [Int64]$StartTicks)

@@ -150,6 +150,16 @@ $baselineSyntheticProducersDistinct = $preflightSyntheticInventoryText.Contains(
 $mainSelfTestText = ''
 $mainSelfTestAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32SelfTest' }, $true)
 if ($null -ne $mainSelfTestAst) { $mainSelfTestText = $mainSelfTestAst.Extent.Text }
+$syntheticRolePlaceholderIndex = $mainSelfTestText.IndexOf('preflight SelfTest synthetic role-entry placeholder path must be absent', [StringComparison]::Ordinal)
+$fixtureGitAddIndex = $mainSelfTestText.IndexOf("@('add', '.')", [StringComparison]::Ordinal)
+$syntheticRolePlaceholdersCommittedBeforeCleanChecks = $syntheticRolePlaceholderIndex -ge 0 -and $fixtureGitAddIndex -gt $syntheticRolePlaceholderIndex
+$syntheticAdmissionDiagnosticsBound = $mainSelfTestText.Contains('$syntheticDiscoveryProducerContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('$syntheticBaselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('$syntheticCopiedDiscoveryValidationContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('$syntheticBaselineSameProcessValidationContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('$syntheticPhase0ProducerContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('$actualCallerFixtureProducerValidationContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('synthetic producer-binding predicate diagnostics')
 $syntheticAdmissionLifecycleBound = $mainSelfTestText.Contains('-DiscoveryProducerAdmission $syntheticDiscoveryAdmission') -and
     $mainSelfTestText.Contains('-BaselineProducerAdmission $syntheticBaselineAdmission') -and
     $mainSelfTestText.Contains("-EntryScriptPath `$syntheticDiscoveryEntryPath") -and
@@ -161,7 +171,8 @@ $syntheticAdmissionLifecycleBound = $mainSelfTestText.Contains('-DiscoveryProduc
     $mainSelfTestText.Contains('Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $syntheticPreflightAdmission') -and
     $mainSelfTestText.Contains('Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease') -and
     $mainSelfTestText.Contains('syntheticPhase0Admission.runner_process.process_id') -and
-    $mainSelfTestText.Contains('role-specific discovery/baseline/Phase0 entry and process identities')
+    $mainSelfTestText.Contains('role-specific discovery/baseline/Phase0 entry and process identities') -and
+    $syntheticAdmissionDiagnosticsBound
 $syntheticAdmissionBuilderComplete = $syntheticAdmissionBuilderText.Contains('This shape-only context is confined to the owned temporary SelfTest') -and
     $syntheticAdmissionBuilderText.Contains('$admission.candidate_sha = $CandidateSha') -and
     $syntheticAdmissionBuilderText.Contains('$admission.source_repo = $repo') -and
@@ -188,7 +199,10 @@ $baselineDiagnosticsBound = $sourceFiles.inventory.Contains('failedAdmissionBind
     $sourceFiles.helper.Contains('producer.distinct-process-identity')
 Add-D32ProducerBindingCase 'source lifecycle parses and binds fixture/discovery/baseline/Phase0/release/aggregate producer contexts' `
     ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure -and $baselineDiagnosticsBound) `
-    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure; baseline_diagnostics=$baselineDiagnosticsBound"
+    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure; baseline_diagnostics=$baselineDiagnosticsBound; predicate_diagnostics=$syntheticAdmissionDiagnosticsBound"
+Add-D32ProducerBindingCase 'SelfTest role-entry placeholders are committed before exact clean-candidate admission checks' `
+    $syntheticRolePlaceholdersCommittedBeforeCleanChecks `
+    "role_placeholder_index=$syntheticRolePlaceholderIndex; git_add_index=$fixtureGitAddIndex"
 
 Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedAtStart
 $passed = $cases.Where({ $_.passed }).Count

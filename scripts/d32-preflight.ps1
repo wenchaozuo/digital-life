@@ -5791,6 +5791,27 @@ function Invoke-D32SelfTest {
         $staleOutputFindings = New-D32FindingList
         $staleOutputRecords = Get-D32FreshReleaseOutputRecords -Repository $fixture -Findings $staleOutputFindings
         Assert-D32SelfTest -Condition ($staleOutputRecords.Count -lt 3 -and @($staleOutputFindings | Where-Object { $_.Check -like 'bundle.build.fresh-output.*' -and $_.Severity -eq 'ERROR' }).Count -eq 3) -Name 'any pre-existing exact release artifact fails fresh-output preflight' -Failures $failures
+        # Keep the role-entry placeholders inside the synthetic fixture's
+        # committed tree. Later admission validation requires both exact
+        # opened entry identity and a clean candidate; creating these files
+        # after the fixture commit would make the shape-only repo dirty.
+        $syntheticAdmissionEntryPath = Join-Path $fixture 'scripts\d32-preflight.ps1'
+        $syntheticDiscoveryEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-discovery.ps1'
+        $syntheticBaselineEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-baseline.ps1'
+        foreach ($entrySpec in @(
+                [PSCustomObject]@{ Path = $syntheticDiscoveryEntryPath; Role = 'inventory-discovery' },
+                [PSCustomObject]@{ Path = $syntheticBaselineEntryPath; Role = 'inventory-baseline' },
+                [PSCustomObject]@{ Path = (Join-Path $fixture 'scripts\d32-phase0-matrix.ps1'); Role = 'phase0-matrix' }
+            )) {
+            if ([IO.File]::Exists([string]$entrySpec.Path) -or [IO.Directory]::Exists([string]$entrySpec.Path)) {
+                throw 'preflight SelfTest synthetic role-entry placeholder path must be absent'
+            }
+            $entryBytes = [Text.UTF8Encoding]::new($false).GetBytes(
+                "# D32 SelfTest-only $($entrySpec.Role) entry placeholder; never executed and not an actual admitted -File launch or module-admission proof.`n")
+            $entryStream = [IO.File]::Open([string]$entrySpec.Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $entryStream.Write($entryBytes, 0, $entryBytes.Length); $entryStream.Flush($true) }
+            finally { $entryStream.Dispose() }
+        }
         $git = Invoke-D32Git -Repository $fixture -Arguments @('init', '-q') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
         Assert-D32PreflightSelfTestGitSetupResult -Name 'init' -Result $git -OwnedRoot $root -FixtureRepository $fixture
         $git = Invoke-D32Git -Repository $fixture -Arguments @('add', '.') -TrustedGitPath $trustedGitPath -TrustedGitSha256 $trustedGitHash
@@ -6005,23 +6026,6 @@ function Invoke-D32SelfTest {
         }
         finally { $syntheticAdmissionReferenceStream.Dispose() }
         $syntheticAdmissionReference = Get-D32Phase0FileReference -Path $syntheticAdmissionReferencePath
-        $syntheticAdmissionEntryPath = Join-Path $fixture 'scripts\d32-preflight.ps1'
-        $syntheticDiscoveryEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-discovery.ps1'
-        $syntheticBaselineEntryPath = Join-Path $fixture 'scripts\d32-test-inventory-baseline.ps1'
-        foreach ($entrySpec in @(
-                [PSCustomObject]@{ Path = $syntheticDiscoveryEntryPath; Role = 'inventory-discovery' },
-                [PSCustomObject]@{ Path = $syntheticBaselineEntryPath; Role = 'inventory-baseline' },
-                [PSCustomObject]@{ Path = (Join-Path $fixture 'scripts\d32-phase0-matrix.ps1'); Role = 'phase0-matrix' }
-            )) {
-            if ([IO.File]::Exists([string]$entrySpec.Path) -or [IO.Directory]::Exists([string]$entrySpec.Path)) {
-                throw 'preflight SelfTest synthetic role-entry placeholder path must be absent'
-            }
-            $entryBytes = [Text.UTF8Encoding]::new($false).GetBytes(
-                "# D32 SelfTest-only $($entrySpec.Role) entry placeholder; never executed and not an actual admitted -File launch or module-admission proof.`n")
-            $entryStream = [IO.File]::Open([string]$entrySpec.Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-            try { $entryStream.Write($entryBytes, 0, $entryBytes.Length); $entryStream.Flush($true) }
-            finally { $entryStream.Dispose() }
-        }
         $syntheticPreflightAdmission = New-D32PreflightSelfTestSyntheticModuleAdmission `
             -TemplateAdmission $actualModuleAdmissionForRestore -SelfTestRoot $root -Repository $fixture -CandidateSha $head `
             -ValidatedProfile $phase0ProfileValidation -EntryScriptPath $syntheticAdmissionEntryPath `
@@ -6045,29 +6049,47 @@ function Invoke-D32SelfTest {
         $syntheticDiscoveryProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticDiscoveryAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_discovery `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticDiscoveryAdmission
+        $syntheticDiscoveryProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
         $syntheticBaselineProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticBaselineAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticDiscoveryAdmission
+        $syntheticBaselineProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
         $syntheticCopiedDiscoveryRejectedAsBaseline = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticDiscoveryAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticDiscoveryAdmission)
+        $syntheticCopiedDiscoveryValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
         $syntheticBaselineSameProcessRejected = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticBaselineAdmission -CandidateSha $head -Repository $fixture -ProducerRole inventory_baseline `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticBaselineAdmission `
             -DistinctFromAdmission $syntheticBaselineAdmission)
+        $syntheticBaselineSameProcessValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
         $syntheticPhase0ProducerAccepted = Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $syntheticPhase0Admission -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
             -ExpectedAdmissionContext $syntheticPreflightAdmission -ExpectedProducerContext $syntheticPhase0Admission
+        $syntheticPhase0ProducerContext = Get-D32PowerShellModuleAdmissionValidationContext
         $actualCallerRejectedAsFixtureProducer = -not (Test-D32PowerShellModuleAdmissionProducerBinding `
             -Document $actualModuleAdmissionForRestore -CandidateSha $head -Repository $fixture -ProducerRole phase0_matrix `
             -ExpectedAdmissionContext $syntheticPreflightAdmission)
+        $actualCallerFixtureProducerValidationContext = Get-D32PowerShellModuleAdmissionValidationContext
         $immediateSyntheticFailureRestored = Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery `
             -PriorAdmission $actualModuleAdmissionForRestore -SyntheticAdmission $syntheticPreflightAdmission
-        Assert-D32SelfTest -Condition ($syntheticDiscoveryProducerAccepted -and $syntheticBaselineProducerAccepted -and
+        $producerBindingCondition = $syntheticDiscoveryProducerAccepted -and $syntheticBaselineProducerAccepted -and
             $syntheticCopiedDiscoveryRejectedAsBaseline -and $syntheticBaselineSameProcessRejected -and $syntheticPhase0ProducerAccepted -and
-            $actualCallerRejectedAsFixtureProducer) `
+            $actualCallerRejectedAsFixtureProducer
+        if (-not $producerBindingCondition) {
+            $producerBindingDiagnostic = [ordered]@{
+                discovery = [ordered]@{ accepted = [bool]$syntheticDiscoveryProducerAccepted; context = [string]$syntheticDiscoveryProducerContext }
+                baseline = [ordered]@{ accepted = [bool]$syntheticBaselineProducerAccepted; context = [string]$syntheticBaselineProducerContext }
+                copied_discovery_rejected_as_baseline = [ordered]@{ rejected = [bool]$syntheticCopiedDiscoveryRejectedAsBaseline; context = [string]$syntheticCopiedDiscoveryValidationContext }
+                same_process_baseline_rejected = [ordered]@{ rejected = [bool]$syntheticBaselineSameProcessRejected; context = [string]$syntheticBaselineSameProcessValidationContext }
+                phase0 = [ordered]@{ accepted = [bool]$syntheticPhase0ProducerAccepted; context = [string]$syntheticPhase0ProducerContext }
+                actual_caller_rejected_as_fixture_producer = [ordered]@{ rejected = [bool]$actualCallerRejectedAsFixtureProducer; context = [string]$actualCallerFixtureProducerValidationContext }
+            }
+            Write-Host ("SELFTEST DETAIL: synthetic producer-binding predicate diagnostics: " + (ConvertTo-D32PowerShellAuthorityJsonText -Value $producerBindingDiagnostic))
+        }
+        Assert-D32SelfTest -Condition $producerBindingCondition `
             -Name 'owned SelfTest-only producer contexts bind role-specific discovery/baseline/Phase0 entry and process identities and reject copied contexts' `
             -Failures $failures
         Assert-D32SelfTest -Condition $immediateSyntheticFailureRestored `

@@ -32,12 +32,13 @@ $scriptRoot = Split-Path -Parent ([IO.Path]::GetFullPath($PSCommandPath))
 . (Join-Path $scriptRoot 'd32-phase0-matrix.ps1') -Phase0LibraryOnly `
     -Phase0ToolchainProfilePath $ToolchainProfilePath -Phase0ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256 `
     -Phase0PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -Phase0ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
-    -Phase0ExpectedCandidateSha $ExpectedCandidateSha -Phase0RepoRoot $Repository -Phase0PinnedGitPath $PinnedGitPath -Phase0PinnedGitSha256 $PinnedGitSha256
+    -Phase0ExpectedCandidateSha $ExpectedCandidateSha -Phase0RepoRoot $Repository -Phase0PinnedGitPath $PinnedGitPath -Phase0PinnedGitSha256 $PinnedGitSha256 `
+    -Phase0InventoryListTimeoutSeconds $Phase0InventoryListTimeoutSeconds -Phase0TimeoutSeconds $Phase0TimeoutSeconds
 $preflightLibraryPath = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'd32-preflight.ps1'))
 if (-not (Test-D32ProfileNoReparsePath -Path $preflightLibraryPath) -or -not (Test-Path -LiteralPath $preflightLibraryPath -PathType Leaf)) {
     throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: exact d32-preflight.ps1 helper library is missing or reparse-backed'
 }
-. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha `
+. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -EvidenceRoot $EvidenceRoot -ModuleAuthorityCandidateSha $ExpectedCandidateSha `
     -ToolchainProfilePath $ToolchainProfilePath -ExpectedToolchainProfileSha256 $ExpectedToolchainProfileSha256 `
     -PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
     -TrustedGitPath $PinnedGitPath -TrustedGitSha256 $PinnedGitSha256

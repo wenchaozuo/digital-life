@@ -103,9 +103,11 @@ $preflightAst = [System.Management.Automation.Language.Parser]::ParseInput($sour
 $aggregateReaderAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32PostBundleAggregateRecord' }, $true)
 $aggregateWriterAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32GeneratePostBundleAggregateRecord' }, $true)
 $preflightSyntheticInventoryAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32PreflightSelfTestInventoryAuthorityArtifacts' }, $true)
+$syntheticAdmissionBuilderAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32PreflightSelfTestSyntheticModuleAdmission' }, $true)
 if ($null -ne $aggregateReaderAst) { $aggregateReaderText = $aggregateReaderAst.Extent.Text }
 if ($null -ne $aggregateWriterAst) { $aggregateWriterText = $aggregateWriterAst.Extent.Text }
 if ($null -ne $preflightSyntheticInventoryAst) { $preflightSyntheticInventoryText = $preflightSyntheticInventoryAst.Extent.Text }
+$syntheticAdmissionBuilderText = if ($null -ne $syntheticAdmissionBuilderAst) { $syntheticAdmissionBuilderAst.Extent.Text } else { '' }
 $fixtureWriterBound = $sourceFiles.fixture.Contains('Test-D32PowerShellModuleAdmissionProducerBinding -Document $Document.powershell_module_admission') -and
     $sourceFiles.fixture.Contains('-ExpectedProducerContext $global:D32PowerShellModuleAuthorityState.Admission')
 $phase0FixtureReferenceBound = $sourceFiles.phase0.Contains('-ExpectedProducerAdmission $document.powershell_module_admission')
@@ -125,14 +127,43 @@ $aggregateWriterCurrentContextBound = $aggregateWriterText.Contains('-ExpectedPr
 $aggregateHistoricalReaderDoesNotBindReaderProcess = $aggregateReaderText.Contains('-ProducerRole post_bundle_aggregate') -and
     $aggregateReaderText.Contains('-ExpectedAdmissionContext $global:D32PowerShellModuleAuthorityState.Admission') -and
     -not $aggregateReaderText.Contains('-ExpectedProducerContext')
-$baselineSyntheticProducersDistinct = $preflightSyntheticInventoryText.Contains('$syntheticDiscoveryAdmission = [System.Management.Automation.PSSerializer]::Deserialize(') -and
-    $preflightSyntheticInventoryText.Contains('runner_process.start_time_utc_ticks = [Int64]$syntheticDiscoveryAdmission.runner_process.start_time_utc_ticks - 10000000L') -and
+$baselineSyntheticProducersDistinct = $preflightSyntheticInventoryText.Contains('[Parameter(Mandatory = $true)][object]$DiscoveryProducerAdmission') -and
+    $preflightSyntheticInventoryText.Contains('[Parameter(Mandatory = $true)][object]$BaselineProducerAdmission') -and
+    $preflightSyntheticInventoryText.Contains('$syntheticDiscoveryAdmission = $DiscoveryProducerAdmission') -and
     $preflightSyntheticInventoryText.Contains('runner_process_id = [int]$syntheticDiscoveryAdmission.runner_process.process_id') -and
     $preflightSyntheticInventoryText.Contains('powershell_module_admission = $syntheticDiscoveryAdmission') -and
-    $preflightSyntheticInventoryText.Contains('-ProducerAdmission $global:D32PowerShellModuleAuthorityState.Admission')
+    $preflightSyntheticInventoryText.Contains('-ProducerAdmission $BaselineProducerAdmission') -and
+    $preflightSyntheticInventoryText.Contains('-ExpectedProducerAdmission $BaselineProducerAdmission')
+$mainSelfTestText = ''
+$mainSelfTestAst = $preflightAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32SelfTest' }, $true)
+if ($null -ne $mainSelfTestAst) { $mainSelfTestText = $mainSelfTestAst.Extent.Text }
+$syntheticAdmissionLifecycleBound = $mainSelfTestText.Contains('-DiscoveryProducerAdmission $syntheticDiscoveryAdmission') -and
+    $mainSelfTestText.Contains('-BaselineProducerAdmission $syntheticPreflightAdmission') -and
+    $mainSelfTestText.Contains('$actualModuleAdmissionState.Admission = $syntheticPreflightAdmission') -and
+    $mainSelfTestText.Contains('$actualModuleAdmissionState.Admission = $actualModuleAdmissionForRestore') -and
+    $mainSelfTestText.Contains('owned SelfTest-only producer contexts bind the fixture candidate/Profile/entry')
+$syntheticAdmissionBuilderComplete = $syntheticAdmissionBuilderText.Contains('This shape-only context is confined to the owned temporary SelfTest') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.candidate_sha = $CandidateSha') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.source_repo = $repo') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.authority_reference = $SyntheticAuthorityReference') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.profile_reference = $profileReference') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.runner_process.process_id = [int]$SyntheticProcessId') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.runner_process.start_time_utc_ticks = [Int64]$SyntheticStartTimeUtcTicks') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.entry_script_path = $entry') -and
+    $syntheticAdmissionBuilderText.Contains('$admission.startup.file_operand = $entry') -and
+    $syntheticAdmissionBuilderText.Contains('does not claim')
+$fixturePrebuildAstTokens = $null; $fixturePrebuildAstErrors = $null
+$fixturePrebuildAst = [System.Management.Automation.Language.Parser]::ParseInput($sourceFiles.fixture, [ref]$fixturePrebuildAstTokens, [ref]$fixturePrebuildAstErrors)
+$fixturePrebuildSelfTestAst = $fixturePrebuildAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32SelfTest' }, $true)
+$fixturePrebuildSelfTestText = if ($null -ne $fixturePrebuildSelfTestAst) { $fixturePrebuildSelfTestAst.Extent.Text } else { '' }
+$fixtureSyntheticAdmissionClosure = $fixturePrebuildSelfTestText.Contains('$fixtureSyntheticAdmission.entry_script_path = $syntheticEntryScriptPath') -and
+    $fixturePrebuildSelfTestText.Contains('$fixtureSyntheticAdmission.runner_process.process_id = [int]$syntheticRunnerProcessId') -and
+    $fixturePrebuildSelfTestText.Contains('powershell_module_admission = $fixtureSyntheticAdmission') -and
+    $fixturePrebuildSelfTestText.Contains('$moduleAdmissionState.Admission = $fixtureSyntheticAdmission') -and
+    $fixturePrebuildSelfTestText.Contains('$moduleAdmissionState.Admission = $moduleAdmissionForRestore')
 Add-D32ProducerBindingCase 'source lifecycle parses and binds fixture/discovery/baseline/Phase0/release/aggregate producer contexts' `
-    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct) `
-    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct"
+    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure) `
+    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure"
 
 Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $loadedAtStart
 $passed = $cases.Where({ $_.passed }).Count

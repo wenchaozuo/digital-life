@@ -6524,6 +6524,12 @@ function Invoke-D32SelfTest {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('d32-fixture-prebuild-selftest-' + [Guid]::NewGuid().ToString('N'))
     $passed = 0
     $owned = $false
+    $moduleAdmissionState = $global:D32PowerShellModuleAuthorityState
+    if ($null -eq $moduleAdmissionState -or $null -eq $moduleAdmissionState.Admission) {
+        throw 'fixture prebuild SelfTest requires the already-admitted caller module context'
+    }
+    $moduleAdmissionForRestore = $moduleAdmissionState.Admission
+    $syntheticModuleAdmissionActive = $false
     try {
         Assert-D32FixtureTimeoutScope -TimeoutSeconds 3600 -OwnerBinding $null -BuildD31RecoverySeeder $false
         try {
@@ -8300,6 +8306,56 @@ public static class D32DebugSelfTestLauncher
         $provenanceRunRoot = Join-Path $provenanceEvidenceRoot 'r'
         $provenanceCargoHome = Join-Path $provenanceRunRoot 'c'
         $provenanceTempRoot = Join-Path $provenanceRunRoot 't'
+        $syntheticRunnerProcessId = 2000000002
+        $syntheticRunnerStartTicks = [Int64]638949002000000000
+        $syntheticEntryScriptPath = Get-D32FullPath (Join-Path $fakeRepo 'scripts/d32-fixture-prebuild.ps1')
+        $syntheticProfilePath = Join-Path $root 'profile.json'
+        $syntheticAuthorityPath = Join-Path $root 'selftest-only-module-authority-reference.txt'
+        foreach ($newPath in @($syntheticProfilePath, $syntheticAuthorityPath, $syntheticEntryScriptPath)) {
+            if (Test-Path -LiteralPath $newPath) { throw 'fixture provenance SelfTest synthetic context paths must be absent before creation' }
+        }
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $syntheticEntryScriptPath))
+        [IO.File]::WriteAllText($syntheticEntryScriptPath,
+            '# D32 SELFTEST-ONLY PLACEHOLDER. Never executed; not the actual admitted -File entry or a module-admission proof.' + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($syntheticProfilePath,
+            'D32 SelfTest-only profile reference; not a Profile V2 pin.' + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($syntheticAuthorityPath,
+            'D32 SelfTest-only authority-shaped reference; not a module authority, caller pin, or gate evidence.' + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false))
+        $syntheticProfileArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticProfilePath
+        $syntheticAuthorityArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticAuthorityPath
+        $syntheticEntryArtifact = Get-D32BoundArtifactWithFileId -Path $syntheticEntryScriptPath
+        $fixtureSyntheticAdmission = [System.Management.Automation.PSSerializer]::Deserialize(
+            [System.Management.Automation.PSSerializer]::Serialize($global:D32PowerShellModuleAuthorityState.Admission))
+        $fixtureSyntheticAdmission.candidate_sha = '0123456789abcdef0123456789abcdef01234567'
+        $fixtureSyntheticAdmission.source_repo = Get-D32FullPath $fakeRepo
+        $fixtureSyntheticAdmission.authority_reference = [ordered]@{
+            path = [string]$syntheticAuthorityArtifact.path
+            bytes = [Int64]$syntheticAuthorityArtifact.bytes
+            sha256 = [string]$syntheticAuthorityArtifact.sha256
+            volume_serial_hex = [string]$syntheticAuthorityArtifact.volume_serial_hex
+            file_id_hex = [string]$syntheticAuthorityArtifact.file_id_hex
+        }
+        $fixtureSyntheticAdmission.profile_reference = [ordered]@{
+            path = [string]$syntheticProfileArtifact.path
+            bytes = [Int64]$syntheticProfileArtifact.bytes
+            sha256 = [string]$syntheticProfileArtifact.sha256
+            volume_serial_hex = [string]$syntheticProfileArtifact.volume_serial_hex
+            file_id_hex = [string]$syntheticProfileArtifact.file_id_hex
+        }
+        $fixtureSyntheticAdmission.runner_process.process_id = [int]$syntheticRunnerProcessId
+        $fixtureSyntheticAdmission.runner_process.start_time_utc_ticks = $syntheticRunnerStartTicks
+        $fixtureSyntheticAdmission.entry_script_path = $syntheticEntryScriptPath
+        $fixtureSyntheticAdmission.entry_script = [ordered]@{
+            path = [string]$syntheticEntryArtifact.path
+            bytes = [Int64]$syntheticEntryArtifact.bytes
+            sha256 = [string]$syntheticEntryArtifact.sha256
+            volume_serial_hex = [string]$syntheticEntryArtifact.volume_serial_hex
+            file_id_hex = [string]$syntheticEntryArtifact.file_id_hex
+        }
+        $fixtureSyntheticAdmission.startup.file_operand = $syntheticEntryScriptPath
         $provenanceLockManifests = @('vita-agent-protocol/Cargo.toml', 'vita-agent/Cargo.toml', 'src-tauri/Cargo.toml')
         $provenanceFetchManifests = [System.Collections.Generic.List[object]]::new()
         $provenanceFetchArguments = [System.Collections.Generic.List[object]]::new()
@@ -8316,7 +8372,7 @@ public static class D32DebugSelfTestLauncher
                     exit_code = 0
                     process_identity = [ordered]@{
                         process_id = 1234 + $fetchIndex
-                        parent_process_id = [int]$PID
+                        parent_process_id = [int]$syntheticRunnerProcessId
                         name = 'cargo.exe'
                         image_path = $provenanceCargoPath
                         creation_date = '2026-09-23T00:00:00.0000000Z'
@@ -8327,8 +8383,8 @@ public static class D32DebugSelfTestLauncher
                 })
         }
         $provenanceEnvironment = [ordered]@{
-            toolchain_profile_path = (Join-Path $root 'profile.json')
-            toolchain_profile_sha256 = ('a' * 64)
+            toolchain_profile_path = [string]$syntheticProfileArtifact.path
+            toolchain_profile_sha256 = [string]$syntheticProfileArtifact.sha256
             target_triple = 'x86_64-pc-windows-msvc'
             env_policy = 'D32_BUILD_ENV_V1'
             cargo_policy = 'FRESH_HOME_LOCKED_FETCH_OFFLINE_AFTER'
@@ -8347,10 +8403,10 @@ public static class D32DebugSelfTestLauncher
             event_source = 'Win32-WaitForDebugEvent-dedicated-OS-thread'
             state = 'COMPLETED'
             block_reason = $null
-            debugger_process_id = [int]$PID
+            debugger_process_id = [int]$syntheticRunnerProcessId
             uncontinued_create_process_id = 0
             uncontinued_create_continue_call_count = 0
-            debugger_thread_id = [int]$PID + 1
+            debugger_thread_id = [int]$syntheticRunnerProcessId + 1
             dedicated_debugger_thread = $true
             debugger_kill_on_exit_enabled = $true
             root_resumed_after_kill_on_exit = $true
@@ -8383,11 +8439,11 @@ public static class D32DebugSelfTestLauncher
             accounting_consistent = $true
             injected_interruption = $false
             process_events = @(
-                [ordered]@{ sequence = 1; kind = 'CREATE'; process_id = 1234; parent_process_id = [int]$PID; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 },
-                [ordered]@{ sequence = 2; kind = 'EXIT'; process_id = 1234; parent_process_id = [int]$PID; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 }
+                [ordered]@{ sequence = 1; kind = 'CREATE'; process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 },
+                [ordered]@{ sequence = 2; kind = 'EXIT'; process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 }
             )
             processes = @([ordered]@{
-                process_id = 1234; parent_process_id = [int]$PID; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation
+                process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation
                 image_path = $provenanceCargoPath; bytes = 100; sha256 = ('a' * 64); volume_serial_hex = ('b' * 16); file_id_hex = ('c' * 32)
                 allowed_image_reason = 'exact-caller-pinned-fixed-root-image'; image_verified = $true; exited = $true; exit_code = 0
                 create_sequence = 1; exit_sequence = 2; created_at_utc = $debuggerCreated; exited_at_utc = $debuggerCreated
@@ -8416,9 +8472,6 @@ public static class D32DebugSelfTestLauncher
             })
         }
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
-        $fixtureSyntheticAdmission = [System.Management.Automation.PSSerializer]::Deserialize([System.Management.Automation.PSSerializer]::Serialize($global:D32PowerShellModuleAuthorityState.Admission))
-        $fixtureSyntheticAdmission.candidate_sha = '0123456789abcdef0123456789abcdef01234567'
-        $fixtureSyntheticAdmission.source_repo = $fakeRepo
         $provenanceDocument = [ordered]@{
             schema_version = 7
             record_type = 'D32_FIXTURE_BUILD_PROVENANCE_V7'
@@ -8456,6 +8509,9 @@ public static class D32DebugSelfTestLauncher
             }
             powershell_module_admission = $fixtureSyntheticAdmission
         }
+        $moduleAdmissionState.Admission = $fixtureSyntheticAdmission
+        $syntheticModuleAdmissionActive = $true
+        try {
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
         $oldTraceProvenance = [ordered]@{}
         foreach ($field in $provenanceDocument.Keys) { $oldTraceProvenance[$field] = $provenanceDocument[$field] }
@@ -8565,6 +8621,13 @@ public static class D32DebugSelfTestLauncher
             throw 'SELFTEST_FAILED: serialized sidecar fetch process identity did not round-trip as producer-shaped JSON'
         }
         $passed++
+        }
+        finally {
+            if ($syntheticModuleAdmissionActive) {
+                $moduleAdmissionState.Admission = $moduleAdmissionForRestore
+                $syntheticModuleAdmissionActive = $false
+            }
+        }
 
         $ambientHandle = [IntPtr]::Zero
         try {
@@ -8786,6 +8849,10 @@ public static class D32DebugSelfTestLauncher
         Write-Host "D32_FIXTURE_PREBUILD_SELFTEST PASS ($passed checks)"
     }
     finally {
+        if ($syntheticModuleAdmissionActive) {
+            $moduleAdmissionState.Admission = $moduleAdmissionForRestore
+            $syntheticModuleAdmissionActive = $false
+        }
         if ($owned -and (Test-Path -LiteralPath $root)) {
             Remove-D32OwnedDirectory $root
         }

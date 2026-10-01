@@ -135,12 +135,8 @@ function New-D32ProducerBindingAdmissionFixture {
 }
 function Test-D32ProducerEntryRoleFixture {
     param([object]$Admission, [string]$Role)
-    $allowed = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $repo -ProducerRole $Role)
-    foreach ($path in $allowed) {
-        if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$Admission.entry_script_path), [IO.Path]::GetFullPath([string]$path)) -and
-            [StringComparer]::OrdinalIgnoreCase.Equals([string]$Admission.startup.file_operand, [string]$Admission.entry_script_path)) { return $true }
-    }
-    return $false
+    return Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $Admission -Repository $repo `
+        -ProducerRole $Role -ExpectedProducerContext $Admission
 }
 
 $phase0Admission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-phase0-matrix.ps1' -ProcessId 3101 -StartTicks 638949001000000000
@@ -205,6 +201,119 @@ foreach ($roleCase in $roleCases) {
     Add-D32ProducerBindingCase "shape-only producer context accepts exact $($roleCase.role) role entry" $rolePositive
     Add-D32ProducerBindingCase "shape-only producer context rejects wrong $($roleCase.role) role entry" $wrongRoleRejected
 }
+$extendedRepository = '\\?\' + $repo
+$allProducerRolesAcceptEquivalentDrivePathForms = $true
+$allProducerRolesRejectMismatchedStartupSpelling = $true
+$equivalentRoleEntryCount = 0
+foreach ($roleCase in $roleCases) {
+    $roleEntryPaths = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $repo -ProducerRole ([string]$roleCase.role))
+    foreach ($roleEntryPath in $roleEntryPaths) {
+        $entryName = [IO.Path]::GetFileName([string]$roleEntryPath)
+        $ordinaryAdmission = New-D32ProducerBindingAdmissionFixture -EntryName $entryName -ProcessId (3700 + $equivalentRoleEntryCount) -StartTicks (638949008100000000 + $equivalentRoleEntryCount)
+        $extendedRootAccepted = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $ordinaryAdmission -Repository $extendedRepository `
+            -ProducerRole ([string]$roleCase.role) -ExpectedProducerContext $ordinaryAdmission
+
+        $extendedAdmission = Copy-D32PowerShellAuthorityJsonShape -Value $ordinaryAdmission
+        $extendedEntryPath = '\\?\' + [string]$extendedAdmission.entry_script_path
+        $extendedAdmission.entry_script_path = $extendedEntryPath
+        $extendedAdmission.entry_script.path = $extendedEntryPath
+        $extendedAdmission.startup.file_operand = $extendedEntryPath
+        $ordinaryRootAccepted = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $extendedAdmission -Repository $repo `
+            -ProducerRole ([string]$roleCase.role) -ExpectedProducerContext $extendedAdmission
+
+        $wrongStartupSpelling = Copy-D32PowerShellAuthorityJsonShape -Value $extendedAdmission
+        $wrongStartupSpelling.startup.file_operand = [string]$ordinaryAdmission.entry_script_path
+        $startupMismatchRejected = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $wrongStartupSpelling -Repository $repo `
+            -ProducerRole ([string]$roleCase.role) -ExpectedProducerContext $wrongStartupSpelling)
+        $allProducerRolesAcceptEquivalentDrivePathForms = $allProducerRolesAcceptEquivalentDrivePathForms -and $extendedRootAccepted -and $ordinaryRootAccepted
+        $allProducerRolesRejectMismatchedStartupSpelling = $allProducerRolesRejectMismatchedStartupSpelling -and $startupMismatchRejected
+        $equivalentRoleEntryCount++
+    }
+}
+Add-D32ProducerBindingCase 'all six producer roles accept only equivalent ordinary/extended forms for every fixed entry script and retain the exact startup operand' `
+    ($equivalentRoleEntryCount -eq 11 -and $allProducerRolesAcceptEquivalentDrivePathForms -and $allProducerRolesRejectMismatchedStartupSpelling) `
+    "role_entry_pairs=$equivalentRoleEntryCount; equivalent_forms=$allProducerRolesAcceptEquivalentDrivePathForms; exact_startup=$allProducerRolesRejectMismatchedStartupSpelling"
+
+$invalidProducerRootsRejected =
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path '.\relative-repository') -and
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path ($repo + '\scripts\..')) -and
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path '\\server\share\digital-life') -and
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path '\\?\UNC\server\share\digital-life') -and
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path '\\.\E:\device-path')
+$wrongRootRoleRejected = $false
+$outOfBoundsAdmission = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-preflight.ps1' -ProcessId 3790 -StartTicks 638949008190000000
+$outOfBoundsAdmission.entry_script_path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'docs', 'governance', 'PROJECT_SOURCE_OF_TRUTH.md'))
+$outOfBoundsAdmission.startup.file_operand = [string]$outOfBoundsAdmission.entry_script_path
+$outOfBoundsAdmission.entry_script.path = [string]$outOfBoundsAdmission.entry_script_path
+$wrongRootRoleRejected = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $outOfBoundsAdmission -Repository $repo `
+    -ProducerRole post_bundle_aggregate -ExpectedProducerContext $outOfBoundsAdmission)
+$wrongRepositoryRootRejected = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $outOfBoundsAdmission -Repository 'E:\d32' `
+    -ProducerRole post_bundle_aggregate -ExpectedProducerContext $outOfBoundsAdmission)
+$knownReparseAlias = 'C:\Users\zuo\Application Data'
+$unapprovedReparseAliasRejected = (Test-D32PowerShellAuthorityPathNoReparse -Path $knownReparseAlias) -eq $false -and
+    $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $knownReparseAlias)
+Add-D32ProducerBindingCase 'producer path normalization rejects relative/traversal/UNC/device namespaces and an existing unapproved reparse alias' `
+    ($invalidProducerRootsRejected -and $wrongRootRoleRejected -and $wrongRepositoryRootRejected -and $unapprovedReparseAliasRejected) `
+    "invalid_roots=$invalidProducerRootsRejected; out_of_bounds_role=$wrongRootRoleRejected; wrong_repository_root=$wrongRepositoryRootRejected; reparse_alias=$unapprovedReparseAliasRejected"
+
+$entryScriptPathForRecordTest = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'scripts', 'd32-preflight.ps1'))
+$entryFencesForRecordTest = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+$entrySnapshotForRecordTest = Open-D32PowerShellAuthorityFile -Path $entryScriptPathForRecordTest -DirectoryFences $entryFencesForRecordTest
+$entryReferenceForRecordTest = Copy-D32PowerShellAuthorityJsonShape -Value $entrySnapshotForRecordTest.Record
+$entrySnapshotForRecordTest.Stream.Dispose()
+foreach ($directoryFence in $entryFencesForRecordTest.Values) { if ($null -ne $directoryFence.Handle -and -not $directoryFence.Handle.IsClosed) { $directoryFence.Handle.Dispose() } }
+$externalReference = {
+    param([string]$Name)
+    [ordered]@{ path = [IO.Path]::GetFullPath([IO.Path]::Combine('E:\d32', $Name)); sha256 = ('a' * 64); bytes = [Int64]1; volume_serial_hex = '0000000000000001'; file_id_hex = ('1' * 32) }
+}
+$minimalEntryBindingRecord = [ordered]@{
+    record_type = 'D32_POWERSHELL_MODULE_ADMISSION_V2'
+    schema_version = 2
+    status = 'ADMITTED'
+    candidate_sha = 'a' * 40
+    source_repo = $repo
+    authority_reference = & $externalReference 'module-authority-candidate.json'
+    profile_reference = & $externalReference 'profile-candidate.json'
+    git_image = & $externalReference 'git-image-candidate.json'
+    powershell_host = [ordered]@{}
+    runner_process = [ordered]@{}
+    startup = [ordered]@{ file_operand = $entryScriptPathForRecordTest; switches = @('-NoProfile','-NonInteractive'); startup_policy = 'DIRECT_NO_PROFILE_FILE_V1' }
+    entry_script_path = $entryScriptPathForRecordTest
+    entry_script = $entryReferenceForRecordTest
+    module_import_order = [string[]]@('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','CimCmdlets')
+    module_closure = [ordered]@{}
+    resolver_admission = [ordered]@{}
+    import_verification = [ordered]@{ state = 'VERIFIED'; verified_import_count = 3; modules = [object[]]@(1,2,3); assemblies = [object[]]@(1); commands = [object[]]@(1); native_modules = [object[]]@(1) }
+    import_attempts = 3
+}
+$mixedRepositoryRepresentationReachesEntryIdentityCheck = -not (Test-D32PowerShellModuleAdmissionRecord -Document $minimalEntryBindingRecord `
+    -CandidateSha ([string]$minimalEntryBindingRecord.candidate_sha) -Repository $extendedRepository -ExpectedContext $null) -and
+    (Get-D32PowerShellModuleAdmissionValidationContext) -ceq 'record.powershell-host-reference'
+$missingEntryIdentityRecord = Copy-D32PowerShellAuthorityJsonShape -Value $minimalEntryBindingRecord
+[void]$missingEntryIdentityRecord.entry_script.Remove('file_id_hex')
+$missingIdentityRejectedAtExactPredicate = -not (Test-D32PowerShellModuleAdmissionRecord -Document $missingEntryIdentityRecord `
+    -CandidateSha ([string]$minimalEntryBindingRecord.candidate_sha) -Repository $extendedRepository -ExpectedContext $null) -and
+    (Get-D32PowerShellModuleAdmissionValidationContext) -ceq 'record.entry-script-reference-shape'
+$repositoryOwnedReferenceRecord = Copy-D32PowerShellAuthorityJsonShape -Value $minimalEntryBindingRecord
+$repositoryOwnedReferenceRecord.authority_reference.path = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'docs', 'governance', 'PROJECT_SOURCE_OF_TRUTH.md'))
+$repositoryOwnedReferenceRejectedAcrossPathForms = -not (Test-D32PowerShellModuleAdmissionRecord -Document $repositoryOwnedReferenceRecord `
+    -CandidateSha ([string]$minimalEntryBindingRecord.candidate_sha) -Repository $extendedRepository -ExpectedContext $null) -and
+    (Get-D32PowerShellModuleAdmissionValidationContext) -ceq 'record.reference.authority_reference'
+$extendedRepositoryOwnedReferenceRecord = Copy-D32PowerShellAuthorityJsonShape -Value $minimalEntryBindingRecord
+$extendedRepositoryOwnedReferenceRecord.authority_reference.path = '\\?\' + [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'docs', 'governance', 'PROJECT_SOURCE_OF_TRUTH.md'))
+$extendedRepositoryOwnedReferenceRejectedAcrossPathForms = -not (Test-D32PowerShellModuleAdmissionRecord -Document $extendedRepositoryOwnedReferenceRecord `
+    -CandidateSha ([string]$minimalEntryBindingRecord.candidate_sha) -Repository $repo -ExpectedContext $null) -and
+    (Get-D32PowerShellModuleAdmissionValidationContext) -ceq 'record.reference.authority_reference'
+$changedEntryIdentityRecord = Copy-D32PowerShellAuthorityJsonShape -Value $minimalEntryBindingRecord
+$replacementEntryId = if ($changedEntryIdentityRecord.entry_script.file_id_hex -ceq ('0' * 32)) { '1' * 32 } else { '0' * 32 }
+$changedEntryIdentityRecord.entry_script.file_id_hex = $replacementEntryId
+$changedIdentityRejectedAtOpenedObjectPredicate = -not (Test-D32PowerShellModuleAdmissionRecord -Document $changedEntryIdentityRecord `
+    -CandidateSha ([string]$minimalEntryBindingRecord.candidate_sha) -Repository $repo -ExpectedContext $null) -and
+    (Get-D32PowerShellModuleAdmissionValidationContext) -ceq 'record.entry-script-opened-reference'
+Add-D32ProducerBindingCase 'mixed repository path forms reach the opened entry identity check while missing/stale entry file identities reject at their exact predicates' `
+    ($mixedRepositoryRepresentationReachesEntryIdentityCheck -and $missingIdentityRejectedAtExactPredicate -and $changedIdentityRejectedAtOpenedObjectPredicate -and
+        $repositoryOwnedReferenceRejectedAcrossPathForms -and $extendedRepositoryOwnedReferenceRejectedAcrossPathForms) `
+    "mixed_path=$mixedRepositoryRepresentationReachesEntryIdentityCheck; missing_identity=$missingIdentityRejectedAtExactPredicate; changed_identity=$changedIdentityRejectedAtOpenedObjectPredicate; ordinary_reference_inside_repo=$repositoryOwnedReferenceRejectedAcrossPathForms; extended_reference_inside_repo=$extendedRepositoryOwnedReferenceRejectedAcrossPathForms"
 $syntheticPreflightContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-preflight.ps1' -ProcessId 3600 -StartTicks 638949008000000000
 $syntheticDiscoveryContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-discovery.ps1' -ProcessId 3601 -StartTicks 638949008010000000
 $syntheticBaselineContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-baseline.ps1' -ProcessId 3602 -StartTicks 638949008020000000
@@ -365,9 +474,29 @@ $baselineDiagnosticsBound = $sourceFiles.inventory.Contains('failedAdmissionBind
     $sourceFiles.inventory.Contains('baseline_profile:$($baselineProfileContext):$baselineProfileDetailJson') -and
     $sourceFiles.helper.Contains('producer.role-entry-path') -and $sourceFiles.helper.Contains('producer.exact-linked-admission') -and
     $sourceFiles.helper.Contains('producer.distinct-process-identity')
+$expectedProducerBindingCallCounts = [ordered]@{
+    fixture = 1
+    phase0 = 4
+    preflight = 12
+    discovery = 1
+    baseline = 1
+    inventory = 2
+}
+$actualProducerBindingCallCounts = [ordered]@{}
+$producerBindingCallTotal = 0
+foreach ($callerName in $expectedProducerBindingCallCounts.Keys) {
+    $callerTokens = $null; $callerParseErrors = $null
+    $callerAst = [System.Management.Automation.Language.Parser]::ParseInput($sourceFiles[$callerName], [ref]$callerTokens, [ref]$callerParseErrors)
+    $bindingCalls = $callerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Test-D32PowerShellModuleAdmissionProducerBinding' }, $true)
+    $actualProducerBindingCallCounts[$callerName] = [Int32]$bindingCalls.Count
+    $producerBindingCallTotal += [Int32]$bindingCalls.Count
+}
+$producerBindingCallCensusExact = $actualProducerBindingCallCounts.Count -eq $expectedProducerBindingCallCounts.Count -and
+    @($expectedProducerBindingCallCounts.Keys | Where-Object { $actualProducerBindingCallCounts[$_] -ne $expectedProducerBindingCallCounts[$_] }).Count -eq 0 -and
+    $producerBindingCallTotal -eq 21
 Add-D32ProducerBindingCase 'source lifecycle parses and binds fixture/discovery/baseline/Phase0/release/aggregate producer contexts' `
-    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure -and $baselineDiagnosticsBound) `
-    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure; baseline_diagnostics=$baselineDiagnosticsBound; predicate_diagnostics=$syntheticAdmissionDiagnosticsBound"
+    ($sourceParseErrors.Count -eq 0 -and $fixtureWriterBound -and $phase0FixtureReferenceBound -and $phase0WriterBound -and $discoveryWriterBound -and $baselineSlotsBound -and $preflightWritersBound -and $historicalRolesBound -and $aggregateWriterCurrentContextBound -and $aggregateHistoricalReaderDoesNotBindReaderProcess -and $baselineSyntheticProducersDistinct -and $syntheticAdmissionLifecycleBound -and $syntheticAdmissionBuilderComplete -and $fixtureSyntheticAdmissionClosure -and $baselineDiagnosticsBound -and $producerBindingCallCensusExact) `
+    "parse_errors=$($sourceParseErrors -join ','); fixture=$fixtureWriterBound; phase0_fixture=$phase0FixtureReferenceBound; phase0_writer=$phase0WriterBound; discovery=$discoveryWriterBound; baseline=$baselineSlotsBound; preflight_writers=$preflightWritersBound; historical=$historicalRolesBound; aggregate_writer=$aggregateWriterCurrentContextBound; aggregate_reader_historical=$aggregateHistoricalReaderDoesNotBindReaderProcess; baseline_synthetic=$baselineSyntheticProducersDistinct; synthetic_lifecycle=$syntheticAdmissionLifecycleBound; synthetic_builder=$syntheticAdmissionBuilderComplete; fixture_synthetic=$fixtureSyntheticAdmissionClosure; baseline_diagnostics=$baselineDiagnosticsBound; binding_calls=$((ConvertTo-D32PowerShellAuthorityJsonText -Value $actualProducerBindingCallCounts)); all_callers_shared=$producerBindingCallCensusExact; predicate_diagnostics=$syntheticAdmissionDiagnosticsBound"
 Add-D32ProducerBindingCase 'SelfTest role-entry placeholders are committed before exact clean-candidate admission checks' `
     $syntheticRolePlaceholdersCommittedBeforeCleanChecks `
     "role_placeholder_index=$syntheticRolePlaceholderIndex; git_add_index=$fixtureGitAddIndex"

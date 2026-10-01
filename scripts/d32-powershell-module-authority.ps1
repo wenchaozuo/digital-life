@@ -2358,19 +2358,28 @@ function Test-D32PowerShellModuleAdmissionRecord {
     $recordType = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'record_type'; $version = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'schema_version'; $status = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'status'
     $candidate = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'candidate_sha'; $repository = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'source_repo'; $attempts = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'import_attempts'
     $order = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'module_import_order'
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.repository-canonical-path'
+    $recordRepositoryIdentity = if ($repository -is [string]) { ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $repository } else { $null }
+    if ($null -eq $recordRepositoryIdentity) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.repository-caller-path'
+    $callerRepositoryIdentity = if ($Repository -is [string]) { ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Repository } else { $null }
+    if ($null -eq $callerRepositoryIdentity) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.repository-representation'
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($recordRepositoryIdentity, $callerRepositoryIdentity)) { return $false }
     $script:D32PowerShellModuleAdmissionValidationContext = 'record.scalar-fields-and-import-order'
     if ($recordType -isnot [string] -or $recordType -cne 'D32_POWERSHELL_MODULE_ADMISSION_V2' -or
         -not ($version -is [byte] -or $version -is [int16] -or $version -is [uint16] -or $version -is [int32] -or $version -is [uint32] -or $version -is [int64] -or $version -is [uint64]) -or [Int64]$version -ne 2 -or
         $status -isnot [string] -or $status -cne 'ADMITTED' -or $candidate -isnot [string] -or $candidate -cnotmatch '^[0-9a-f]{40}$' -or
         (-not [String]::IsNullOrWhiteSpace($CandidateSha) -and $candidate -cne $CandidateSha) -or
-        $repository -isnot [string] -or (-not [String]::IsNullOrWhiteSpace($Repository) -and -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($repository), [IO.Path]::GetFullPath($Repository))) -or
+        $repository -isnot [string] -or
         -not ($attempts -is [byte] -or $attempts -is [int16] -or $attempts -is [uint16] -or $attempts -is [int32] -or $attempts -is [uint32] -or $attempts -is [int64] -or $attempts -is [uint64]) -or [Int64]$attempts -ne 3 -or
         $order -isnot [Array] -or $order.Count -ne 3 -or ($order -join "`n") -cne "Microsoft.PowerShell.Management`nMicrosoft.PowerShell.Utility`nCimCmdlets") { return $false }
     $script:D32PowerShellModuleAdmissionValidationContext = 'record.repository-and-entry-path'
-    if ($repository -cne [IO.Path]::GetFullPath($repository) -or
-        -not [IO.Path]::IsPathRooted($repository) -or
-        -not (Test-D32PowerShellAuthorityPathWithin -Child ([string](& $get $Document 'entry_script_path')) -Parent $repository) -or
-        [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string](& $get $Document 'entry_script_path')), $repository)) { return $false }
+    $entryPathForRepository = & $get $Document 'entry_script_path'
+    $entryPathIdentity = if ($entryPathForRepository -is [string]) { ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $entryPathForRepository } else { $null }
+    if ($null -eq $entryPathIdentity -or
+        -not (Test-D32PowerShellModulePathWithin -Child $entryPathForRepository -Parent $repository) -or
+        [StringComparer]::OrdinalIgnoreCase.Equals($entryPathIdentity, $recordRepositoryIdentity)) { return $false }
     $referenceFields = @('path','sha256','bytes','volume_serial_hex','file_id_hex')
     foreach ($referenceName in @('authority_reference','profile_reference','git_image')) {
         $script:D32PowerShellModuleAdmissionValidationContext = "record.reference.$referenceName"
@@ -2387,24 +2396,27 @@ function Test-D32PowerShellModuleAdmissionRecord {
             $sha -isnot [string] -or $sha -cnotmatch '^[0-9a-f]{64}$' -or
             -not ($bytes -is [int32] -or $bytes -is [int64] -or $bytes -is [uint32] -or $bytes -is [uint64]) -or [Int64]$bytes -le 0 -or
             $volume -isnot [string] -or $volume -cnotmatch '^[0-9a-f]{16}$' -or $fileId -isnot [string] -or $fileId -cnotmatch '^[0-9a-f]{32}$') { return $false }
-        if ((Test-D32PowerShellAuthorityPathWithin -Child $path -Parent $repository) -or
-            (Test-D32PowerShellAuthorityPathWithin -Child $repository -Parent $path)) { return $false }
+        if ((Test-D32PowerShellModulePathWithin -Child $path -Parent $repository) -or
+            (Test-D32PowerShellModulePathWithin -Child $repository -Parent $path)) { return $false }
     }
     $script:D32PowerShellModuleAdmissionValidationContext = 'record.runner-startup-and-entry'
     $hostRecord = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'powershell_host'; $runner = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'runner_process'; $startup = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'startup'
     $entry = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'entry_script_path'; $entryFile = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'entry_script'; $closure = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'module_closure'; $verification = Get-D32PowerShellModuleAdmissionField -Record $Document -Name 'import_verification'
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.entry-script-canonical-path'
     if ($null -eq $hostRecord -or $null -eq $runner -or $null -eq $startup -or $entry -isnot [string] -or $null -eq $entryFile -or
-        -not [IO.Path]::IsPathRooted($entry) -or [IO.Path]::GetFullPath($entry) -cne $entry) { return $false }
+        $null -eq (ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $entry)) { return $false }
     $verifyNames = [System.Collections.Generic.List[string]]::new()
     if ($verification -is [System.Collections.IDictionary]) { foreach ($key in $verification.Keys) { $verifyNames.Add([string]$key) } } elseif ($null -ne $verification) { foreach ($property in $verification.PSObject.Properties) { $verifyNames.Add([string]$property.Name) } }
     if ($verifyNames.Count -ne 6 -or -not $verifyNames.Contains('state') -or -not $verifyNames.Contains('verified_import_count') -or -not $verifyNames.Contains('modules') -or -not $verifyNames.Contains('assemblies') -or -not $verifyNames.Contains('commands') -or -not $verifyNames.Contains('native_modules') -or
         (& $get $verification 'state') -cne 'VERIFIED' -or (& $get $verification 'verified_import_count') -ne 3 -or (& $get $verification 'modules') -isnot [Array] -or (& $get $verification 'modules').Count -ne 3 -or
         (& $get $verification 'assemblies') -isnot [Array] -or (& $get $verification 'assemblies').Count -eq 0 -or (& $get $verification 'commands') -isnot [Array] -or (& $get $verification 'commands').Count -eq 0 -or
         (& $get $verification 'native_modules') -isnot [Array] -or (& $get $verification 'native_modules').Count -eq 0) { return $false }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.entry-script-reference-shape'
     $entryFileNames = [System.Collections.Generic.List[string]]::new()
     if ($entryFile -is [System.Collections.IDictionary]) { foreach ($key in $entryFile.Keys) { $entryFileNames.Add([string]$key) } } else { foreach ($property in $entryFile.PSObject.Properties) { $entryFileNames.Add([string]$property.Name) } }
     if ($entryFileNames.Count -ne 5) { return $false }
     foreach ($field in $referenceFields) { if (-not $entryFileNames.Contains($field)) { return $false } }
+    $script:D32PowerShellModuleAdmissionValidationContext = 'record.entry-script-reference-fields'
     if ((& $get $entryFile 'path') -cne $entry -or (& $get $entryFile 'sha256') -isnot [string] -or (& $get $entryFile 'sha256') -cnotmatch '^[0-9a-f]{64}$' -or
         -not ((& $get $entryFile 'bytes') -is [int64] -or (& $get $entryFile 'bytes') -is [int32]) -or [Int64](& $get $entryFile 'bytes') -le 0 -or
         (& $get $entryFile 'volume_serial_hex') -isnot [string] -or (& $get $entryFile 'volume_serial_hex') -cnotmatch '^[0-9a-f]{16}$' -or
@@ -2658,7 +2670,8 @@ function Get-D32PowerShellModuleProducerEntryPaths {
         [ValidateSet('fixture_provenance','inventory_discovery','inventory_baseline','phase0_matrix','release_attestation','post_bundle_aggregate')]
         [string]$ProducerRole
     )
-    $repo = [IO.Path]::GetFullPath($Repository)
+    $repo = ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Repository
+    if ($null -eq $repo) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: producer repository path must be a canonical local non-reparse path' }
     $scripts = [IO.Path]::Combine($repo, 'scripts')
     $names = switch ($ProducerRole) {
         'fixture_provenance' { @('d32-fixture-prebuild.ps1','d32-phase0-matrix.ps1','d32-preflight.ps1') }
@@ -2669,6 +2682,45 @@ function Get-D32PowerShellModuleProducerEntryPaths {
         'post_bundle_aggregate' { @('d32-preflight.ps1') }
     }
     return @($names | ForEach-Object { [IO.Path]::GetFullPath([IO.Path]::Combine($scripts, [string]$_)) })
+}
+
+function ConvertTo-D32PowerShellModuleLocalPathIdentity {
+    param([AllowNull()][string]$Path)
+    try {
+        # Admission records retain their exact startup and opened-file paths.
+        # This comparison-only projection collapses just the Win32 extended
+        # prefix for canonical local DOS-drive paths, after rejecting traversal,
+        # UNC/device namespaces and every reparse component. File/object identity
+        # is still reopened and compared by Test-D32PowerShellModuleAdmissionRecord.
+        if ([String]::IsNullOrWhiteSpace($Path) -or $Path.Contains('/')) { return $null }
+        $ordinary = $Path
+        if ($ordinary.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if ($ordinary.StartsWith('\\?\', [StringComparison]::Ordinal)) { $ordinary = $ordinary.Substring(4) }
+        elseif ($ordinary.StartsWith('\\', [StringComparison]::Ordinal) -or $ordinary.StartsWith('\\.\', [StringComparison]::Ordinal)) { return $null }
+        if ($ordinary -notmatch '^[A-Za-z]:\\' -or $ordinary.Length -le 3 -or $ordinary.Substring(2).Contains(':')) { return $null }
+        foreach ($part in @($ordinary.Substring(3) -split '\\')) {
+            if ([String]::IsNullOrWhiteSpace($part) -or $part -ceq '.' -or $part -ceq '..' -or $part.EndsWith('.') -or $part.EndsWith(' ')) { return $null }
+        }
+        if ([IO.Path]::GetFullPath($ordinary) -cne $ordinary -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $ordinary)) { return $null }
+        return $ordinary
+    }
+    catch { return $null }
+}
+
+function Test-D32PowerShellModulePathIdentityEqual {
+    param([AllowNull()][string]$Left, [AllowNull()][string]$Right)
+    $leftIdentity = ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Left
+    $rightIdentity = ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Right
+    return $null -ne $leftIdentity -and $null -ne $rightIdentity -and
+        [StringComparer]::OrdinalIgnoreCase.Equals($leftIdentity, $rightIdentity)
+}
+
+function Test-D32PowerShellModulePathWithin {
+    param([AllowNull()][string]$Child, [AllowNull()][string]$Parent)
+    $childIdentity = ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Child
+    $parentIdentity = ConvertTo-D32PowerShellModuleLocalPathIdentity -Path $Parent
+    if ($null -eq $childIdentity -or $null -eq $parentIdentity) { return $false }
+    return Test-D32PowerShellAuthorityPathWithin -Child $childIdentity -Parent $parentIdentity
 }
 
 function Test-D32PowerShellModuleProducerContextEqual {
@@ -2736,12 +2788,13 @@ function Test-D32PowerShellModuleAdmissionProducerContextBinding {
             $script:D32PowerShellModuleAdmissionValidationContext = 'producer.document'
             return $false
         }
+        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.role-entry-path'
+        if ($Document.entry_script_path -isnot [string]) { return $false }
         $entryPath = [string]$Document.entry_script_path
         $rolePaths = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $Repository -ProducerRole $ProducerRole)
-        $script:D32PowerShellModuleAdmissionValidationContext = 'producer.role-entry-path'
         $roleMatch = $false
         foreach ($path in $rolePaths) {
-            if ([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($entryPath), [IO.Path]::GetFullPath([string]$path))) { $roleMatch = $true; break }
+            if (Test-D32PowerShellModulePathIdentityEqual -Left $entryPath -Right ([string]$path)) { $roleMatch = $true; break }
         }
         if (-not $roleMatch) { return $false }
         $script:D32PowerShellModuleAdmissionValidationContext = 'producer.startup-file-operand'

@@ -3848,6 +3848,20 @@ function New-D32PreflightSelfTestPhase0Command {
     }
 }
 
+function Get-D32PreflightSelfTestProducerContextDiagnostic {
+    param([AllowNull()][object]$Document)
+    if ($null -eq $Document) { return $null }
+    return [ordered]@{
+        status = [string]$Document.status
+        candidate_sha = [string]$Document.candidate_sha
+        source_repo = [string]$Document.source_repo
+        runner_process_id = [Int64]$Document.runner_process.process_id
+        runner_start_time_utc_ticks = [Int64]$Document.runner_process.start_time_utc_ticks
+        entry_script_path = [string]$Document.entry_script_path
+        startup_file_operand = [string]$Document.startup.file_operand
+    }
+}
+
 function New-D32PreflightSelfTestSyntheticModuleAdmission {
     param(
         [Parameter(Mandatory = $true)][object]$TemplateAdmission,
@@ -6080,12 +6094,50 @@ function Invoke-D32SelfTest {
             $actualCallerRejectedAsFixtureProducer
         if (-not $producerBindingCondition) {
             $producerBindingDiagnostic = [ordered]@{
-                discovery = [ordered]@{ accepted = [bool]$syntheticDiscoveryProducerAccepted; context = [string]$syntheticDiscoveryProducerContext }
-                baseline = [ordered]@{ accepted = [bool]$syntheticBaselineProducerAccepted; context = [string]$syntheticBaselineProducerContext }
-                copied_discovery_rejected_as_baseline = [ordered]@{ rejected = [bool]$syntheticCopiedDiscoveryRejectedAsBaseline; context = [string]$syntheticCopiedDiscoveryValidationContext }
-                same_process_baseline_rejected = [ordered]@{ rejected = [bool]$syntheticBaselineSameProcessRejected; context = [string]$syntheticBaselineSameProcessValidationContext }
-                phase0 = [ordered]@{ accepted = [bool]$syntheticPhase0ProducerAccepted; context = [string]$syntheticPhase0ProducerContext }
-                actual_caller_rejected_as_fixture_producer = [ordered]@{ rejected = [bool]$actualCallerRejectedAsFixtureProducer; context = [string]$actualCallerFixtureProducerValidationContext }
+                discovery = [ordered]@{
+                    accepted = [bool]$syntheticDiscoveryProducerAccepted
+                    validator_context = [string]$syntheticDiscoveryProducerContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
+                baseline = [ordered]@{
+                    accepted = [bool]$syntheticBaselineProducerAccepted
+                    validator_context = [string]$syntheticBaselineProducerContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    distinct_from = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
+                copied_discovery_rejected_as_baseline = [ordered]@{
+                    rejected = [bool]$syntheticCopiedDiscoveryRejectedAsBaseline
+                    validator_context = [string]$syntheticCopiedDiscoveryValidationContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    distinct_from = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticDiscoveryAdmission
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
+                same_process_baseline_rejected = [ordered]@{
+                    rejected = [bool]$syntheticBaselineSameProcessRejected
+                    validator_context = [string]$syntheticBaselineSameProcessValidationContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    distinct_from = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticBaselineAdmission
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
+                phase0 = [ordered]@{
+                    accepted = [bool]$syntheticPhase0ProducerAccepted
+                    validator_context = [string]$syntheticPhase0ProducerContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPhase0Admission
+                    expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPhase0Admission
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
+                actual_caller_rejected_as_fixture_producer = [ordered]@{
+                    rejected = [bool]$actualCallerRejectedAsFixtureProducer
+                    validator_context = [string]$actualCallerFixtureProducerValidationContext
+                    actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $actualModuleAdmissionForRestore
+                    expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic -Document $syntheticPreflightAdmission
+                }
             }
             Write-Host ("SELFTEST DETAIL: synthetic producer-binding predicate diagnostics: " + (ConvertTo-D32PowerShellAuthorityJsonText -Value $producerBindingDiagnostic))
         }

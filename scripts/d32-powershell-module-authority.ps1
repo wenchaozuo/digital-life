@@ -2405,6 +2405,28 @@ function Test-D32PowerShellModuleAdmissionProducerBinding {
     try {
         $script:D32PowerShellModuleAdmissionValidationContext = 'producer.admission-record'
         if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $ExpectedAdmissionContext)) { return $false }
+        return Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $Document -Repository $Repository -ProducerRole $ProducerRole `
+            -ExpectedProducerContext $ExpectedProducerContext -ExactLinkedAdmission $ExactLinkedAdmission -DistinctFromAdmission $DistinctFromAdmission
+    }
+    catch { return $false }
+}
+
+function Test-D32PowerShellModuleAdmissionProducerContextBinding {
+    param(
+        [AllowNull()][object]$Document,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('fixture_provenance','inventory_discovery','inventory_baseline','phase0_matrix','release_attestation','post_bundle_aggregate')]
+        [string]$ProducerRole,
+        [AllowNull()][object]$ExpectedProducerContext,
+        [AllowNull()][object]$ExactLinkedAdmission,
+        [AllowNull()][object]$DistinctFromAdmission
+    )
+    try {
+        if ($null -eq $Document) {
+            $script:D32PowerShellModuleAdmissionValidationContext = 'producer.document'
+            return $false
+        }
         $entryPath = [string]$Document.entry_script_path
         $rolePaths = @(Get-D32PowerShellModuleProducerEntryPaths -Repository $Repository -ProducerRole $ProducerRole)
         $script:D32PowerShellModuleAdmissionValidationContext = 'producer.role-entry-path'

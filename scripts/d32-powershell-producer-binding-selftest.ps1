@@ -75,6 +75,55 @@ Add-D32ProducerBindingCase 'discovery, baseline, and Phase0 shape-only producers
         (Test-D32PowerShellModuleProducerProcessDistinct -Document $phase0MatrixAdmission -OtherAdmission $baselineAdmission) -and
         (Test-D32PowerShellModuleProducerProcessDistinct -Document $phase0MatrixAdmission -OtherAdmission $discoveryAdmission))
 
+# Exercise the production producer-context predicate directly with shape-only
+# records. These deliberately omit the shared ADMITTED schema and therefore
+# cannot be mistaken for an actual module admission; the full-record validator
+# remains mandatory in production callers.
+$roleCases = @(
+    @{ role = 'fixture_provenance'; entry = 'd32-phase0-matrix.ps1'; wrong = 'd32-test-inventory-discovery.ps1' },
+    @{ role = 'inventory_discovery'; entry = 'd32-test-inventory-discovery.ps1'; wrong = 'd32-test-inventory-baseline.ps1' },
+    @{ role = 'inventory_baseline'; entry = 'd32-test-inventory-baseline.ps1'; wrong = 'd32-test-inventory-discovery.ps1' },
+    @{ role = 'phase0_matrix'; entry = 'd32-phase0-matrix.ps1'; wrong = 'd32-test-inventory-discovery.ps1' },
+    @{ role = 'release_attestation'; entry = 'd32-preflight.ps1'; wrong = 'd32-phase0-matrix.ps1' },
+    @{ role = 'post_bundle_aggregate'; entry = 'd32-preflight.ps1'; wrong = 'd32-phase0-matrix.ps1' }
+)
+$roleContextResults = [System.Collections.Generic.List[object]]::new()
+foreach ($roleCase in $roleCases) {
+    $roleAdmission = New-D32ProducerBindingAdmissionFixture -EntryName ([string]$roleCase.entry) -ProcessId (3400 + $roleContextResults.Count) -StartTicks (638949006000000000 + $roleContextResults.Count)
+    $rolePositive = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $roleAdmission -Repository $repo `
+        -ProducerRole ([string]$roleCase.role) -ExpectedProducerContext $roleAdmission
+    $wrongRoleAdmission = New-D32ProducerBindingAdmissionFixture -EntryName ([string]$roleCase.wrong) -ProcessId (3500 + $roleContextResults.Count) -StartTicks (638949007000000000 + $roleContextResults.Count)
+    $wrongRoleRejected = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $wrongRoleAdmission -Repository $repo `
+        -ProducerRole ([string]$roleCase.role) -ExpectedProducerContext $roleAdmission)
+    $roleContextResults.Add([PSCustomObject]@{ role = [string]$roleCase.role; accepted = [bool]$rolePositive; wrong_entry_rejected = [bool]$wrongRoleRejected })
+    Add-D32ProducerBindingCase "shape-only producer context accepts exact $($roleCase.role) role entry" $rolePositive
+    Add-D32ProducerBindingCase "shape-only producer context rejects wrong $($roleCase.role) role entry" $wrongRoleRejected
+}
+$syntheticPreflightContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-preflight.ps1' -ProcessId 3600 -StartTicks 638949008000000000
+$syntheticDiscoveryContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-discovery.ps1' -ProcessId 3601 -StartTicks 638949008010000000
+$syntheticBaselineContext = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-baseline.ps1' -ProcessId 3602 -StartTicks 638949008020000000
+$syntheticPhase0Context = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-phase0-matrix.ps1' -ProcessId 3603 -StartTicks 638949008030000000
+$sixPredicateResults = [ordered]@{
+    discovery_accepts_own = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticDiscoveryContext -Repository $repo `
+        -ProducerRole inventory_discovery -ExpectedProducerContext $syntheticDiscoveryContext
+    baseline_accepts_own_distinct_from_discovery = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticBaselineContext -Repository $repo `
+        -ProducerRole inventory_baseline -ExpectedProducerContext $syntheticBaselineContext -DistinctFromAdmission $syntheticDiscoveryContext
+    copied_discovery_rejected_as_baseline = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticDiscoveryContext -Repository $repo `
+        -ProducerRole inventory_baseline -ExpectedProducerContext $syntheticBaselineContext -DistinctFromAdmission $syntheticDiscoveryContext)
+    baseline_rejects_same_process = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticBaselineContext -Repository $repo `
+        -ProducerRole inventory_baseline -ExpectedProducerContext $syntheticBaselineContext -DistinctFromAdmission $syntheticBaselineContext)
+    phase0_accepts_own = Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticPhase0Context -Repository $repo `
+        -ProducerRole phase0_matrix -ExpectedProducerContext $syntheticPhase0Context
+    caller_context_rejected_as_fake_phase0_producer = -not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $syntheticPreflightContext -Repository $repo `
+        -ProducerRole phase0_matrix -ExpectedProducerContext $syntheticPhase0Context)
+}
+Add-D32ProducerBindingCase 'all six SelfTest producer predicates replay with exact role and process contexts without constructing an admission record' `
+    (@($sixPredicateResults.Values | Where-Object { -not [bool]$_ }).Count -eq 0)
+$startupMismatch = New-D32ProducerBindingAdmissionFixture -EntryName 'd32-test-inventory-discovery.ps1' -ProcessId 3604 -StartTicks 638949008040000000
+$startupMismatch.startup.file_operand = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, 'scripts', 'd32-test-inventory-baseline.ps1'))
+Add-D32ProducerBindingCase 'producer context rejects a role-correct entry with a different startup -File operand' `
+    (-not (Test-D32PowerShellModuleAdmissionProducerContextBinding -Document $startupMismatch -Repository $repo -ProducerRole inventory_discovery))
+
 $leasePriorAdmission = [PSCustomObject]@{ marker = 'prior-shape-only' }
 $leaseSyntheticAdmission = [PSCustomObject]@{ marker = 'synthetic-shape-only' }
 $immediateFailureLeaseRecovery = Test-D32PowerShellModuleSelfTestAdmissionImmediateFailureRecovery `
@@ -159,6 +208,9 @@ $syntheticAdmissionDiagnosticsBound = $mainSelfTestText.Contains('$syntheticDisc
     $mainSelfTestText.Contains('$syntheticBaselineSameProcessValidationContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
     $mainSelfTestText.Contains('$syntheticPhase0ProducerContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
     $mainSelfTestText.Contains('$actualCallerFixtureProducerValidationContext = Get-D32PowerShellModuleAdmissionValidationContext') -and
+    $mainSelfTestText.Contains('actual_document = Get-D32PreflightSelfTestProducerContextDiagnostic') -and
+    $mainSelfTestText.Contains('expected_producer_context = Get-D32PreflightSelfTestProducerContextDiagnostic') -and
+    $mainSelfTestText.Contains('expected_admission_context = Get-D32PreflightSelfTestProducerContextDiagnostic') -and
     $mainSelfTestText.Contains('synthetic producer-binding predicate diagnostics')
 $syntheticAdmissionLifecycleBound = $mainSelfTestText.Contains('-DiscoveryProducerAdmission $syntheticDiscoveryAdmission') -and
     $mainSelfTestText.Contains('-BaselineProducerAdmission $syntheticBaselineAdmission') -and
@@ -213,6 +265,9 @@ $result = [ordered]@{
     failed = @($failures.ToArray())
     cases = $cases.ToArray()
     module_import_attempts = [int]$global:D32PowerShellModuleImportAttempts
+    shape_only_producer_role_results = $roleContextResults.ToArray()
+    shape_only_six_predicate_results = $sixPredicateResults
+    actual_module_admission_constructed = $false
     cargo_invoked = $false
     discovery_invoked = $false
     formal_root_claimed = $false

@@ -391,10 +391,33 @@ function ConvertTo-D32Phase0ProcessRecord {
         [AllowNull()][object]$VendoredProtocGrant,
         [AllowNull()][object]$H7CGitRunGrant
     )
-    if ($Process.process_id -le 0 -or $null -eq $Process.parent_process_id -or
+    $captureRequiredProperty = $Process.PSObject.Properties['command_line_capture_required']
+    $captureSourceProperty = $Process.PSObject.Properties['command_line_capture_source']
+    $captureRequired = if ($null -ne $captureRequiredProperty) { $captureRequiredProperty.Value } else { $null }
+    $captureSource = if ($null -ne $captureSourceProperty) { $captureSourceProperty.Value } else { $null }
+    $captureSourceExpected = if ($captureRequired -is [bool] -and $captureRequired) {
+        'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine'
+    }
+    else {
+        'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+    }
+    $commandLineValid = if ($captureRequired -is [bool] -and $captureRequired) {
+        $Process.command_line -is [string] -and -not [String]::IsNullOrWhiteSpace([string]$Process.command_line)
+    }
+    else {
+        $captureRequired -is [bool] -and -not $captureRequired -and
+        $Process.command_line -is [string] -and $Process.command_line.Length -eq 0
+    }
+    if (-not (Test-D32Phase0ExactProperties -Object $Process -Expected @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line',
+                'command_line_capture_required', 'command_line_capture_source', 'creation_date', 'observed_at_utc')) -or
+        -not (Test-D32Phase0Integer -Value $Process.process_id -Positive) -or
+        -not (Test-D32Phase0Integer -Value $Process.parent_process_id -Positive) -or
+        $Process.name -isnot [string] -or $Process.image_path -isnot [string] -or
+        $Process.creation_date -isnot [string] -or $Process.observed_at_utc -isnot [string] -or
+        $captureRequired -isnot [bool] -or $captureSource -isnot [string] -or $captureSource -cne $captureSourceExpected -or
+        -not $commandLineValid -or
         [String]::IsNullOrWhiteSpace([string]$Process.name) -or
         [String]::IsNullOrWhiteSpace([string]$Process.image_path) -or
-        [String]::IsNullOrWhiteSpace([string]$Process.command_line) -or
         [String]::IsNullOrWhiteSpace([string]$Process.creation_date)) {
         throw 'PHASE0_PROCESS_TREE_BLOCKED: process identity fields are incomplete'
     }
@@ -616,6 +639,9 @@ function ConvertFrom-D32Phase0DebugProcess {
     param([Parameter(Mandatory = $true)][object]$Process, [AllowNull()][string]$ExpectedCommandLine)
     $commandLine = Get-D32Phase0ActualDebugCommandLine -Process $Process -ExpectedCommandLine $ExpectedCommandLine `
         -ExpectedCommandLineBound:($PSBoundParameters.ContainsKey('ExpectedCommandLine'))
+    $requiredCaptureProperty = $Process.PSObject.Properties['CommandLineCaptureRequired']
+    $commandLineRequired = if ($null -eq $requiredCaptureProperty) { $true } else { [bool]$requiredCaptureProperty.Value }
+    $capture = $Process.CommandLineCapture
     $created = if ([Int64]$Process.CreationFileTime -gt 0) { [DateTime]::FromFileTimeUtc([Int64]$Process.CreationFileTime).ToString('o') } else { $null }
     $proxy = [PSCustomObject]@{
         process_id = [int]$Process.ProcessId
@@ -623,6 +649,8 @@ function ConvertFrom-D32Phase0DebugProcess {
         name = [IO.Path]::GetFileName([string]$Process.ImagePath)
         image_path = [string]$Process.ImagePath
         command_line = $commandLine
+        command_line_capture_required = [bool]$commandLineRequired
+        command_line_capture_source = [string]$capture.Source
         creation_date = $created
         observed_at_utc = [string]$Process.CreatedAtUtc
     }
@@ -2251,6 +2279,14 @@ function Assert-D32TestInventoryRootsDisjoint {
     return $true
 }
 
+function Test-D32Phase0OptionalChildCommandLine {
+    param([AllowNull()][object]$Value)
+
+    if ($Value -isnot [string]) { return $false }
+    if ($Value.Length -eq 0) { return $true }
+    return -not [String]::IsNullOrWhiteSpace($Value)
+}
+
 function Resolve-D32TestInventoryProtocPolicy {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('protocol', 'vita', 'host')][string]$Package,
@@ -2351,11 +2387,38 @@ function Test-D32Phase0InventoryProcessRecord {
         $traceRoot[0].parent_process_id -ne $root.parent_process_id -or $traceRoot[0].exit_code -ne $Command.exit_code -or
         $Command.descendant_processes.Count -ne ($Command.process_trace.processes.Count - 1)) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name CREATE/EXIT/descendant inventory differs from V2 trace" }
     foreach ($child in $Command.descendant_processes) {
+        $childFields = @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc',
+            'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'identity_verified')
+        if (-not (Test-D32Phase0ExactProperties -Object $child -Expected $childFields)) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name descendant identity field set is missing, extra, or aliased"
+        }
+        $invalidChildFields = [System.Collections.Generic.List[string]]::new()
+        if (-not (Test-D32Phase0Integer -Value $child.process_id -Positive)) { $invalidChildFields.Add('process_id') }
+        if (-not (Test-D32Phase0Integer -Value $child.parent_process_id -Positive)) { $invalidChildFields.Add('parent_process_id') }
+        if ($child.name -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$child.name)) { $invalidChildFields.Add('name') }
+        if ($child.image_path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path ([string]$child.image_path))) { $invalidChildFields.Add('image_path') }
+        if (-not (Test-D32Phase0OptionalChildCommandLine -Value $child.command_line)) {
+            $invalidChildFields.Add('command_line')
+        }
+        if ($child.creation_date -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$child.creation_date)) { $invalidChildFields.Add('creation_date') }
+        if ($child.observed_at_utc -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$child.observed_at_utc)) { $invalidChildFields.Add('observed_at_utc') }
+        if ($child.sha256 -isnot [string] -or $child.sha256 -cnotmatch '^[0-9a-f]{64}$') { $invalidChildFields.Add('sha256') }
+        if (-not (Test-D32Phase0Integer -Value $child.bytes -Positive)) { $invalidChildFields.Add('bytes') }
+        if ($child.volume_serial_hex -isnot [string] -or $child.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$') { $invalidChildFields.Add('volume_serial_hex') }
+        if ($child.file_id_hex -isnot [string] -or $child.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { $invalidChildFields.Add('file_id_hex') }
+        if ($child.allowed_image_reason -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$child.allowed_image_reason)) { $invalidChildFields.Add('allowed_image_reason') }
+        if ($child.identity_verified -isnot [bool] -or -not $child.identity_verified) { $invalidChildFields.Add('identity_verified') }
+        if ($invalidChildFields.Count -gt 0) {
+            throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name descendant identity has invalid fields: $($invalidChildFields -join ',')"
+        }
         $childTime = [DateTime]::Parse([string]$child.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()
         $traceChild = @($Command.process_trace.processes | Where-Object { $_.process_id -eq $child.process_id -and $_.creation_filetime -eq $childTime })
         if ($traceChild.Count -ne 1 -or $traceChild[0].parent_process_id -ne $child.parent_process_id -or
+            -not (Test-D32ProfilePathEqual -Left $traceChild[0].image_path -Right $child.image_path) -or
+            [IO.Path]::GetFileName([string]$child.image_path) -cne $child.name -or
             $traceChild[0].sha256 -cne $child.sha256 -or [Int64]$traceChild[0].bytes -ne [Int64]$child.bytes -or
-            $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name child identity differs from V2 CREATE evidence" }
+            $traceChild[0].volume_serial_hex -cne $child.volume_serial_hex -or $traceChild[0].file_id_hex -cne $child.file_id_hex -or
+            $traceChild[0].allowed_image_reason -cne $child.allowed_image_reason) { throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $Name child identity differs from V2 CREATE evidence" }
     }
     return $true
 }
@@ -2915,6 +2978,7 @@ function Test-D32Phase0MatrixRecord {
                 if (-not (Test-D32Phase0ExactProperties -Object $child -Expected @('process_id', 'parent_process_id', 'name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'identity_verified')) -or
                     -not (Test-D32Phase0Integer -Value $child.process_id -Positive) -or -not (Test-D32Phase0Integer -Value $child.parent_process_id -Positive) -or
                     @($child.PSObject.Properties | Where-Object { @('name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason') -contains $_.Name -and $_.Value -isnot [string] }).Count -ne 0 -or
+                    -not (Test-D32Phase0OptionalChildCommandLine -Value $child.command_line) -or
                     $child.identity_verified -isnot [bool] -or -not $child.identity_verified -or $child.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
                     -not (Test-D32Phase0Integer -Value $child.bytes -Positive) -or $child.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or $child.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { throw "Phase0 command[$i] child process identity schema is invalid" }
                 if (-not $processKeys.Add("$($child.process_id)|$($child.creation_date)")) { throw "Phase0 command[$i] process snapshot contains duplicate PID/creation identity" }

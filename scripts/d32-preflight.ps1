@@ -3268,6 +3268,7 @@ function Test-D32ReleaseEvidenceBundle {
                     $childValid = Test-D32Phase0ExactProperties -Object $child -Expected $childFields
                     if ($childValid) {
                         foreach ($field in @('name', 'image_path', 'command_line', 'creation_date', 'observed_at_utc', 'sha256', 'volume_serial_hex', 'file_id_hex', 'allowed_image_reason')) { if ($child.$field -isnot [string]) { $childValid = $false } }
+                        if (-not (Test-D32Phase0OptionalChildCommandLine -Value $child.command_line)) { $childValid = $false }
                         if (-not (Test-D32Phase0Integer -Value $child.process_id -Positive) -or -not (Test-D32Phase0Integer -Value $child.parent_process_id -Positive) -or -not (Test-D32Phase0Integer -Value $child.bytes -Positive) -or $child.identity_verified -isnot [bool] -or -not $child.identity_verified) { $childValid = $false }
                         if ($child.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $child.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or $child.file_id_hex -cnotmatch '^[0-9a-f]{32}$') { $childValid = $false }
                     }

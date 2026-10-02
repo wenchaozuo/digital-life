@@ -495,14 +495,20 @@ function Assert-D32DownstreamD31DirectoryReference {
 }
 
 function Assert-D32DownstreamD31ProcessIdentityDocument {
-    param([Parameter(Mandatory = $true)][AllowNull()][object]$Identity, [Parameter(Mandatory = $true)][string]$Name)
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Identity,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [switch]$AllowMissingCommandLine
+    )
     Assert-D32DownstreamExactKeys -Value $Identity -Expected @('process_id', 'parent_process_id', 'name', 'image_path', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified') -Name $Name
     Assert-D32DownstreamInteger -Value $Identity.process_id -Name "$Name process id" -Minimum 1
     Assert-D32DownstreamInteger -Value $Identity.parent_process_id -Name "$Name parent process id" -Minimum 1
     if ($Identity.name -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Identity.name) -or
         $Identity.image_path -isnot [string] -or -not [System.IO.Path]::IsPathRooted([string]$Identity.image_path) -or
         $Identity.creation_date -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Identity.creation_date) -or
-        $Identity.command_line -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Identity.command_line) -or
+        $Identity.command_line -isnot [string] -or
+        ([string]::IsNullOrWhiteSpace([string]$Identity.command_line) -and
+            (-not $AllowMissingCommandLine -or $Identity.command_line.Length -ne 0)) -or
         $Identity.observed_at_utc -isnot [string] -or $Identity.identity_verified -isnot [bool] -or -not $Identity.identity_verified) {
         throw "$Name process identity is malformed or unverified"
     }
@@ -568,9 +574,10 @@ function Assert-D32DownstreamD31IdentityMatchesTrace {
     param(
         [Parameter(Mandatory = $true)][AllowNull()][object]$Identity,
         [Parameter(Mandatory = $true)][AllowNull()][object]$TraceProcess,
-        [Parameter(Mandatory = $true)][string]$Name
+        [Parameter(Mandatory = $true)][string]$Name,
+        [switch]$AllowMissingCommandLine
     )
-    Assert-D32DownstreamD31ProcessIdentityDocument -Identity $Identity -Name $Name
+    Assert-D32DownstreamD31ProcessIdentityDocument -Identity $Identity -Name $Name -AllowMissingCommandLine:$AllowMissingCommandLine
     if ([decimal]$Identity.process_id -ne [decimal]$TraceProcess.process_id -or
         [decimal]$Identity.parent_process_id -ne [decimal]$TraceProcess.parent_process_id -or
         -not (Test-D32DownstreamPathEqual -Left ([string]$Identity.image_path) -Right ([string]$TraceProcess.image_path)) -or
@@ -713,7 +720,8 @@ function Assert-D32DownstreamD31Phase {
         throw "$Name descendant identity count differs from Trace V2 process order"
     }
     for ($index = 0; $index -lt $Phase.descendant_records.Count; $index++) {
-        Assert-D32DownstreamD31IdentityMatchesTrace -Identity $Phase.descendant_records[$index] -TraceProcess $trace.processes[$index + 1] -Name "$Name descendant[$index]"
+        Assert-D32DownstreamD31IdentityMatchesTrace -Identity $Phase.descendant_records[$index] -TraceProcess $trace.processes[$index + 1] `
+            -Name "$Name descendant[$index]" -AllowMissingCommandLine
     }
     foreach ($process in $trace.processes) {
         if ([string]$process.image_path -match '(?i)(^|[\\/])vctip(?:\.exe)?$') { throw "$Name Trace V2 contains prohibited VCTIP" }

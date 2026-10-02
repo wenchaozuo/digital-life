@@ -1,14 +1,16 @@
 # Module-free focused regression checks for the V2 debug-trace root identity boundary.
 [CmdletBinding()]
-param()
+param([string]$ReplayPhase0DiagnosticPath)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
 $phase0Path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1'))
 $fixturePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
+$preflightPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-preflight.ps1'))
 $vendoredProtocPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-vendored-protoc-authority.ps1'))
 $h7AuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-h7c-git-child-authority.ps1'))
+$downstreamReadinessPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-downstream-readiness.ps1'))
 $profilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'))
 $moduleAuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'))
 $moduleStart = @(Microsoft.PowerShell.Core\Get-Module | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Version, $_.Path } | Sort-Object)
@@ -131,12 +133,20 @@ function Get-D32Phase0AllowedChildImageReason {
         [AllowNull()][object]$VendoredProtocGrant,
         [AllowNull()][object]$H7CGitRunGrant
     )
+    $imageSha = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('sha256', 'Sha256')
+    $imageBytes = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('bytes', 'Bytes')
+    $imageVolume = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('volume_serial_hex', 'VolumeSerialHex')
+    $imageFileId = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('file_id_hex', 'FileIdHex')
     $matches = @($ValidatedProfile.ExecutableInventory + $ValidatedProfile.WindowsImageInventory | Where-Object {
         (Test-D32ProfilePathEqual -Left $_.Path -Right $ImagePath) -and
-        $_.Sha256 -ceq $ImageIdentity.sha256 -and [Int64]$_.Bytes -eq [Int64]$ImageIdentity.bytes -and
-        $_.VolumeSerialHex -ceq $ImageIdentity.volume_serial_hex -and $_.FileIdHex -ceq $ImageIdentity.file_id_hex
+        $_.Sha256 -ceq $imageSha -and [Int64]$_.Bytes -eq [Int64]$imageBytes -and
+        $_.VolumeSerialHex -ceq $imageVolume -and $_.FileIdHex -ceq $imageFileId
     })
-    if ($matches.Count -eq 1) { return 'module-free-selftest-exact-child-pin' }
+    if ($matches.Count -eq 1) {
+        $recordedReason = Get-D32Phase0DiagnosticPropertyValue -Object $ImageIdentity -Names @('allowed_image_reason', 'AllowedImageReason')
+        if ($recordedReason -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$recordedReason)) { return [string]$recordedReason }
+        return 'caller-pinned-toolchain-native-or-Windows-image'
+    }
     return $null
 }
 
@@ -152,6 +162,7 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfileJsonElementDuplicates' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0ExactProperties' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0Integer' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0OptionalChildCommandLine' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0DirectoryEntryExists' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0ActualDebugCommandLine' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiscoveryFailureEvidence' },
@@ -167,6 +178,8 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0FixtureGitStates' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0FixtureFailurePayload' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertFrom-D32Phase0DebugProcess' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0ProcessRecord' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0InventoryProcessRecord' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiagnosticPropertyValue' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Write-D32Phase0BlockedDiagnostic' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Assert-D32Phase0DiscoveryNoBlockedDiagnostic' },
@@ -217,6 +230,16 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Test-D32D31RecoverySeederOwnerMarker' }
     )) {
     Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $entry.Path -Name $entry.Name)
+}
+foreach ($entry in @(
+        [PSCustomObject]@{ Name = 'Assert-D32DownstreamExactKeys' },
+        [PSCustomObject]@{ Name = 'Assert-D32DownstreamInteger' },
+        [PSCustomObject]@{ Name = 'Get-D32DownstreamCanonicalPath' },
+        [PSCustomObject]@{ Name = 'Test-D32DownstreamPathEqual' },
+        [PSCustomObject]@{ Name = 'Assert-D32DownstreamD31ProcessIdentityDocument' },
+        [PSCustomObject]@{ Name = 'Assert-D32DownstreamD31IdentityMatchesTrace' }
+    )) {
+    Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $downstreamReadinessPath -Name $entry.Name)
 }
 
 # This fixture isolates the companion envelope's delegation boundary; the
@@ -395,7 +418,7 @@ function New-D32CompanionSelfTestPhase {
     $descendants = @([ordered]@{
         process_id = $childPid; parent_process_id = $rootPid; name = [IO.Path]::GetFileName([string]$child.image_path)
         image_path = [string]$child.image_path; creation_date = $childCreatedAt
-        command_line = 'synthetic-child.exe --no-network'; observed_at_utc = $childCreatedAt; identity_verified = $true
+        command_line = ''; observed_at_utc = $childCreatedAt; identity_verified = $true
     })
     $phaseLog = Join-Path (Join-Path $RunRoot 'logs') $Name
     $stdoutPath = $phaseLog + '.stdout.log'
@@ -605,6 +628,319 @@ $optionalRootRejected = $false
 try { $null = ConvertFrom-D32Phase0DebugProcess -Process $optionalChild -ExpectedCommandLine $captureLine }
 catch { $optionalRootRejected = $_.Exception.Message -like 'PHASE0_PROCESS_IDENTITY_BLOCKED:*' }
 Add-D32TraceIdentitySelfTestCase -Name 'fixed root identity rejects an optional empty child command-line diagnostic' -Passed $optionalRootRejected
+$phase0ConverterPath = [IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
+$phase0ConverterSnapshot = Get-D32ProfileFileSnapshot -Path $phase0ConverterPath
+$phase0ConverterPin = [PSCustomObject]@{
+    Path = $phase0ConverterPath; Sha256 = [string]$phase0ConverterSnapshot.Sha256; Bytes = [Int64]$phase0ConverterSnapshot.Bytes
+    VolumeSerialHex = [string]$phase0ConverterSnapshot.VolumeSerialHex; FileIdHex = [string]$phase0ConverterSnapshot.FileIdHex
+}
+$phase0ConverterProfile = [PSCustomObject]@{ ExecutableInventory = @($phase0ConverterPin); WindowsImageInventory = @() }
+$phase0ConverterNative = Copy-D32DebugCommandLineCaptureSelfTestShape -Value $nativeProcess
+$phase0ConverterNative.ImagePath = $phase0ConverterPath
+$phase0ConverterNative.Bytes = [Int64]$phase0ConverterSnapshot.Bytes
+$phase0ConverterNative.Sha256 = [string]$phase0ConverterSnapshot.Sha256
+$phase0ConverterNative.VolumeSerialHex = [string]$phase0ConverterSnapshot.VolumeSerialHex
+$phase0ConverterNative.FileIdHex = [string]$phase0ConverterSnapshot.FileIdHex
+$phase0ConverterNative.CommandLineCapture.ImagePath = $phase0ConverterPath
+$phase0ConverterNative.CommandLineCapture.Bytes = [Int64]$phase0ConverterSnapshot.Bytes
+$phase0ConverterNative.CommandLineCapture.Sha256 = [string]$phase0ConverterSnapshot.Sha256
+$phase0ConverterNative.CommandLineCapture.VolumeSerialHex = [string]$phase0ConverterSnapshot.VolumeSerialHex
+$phase0ConverterNative.CommandLineCapture.FileIdHex = [string]$phase0ConverterSnapshot.FileIdHex
+$phase0ConverterArguments = @($phase0ConverterPath, 'fetch', '--locked', '--manifest-path', 'E:\d32\synthetic repo\Cargo.toml')
+$phase0ConverterLine = ConvertTo-D32Phase0CommandLine -Arguments $phase0ConverterArguments
+$phase0ConverterNative.CommandLineCapture.CommandLine = $phase0ConverterLine
+$phase0RootProxy = ConvertFrom-D32Phase0DebugProcess -Process $phase0ConverterNative -ExpectedCommandLine $phase0ConverterLine
+$phase0RootRecord = ConvertTo-D32Phase0ProcessRecord -Process $phase0RootProxy -ValidatedProfile $phase0ConverterProfile `
+    -Repository $repo -ExpectedRootPath $phase0ConverterPath -VendoredProtocGrant $null -H7CGitRunGrant $null
+Add-D32TraceIdentitySelfTestCase -Name 'production Phase0 converter accepts the actual-required root PEB line only with its exact capture source and image identity' `
+    -Passed ($phase0RootRecord.command_line -ceq $phase0ConverterLine -and $phase0RootRecord.identity_verified -and
+        $phase0RootRecord.sha256 -ceq $phase0ConverterPin.Sha256 -and $phase0RootRecord.file_id_hex -ceq $phase0ConverterPin.FileIdHex)
+$phase0OptionalNative = Copy-D32DebugCommandLineCaptureSelfTestShape -Value $phase0ConverterNative
+$phase0OptionalNative.CommandLineCaptureRequired = $false
+$phase0OptionalNative.CommandLineCapture.Source = 'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+$phase0OptionalNative.CommandLineCapture.CommandLine = ''
+$phase0OptionalProxy = ConvertFrom-D32Phase0DebugProcess -Process $phase0OptionalNative
+$phase0OptionalRecord = ConvertTo-D32Phase0ProcessRecord -Process $phase0OptionalProxy -ValidatedProfile $phase0ConverterProfile `
+    -Repository $repo -ExpectedRootPath $phase0ConverterPath -VendoredProtocGrant $null -H7CGitRunGrant $null
+Add-D32TraceIdentitySelfTestCase -Name 'production Phase0 converter serializes only an explicitly uncaptured ordinary descendant as the frozen empty-string diagnostic' `
+    -Passed ($phase0OptionalRecord.command_line -ceq '' -and $phase0OptionalRecord.identity_verified -and
+        $phase0OptionalRecord.process_id -eq $phase0OptionalNative.ProcessId -and
+        $phase0OptionalRecord.parent_process_id -eq $phase0OptionalNative.ParentProcessId -and
+        $phase0OptionalRecord.image_path -ceq $phase0ConverterPath -and
+        $phase0OptionalRecord.file_id_hex -ceq $phase0ConverterPin.FileIdHex)
+$phase0OptionalConverterNegatives = [System.Collections.Generic.List[string]]::new()
+foreach ($badLineKind in @('null', 'DBNull', 'whitespace', 'invented')) {
+    $badProxy = ConvertFrom-D32Phase0DebugProcess -Process $phase0OptionalNative
+    switch ($badLineKind) {
+        'null' { $badProxy.command_line = $null }
+        'DBNull' { $badProxy.command_line = [DBNull]::Value }
+        'whitespace' { $badProxy.command_line = ' ' }
+        'invented' { $badProxy.command_line = 'caller-invented command' }
+    }
+    $rejected = $false
+    try { $null = ConvertTo-D32Phase0ProcessRecord -Process $badProxy -ValidatedProfile $phase0ConverterProfile `
+            -Repository $repo -ExpectedRootPath $phase0ConverterPath -VendoredProtocGrant $null -H7CGitRunGrant $null }
+    catch { $rejected = $_.Exception.Message -like 'PHASE0_PROCESS_TREE_BLOCKED:*' }
+    if (-not $rejected) { $phase0OptionalConverterNegatives.Add($badLineKind) }
+}
+$rootEmptyConverterRejected = $false
+$phase0EmptyRootProxy = ConvertFrom-D32Phase0DebugProcess -Process $phase0ConverterNative -ExpectedCommandLine $phase0ConverterLine
+$phase0EmptyRootProxy.command_line = ''
+try { $null = ConvertTo-D32Phase0ProcessRecord -Process $phase0EmptyRootProxy -ValidatedProfile $phase0ConverterProfile `
+        -Repository $repo -ExpectedRootPath $phase0ConverterPath -VendoredProtocGrant $null -H7CGitRunGrant $null }
+catch { $rootEmptyConverterRejected = $_.Exception.Message -like 'PHASE0_PROCESS_TREE_BLOCKED:*' }
+Add-D32TraceIdentitySelfTestCase -Name 'production Phase0 converter rejects null, DBNull, whitespace-only, invented optional text, and empty required root argv' `
+    -Passed ($phase0OptionalConverterNegatives.Count -eq 0 -and $rootEmptyConverterRejected) `
+    -Detail ('optional_rejected={0};root_empty_rejected={1}' -f ($phase0OptionalConverterNegatives -join '|'), $rootEmptyConverterRejected)
+
+if (-not [String]::IsNullOrWhiteSpace($ReplayPhase0DiagnosticPath)) {
+    $replayPassed = $false
+    $replayFailure = $null
+    $replayDetail = $null
+    $priorNativeSnapshotMode = $script:D32TraceIdentityUseNativeSnapshots
+    try {
+        $script:D32TraceIdentityUseNativeSnapshots = $true
+        $replayPath = [IO.Path]::GetFullPath($ReplayPhase0DiagnosticPath)
+        $replayRoot = [IO.Path]::GetDirectoryName($replayPath)
+        if (-not (Test-D32ProfileNoReparsePath -Path $replayRoot) -or -not (Test-D32ProfileNoReparsePath -Path $replayPath) -or
+            (Test-D32ProfilePathWithin -Child $replayRoot -Parent $repo) -or (Test-D32ProfilePathWithin -Child $repo -Parent $replayRoot)) {
+            throw 'SELFTEST_BLOCKED: replay diagnostic must be an external non-reparse evidence file'
+        }
+        $replay = [IO.File]::ReadAllText($replayPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 100 -DateKind String
+        if ($replay.record_type -cne 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1' -or $replay.status -cne 'BLOCKED' -or $replay.gate_authority -cne 'NONE' -or
+            $replay.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or $replay.primary_error -notmatch 'process identity fields are incomplete' -or
+            $replay.raw_v2_trace.state -cne 'COMPLETED' -or -not $replay.raw_v2_trace.event_chain_complete -or
+            $replay.raw_v2_trace.processes.Count -ne 2 -or $replay.raw_v2_trace.process_events.Count -ne 4 -or
+            $replay.job_debug_cleanup.verification -cne 'VERIFIED' -or $replay.unverified_fields.Count -ne 0 -or
+            $replay.ordered_stream_captures.Count -ne 2 -or $replay.ordered_stream_captures[0].stream -cne 'stdout' -or
+            $replay.ordered_stream_captures[1].stream -cne 'stderr' -or
+            @($replay.ordered_stream_captures | Where-Object { $_.status -cne 'CAPTURED' -or $null -eq $_.reference }).Count -ne 0) {
+            throw 'SELFTEST_BLOCKED: replay diagnostic is not the complete inv5 process-tree failure evidence'
+        }
+
+        $replayTrace = $replay.raw_v2_trace
+        $replayRootTrace = @($replayTrace.processes | Where-Object { $_.create_sequence -eq 1 })
+        $replayChildren = @($replayTrace.processes | Where-Object { $_.create_sequence -ne 1 })
+        if ($replayRootTrace.Count -ne 1 -or $replayChildren.Count -ne 1 -or
+            $replayRootTrace[0].process_id -ne $replay.process_identity.process_id -or
+            $replayRootTrace[0].creation_filetime -ne ([DateTime]::Parse([string]$replay.process_identity.creation_date, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToFileTimeUtc()) -or
+            $replayRootTrace[0].image_path -cne $replay.process_identity.image_path -or
+            $replayRootTrace[0].sha256 -cne $replay.process_identity.sha256 -or
+            $replayRootTrace[0].file_id_hex -cne $replay.process_identity.file_id_hex) {
+            throw 'SELFTEST_BLOCKED: replay root outer identity differs from its actual V2 CREATE record'
+        }
+        $replayFailureCommand = $replay.failing_fixed_command
+        $replayCargoSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$replayFailureCommand.executable)
+        if ($replayCargoSnapshot.Sha256 -cne [string]$replayRootTrace[0].sha256 -or
+            [Int64]$replayCargoSnapshot.Bytes -ne [Int64]$replayRootTrace[0].bytes -or
+            $replayCargoSnapshot.VolumeSerialHex -cne [string]$replayRootTrace[0].volume_serial_hex -or
+            $replayCargoSnapshot.FileIdHex -cne [string]$replayRootTrace[0].file_id_hex) {
+            throw 'SELFTEST_BLOCKED: replay fixed Cargo image no longer matches its preserved CREATE/opened-image identity'
+        }
+        $replayChildSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$replayChildren[0].image_path)
+        if ($replayChildSnapshot.Sha256 -cne [string]$replayChildren[0].sha256 -or
+            [Int64]$replayChildSnapshot.Bytes -ne [Int64]$replayChildren[0].bytes -or
+            $replayChildSnapshot.VolumeSerialHex -cne [string]$replayChildren[0].volume_serial_hex -or
+            $replayChildSnapshot.FileIdHex -cne [string]$replayChildren[0].file_id_hex) {
+            throw 'SELFTEST_BLOCKED: replay descendant image no longer matches its preserved CREATE/opened-image identity'
+        }
+        $replayCargoPin = [PSCustomObject]@{
+            name = 'cargo.exe'; path = $replayCargoSnapshot.Path; sha256 = $replayCargoSnapshot.Sha256; bytes = [Int64]$replayCargoSnapshot.Bytes
+            volume_serial_hex = $replayCargoSnapshot.VolumeSerialHex; file_id_hex = $replayCargoSnapshot.FileIdHex
+            reason = 'module-free inv5 replay projection of the preserved direct Cargo root pin'
+        }
+        $replayCargoInventoryPin = [PSCustomObject]@{
+            Path = $replayCargoSnapshot.Path; Sha256 = $replayCargoSnapshot.Sha256; Bytes = [Int64]$replayCargoSnapshot.Bytes
+            VolumeSerialHex = $replayCargoSnapshot.VolumeSerialHex; FileIdHex = $replayCargoSnapshot.FileIdHex
+        }
+        $replayChildPin = [PSCustomObject]@{
+            Path = $replayChildSnapshot.Path; Sha256 = $replayChildSnapshot.Sha256; Bytes = [Int64]$replayChildSnapshot.Bytes
+            VolumeSerialHex = $replayChildSnapshot.VolumeSerialHex; FileIdHex = $replayChildSnapshot.FileIdHex
+        }
+        $replayProfile = [PSCustomObject]@{
+            Profile = [PSCustomObject]@{ toolchain = [PSCustomObject]@{ cargo = $replayCargoPin } }
+            ExecutableInventory = @($replayCargoInventoryPin); WindowsImageInventory = @($replayChildPin)
+        }
+        $null = Test-D32Phase0DebugProcessTrace -Trace $replayTrace -ExpectedRootPath ([string]$replayCargoSnapshot.Path) `
+            -ExpectedRootIdentity $replayCargoPin -ExpectedParentProcessId ([int]$replayTrace.debugger_process_id) `
+            -ValidatedProfile $replayProfile -Repository $repo -VendoredProtocGrant $null
+
+        $replayRootCapture = [PSCustomObject][ordered]@{
+            Source = 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine'
+            ProcessId = [uint32]$replayRootTrace[0].process_id; CreationFileTime = [Int64]$replayRootTrace[0].creation_filetime
+            ParentProcessId = [uint32]$replayRootTrace[0].parent_process_id; ParentCreationFileTime = [Int64]$replayRootTrace[0].parent_creation_filetime
+            ImagePath = [string]$replayRootTrace[0].image_path; Bytes = [Int64]$replayRootTrace[0].bytes
+            Sha256 = [string]$replayRootTrace[0].sha256; VolumeSerialHex = [string]$replayRootTrace[0].volume_serial_hex
+            FileIdHex = [string]$replayRootTrace[0].file_id_hex; CommandLine = [string]$replay.process_identity.command_line
+        }
+        $replayRootNative = [PSCustomObject][ordered]@{
+            ProcessId = [uint32]$replayRootTrace[0].process_id; ParentProcessId = [uint32]$replayRootTrace[0].parent_process_id
+            CreationFileTime = [Int64]$replayRootTrace[0].creation_filetime; ParentCreationFileTime = [Int64]$replayRootTrace[0].parent_creation_filetime
+            ImagePath = [string]$replayRootTrace[0].image_path; Bytes = [Int64]$replayRootTrace[0].bytes
+            Sha256 = [string]$replayRootTrace[0].sha256; VolumeSerialHex = [string]$replayRootTrace[0].volume_serial_hex
+            FileIdHex = [string]$replayRootTrace[0].file_id_hex; ImageVerified = [bool]$replayRootTrace[0].image_verified
+            CommandLineCaptureRequired = $true; Exited = [bool]$replayRootTrace[0].exited
+            CreatedAtUtc = [string]$replayRootTrace[0].created_at_utc; CommandLineCapture = $replayRootCapture
+        }
+        $replayRootProxy = ConvertFrom-D32Phase0DebugProcess -Process $replayRootNative -ExpectedCommandLine ([string]$replay.process_identity.command_line)
+        $replayRootRecord = ConvertTo-D32Phase0ProcessRecord -Process $replayRootProxy -ValidatedProfile $replayProfile `
+            -Repository $repo -ExpectedRootPath ([string]$replayCargoSnapshot.Path) -VendoredProtocGrant $null -H7CGitRunGrant $null
+        if ($replayRootRecord.command_line -cne [string]$replay.process_identity.command_line -or
+            $replayRootRecord.process_id -ne $replay.process_identity.process_id -or
+            $replayRootRecord.parent_process_id -ne $replay.process_identity.parent_process_id -or
+            $replayRootRecord.file_id_hex -cne $replay.process_identity.file_id_hex) {
+            throw 'SELFTEST_BLOCKED: replay fixed Cargo root no longer preserves its exact required argv and identity'
+        }
+
+        $replayDescendantRecords = [System.Collections.Generic.List[object]]::new()
+        foreach ($traceChild in $replayChildren) {
+            $optionalCapture = [PSCustomObject][ordered]@{
+                Source = 'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+                ProcessId = [uint32]$traceChild.process_id; CreationFileTime = [Int64]$traceChild.creation_filetime
+                ParentProcessId = [uint32]$traceChild.parent_process_id; ParentCreationFileTime = [Int64]$traceChild.parent_creation_filetime
+                ImagePath = [string]$traceChild.image_path; Bytes = [Int64]$traceChild.bytes
+                Sha256 = [string]$traceChild.sha256; VolumeSerialHex = [string]$traceChild.volume_serial_hex
+                FileIdHex = [string]$traceChild.file_id_hex; CommandLine = ''
+            }
+            $nativeChild = [PSCustomObject][ordered]@{
+                ProcessId = [uint32]$traceChild.process_id; ParentProcessId = [uint32]$traceChild.parent_process_id
+                CreationFileTime = [Int64]$traceChild.creation_filetime; ParentCreationFileTime = [Int64]$traceChild.parent_creation_filetime
+                ImagePath = [string]$traceChild.image_path; Bytes = [Int64]$traceChild.bytes
+                Sha256 = [string]$traceChild.sha256; VolumeSerialHex = [string]$traceChild.volume_serial_hex
+                FileIdHex = [string]$traceChild.file_id_hex; ImageVerified = [bool]$traceChild.image_verified
+                CommandLineCaptureRequired = $false; Exited = [bool]$traceChild.exited
+                CreatedAtUtc = [string]$traceChild.created_at_utc; CommandLineCapture = $optionalCapture
+            }
+            $childProxy = ConvertFrom-D32Phase0DebugProcess -Process $nativeChild
+            $replayDescendantRecords.Add((ConvertTo-D32Phase0ProcessRecord -Process $childProxy -ValidatedProfile $replayProfile `
+                    -Repository $repo -ExpectedRootPath ([string]$replayCargoSnapshot.Path) -VendoredProtocGrant $null -H7CGitRunGrant $null))
+        }
+        $nativeCleanup = $replay.job_debug_cleanup.raw_native_cleanup
+        $replayCommand = [ordered]@{
+            name = [string]$replayFailureCommand.name; timeout_seconds = [Int64]14400
+            executable = [string]$replayFailureCommand.executable; executable_sha256 = [string]$replayFailureCommand.executable_sha256
+            executable_bytes = [Int64]$replayFailureCommand.executable_bytes
+            executable_volume_serial_hex = [string]$replayFailureCommand.executable_volume_serial_hex
+            executable_file_id_hex = [string]$replayFailureCommand.executable_file_id_hex
+            argv = @([string]$replayFailureCommand.executable) + @($replayFailureCommand.arguments)
+            arguments = @($replayFailureCommand.arguments); command_line = [string]$replayFailureCommand.command_line
+            working_directory = [string]$replayFailureCommand.working_directory
+            candidate_sha_before = [string]$replay.candidate_sha; clean_before = $true
+            started_at_utc = [string]$replayTrace.started_at_utc; completed_at_utc = [string]$replayTrace.completed_at_utc
+            exit_code = [int]$replayRootTrace[0].exit_code; root_process = $replay.process_identity
+            descendant_processes = @($replayDescendantRecords.ToArray()); process_trace = $replayTrace
+            process_tree_cleanup = [ordered]@{
+                launch_mode = 'DedicatedOSDebuggerThread(CreateProcessW(DEBUG_PROCESS|CREATE_SUSPENDED)+DebugSetProcessKillOnExit(TRUE)+ResumeThread+WaitForDebugEvent+ContinueDebugEvent)+EXTENDED_STARTUP_INFO+HANDLE_LIST(stdout/stderr)+AssignProcessToJobObject(KILL_ON_JOB_CLOSE)'
+                job_close_succeeded = [bool]$nativeCleanup.JobCloseSucceeded
+                process_wait_signaled = [bool]$nativeCleanup.ProcessWaitSignaled
+                active_process_count_verified = [bool]$nativeCleanup.JobActiveProcessCountVerified
+                active_process_count = [uint32]$nativeCleanup.JobActiveProcessCount
+                debugger_thread_id = [uint32]$nativeCleanup.DebuggerThreadId
+                debugger_thread_exited = [bool]$nativeCleanup.DebuggerThreadExited
+                debugger_thread_joined = [bool]$nativeCleanup.DebuggerThreadJoined
+                debugger_kill_on_exit_enabled = [bool]$nativeCleanup.DebuggerKillOnExitEnabled
+                retained_process_handle_count = [int]$nativeCleanup.RetainedProcessHandleCount
+                retained_process_handles_signaled = [bool]$nativeCleanup.RetainedProcessHandlesSignaled
+                debugger_association_query_verified = [bool]$nativeCleanup.DebuggerAssociationQueryVerified
+                debugger_association_absent = [bool]$nativeCleanup.DebuggerAssociationAbsent
+                cleanup_succeeded = [bool]$nativeCleanup.CleanupSucceeded; detail = [string]$nativeCleanup.Detail
+            }
+            stdout = $replay.ordered_stream_captures[0].reference; stderr = $replay.ordered_stream_captures[1].reference
+            candidate_sha_after = [string]$replay.candidate_sha; clean_after = $true
+        }
+        $null = Test-D32Phase0InventoryProcessRecord -Command $replayCommand -Name ([string]$replayFailureCommand.name) `
+            -Executable ([string]$replayFailureCommand.executable) -Arguments ([string[]]$replayFailureCommand.arguments) `
+            -TimeoutSeconds 14400 -RunnerProcessId ([int]$replayTrace.debugger_process_id) -Profile $replayProfile `
+            -Repository $repo -CandidateSha ([string]$replay.candidate_sha) -EvidenceRoot $replayRoot -VendoredProtocGrant $null
+
+        $readerRejected = [System.Collections.Generic.List[string]]::new()
+        foreach ($case in @(
+                [PSCustomObject]@{ Name = 'missing command-line property'; Mutate = { param($value) $value.Remove('command_line') } },
+                [PSCustomObject]@{ Name = 'null command line'; Mutate = { param($value) $value['command_line'] = $null } },
+                [PSCustomObject]@{ Name = 'DBNull command line'; Mutate = { param($value) $value['command_line'] = [DBNull]::Value } },
+                [PSCustomObject]@{ Name = 'whitespace-only command line'; Mutate = { param($value) $value['command_line'] = ' ' } },
+                [PSCustomObject]@{ Name = 'wrong descendant parent'; Mutate = { param($value) $value['parent_process_id']++ } },
+                [PSCustomObject]@{ Name = 'wrong descendant image'; Mutate = { param($value) $value['image_path'] = 'C:\Windows\System32\unapproved.exe' } }
+            )) {
+            $badChildMap = [ordered]@{}
+            foreach ($property in $replayDescendantRecords[0].PSObject.Properties) { $badChildMap[$property.Name] = $property.Value }
+            & $case.Mutate $badChildMap
+            $badChild = [PSCustomObject]$badChildMap
+            $badCommand = [ordered]@{}
+            foreach ($key in $replayCommand.Keys) { $badCommand[$key] = $replayCommand[$key] }
+            $badCommand.descendant_processes = @($badChild)
+            $rejected = $false
+            try { $null = Test-D32Phase0InventoryProcessRecord -Command $badCommand -Name ([string]$replayFailureCommand.name) `
+                    -Executable ([string]$replayFailureCommand.executable) -Arguments ([string[]]$replayFailureCommand.arguments) `
+                    -TimeoutSeconds 14400 -RunnerProcessId ([int]$replayTrace.debugger_process_id) -Profile $replayProfile `
+                    -Repository $repo -CandidateSha ([string]$replay.candidate_sha) -EvidenceRoot $replayRoot -VendoredProtocGrant $null }
+            catch { $rejected = $_.Exception.Message -like 'TEST_INVENTORY_DISCOVERY_BLOCKED:*' }
+            if (-not $rejected) { $readerRejected.Add($case.Name) }
+        }
+        if ($readerRejected.Count -ne 0) { throw ('SELFTEST_BLOCKED: official discovery command reader accepted child mutations: ' + ($readerRejected -join '|')) }
+
+        $actualStdout = [IO.File]::ReadAllBytes([string]$replayCommand.stdout.path)
+        $actualStderr = [IO.File]::ReadAllBytes([string]$replayCommand.stderr.path)
+        $stdoutSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($actualStdout)).ToLowerInvariant()
+        $stderrSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($actualStderr)).ToLowerInvariant()
+        if ($actualStdout.LongLength -ne [Int64]$replayCommand.stdout.bytes -or $stdoutSha -cne [string]$replayCommand.stdout.sha256 -or
+            $actualStderr.LongLength -ne [Int64]$replayCommand.stderr.bytes -or $stderrSha -cne [string]$replayCommand.stderr.sha256) {
+            throw 'SELFTEST_BLOCKED: replay raw stream bytes differ from their immutable V1 references'
+        }
+
+        $replayChildIdentity = $replayDescendantRecords[0]
+        $downstreamIdentity = [ordered]@{
+            process_id = [Int64]$replayChildIdentity.process_id; parent_process_id = [Int64]$replayChildIdentity.parent_process_id
+            name = [string]$replayChildIdentity.name; image_path = [string]$replayChildIdentity.image_path
+            creation_date = [string]$replayChildIdentity.creation_date; command_line = ''
+            observed_at_utc = [string]$replayChildIdentity.observed_at_utc; identity_verified = [bool]$replayChildIdentity.identity_verified
+        }
+        $null = Assert-D32DownstreamD31IdentityMatchesTrace -Identity $downstreamIdentity -TraceProcess $replayChildren[0] `
+            -Name 'inv5 replay optional descendant' -AllowMissingCommandLine
+        $downstreamPositive = $true
+        $downstreamNegatives = [System.Collections.Generic.List[string]]::new()
+        foreach ($case in @(
+                [PSCustomObject]@{ Name = 'missing command-line property'; Mutate = { param($value) $value.Remove('command_line') } },
+                [PSCustomObject]@{ Name = 'null command line'; Mutate = { param($value) $value['command_line'] = $null } },
+                [PSCustomObject]@{ Name = 'DBNull command line'; Mutate = { param($value) $value['command_line'] = [DBNull]::Value } },
+                [PSCustomObject]@{ Name = 'whitespace-only command line'; Mutate = { param($value) $value['command_line'] = ' ' } },
+                [PSCustomObject]@{ Name = 'wrong descendant parent'; Mutate = { param($value) $value['parent_process_id']++ } },
+                [PSCustomObject]@{ Name = 'wrong descendant image'; Mutate = { param($value) $value['image_path'] = 'C:\Windows\System32\unapproved.exe' } }
+            )) {
+            $badIdentity = [ordered]@{}
+            foreach ($key in $downstreamIdentity.Keys) { $badIdentity[$key] = $downstreamIdentity[$key] }
+            & $case.Mutate $badIdentity
+            $rejected = $false
+            try { Assert-D32DownstreamD31IdentityMatchesTrace -Identity $badIdentity -TraceProcess $replayChildren[0] `
+                    -Name "inv5 replay $($case.Name)" -AllowMissingCommandLine }
+            catch { $rejected = $true }
+            if (-not $rejected) { $downstreamNegatives.Add($case.Name) }
+        }
+        $rootMissingCommandRejected = $false
+        $rootDownstreamIdentity = [ordered]@{
+            process_id = [Int64]$replay.process_identity.process_id; parent_process_id = [Int64]$replay.process_identity.parent_process_id
+            name = [string]$replay.process_identity.name; image_path = [string]$replay.process_identity.image_path
+            creation_date = [string]$replay.process_identity.creation_date; command_line = ''
+            observed_at_utc = [string]$replay.process_identity.observed_at_utc; identity_verified = [bool]$replay.process_identity.identity_verified
+        }
+        try { Assert-D32DownstreamD31ProcessIdentityDocument -Identity $rootDownstreamIdentity -Name 'inv5 replay fixed Cargo root' }
+        catch { $rootMissingCommandRejected = $true }
+        Add-D32TraceIdentitySelfTestCase -Name 'official Phase0 discovery reader accepts inv5 ordinary empty diagnostic but rejects missing/null/DBNull/whitespace and wrong parent/image projections' `
+            -Passed ($readerRejected.Count -eq 0) -Detail ('rejected_mutations={0}' -f $readerRejected.Count)
+        Add-D32TraceIdentitySelfTestCase -Name 'official downstream D31 identity reader accepts only explicit empty optional descendant diagnostics and keeps root argv strict' `
+            -Passed ($downstreamPositive -and $downstreamNegatives.Count -eq 0 -and $rootMissingCommandRejected) `
+            -Detail ('rejected_mutations={0};root_empty_rejected={1}' -f $downstreamNegatives.Count, $rootMissingCommandRejected)
+        $replayPassed = $downstreamPositive -and $downstreamNegatives.Count -eq 0 -and $rootMissingCommandRejected -and
+            $replayCommand.descendant_processes.Count -eq $replayTrace.processes.Count - 1 -and $actualStdout.LongLength -eq 0 -and
+            $actualStderr.LongLength -eq [Int64]$replayCommand.stderr.bytes
+        $replayDetail = 'source=immutable-inv5-diagnostic; trace_processes={0}; events={1}; stdout_bytes={2}; stdout_sha256={3}; stderr_bytes={4}; stderr_sha256={5}; synthesized_outer_command_wrapper=true' -f `
+            $replayTrace.processes.Count, $replayTrace.process_events.Count, $actualStdout.LongLength, $stdoutSha, $actualStderr.LongLength, $stderrSha
+    }
+    catch { $replayFailure = $_.Exception.Message }
+    finally { $script:D32TraceIdentityUseNativeSnapshots = $priorNativeSnapshotMode }
+    Add-D32TraceIdentitySelfTestCase -Name 'inv5 immutable Cargo/conhost V2 trace and raw streams replay through official Phase0 converter, discovery command reader, and D31 downstream identity reader' `
+        -Passed ($replayPassed -and $null -eq $replayFailure) -Detail $(if ($null -ne $replayFailure) { $replayFailure } else { $replayDetail })
+}
 foreach ($optionalCase in @(
         [PSCustomObject]@{ Name = 'invented command line'; Mutate = { param($p) $p.CommandLineCapture.CommandLine = 'caller argv' } },
         [PSCustomObject]@{ Name = 'actual-source claim'; Mutate = { param($p) $p.CommandLineCapture.Source = 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine' } },
@@ -751,6 +1087,43 @@ $wireSerializersDoNotExtendV2 = $null -ne $traceSerializer -and $fixtureAst -and
     $fixtureSource.Contains('cursor.ParentCreationFileTime != debuggerCreation') -and
     $remoteUnicodeReaderSafe -and $unicodeBoundsMatch.Success
 Add-D32TraceIdentitySelfTestCase -Name 'native CREATE PEB capture and retained child/parent revalidation precede Continue while frozen V2 wire schema stays unchanged' -Passed $wireSerializersDoNotExtendV2
+$inventoryProcessReaderAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0InventoryProcessRecord' }, $true)
+$phase0ReleaseReaderAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0MatrixRecord' }, $true)
+$optionalChildCommandLineAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0OptionalChildCommandLine' }, $true)
+$downstreamSourceTokens = $null; $downstreamSourceErrors = $null
+$downstreamAst = [System.Management.Automation.Language.Parser]::ParseFile($downstreamReadinessPath, [ref]$downstreamSourceTokens, [ref]$downstreamSourceErrors)
+$downstreamPhaseReaderAst = $downstreamAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32DownstreamD31Phase' }, $true)
+$phase0OptionalDiagnosticConsumerChain = $phase0SourceErrors.Count -eq 0 -and $downstreamSourceErrors.Count -eq 0 -and
+    $null -ne $inventoryProcessReaderAst -and $inventoryProcessReaderAst.Extent.Text.Contains('Test-D32Phase0OptionalChildCommandLine -Value $child.command_line') -and
+    $null -ne $optionalChildCommandLineAst -and $optionalChildCommandLineAst.Extent.Text.Contains('$Value -isnot [string]') -and
+    $phase0ReleaseReaderAst.Extent.Text.Contains('Test-D32Phase0OptionalChildCommandLine -Value $child.command_line') -and
+    $phase0ReleaseReaderAst.Extent.Text.Contains('$rootProcess.command_line -cne $expectedLine') -and
+    $null -ne $downstreamPhaseReaderAst -and $downstreamPhaseReaderAst.Extent.Text.Contains('-AllowMissingCommandLine') -and
+    $downstreamPhaseReaderAst.Extent.Text.Contains('$Phase.process_identity') -and
+    $downstreamPhaseReaderAst.Extent.Text.Contains('Assert-D32DownstreamD31ProcessIdentityDocument -Identity $Phase.process_identity')
+Add-D32TraceIdentitySelfTestCase -Name 'discovery, released Phase0 matrix, and downstream D31 readers isolate explicit empty diagnostics to descendants while fixed roots retain required argv' `
+    -Passed $phase0OptionalDiagnosticConsumerChain
+$optionalChildCommandLineCases = @(
+    [PSCustomObject]@{ Name = 'exact empty diagnostic'; Value = ''; Expected = $true },
+    [PSCustomObject]@{ Name = 'captured nonempty diagnostic'; Value = 'conhost.exe --headless'; Expected = $true },
+    [PSCustomObject]@{ Name = 'missing/null diagnostic'; Value = $null; Expected = $false },
+    [PSCustomObject]@{ Name = 'DBNull diagnostic'; Value = [DBNull]::Value; Expected = $false },
+    [PSCustomObject]@{ Name = 'non-string diagnostic'; Value = 32; Expected = $false },
+    [PSCustomObject]@{ Name = 'whitespace-only diagnostic'; Value = " `t"; Expected = $false }
+)
+$optionalChildCommandLineCasesPassed = $true
+foreach ($case in $optionalChildCommandLineCases) {
+    if ((Test-D32Phase0OptionalChildCommandLine -Value $case.Value) -ne [bool]$case.Expected) {
+        $optionalChildCommandLineCasesPassed = $false
+    }
+}
+$preflightSourceTokens = $null; $preflightSourceErrors = $null
+$preflightAst = [System.Management.Automation.Language.Parser]::ParseFile($preflightPath, [ref]$preflightSourceTokens, [ref]$preflightSourceErrors)
+$preflightOptionalChildConsumer = $preflightSourceErrors.Count -eq 0 -and
+    $preflightAst.Extent.Text.Contains('Test-D32Phase0OptionalChildCommandLine -Value $child.command_line')
+Add-D32TraceIdentitySelfTestCase -Name 'shared descendant command-line predicate permits only literal empty or non-whitespace strings and is used by the official release/aggregate reader' `
+    -Passed ($optionalChildCommandLineCasesPassed -and $preflightOptionalChildConsumer) `
+    -Detail ('cases={0};preflight_uses_shared_predicate={1}' -f $optionalChildCommandLineCases.Count, $preflightOptionalChildConsumer)
 Add-D32TraceIdentitySelfTestCase -Name 'remote UNICODE_STRING byte-length boundary accepts a maximum valid Windows command line and rejects malformed length/maximum/pointer cases' `
     -Passed ($unicodeBoundsCasesPassed -and $remoteUnicodeReaderSafe) -Detail $unicodeBoundsFailure
 
@@ -1748,7 +2121,7 @@ $child = [PSCustomObject][ordered]@{
     creation_filetime = $childCreation; parent_creation_filetime = $rootCreation
     image_path = $childPin.Path; bytes = $childPin.Bytes; sha256 = $childPin.Sha256
     volume_serial_hex = $childPin.VolumeSerialHex; file_id_hex = $childPin.FileIdHex
-    allowed_image_reason = 'module-free-selftest-exact-child-pin'; image_verified = $true
+    allowed_image_reason = 'caller-pinned-toolchain-native-or-Windows-image'; image_verified = $true
     exited = $true; exit_code = 0; create_sequence = 2; exit_sequence = 3
     created_at_utc = $childCreatedAt; exited_at_utc = $childExitedAt
 }
@@ -1826,7 +2199,7 @@ try {
         descendant_records = @([ordered]@{
             process_id = [Int64]$phaseChild.process_id; parent_process_id = [Int64]$phaseChild.parent_process_id
             name = [IO.Path]::GetFileName([string]$phaseChild.image_path); image_path = [string]$phaseChild.image_path
-            creation_date = $phaseChildDate; command_line = 'synthetic-child.exe --no-network'
+            creation_date = $phaseChildDate; command_line = ''
             observed_at_utc = [string]$phaseChild.created_at_utc; identity_verified = $true
         })
         process_trace = $phaseTrace; native_cleanup = $phaseCleanup; reap = $null
@@ -1849,6 +2222,9 @@ try {
             [PSCustomObject]@{ Name = 'child image path'; Mutate = { param($value) $value.process_trace.processes[1].image_path = 'E:\d32\unapproved-child.exe' } },
             [PSCustomObject]@{ Name = 'child opened file ID'; Mutate = { param($value) $value.process_trace.processes[1].file_id_hex = '9' * 32 } },
             [PSCustomObject]@{ Name = 'descendant PID'; Mutate = { param($value) $value.descendant_records[0].process_id++ } },
+            [PSCustomObject]@{ Name = 'descendant null command-line type'; Mutate = { param($value) $value.descendant_records[0].command_line = $null } },
+            [PSCustomObject]@{ Name = 'descendant DBNull command-line type'; Mutate = { param($value) $value.descendant_records[0].command_line = [DBNull]::Value } },
+            [PSCustomObject]@{ Name = 'descendant whitespace-only command line'; Mutate = { param($value) $value.descendant_records[0].command_line = ' ' } },
             [PSCustomObject]@{ Name = 'fixed command line'; Mutate = { param($value) $value.root_record.command_line += ' --offline' } },
             [PSCustomObject]@{ Name = 'cleanup active process count'; Mutate = { param($value) $value.native_cleanup.job_active_process_count = 1 } },
             [PSCustomObject]@{ Name = 'stdout reference hash'; Mutate = { param($value) $value.stdout_log_ref.sha256 = '0' * 64 } },

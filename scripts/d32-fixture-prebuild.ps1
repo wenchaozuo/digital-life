@@ -1167,6 +1167,8 @@ function Assert-D32D31RecoverySeederProcessPhase {
         if (-not [bool]$descendant.identity_verified -or
             -not (Test-D32FixtureBuildBudgetInteger -Value $descendant.process_id) -or
             -not (Test-D32FixtureBuildBudgetInteger -Value $descendant.parent_process_id) -or
+            $descendant.command_line -isnot [string] -or
+            ($descendant.command_line.Length -gt 0 -and [string]::IsNullOrWhiteSpace([string]$descendant.command_line)) -or
             [Int64]$descendant.process_id -ne [Int64]$traceIdentity.process_id -or
             [Int64]$descendant.parent_process_id -ne [Int64]$traceIdentity.parent_process_id -or
             $descendant.name -isnot [string] -or [string]$descendant.name -cne [IO.Path]::GetFileName([string]$traceIdentity.image_path) -or

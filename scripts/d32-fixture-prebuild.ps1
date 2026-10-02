@@ -412,6 +412,17 @@ function Get-D32D31RecoverySeederFileReference {
     }
 }
 
+function ConvertTo-D32FixtureValidatedProfileIdentity {
+    param([Parameter(Mandatory = $true)][object]$Artifact)
+    return [PSCustomObject][ordered]@{
+        Path = [string]$Artifact.path
+        Bytes = [Int64]$Artifact.bytes
+        Sha256 = [string]$Artifact.sha256
+        VolumeSerialHex = [string]$Artifact.volume_serial_hex
+        FileIdHex = [string]$Artifact.file_id_hex
+    }
+}
+
 function Get-D32D31RecoverySeederOptionalFileReference {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
@@ -906,7 +917,7 @@ function Assert-D32D31RecoverySeederCompanionShape {
                 (@($phase.command | ForEach-Object { [string]$_ }) -join "`0") -cne ($expectedArguments -join "`0")) {
                 throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: locked fetch command/lock binding differs at index $index"
             }
-            Assert-D32D31RecoverySeederProcessPhase -Phase $phase -ExpectedName $expectedName -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) `
+            $null = Assert-D32D31RecoverySeederProcessPhase -Phase $phase -ExpectedName $expectedName -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) `
                 -Arguments $expectedArguments -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path) `
                 -Repository $Repository -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ExpectedModuleAdmission `
                 -ProtocGrant $grant -ExpectedTargetRoot $null
@@ -918,7 +929,7 @@ function Assert-D32D31RecoverySeederCompanionShape {
             (@($Document.build_phase.command | ForEach-Object { [string]$_ }) -join "`0") -cne ($expectedBuildArguments -join "`0")) {
             throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: seeder Cargo argv differs from the fixed D31 V2 command'
         }
-        Assert-D32D31RecoverySeederProcessPhase -Phase $Document.build_phase -ExpectedName 'd31-recovery-seeder' `
+        $null = Assert-D32D31RecoverySeederProcessPhase -Phase $Document.build_phase -ExpectedName 'd31-recovery-seeder' `
             -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) -Arguments $expectedBuildArguments `
             -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path) `
             -Repository $Repository -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ExpectedModuleAdmission `
@@ -10166,7 +10177,7 @@ public static class D32DebugSelfTestLauncher
             IsValid = $true
             ProfilePath = [string]$syntheticProfileArtifact.path
             Digest = [string]$syntheticProfileArtifact.sha256
-            Identity = $syntheticProfileArtifact
+            Identity = ConvertTo-D32FixtureValidatedProfileIdentity -Artifact $syntheticProfileArtifact
             Profile = [ordered]@{ toolchain = [ordered]@{ cargo = $syntheticCargoIdentity } }
         }
         $provenanceLockManifests = @('vita-agent-protocol/Cargo.toml', 'vita-agent/Cargo.toml', 'src-tauri/Cargo.toml')

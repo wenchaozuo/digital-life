@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
 $phase0Path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1'))
 $fixturePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
+$vendoredProtocPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-vendored-protoc-authority.ps1'))
 $h7AuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-h7c-git-child-authority.ps1'))
 $profilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'))
 $moduleAuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'))
@@ -16,6 +17,19 @@ $script:cases = [System.Collections.Generic.List[object]]::new()
 $script:failures = [System.Collections.Generic.List[string]]::new()
 $script:D32Phase0LastCompletedCommandEvidence = $null
 $script:D32Phase0OwnerBindingName = 'D32-PHASE0-OWNER.json'
+$script:D32TraceIdentityUseNativeSnapshots = $false
+$script:D32CompanionSelfTestCandidateSha = $null
+$script:D32CompanionSelfTestRepository = $null
+$script:D32CompanionSelfTestProfileDigest = $null
+$script:D32CompanionSelfTestRunRoot = $null
+$script:D32CompanionSelfTestCargoHome = $null
+$script:D32CompanionSelfTestTempRoot = $null
+$script:D32CompanionSelfTestRunId = $null
+$script:D32CompanionSelfTestSourceReference = $null
+$script:D32CompanionSelfTestSourceDocument = $null
+$script:D32CompanionSelfTestGrantReference = $null
+$script:D32CompanionSelfTestGrantDocument = $null
+$script:D32CompanionSelfTestOwnerReference = $null
 
 function Import-D32TraceIdentitySelfTestFunction {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Name)
@@ -132,6 +146,10 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfilePathEqual' },
         [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfilePathWithin' },
         [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfileNoReparsePath' },
+        [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfileWindows' },
+        [PSCustomObject]@{ Path = $profilePath; Name = 'Initialize-D32ProfileFileIdentityType' },
+        [PSCustomObject]@{ Path = $profilePath; Name = 'Get-D32ProfileDirectoryIdentity' },
+        [PSCustomObject]@{ Path = $profilePath; Name = 'Test-D32ProfileJsonElementDuplicates' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0ExactProperties' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0Integer' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0DirectoryEntryExists' },
@@ -170,6 +188,7 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederChildImage' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederRecordShape' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32D31RecoverySeederFileReference' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertTo-D32FixtureValidatedProfileIdentity' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32FixtureFieldValue' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertTo-D32FixtureAuthorityHashtable' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32FixtureDebugProcessTraceLedger' },
@@ -189,7 +208,13 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $moduleAuthorityPath; Name = 'Copy-D32PowerShellAuthorityJsonShape' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'New-D32ProcessIdentityRecord' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32FixtureDebugProcessCommandLine' },
-        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertFrom-D32DebugProcessRecord' }
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertFrom-D32DebugProcessRecord' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Get-D32VendoredProperty' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Test-D32VendoredObjectExactProperties' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Test-D32VendoredInteger' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Get-D32VendoredFileReference' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Assert-D32VendoredFileReference' },
+        [PSCustomObject]@{ Path = $vendoredProtocPath; Name = 'Test-D32D31RecoverySeederOwnerMarker' }
     )) {
     Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $entry.Path -Name $entry.Name)
 }
@@ -209,12 +234,191 @@ function Get-D32ProfileFileSnapshot {
     param([Parameter(Mandatory = $true)][string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-D32ProfileNoReparsePath -Path $full)) { throw 'SELFTEST_BLOCKED: synthetic completed-command output is missing or reparse-backed' }
+    if ($script:D32TraceIdentityUseNativeSnapshots) {
+        $artifact = Get-D32BoundArtifactWithFileId -Path $full
+        return [PSCustomObject]@{
+            Path = [string]$artifact.path; Bytes = [Int64]$artifact.bytes; Sha256 = [string]$artifact.sha256
+            VolumeSerialHex = [string]$artifact.volume_serial_hex; FileIdHex = [string]$artifact.file_id_hex
+            Attributes = 0; CreationTimeUtcTicks = [Int64]0; LastWriteTimeUtcTicks = [Int64]0
+        }
+    }
     $bytes = [IO.File]::ReadAllBytes($full)
     return [PSCustomObject]@{
         Path = $full; Bytes = [Int64]$bytes.LongLength
         Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
         VolumeSerialHex = '0000000000000001'; FileIdHex = '1' * 32
     }
+}
+
+function Get-D32D31RecoverySeederSourceAuthority {
+    param(
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$SeederEvidenceRoot
+    )
+    $reference = $script:D32CompanionSelfTestSourceReference
+    if ($null -eq $reference -or
+        -not (Test-D32ProfilePathEqual -Left $AuthorityPath -Right ([string]$reference.path)) -or
+        $AuthoritySha256 -cne [string]$reference.sha256 -or
+        $CandidateSha -cne $script:D32CompanionSelfTestCandidateSha -or
+        -not (Test-D32ProfilePathEqual -Left $Repository -Right $script:D32CompanionSelfTestRepository) -or
+        -not (Test-D32ProfilePathEqual -Left $SeederEvidenceRoot -Right $script:D32CompanionSelfTestRunRoot) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $SeederEvidenceRoot) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $Repository) -or
+        $ValidatedProfile.Digest -cne $script:D32CompanionSelfTestProfileDigest) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: synthetic source authority did not receive the exact candidate/profile/root reference'
+    }
+    $opened = Get-D32BoundArtifactWithFileId -Path $AuthorityPath
+    if ($opened.bytes -ne [Int64]$reference.bytes -or $opened.sha256 -cne [string]$reference.sha256 -or
+        $opened.volume_serial_hex -cne [string]$reference.volume_serial_hex -or $opened.file_id_hex -cne [string]$reference.file_id_hex) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: synthetic source authority reference does not bind the opened test file'
+    }
+    return [PSCustomObject]@{ Reference = $reference; Document = $script:D32CompanionSelfTestSourceDocument }
+}
+
+function Test-D32D31RecoverySeederProtocRunGrant {
+    param(
+        [Parameter(Mandatory = $true)][object]$Reference,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedRunId,
+        [Parameter(Mandatory = $true)][int]$ExpectedRunnerProcessId,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$TempRoot,
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][object]$OwnerMarkerReference
+    )
+    $expected = $script:D32CompanionSelfTestGrantReference
+    if ($null -eq $expected -or
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $Reference) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $expected) -or
+        $CandidateSha -cne $script:D32CompanionSelfTestCandidateSha -or
+        -not (Test-D32ProfilePathEqual -Left $Repository -Right $script:D32CompanionSelfTestRepository) -or
+        -not (Test-D32ProfilePathEqual -Left $RunRoot -Right $script:D32CompanionSelfTestRunRoot) -or
+        -not (Test-D32ProfilePathEqual -Left $CargoHome -Right $script:D32CompanionSelfTestCargoHome) -or
+        -not (Test-D32ProfilePathEqual -Left $TempRoot -Right $script:D32CompanionSelfTestTempRoot) -or
+        $ExpectedRunId -cne $script:D32CompanionSelfTestRunId -or $ExpectedRunnerProcessId -ne $PID -or
+        $ValidatedProfile.Digest -cne $script:D32CompanionSelfTestProfileDigest -or
+        -not (Test-D32ProfilePathEqual -Left $AuthorityPath -Right ([string]$script:D32CompanionSelfTestSourceReference.path)) -or
+        $AuthoritySha256 -cne [string]$script:D32CompanionSelfTestSourceReference.sha256 -or
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $OwnerMarkerReference) -cne
+            (ConvertTo-D32PowerShellAuthorityJsonText -Value $script:D32CompanionSelfTestOwnerReference)) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: synthetic grant validator received mismatched owner/run/profile/source context'
+    }
+    $opened = Get-D32BoundArtifactWithFileId -Path ([string]$Reference.path)
+    if ($opened.bytes -ne [Int64]$Reference.bytes -or $opened.sha256 -cne [string]$Reference.sha256 -or
+        $opened.volume_serial_hex -cne [string]$Reference.volume_serial_hex -or $opened.file_id_hex -cne [string]$Reference.file_id_hex) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: synthetic grant reference does not bind its opened test file'
+    }
+    $raw = [IO.File]::ReadAllText([string]$Reference.path, [Text.Encoding]::UTF8)
+    $parsed = $raw | ConvertFrom-Json -DateKind String
+    if ((ConvertTo-D32PowerShellAuthorityJsonText -Value $parsed) -cne
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $script:D32CompanionSelfTestGrantDocument)) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: synthetic grant JSON differs from its expected strict-shape fixture'
+    }
+    return [PSCustomObject]@{ Reference = $Reference; Document = $script:D32CompanionSelfTestGrantDocument; Image = $null }
+}
+
+function New-D32CompanionSelfTestPhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$CargoPath,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][object]$BaseTrace,
+        [Parameter(Mandatory = $true)][int]$Index,
+        [AllowNull()][string]$ManifestPath,
+        [AllowNull()][string]$LockSha256
+    )
+    $trace = ConvertTo-D32FixtureAuthorityHashtable -Value $BaseTrace
+    $rootPid = [Int64]($PID + 30000 + ($Index * 10))
+    $childPid = $rootPid + 1
+    $runner = [Diagnostics.Process]::GetCurrentProcess()
+    try { $runnerCreation = [DateTime]$runner.StartTime.ToUniversalTime() }
+    finally { $runner.Dispose() }
+    $rootCreation = [Int64][DateTime]::UtcNow.ToFileTimeUtc()
+    if ($rootCreation -le $runnerCreation.ToFileTimeUtc()) { $rootCreation = $runnerCreation.ToFileTimeUtc() + 1000000L }
+    $childCreation = $rootCreation + [TimeSpan]::TicksPerSecond
+    $childExit = $childCreation + [TimeSpan]::TicksPerSecond
+    $rootExit = $childExit + [TimeSpan]::TicksPerSecond
+    $rootCreatedAt = [DateTime]::FromFileTimeUtc($rootCreation).ToString('o')
+    $childCreatedAt = [DateTime]::FromFileTimeUtc($childCreation).ToString('o')
+    $childExitedAt = [DateTime]::FromFileTimeUtc($childExit).ToString('o')
+    $rootExitedAt = [DateTime]::FromFileTimeUtc($rootExit).ToString('o')
+    $trace.process_events[0].process_id = $rootPid
+    $trace.process_events[0].parent_process_id = [Int64]$PID
+    $trace.process_events[0].creation_filetime = $rootCreation
+    $trace.process_events[0].parent_creation_filetime = [Int64]$trace.debugger_creation_filetime
+    $trace.process_events[1].process_id = $childPid
+    $trace.process_events[1].parent_process_id = $rootPid
+    $trace.process_events[1].creation_filetime = $childCreation
+    $trace.process_events[1].parent_creation_filetime = $rootCreation
+    $trace.process_events[2].process_id = $childPid
+    $trace.process_events[2].parent_process_id = $rootPid
+    $trace.process_events[2].creation_filetime = $childCreation
+    $trace.process_events[2].parent_creation_filetime = $rootCreation
+    $trace.process_events[3].process_id = $rootPid
+    $trace.process_events[3].parent_process_id = [Int64]$PID
+    $trace.process_events[3].creation_filetime = $rootCreation
+    $trace.process_events[3].parent_creation_filetime = [Int64]$trace.debugger_creation_filetime
+    $root = $trace.processes[0]
+    $root.process_id = $rootPid
+    $root.parent_process_id = [Int64]$PID
+    $root.creation_filetime = $rootCreation
+    $root.parent_creation_filetime = [Int64]$trace.debugger_creation_filetime
+    $root.create_sequence = 1
+    $root.exit_sequence = 4
+    $root.created_at_utc = $rootCreatedAt
+    $root.exited_at_utc = $rootExitedAt
+    $child = $trace.processes[1]
+    $child.process_id = $childPid
+    $child.parent_process_id = $rootPid
+    $child.creation_filetime = $childCreation
+    $child.parent_creation_filetime = $rootCreation
+    $child.create_sequence = 2
+    $child.exit_sequence = 3
+    $child.created_at_utc = $childCreatedAt
+    $child.exited_at_utc = $childExitedAt
+    $trace.completed_at_utc = [DateTime]::FromFileTimeUtc($rootExit + 10000L).ToString('o')
+
+    $commandLine = ConvertTo-D32CommandLine (@($CargoPath) + $Arguments)
+    $rootRecord = [ordered]@{
+        process_id = $rootPid; parent_process_id = [Int64]$PID; name = 'cargo.exe'; image_path = $CargoPath
+        creation_date = $rootCreatedAt; command_line = $commandLine; observed_at_utc = $rootCreatedAt; identity_verified = $true
+    }
+    $descendants = @([ordered]@{
+        process_id = $childPid; parent_process_id = $rootPid; name = [IO.Path]::GetFileName([string]$child.image_path)
+        image_path = [string]$child.image_path; creation_date = $childCreatedAt
+        command_line = 'synthetic-child.exe --no-network'; observed_at_utc = $childCreatedAt; identity_verified = $true
+    })
+    $phaseLog = Join-Path (Join-Path $RunRoot 'logs') $Name
+    $stdoutPath = $phaseLog + '.stdout.log'
+    $stderrPath = $phaseLog + '.stderr.log'
+    [IO.File]::WriteAllText($phaseLog, "synthetic phase $Name" + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($stdoutPath, "synthetic stdout $Name" + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($stderrPath, '', [Text.UTF8Encoding]::new($false))
+    $phase = [ordered]@{
+        name = $Name; executable = $CargoPath; command = @($Arguments); command_line = $commandLine
+        working_directory = $WorkingDirectory; status = 'succeeded'; exit_code = 0
+        process_identity = $rootRecord; root_record = $rootRecord; descendant_records = $descendants; process_trace = $trace
+        native_cleanup = [ordered]@{
+            job_terminate_call_succeeded = $true; job_terminate_last_error = 0; process_was_already_signaled = $false
+            process_wait_signaled = $true; job_active_process_count_verified = $true; job_active_process_count = 0
+            job_active_process_count_last_error = 0; job_close_succeeded = $true; cleanup_succeeded = $true
+            already_closed = $false; detail = 'synthetic module-free companion trace'
+        }
+        reap = $null; phase_log = $phaseLog; stdout_log = $stdoutPath; stderr_log = $stderrPath
+        stdout_log_ref = Get-D32D31RecoverySeederFileReference -Path $stdoutPath
+        stderr_log_ref = Get-D32D31RecoverySeederFileReference -Path $stderrPath
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) { $phase.manifest_path = $ManifestPath; $phase.lock_sha256 = $LockSha256 }
+    return $phase
 }
 
 function ConvertTo-D32TraceIdentityListLines {
@@ -922,6 +1126,17 @@ $wireProjectionExact = $wireProjection.path -ceq $cargoWire.path -and $wireProje
     $wireProjection.sha256 -ceq $cargoWire.sha256 -and $wireProjection.volume_serial_hex -ceq $cargoWire.volume_serial_hex -and
     $wireProjection.file_id_hex -ceq $cargoWire.file_id_hex -and $wireProjection.Count -eq 5
 Add-D32TraceIdentitySelfTestCase -Name 'strict Profile V2 flat wire identity projects without dropping volume or file identity' -Passed $wireProjectionExact
+$profileIdentityProjection = ConvertTo-D32FixtureValidatedProfileIdentity -Artifact $cargoWire
+$profileIdentityProjectionNames = @($profileIdentityProjection.PSObject.Properties | ForEach-Object { [string]$_.Name })
+$profileIdentityProjectionExact = $profileIdentityProjectionNames.Count -eq 5 -and
+    @($profileIdentityProjectionNames | Where-Object { $_ -cnotin @('Path', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex') }).Count -eq 0 -and
+    [string]$profileIdentityProjection.Path -ceq [string]$cargoSnapshot.Path -and
+    [Int64]$profileIdentityProjection.Bytes -eq [Int64]$cargoSnapshot.Bytes -and
+    [string]$profileIdentityProjection.Sha256 -ceq [string]$cargoSnapshot.Sha256 -and
+    [string]$profileIdentityProjection.VolumeSerialHex -ceq [string]$cargoSnapshot.VolumeSerialHex -and
+    [string]$profileIdentityProjection.FileIdHex -ceq [string]$cargoSnapshot.FileIdHex
+Add-D32TraceIdentitySelfTestCase -Name 'synthetic Profile V2 validated-profile Identity maps flat artifact volume/file wire fields to the required PascalCase producer shape' `
+    -Passed $profileIdentityProjectionExact
 
 $nativeTrace = [ordered]@{}
 $topMappings = @(
@@ -1101,6 +1316,341 @@ foreach ($companionMutation in @(
     }
     Add-D32TraceIdentitySelfTestCase -Name "D31 companion shape rejects $($companionMutation.Name) tampering" -Passed $companionRejected -Detail $companionFailure
 }
+
+$companionFullRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('d32-d31-companion-selftest-' + [Guid]::NewGuid().ToString('N'))))
+$companionFullPassed = $false
+$companionFullDetail = $null
+$companionFullMutationResults = [System.Collections.Generic.List[bool]]::new()
+$companionOwnerMutationPassed = $false
+$companionProfileIdentityNegativePassed = $false
+$companionChildPin = [PSCustomObject]@{
+    Path = [IO.Path]::GetFullPath('E:\d32\synthetic-companion-child.exe'); Bytes = [Int64]200
+    Sha256 = 'b' * 64; VolumeSerialHex = '0000000000000002'; FileIdHex = '2' * 32
+}
+$companionFullBaseTrace = Copy-D32TraceIdentitySelfTestShape -Value $nativeWireTrace
+$companionFullRootProcess = $companionFullBaseTrace.processes[0]
+$companionFullRootPid = [uint32]$companionFullRootProcess.process_id
+$companionFullRootCreation = [Int64]$companionFullRootProcess.creation_filetime
+$companionFullChildPid = [uint32]($companionFullRootPid + 1)
+$companionFullChildCreation = $companionFullRootCreation + 10000000L
+$companionFullChildExit = $companionFullChildCreation + 10000000L
+$companionFullRootExit = $companionFullChildExit + 10000000L
+$companionFullChildCreatedAt = [DateTime]::FromFileTimeUtc($companionFullChildCreation).ToString('o')
+$companionFullChildExitedAt = [DateTime]::FromFileTimeUtc($companionFullChildExit).ToString('o')
+$companionFullRootExitedAt = [DateTime]::FromFileTimeUtc($companionFullRootExit).ToString('o')
+$companionFullRootProcess.exit_sequence = 4
+$companionFullRootProcess.exited_at_utc = $companionFullRootExitedAt
+$companionFullChildProcess = [PSCustomObject][ordered]@{
+    process_id = $companionFullChildPid; parent_process_id = $companionFullRootPid
+    creation_filetime = $companionFullChildCreation; parent_creation_filetime = $companionFullRootCreation
+    image_path = $companionChildPin.Path; bytes = $companionChildPin.Bytes; sha256 = $companionChildPin.Sha256
+    volume_serial_hex = $companionChildPin.VolumeSerialHex; file_id_hex = $companionChildPin.FileIdHex
+    allowed_image_reason = 'caller-pinned-toolchain-native-or-Windows-image'; image_verified = $true
+    exited = $true; exit_code = 0; create_sequence = 2; exit_sequence = 3
+    created_at_utc = $companionFullChildCreatedAt; exited_at_utc = $companionFullChildExitedAt
+}
+$companionFullBaseTrace.process_events = @(
+    [PSCustomObject][ordered]@{ sequence = 1; kind = 'CREATE'; process_id = $companionFullRootPid; parent_process_id = [uint32]$PID; creation_filetime = $companionFullRootCreation; parent_creation_filetime = [Int64]$companionFullBaseTrace.debugger_creation_filetime; exit_code = 0 },
+    [PSCustomObject][ordered]@{ sequence = 2; kind = 'CREATE'; process_id = $companionFullChildPid; parent_process_id = $companionFullRootPid; creation_filetime = $companionFullChildCreation; parent_creation_filetime = $companionFullRootCreation; exit_code = 0 },
+    [PSCustomObject][ordered]@{ sequence = 3; kind = 'EXIT'; process_id = $companionFullChildPid; parent_process_id = $companionFullRootPid; creation_filetime = $companionFullChildCreation; parent_creation_filetime = $companionFullRootCreation; exit_code = 0 },
+    [PSCustomObject][ordered]@{ sequence = 4; kind = 'EXIT'; process_id = $companionFullRootPid; parent_process_id = [uint32]$PID; creation_filetime = $companionFullRootCreation; parent_creation_filetime = [Int64]$companionFullBaseTrace.debugger_creation_filetime; exit_code = 0 }
+)
+$companionFullBaseTrace.processes = @($companionFullRootProcess, $companionFullChildProcess)
+$companionFullBaseTrace.process_create_event_count = 2
+$companionFullBaseTrace.process_exit_event_count = 2
+$companionFullBaseTrace.process_event_count = 4
+$companionFullBaseTrace.job_total_processes = 2
+$companionFullBaseTrace.retained_process_handle_count = 3
+$companionFullBaseTrace.debug_event_count = 4
+$companionFullBaseTrace.completed_at_utc = [DateTimeOffset]::Parse($companionFullRootExitedAt).AddMilliseconds(1).ToString('o')
+$script:D32TraceIdentityUseNativeSnapshots = $true
+try {
+    [void][IO.Directory]::CreateDirectory($companionFullRoot)
+    $companionFullOutputRoot = Join-Path $companionFullRoot 'output'
+    $successProfilePath = Join-Path $companionFullRoot 'profile.json'
+    $successSourcePath = Join-Path $companionFullRoot 'source-protoc-authority.json'
+    $successRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
+    $successRunRoot = Join-Path $companionFullOutputRoot "d31-recovery-seeder-run-$successRunId"
+    $successCargoHome = Join-Path $successRunRoot 'cargo-home'
+    $successTempRoot = Join-Path $successRunRoot 'temp'
+    $successLogsRoot = Join-Path $successRunRoot 'logs'
+    $successTargetRoot = Join-Path $companionFullOutputRoot 'd31-recovery-seeder-target'
+    $successArtifactPath = Join-Path $successTargetRoot 'debug/vita-agent.exe'
+    $successRecordPath = Join-Path $companionFullOutputRoot 'd31-recovery-seeder-build.json'
+    foreach ($directory in @($companionFullOutputRoot, $successRunRoot, $successCargoHome, $successTempRoot, $successLogsRoot,
+            (Join-Path $successTargetRoot 'debug'))) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+    [IO.File]::WriteAllText($successProfilePath, '{"synthetic":"module-free Profile V2 shape only"}', [Text.UTF8Encoding]::new($false))
+    $successProfileArtifact = Get-D32BoundArtifactWithFileId -Path $successProfilePath
+    $successProfileIdentity = ConvertTo-D32FixtureValidatedProfileIdentity -Artifact $successProfileArtifact
+    $successCargoWire = [PSCustomObject][ordered]@{
+        path = [string]$cargoWire.path; bytes = [Int64]$cargoWire.bytes; sha256 = [string]$cargoWire.sha256
+        volume_serial_hex = [string]$cargoWire.volume_serial_hex; file_id_hex = [string]$cargoWire.file_id_hex
+    }
+    $successLockManifests = @('vita-agent-protocol/Cargo.toml', 'vita-agent/Cargo.toml', 'src-tauri/Cargo.toml')
+    $successLockInputs = [System.Collections.Generic.List[object]]::new()
+    for ($lockIndex = 0; $lockIndex -lt $successLockManifests.Count; $lockIndex++) {
+        $manifestPath = [string]$successLockManifests[$lockIndex]
+        $manifestFullPath = Get-D32FullPath (Join-Path $repo $manifestPath)
+        $successLockInputs.Add([PSCustomObject]@{
+            ManifestPath = $manifestPath; ManifestFullPath = $manifestFullPath
+            LockSha256 = ([string]([char](97 + $lockIndex)) * 64)
+        })
+    }
+    $successValidatedProfile = [PSCustomObject]@{
+        IsValid = $true; ProfilePath = [string]$successProfileArtifact.path; Digest = [string]$successProfileArtifact.sha256
+        Identity = $successProfileIdentity
+        Profile = [PSCustomObject][ordered]@{
+            target_triple = 'x86_64-pc-windows-msvc'
+            toolchain = [PSCustomObject][ordered]@{ cargo = $successCargoWire }
+        }
+        LockInputs = $successLockInputs.ToArray()
+        ExecutableInventory = @($companionChildPin); WindowsImageInventory = @()
+    }
+    $runnerForCompanion = [Diagnostics.Process]::GetCurrentProcess()
+    try { $successRunnerCreation = [DateTime]$runnerForCompanion.StartTime.ToUniversalTime() }
+    finally { $runnerForCompanion.Dispose() }
+    $successAdmission = [ordered]@{
+        candidate_sha = $companionCandidate
+        source_repo = $repo
+        entry_script_path = [IO.Path]::GetFullPath((Join-Path $repo 'scripts/d32-fixture-prebuild.ps1'))
+        runner_process = [ordered]@{ process_id = [Int64]$PID; start_time_utc_ticks = [Int64]$successRunnerCreation.Ticks }
+        profile_reference = [ordered]@{
+            path = [string]$successProfileArtifact.path; bytes = [Int64]$successProfileArtifact.bytes
+            sha256 = [string]$successProfileArtifact.sha256; volume_serial_hex = [string]$successProfileArtifact.volume_serial_hex
+            file_id_hex = [string]$successProfileArtifact.file_id_hex
+        }
+        selftest_only = $true
+    }
+    $successSourceDocument = [ordered]@{
+        schema_version = 1; record_type = 'D32_VENDORED_PROTOC_AUTHORITY_V1'; scope = 'D32_PHASE0_PHASE1_ONLY'
+        evidence_root_path = Join-Path $companionFullRoot 'not-claimed-phase0-root'
+        candidate_sha = $companionCandidate; toolchain_profile_sha256 = [string]$successProfileArtifact.sha256
+        test_only = $true
+    }
+    [IO.File]::WriteAllText($successSourcePath, (ConvertTo-Json -InputObject $successSourceDocument -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+    $successSourceReference = Get-D32VendoredFileReference -Path $successSourcePath
+
+    $successRunRootIdentity = Get-D32ProfileDirectoryIdentity -Path $successRunRoot
+    $successOwnerPath = Join-Path $successRunRoot 'D32-D31-RECOVERY-SEEDER-OWNER.json'
+    $successOwnerDocument = [ordered]@{
+        schema_version = 1; record_type = 'D32_D31_RECOVERY_SEEDER_OWNER_V1'; candidate_sha = $companionCandidate
+        toolchain_profile_path = [string]$successProfileArtifact.path; toolchain_profile_sha256 = [string]$successProfileArtifact.sha256
+        toolchain_profile_bytes = [Int64]$successProfileArtifact.bytes
+        toolchain_profile_volume_serial_hex = [string]$successProfileArtifact.volume_serial_hex
+        toolchain_profile_file_id_hex = [string]$successProfileArtifact.file_id_hex
+        run_root_path = $successRunRoot; run_root_volume_serial_hex = [string]$successRunRootIdentity.VolumeSerialHex
+        run_root_file_id_hex = [string]$successRunRootIdentity.FileIdHex; run_id = $successRunId; runner_process_id = [Int64]$PID
+    }
+    [IO.File]::WriteAllText($successOwnerPath, (ConvertTo-Json -InputObject $successOwnerDocument -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+    $successOwnerReference = Get-D32VendoredFileReference -Path $successOwnerPath
+
+    $successRegistryRoot = Join-Path $successCargoHome 'registry'
+    $successRegistryHash = 'index.crates.io-1949cf8c6b5b557f'
+    $successArchivePath = Join-Path (Join-Path $successRegistryRoot "cache/$successRegistryHash") 'protoc-bin-vendored-win32-3.2.0.crate'
+    $successProtocSource = Join-Path (Join-Path $successRegistryRoot "src/$successRegistryHash") 'protoc-bin-vendored-win32-3.2.0'
+    $successProtocImagePath = Join-Path (Join-Path $successProtocSource 'bin') 'protoc.exe'
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $successArchivePath))
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $successProtocImagePath))
+    [IO.File]::WriteAllText($successArchivePath, 'synthetic protoc archive; no Cargo/cache authority', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($successProtocImagePath, 'synthetic protoc image; never launched', [Text.UTF8Encoding]::new($false))
+    $successCargoHomeIdentity = Get-D32ProfileDirectoryIdentity -Path $successCargoHome
+    $successTempIdentity = Get-D32ProfileDirectoryIdentity -Path $successTempRoot
+    $successSourceDirectoryIdentity = Get-D32ProfileDirectoryIdentity -Path $successProtocSource
+    $successGrantPath = Join-Path $successRunRoot 'D32-D31-RECOVERY-SEEDER-PROTOC-RUN-GRANT.json'
+    $successCargoLockReference = Get-D32VendoredFileReference -Path (Join-Path $repo 'vita-agent/Cargo.lock')
+    $successArchiveReference = Get-D32VendoredFileReference -Path $successArchivePath
+    $successProtocImageReference = Get-D32VendoredFileReference -Path $successProtocImagePath
+    $successGrantDocument = [ordered]@{
+        schema_version = 1; record_type = 'D32_D31_RECOVERY_SEEDER_PROTOC_RUN_GRANT_V1'; scope = 'D32_D31_RECOVERY_SEEDER_ONLY'
+        source_authority = $successSourceReference; candidate_sha = $companionCandidate
+        toolchain_profile = [ordered]@{
+            path = [string]$successProfileArtifact.path; sha256 = [string]$successProfileArtifact.sha256
+            bytes = [Int64]$successProfileArtifact.bytes; volume_serial_hex = [string]$successProfileArtifact.volume_serial_hex
+            file_id_hex = [string]$successProfileArtifact.file_id_hex
+        }
+        run_root = [ordered]@{ path = $successRunRootIdentity.Path; volume_serial_hex = [string]$successRunRootIdentity.VolumeSerialHex; file_id_hex = [string]$successRunRootIdentity.FileIdHex }
+        owner_marker = $successOwnerReference; run_id = $successRunId; runner_process_id = [Int64]$PID
+        cargo_home = [ordered]@{ path = $successCargoHomeIdentity.Path; volume_serial_hex = [string]$successCargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$successCargoHomeIdentity.FileIdHex }
+        temp_root = [ordered]@{ path = $successTempIdentity.Path; volume_serial_hex = [string]$successTempIdentity.VolumeSerialHex; file_id_hex = [string]$successTempIdentity.FileIdHex }
+        vita_cargo_lock = $successCargoLockReference; cargo_archive = $successArchiveReference
+        source_directory = [ordered]@{ path = $successSourceDirectoryIdentity.Path; volume_serial_hex = [string]$successSourceDirectoryIdentity.VolumeSerialHex; file_id_hex = [string]$successSourceDirectoryIdentity.FileIdHex }
+        protoc_image = $successProtocImageReference
+    }
+    [IO.File]::WriteAllText($successGrantPath, (ConvertTo-Json -InputObject $successGrantDocument -Depth 18 -Compress), [Text.UTF8Encoding]::new($false))
+    $successGrantReference = Get-D32VendoredFileReference -Path $successGrantPath
+
+    $script:D32CompanionSelfTestCandidateSha = $companionCandidate
+    $script:D32CompanionSelfTestRepository = $repo
+    $script:D32CompanionSelfTestProfileDigest = [string]$successProfileArtifact.sha256
+    $script:D32CompanionSelfTestRunRoot = $successRunRoot
+    $script:D32CompanionSelfTestCargoHome = $successCargoHome
+    $script:D32CompanionSelfTestTempRoot = $successTempRoot
+    $script:D32CompanionSelfTestRunId = $successRunId
+    $script:D32CompanionSelfTestSourceReference = $successSourceReference
+    $script:D32CompanionSelfTestSourceDocument = $successSourceDocument
+    $script:D32CompanionSelfTestGrantReference = $successGrantReference
+    $script:D32CompanionSelfTestGrantDocument = $successGrantDocument
+    $script:D32CompanionSelfTestOwnerReference = $successOwnerReference
+
+    $successPhases = [System.Collections.Generic.List[object]]::new()
+    for ($phaseIndex = 0; $phaseIndex -lt 3; $phaseIndex++) {
+        $lockInput = $successLockInputs[$phaseIndex]
+        $fetchName = 'd31-seeder-{0:D2}-fetch' -f ($phaseIndex + 1)
+        $fetchArguments = @('fetch', '--locked', '--manifest-path', [string]$lockInput.ManifestFullPath, '--target', 'x86_64-pc-windows-msvc')
+        $successPhases.Add((New-D32CompanionSelfTestPhase -Name $fetchName -Arguments $fetchArguments -WorkingDirectory $repo `
+                -CargoPath $cargoPath -RunRoot $successRunRoot -BaseTrace $companionFullBaseTrace -Index $phaseIndex `
+                -ManifestPath ([string]$lockInput.ManifestPath) -LockSha256 ([string]$lockInput.LockSha256)))
+    }
+    $successBuildManifest = Get-D32FullPath (Join-Path $repo 'vita-agent/Cargo.toml')
+    $successBuildArguments = @('build', '--quiet', '--locked', '--manifest-path', $successBuildManifest, '--bin', 'vita-agent',
+        '--features', 'd29-h9-test-helper', '--target-dir', $successTargetRoot)
+    $successBuildPhase = New-D32CompanionSelfTestPhase -Name 'd31-recovery-seeder' -Arguments $successBuildArguments `
+        -WorkingDirectory $repo -CargoPath $cargoPath -RunRoot $successRunRoot -BaseTrace $companionFullBaseTrace -Index 3 `
+        -ManifestPath $null -LockSha256 $null
+
+    [IO.File]::WriteAllText($successArtifactPath, 'synthetic D31 artifact; never executed', [Text.UTF8Encoding]::new($false))
+    $successArtifact = Get-D32BoundArtifactWithFileId -Path $successArtifactPath
+    $successRecordDocument = [ordered]@{
+        schema_version = 2; purpose = 'd31-recovery-seeder-test-helper'; run_id = $successRunId
+        candidate_sha = $companionCandidate; runner_process_id = [Int64]$PID; source_repo = $repo
+        manifest_path = $successBuildManifest; feature = 'd29-h9-test-helper'; command = $successBuildArguments
+        target_dir = $successTargetRoot; run_root = $successRunRoot; cargo_home = $successCargoHome; temp_root = $successTempRoot
+        toolchain_profile_path = [string]$successProfileArtifact.path; toolchain_profile_sha256 = [string]$successProfileArtifact.sha256
+        target_triple = 'x86_64-pc-windows-msvc'; powershell = [ordered]@{ version = $PSVersionTable.PSVersion.ToString() }
+        toolchain = [ordered]@{}; fetch_manifests = @($successLockInputs | ForEach-Object { [string]$_.ManifestPath })
+        fetch_phases = @(); cargo_path = $cargoPath; process_identity = $successBuildPhase.process_identity
+        status = 'succeeded'; exit_code = 0
+        artifact = [ordered]@{ path = $successArtifactPath; bytes = [Int64]$successArtifact.bytes; sha256 = [string]$successArtifact.sha256; file_identity = $successArtifact.file_identity }
+    }
+    [IO.File]::WriteAllText($successRecordPath, (ConvertTo-Json -InputObject $successRecordDocument -Depth 20 -Compress), [Text.UTF8Encoding]::new($false))
+    $successRecordReference = Get-D32D31RecoverySeederFileReference -Path $successRecordPath
+    $successArtifactReference = Get-D32D31RecoverySeederFileReference -Path $successArtifactPath
+    $successOutputDirectoryIdentity = Get-D32ProfileDirectoryIdentity -Path $successRunRoot
+    $successAdmission.entry_script_path = [IO.Path]::GetFullPath((Join-Path $repo 'scripts/d32-fixture-prebuild.ps1'))
+    $successCompanionPath = Join-Path $companionFullOutputRoot 'd31-recovery-seeder-companion.json'
+    $successCompanionDocument = [ordered]@{
+        schema_version = 1; record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V1'; status = 'succeeded'
+        candidate_sha = $companionCandidate; source_repo = $repo; run_id = $successRunId; runner_process_id = [Int64]$PID
+        toolchain_profile = [ordered]@{
+            path = [string]$successProfileArtifact.path; sha256 = [string]$successProfileArtifact.sha256
+            bytes = [Int64]$successProfileArtifact.bytes; volume_serial_hex = [string]$successProfileArtifact.volume_serial_hex
+            file_id_hex = [string]$successProfileArtifact.file_id_hex
+        }
+        powershell_module_admission = $successAdmission
+        source_protoc_authority = $successSourceReference; owner_marker = $successOwnerReference; protoc_run_grant = $successGrantReference
+        run_root = [ordered]@{ path = $successRunRoot; volume_serial_hex = [string]$successOutputDirectoryIdentity.VolumeSerialHex; file_id_hex = [string]$successOutputDirectoryIdentity.FileIdHex }
+        cargo_home = [ordered]@{ path = $successCargoHome; volume_serial_hex = [string]$successCargoHomeIdentity.VolumeSerialHex; file_id_hex = [string]$successCargoHomeIdentity.FileIdHex }
+        temp_root = [ordered]@{ path = $successTempRoot; volume_serial_hex = [string]$successTempIdentity.VolumeSerialHex; file_id_hex = [string]$successTempIdentity.FileIdHex }
+        fetch_phases = $successPhases.ToArray(); build_phase = $successBuildPhase
+        seeder_record = $successRecordReference
+        artifact = $successArtifactReference
+        process_cleanup = [ordered]@{
+            status = 'succeeded'; checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+            relevant_pattern = 'd31-recovery-seeder'; residual_identities = @(); error = $null
+        }
+        blocked_reason = $null
+    }
+    Assert-D32D31RecoverySeederCompanionShape -Document $successCompanionDocument -Path $successCompanionPath `
+        -OutputRoot $companionFullOutputRoot -Repository $repo -CandidateSha $companionCandidate `
+        -ValidatedProfile $successValidatedProfile -ExpectedModuleAdmission $successAdmission
+    $companionFullPassed = $true
+    $companionFullDetail = 'four successful process phases, owner/profile binding, strict V2 record and artifact, source/grant refs, complete log refs, and successful cleanup reached production companion/phase/record/owner validators'
+
+    $fullCompanionMutations = @(
+        [PSCustomObject]@{ Name = 'source authority hash'; Mutate = { param($value) $value.source_protoc_authority.sha256 = '0' * 64 } },
+        [PSCustomObject]@{ Name = 'owner marker file identity'; Mutate = { param($value) $value.owner_marker.file_id_hex = '9' * 32 } },
+        [PSCustomObject]@{ Name = 'protoc grant hash'; Mutate = { param($value) $value.protoc_run_grant.sha256 = '0' * 64 } },
+        [PSCustomObject]@{ Name = 'run-root directory identity'; Mutate = { param($value) $value.run_root.file_id_hex = '9' * 32 } },
+        [PSCustomObject]@{ Name = 'Cargo-home path'; Mutate = { param($value) $value.cargo_home.path = Join-Path $successRunRoot 'not-cargo-home' } },
+        [PSCustomObject]@{ Name = 'fetch order'; Mutate = { param($value) $swap = $value.fetch_phases[0]; $value.fetch_phases[0] = $value.fetch_phases[1]; $value.fetch_phases[1] = $swap } },
+        [PSCustomObject]@{ Name = 'fetch fixed argv gained offline'; Mutate = { param($value) $value.fetch_phases[0].command = @($value.fetch_phases[0].command) + @('--offline') } },
+        [PSCustomObject]@{ Name = 'build CREATE parent'; Mutate = { param($value) $value.build_phase.process_trace.process_events[0].parent_process_id++ } },
+        [PSCustomObject]@{ Name = 'stdout opened-file hash'; Mutate = { param($value) $value.fetch_phases[0].stdout_log_ref.sha256 = '0' * 64 } },
+        [PSCustomObject]@{ Name = 'cleanup timestamp offset'; Mutate = { param($value) $value.process_cleanup.checked_at_utc = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(1)).ToString('o') } },
+        [PSCustomObject]@{ Name = 'strict V2 record file ID'; Mutate = { param($value) $value.seeder_record.file_id_hex = '0' * 32 } },
+        [PSCustomObject]@{ Name = 'artifact fixed path'; Mutate = { param($value) $value.artifact.path = Join-Path $successTargetRoot 'debug/other.exe' } },
+        [PSCustomObject]@{ Name = 'module admission runner context'; Mutate = { param($value) $value.powershell_module_admission.runner_process.process_id++ } },
+        [PSCustomObject]@{ Name = 'unknown companion field'; Mutate = { param($value) $value['unapproved'] = $true } }
+    )
+    foreach ($mutation in $fullCompanionMutations) {
+        $mutated = ConvertTo-D32FixtureAuthorityHashtable -Value $successCompanionDocument
+        & $mutation.Mutate $mutated
+        $rejectedByProductionPredicate = $false
+        $failureMessage = $null
+        try {
+            Assert-D32D31RecoverySeederCompanionShape -Document $mutated -Path $successCompanionPath `
+                -OutputRoot $companionFullOutputRoot -Repository $repo -CandidateSha $companionCandidate `
+                -ValidatedProfile $successValidatedProfile -ExpectedModuleAdmission $successAdmission
+        }
+        catch {
+            $failureMessage = $_.Exception.Message
+            $rejectedByProductionPredicate = $failureMessage -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*' -or
+                $failureMessage -like 'D31_RECOVERY_SEEDER_OWNER_BLOCKED:*' -or
+                $failureMessage -like 'D31_RECOVERY_SEEDER_RECORD_INVALID:*' -or
+                $failureMessage -like 'ARTIFACT_IDENTITY_CHANGED:*'
+        }
+        $companionFullMutationResults.Add($rejectedByProductionPredicate)
+        Add-D32TraceIdentitySelfTestCase -Name "D31 successful companion production validator rejects $($mutation.Name) mutation without parameter-binding failure" `
+            -Passed $rejectedByProductionPredicate -Detail $failureMessage
+    }
+
+    $ownerBytes = [IO.File]::ReadAllBytes($successOwnerPath)
+    try {
+        $badOwner = ConvertTo-D32FixtureAuthorityHashtable -Value $successOwnerDocument
+        $badOwner.toolchain_profile_file_id_hex = '8' * 32
+        [IO.File]::WriteAllText($successOwnerPath, (ConvertTo-Json -InputObject $badOwner -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+        $badOwnerCompanion = ConvertTo-D32FixtureAuthorityHashtable -Value $successCompanionDocument
+        $badOwnerCompanion.owner_marker = Get-D32VendoredFileReference -Path $successOwnerPath
+        try {
+            Assert-D32D31RecoverySeederCompanionShape -Document $badOwnerCompanion -Path $successCompanionPath `
+                -OutputRoot $companionFullOutputRoot -Repository $repo -CandidateSha $companionCandidate `
+                -ValidatedProfile $successValidatedProfile -ExpectedModuleAdmission $successAdmission
+        }
+        catch { $companionOwnerMutationPassed = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_OWNER_BLOCKED:*' }
+    }
+    finally { [IO.File]::WriteAllBytes($successOwnerPath, $ownerBytes) }
+
+    $badProfileContext = ConvertTo-D32FixtureAuthorityHashtable -Value $successValidatedProfile
+    $badProfileContext.Identity = [ordered]@{
+        path = [string]$successProfileArtifact.path; bytes = [Int64]$successProfileArtifact.bytes
+        sha256 = [string]$successProfileArtifact.sha256; volume_serial_hex = [string]$successProfileArtifact.volume_serial_hex
+        file_id_hex = [string]$successProfileArtifact.file_id_hex
+    }
+    try {
+        Assert-D32D31RecoverySeederCompanionShape -Document $successCompanionDocument -Path $successCompanionPath `
+            -OutputRoot $companionFullOutputRoot -Repository $repo -CandidateSha $companionCandidate `
+            -ValidatedProfile $badProfileContext -ExpectedModuleAdmission $successAdmission
+    }
+    catch { $companionProfileIdentityNegativePassed = $_.Exception.Message -notlike '*ParameterBindingException*' }
+}
+catch { $companionFullDetail = $_.Exception.Message }
+finally {
+    $script:D32TraceIdentityUseNativeSnapshots = $false
+    $script:D32CompanionSelfTestCandidateSha = $null
+    $script:D32CompanionSelfTestRepository = $null
+    $script:D32CompanionSelfTestProfileDigest = $null
+    $script:D32CompanionSelfTestRunRoot = $null
+    $script:D32CompanionSelfTestCargoHome = $null
+    $script:D32CompanionSelfTestTempRoot = $null
+    $script:D32CompanionSelfTestRunId = $null
+    $script:D32CompanionSelfTestSourceReference = $null
+    $script:D32CompanionSelfTestSourceDocument = $null
+    $script:D32CompanionSelfTestGrantReference = $null
+    $script:D32CompanionSelfTestGrantDocument = $null
+    $script:D32CompanionSelfTestOwnerReference = $null
+    if ([IO.Directory]::Exists($companionFullRoot) -and [IO.Path]::GetFileName($companionFullRoot).StartsWith('d32-d31-companion-selftest-', [StringComparison]::Ordinal)) {
+        [IO.Directory]::Delete($companionFullRoot, $true)
+    }
+}
+Add-D32TraceIdentitySelfTestCase -Name 'D31 companion complete successful synthetic graph reaches production companion, ProcessPhase, V2 record, cleanup, owner/profile, and opened log-reference validators' `
+    -Passed $companionFullPassed -Detail $companionFullDetail
+Add-D32TraceIdentitySelfTestCase -Name 'D31 successful companion rejects every same-graph mutation through intended production predicates' `
+    -Passed ($companionFullMutationResults.Count -eq 14 -and @($companionFullMutationResults | Where-Object { -not $_ }).Count -eq 0) `
+    -Detail ("mutations={0}; rejected={1}" -f $companionFullMutationResults.Count, @($companionFullMutationResults | Where-Object { $_ }).Count)
+Add-D32TraceIdentitySelfTestCase -Name 'D31 owner marker positive path rejects Profile V2 PascalCase identity drift through the official owner validator' -Passed $companionOwnerMutationPassed
+Add-D32TraceIdentitySelfTestCase -Name 'D31 companion validated-profile input rejects flat wire identity instead of treating missing PascalCase fields as valid' -Passed $companionProfileIdentityNegativePassed
 
 foreach ($case in @(
         [PSCustomObject]@{ Name = 'missing file ID'; Mutate = { param($value) $null = $value.Remove('file_id_hex') } },

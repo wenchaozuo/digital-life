@@ -403,7 +403,7 @@ function Test-D32H7CGitRunGrant {
 }
 
 function Get-D32H7CGitTestResults {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
     $inventory = @($script:D32H7CGitTestInventory)
     if ($inventory.Count -ne 46 -or @($inventory | Select-Object -Unique).Count -ne 46) { throw 'H7C_GIT_TESTS_BLOCKED: code-owned fixed H7-C test inventory is not unique and complete' }
     $seen = @{}
@@ -557,7 +557,7 @@ function New-D32H7CGitChildAttestation {
         [Parameter(Mandatory = $true)][object]$RunGrant,
         [Parameter(Mandatory = $true)][object]$OwnerBinding,
         [Parameter(Mandatory = $true)][object]$Phase0Command,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SuiteLines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$SuiteLines,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$GitChildren,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$CandidateSha,

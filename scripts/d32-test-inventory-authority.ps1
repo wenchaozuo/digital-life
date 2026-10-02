@@ -42,7 +42,7 @@ function Get-D32TestInventoryRowKey {
 
 function Get-D32TestInventoryListOutput {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory = $true)][string]$Package,
         [Parameter(Mandatory = $true)][ValidateSet('all', 'ignored')][string]$ListingKind
     )
@@ -52,9 +52,19 @@ function Get-D32TestInventoryListOutput {
     $rows = [System.Collections.Generic.List[object]]::new()
     $summaries = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $separatorSeen = $false
+    $summarySeen = $false
     foreach ($line in $Lines) {
-        if ($line -ceq '') { throw "TEST_INVENTORY_BLOCKED: blank/truncated libtest list output row in $Package/$ListingKind" }
+        if ($line -ceq '') {
+            if ($summarySeen -or $separatorSeen -or $rows.Count -eq 0) {
+                throw "TEST_INVENTORY_BLOCKED: unexpected blank/truncated libtest list output row in $Package/$ListingKind"
+            }
+            $separatorSeen = $true
+            continue
+        }
+        if ($summarySeen) { throw "TEST_INVENTORY_BLOCKED: extra libtest list output after the summary in $Package/$ListingKind" }
         if ($line -cmatch '^(?<name>.+): (?<kind>test|benchmark)$') {
+            if ($separatorSeen) { throw "TEST_INVENTORY_BLOCKED: libtest list row follows its separator in $Package/$ListingKind" }
             $name = [string]$Matches.name
             $kind = [string]$Matches.kind
             if ([String]::IsNullOrWhiteSpace($name) -or $name.Trim() -cne $name -or $name -match '[\x00-\x1f\x7f]' -or
@@ -64,13 +74,20 @@ function Get-D32TestInventoryListOutput {
             $rows.Add([PSCustomObject][ordered]@{ package = $Package; kind = $kind; full_name = $name })
             continue
         }
-        if ($line -cmatch '^(?<tests>\d+) (?<test_label>test|tests), (?<benches>\d+) (?<benchmark_label>benchmark|benchmarks)$') {
-            $testLabel = if ([Int64]$Matches.tests -eq 1) { 'test' } else { 'tests' }
-            $benchmarkLabel = if ([Int64]$Matches.benches -eq 1) { 'benchmark' } else { 'benchmarks' }
+        if ($line -cmatch '^(?<tests>0|[1-9][0-9]*) (?<test_label>test|tests), (?<benches>0|[1-9][0-9]*) (?<benchmark_label>benchmark|benchmarks)$') {
+            $testCount = [Int64]0
+            $benchmarkCount = [Int64]0
+            if (-not [Int64]::TryParse([string]$Matches.tests, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$testCount) -or
+                -not [Int64]::TryParse([string]$Matches.benches, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$benchmarkCount)) {
+                throw "TEST_INVENTORY_BLOCKED: libtest summary count exceeds the supported integer range in $Package/$ListingKind"
+            }
+            $testLabel = if ($testCount -eq 1) { 'test' } else { 'tests' }
+            $benchmarkLabel = if ($benchmarkCount -eq 1) { 'benchmark' } else { 'benchmarks' }
             if ($Matches.test_label -cne $testLabel -or $Matches.benchmark_label -cne $benchmarkLabel) {
                 throw "TEST_INVENTORY_BLOCKED: count-specific libtest summary grammar is invalid in $Package/$ListingKind"
             }
-            $summaries.Add([PSCustomObject][ordered]@{ tests = [Int64]$Matches.tests; benchmarks = [Int64]$Matches.benches })
+            $summaries.Add([PSCustomObject][ordered]@{ tests = $testCount; benchmarks = $benchmarkCount })
+            $summarySeen = $true
             continue
         }
         throw "TEST_INVENTORY_BLOCKED: unknown/truncated libtest list output row in $Package/$ListingKind"
@@ -665,7 +682,7 @@ function Test-D32TestInventoryRowsEqual {
 }
 
 function Get-D32Phase0SuiteTestResultRows {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
     $rows = [System.Collections.Generic.List[object]]::new()
     $summaries = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Lines) {
@@ -694,7 +711,7 @@ function Assert-D32TestInventorySuiteRows {
     param(
         [Parameter(Mandatory = $true)][string]$Package,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$BaselineEntries,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory = $true)][int64]$ExpectedIgnored,
         [Parameter(Mandatory = $true)][int64]$ExpectedDeferred
     )

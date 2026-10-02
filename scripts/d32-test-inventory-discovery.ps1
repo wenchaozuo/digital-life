@@ -381,7 +381,12 @@ catch {
     $primaryError = $caughtError
     $secondaryErrors = [System.Collections.Generic.List[string]]::new()
     $evidence = $null
-    try { $evidence = Get-D32Phase0DiscoveryFailureEvidence }
+    $includeCompletedCommandContext = $caughtError -match '^(TEST_INVENTORY_BLOCKED|TEST_INVENTORY_BASELINE_BLOCKED|PHASE0_TEST_INVENTORY_BLOCKED):' -or
+        $caughtError.StartsWith('TEST_INVENTORY_DISCOVERY_BLOCKED: captured raw list output differs from structured ', [StringComparison]::Ordinal)
+    try {
+        if ($includeCompletedCommandContext) { $evidence = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext }
+        else { $evidence = Get-D32Phase0DiscoveryFailureEvidence }
+    }
     catch { $secondaryErrors.Add('last fixed-command evidence retrieval failed: ' + $_.Exception.Message) }
     if ($null -ne $evidence) {
         if (-not [String]::IsNullOrWhiteSpace([string]$evidence.PrimaryError) -and [string]$evidence.PrimaryError -cne $caughtError) {
@@ -392,12 +397,15 @@ catch {
             if (-not [String]::IsNullOrWhiteSpace([string]$secondary)) { $secondaryErrors.Add([string]$secondary) }
         }
     }
+    $commandResult = if ($null -eq $evidence) { $null } else { $evidence.CommandResult }
     $command = if ($null -eq $evidence) { $null } else { $evidence.Command }
     $processIdentity = if ($null -eq $evidence) { $null } else { $evidence.ProcessIdentity }
     $rawTrace = if ($null -eq $evidence) { $null } else { $evidence.RawV2Trace }
     $nativeCleanup = if ($null -eq $evidence) { $null } else { $evidence.NativeCleanup }
     $stdoutPath = if ($null -eq $evidence) { $null } else { $evidence.StdoutPath }
     $stderrPath = if ($null -eq $evidence) { $null } else { $evidence.StderrPath }
+    $stdoutReference = if ($null -eq $commandResult) { $null } else { $commandResult.stdout }
+    $stderrReference = if ($null -eq $commandResult) { $null } else { $commandResult.stderr }
     foreach ($capture in @([PSCustomObject]@{ Name = 'stdout'; Path = $stdoutPath }, [PSCustomObject]@{ Name = 'stderr'; Path = $stderrPath })) {
         if ([String]::IsNullOrWhiteSpace([string]$capture.Path)) { continue }
         try {
@@ -415,7 +423,7 @@ catch {
     try {
         $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryError -SecondaryErrors @($secondaryErrors.ToArray()) `
             -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup `
-            -StdoutPath $stdoutPath -StderrPath $stderrPath
+            -StdoutPath $stdoutPath -StderrPath $stderrPath -ExpectedStdoutReference $stdoutReference -ExpectedStderrReference $stderrReference
     }
     catch { $secondaryErrors.Add('blocked diagnostic capture failed: ' + $_.Exception.Message) }
     if ($secondaryErrors.Count -gt 0) {

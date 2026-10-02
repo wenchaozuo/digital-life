@@ -688,10 +688,13 @@ function Set-D32Phase0FailureContext {
 }
 
 function Get-D32Phase0DiscoveryFailureEvidence {
+    param([switch]$IncludeCompletedCommandContext)
     if ($null -ne $script:D32Phase0LastProcessFailure) { return $script:D32Phase0LastProcessFailure }
-    # A prior successful command is not evidence for the command that failed in
-    # later orchestration. Keep the failure-only sidecar's command/identity/trace
-    # fields truthful instead of attributing the last success to a new failure.
+    if ($IncludeCompletedCommandContext -and $null -ne $script:D32Phase0LastProcessEvidence -and
+        $script:D32Phase0LastProcessEvidence.Completed -is [bool] -and $script:D32Phase0LastProcessEvidence.Completed -and
+        $null -ne $script:D32Phase0LastProcessEvidence.CommandResult) {
+        return $script:D32Phase0LastProcessEvidence
+    }
     return $null
 }
 
@@ -986,7 +989,7 @@ function Test-D32Phase0SuiteCounts {
 
 function Get-D32Phase0FixtureGitStates {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [switch]$AllowPartial
     )
@@ -1153,6 +1156,8 @@ function Invoke-D32Phase0PinnedProcess {
     $script:D32Phase0LastProcessFailure = [ordered]@{
         PrimaryError = $null
         SecondaryErrors = @()
+        Completed = $false
+        CommandResult = $null
         Command = [ordered]@{
             name = $Name
             executable = [IO.Path]::GetFullPath($Executable)
@@ -1169,6 +1174,8 @@ function Invoke-D32Phase0PinnedProcess {
     $script:D32Phase0LastProcessEvidence = [ordered]@{
         PrimaryError = $null
         SecondaryErrors = @()
+        Completed = $false
+        CommandResult = $null
         Command = $script:D32Phase0LastProcessFailure.Command
         ProcessIdentity = $null
         RawV2Trace = $null
@@ -1397,10 +1404,10 @@ function Invoke-D32Phase0PinnedProcess {
     if ($exitCode -ne 0) { $script:D32Phase0LastProcessFailure.PrimaryError = "PHASE0_COMMAND_FAILED: $Name exit_code=$exitCode"; throw [string]$script:D32Phase0LastProcessFailure.PrimaryError }
     $stdoutRef = Get-D32Phase0FileReference -Path $stdoutPath
     $stderrRef = Get-D32Phase0FileReference -Path $stderrPath
+    $completedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     $script:D32Phase0LastProcessEvidence.PrimaryError = $null
     $script:D32Phase0LastProcessEvidence.SecondaryErrors = @($captureSecondaryErrors.ToArray())
-    $script:D32Phase0LastProcessFailure = $null
-    return [ordered]@{
+    $commandResult = [ordered]@{
         name = $Name
         timeout_seconds = [Int64]$TimeoutSeconds
         executable = $image.Path
@@ -1415,7 +1422,7 @@ function Invoke-D32Phase0PinnedProcess {
         candidate_sha_before = $pre.Head
         clean_before = $true
         started_at_utc = $started.ToString('o')
-        completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+        completed_at_utc = $completedAtUtc
         exit_code = [int]$exitCode
         root_process = $rootRecord
         descendant_processes = @($descendants.Values)
@@ -1442,6 +1449,10 @@ function Invoke-D32Phase0PinnedProcess {
         candidate_sha_after = $post.Head
         clean_after = $true
     }
+    $script:D32Phase0LastProcessEvidence.CommandResult = $commandResult
+    $script:D32Phase0LastProcessEvidence.Completed = $true
+    $script:D32Phase0LastProcessFailure = $null
+    return $commandResult
 }
 
 function Invoke-D32Phase0LoggedCommand {
@@ -1613,7 +1624,9 @@ function Write-D32Phase0BlockedDiagnostic {
         [AllowNull()][object]$RawV2Trace,
         [AllowNull()][object]$NativeCleanup,
         [AllowNull()][string]$StdoutPath,
-        [AllowNull()][string]$StderrPath
+        [AllowNull()][string]$StderrPath,
+        [AllowNull()][object]$ExpectedStdoutReference,
+        [AllowNull()][object]$ExpectedStderrReference
     )
 
     $context = $script:D32Phase0FailureContext
@@ -1624,8 +1637,8 @@ function Write-D32Phase0BlockedDiagnostic {
     $captures = [System.Collections.Generic.List[object]]::new()
     $ordinal = 0
     foreach ($entry in @(
-        [PSCustomObject]@{ Stream = 'stdout'; Path = $StdoutPath },
-        [PSCustomObject]@{ Stream = 'stderr'; Path = $StderrPath }
+        [PSCustomObject]@{ Stream = 'stdout'; Path = $StdoutPath; ExpectedReference = $ExpectedStdoutReference },
+        [PSCustomObject]@{ Stream = 'stderr'; Path = $StderrPath; ExpectedReference = $ExpectedStderrReference }
     )) {
         $ordinal++
         $capturePath = if ([String]::IsNullOrWhiteSpace([string]$entry.Path)) { $null } else { [IO.Path]::GetFullPath([string]$entry.Path) }
@@ -1637,8 +1650,21 @@ function Write-D32Phase0BlockedDiagnostic {
             if (-not (Test-D32ProfileNoReparsePath -Path $captureParent)) { throw "PHASE0_DIAGNOSTIC_BLOCKED: $($entry.Stream) capture parent is missing or reparse-backed" }
             if (Test-Path -LiteralPath $capturePath -PathType Leaf) {
                 $reference = Get-D32Phase0FileReference -Path $capturePath
+                if ($null -ne $entry.ExpectedReference -and
+                    (-not (Test-D32Phase0ExactProperties -Object $entry.ExpectedReference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+                        $reference.path -cne [string]$entry.ExpectedReference.path -or $reference.bytes -ne [Int64]$entry.ExpectedReference.bytes -or
+                        $reference.sha256 -cne [string]$entry.ExpectedReference.sha256 -or $reference.volume_serial_hex -cne [string]$entry.ExpectedReference.volume_serial_hex -or
+                        $reference.file_id_hex -cne [string]$entry.ExpectedReference.file_id_hex)) {
+                    throw "PHASE0_DIAGNOSTIC_BLOCKED: $($entry.Stream) output changed after its completed command reference was captured"
+                }
                 $status = 'CAPTURED'
             }
+            elseif ($null -ne $entry.ExpectedReference) {
+                throw "PHASE0_DIAGNOSTIC_BLOCKED: $($entry.Stream) output disappeared after its completed command reference was captured"
+            }
+        }
+        elseif ($null -ne $entry.ExpectedReference) {
+            throw "PHASE0_DIAGNOSTIC_BLOCKED: $($entry.Stream) output path is unavailable despite a completed command reference"
         }
         $captures.Add([ordered]@{ ordinal = $ordinal; stream = $entry.Stream; path = $capturePath; status = $status; reference = $reference })
     }
@@ -1743,7 +1769,7 @@ function Write-D32Phase0BlockedDiagnostic {
 
 function Get-D32Phase0FixtureFailurePayload {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory = $true)][string]$Repository,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
         [Parameter(Mandatory = $true)][object]$ValidatedProfile,
@@ -2822,29 +2848,27 @@ function Get-D32Phase0TestCommand {
 }
 
 function Get-D32Phase0ListedTests {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
-    if ($Lines.Count -eq 0) { throw 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
-    $tests = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in $Lines) {
-        if ($line -match '^\s*(.+): test\s*$') { $tests.Add([string]$Matches[1]) }
-    }
-    return @($tests.ToArray())
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    $parsed = Get-D32TestInventoryListOutput -Lines $Lines -Package protocol -ListingKind all
+    return @($parsed.rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
 }
 
 function Get-D32Phase0IgnoredTests {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
-    return @(Get-D32Phase0ListedTests -Lines $Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    $parsed = Get-D32TestInventoryListOutput -Lines $Lines -Package protocol -ListingKind ignored
+    return @($parsed.rows | Where-Object { $_.kind -ceq 'test' } | ForEach-Object { [string]$_.full_name })
 }
 
 function Test-D32Phase0ExactTestListOutput {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected, [switch]$Ignored)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected, [switch]$Ignored)
     if ($Lines.Count -eq 0) { return $false }
-    $observed = if ($Ignored) { @(Get-D32Phase0IgnoredTests -Lines $Lines) } else { @(Get-D32Phase0ListedTests -Lines $Lines) }
+    try { $observed = if ($Ignored) { @(Get-D32Phase0IgnoredTests -Lines $Lines) } else { @(Get-D32Phase0ListedTests -Lines $Lines) } }
+    catch { return $false }
     return (($observed -join "`0") -ceq ($Expected -join "`0"))
 }
 
 function Get-D32Phase0Summaries {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
     $records = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Lines) {
         if ($line -match '^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;') {
@@ -4013,16 +4037,16 @@ function Test-D32Phase0MatrixRecordSelfTest {
     catch { & $add 'source-ignored protocol test is rejected' ($_.Exception.Message -match 'unapproved source-ignored') }
 
     & $add 'captured test list exactly matches the declared inventory' (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::b: test', '2 tests, 0 benchmarks') -Expected @('module::a', 'module::b'))
-    & $add 'captured test list rejects a missing declared name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test') -Expected @('module::a', 'module::b')))
-    & $add 'captured test list rejects an extra name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::b: test') -Expected @('module::a')))
-    & $add 'captured test list rejects a duplicate name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::a: test') -Expected @('module::a')))
+    & $add 'captured test list rejects a missing declared name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', '1 test, 0 benchmarks') -Expected @('module::a', 'module::b')))
+    & $add 'captured test list rejects an extra name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::b: test', '2 tests, 0 benchmarks') -Expected @('module::a')))
+    & $add 'captured test list rejects a duplicate name' (-not (Test-D32Phase0ExactTestListOutput -Lines @('module::a: test', 'module::a: test', '2 tests, 0 benchmarks') -Expected @('module::a')))
     $emptyTestListOutputRejected = $false
     try { $null = Get-D32Phase0ListedTests -Lines @() }
-    catch { $emptyTestListOutputRejected = $_.Exception.Message -ceq 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
+    catch { $emptyTestListOutputRejected = $_.Exception.Message -like 'TEST_INVENTORY_BLOCKED:*' }
     & $add 'empty Cargo test-list output is explicit blocked evidence' $emptyTestListOutputRejected
     $emptyIgnoredListOutputRejected = $false
     try { $null = Get-D32Phase0IgnoredTests -Lines @() }
-    catch { $emptyIgnoredListOutputRejected = $_.Exception.Message -ceq 'PHASE0_TEST_OUTPUT_BLOCKED: captured Cargo test-list output is empty' }
+    catch { $emptyIgnoredListOutputRejected = $_.Exception.Message -like 'TEST_INVENTORY_BLOCKED:*' }
     & $add 'empty Cargo ignored-list output is explicit blocked evidence' $emptyIgnoredListOutputRejected
     & $add 'zero expected ignored tests require a nonempty captured Cargo list transcript' `
         (Test-D32Phase0ExactTestListOutput -Lines @('0 tests, 0 benchmarks') -Expected @() -Ignored)
@@ -4310,7 +4334,7 @@ function Test-D32Phase0MatrixRecordSelfTest {
     foreach ($name in $script:D32Phase0DeferredVita) { $expectedSkips += @('--skip', $name) }
     & $add 'full suite argv contains each exact D31 deferral only' (($suiteArgv -join "`0") -ceq ((@('test', '--manifest-path', 'vita-agent/Cargo.toml', '--all-targets', '--locked', '--offline', '--features', 'd32-a-test-helper', '--') + $expectedSkips) -join "`0"))
     & $add 'full suite argv does not globally serialize tests' (-not ($suiteArgv -contains '--test-threads=1'))
-    & $add 'fixed test list parser ignores non-test benchmark count lines' ((@(Get-D32Phase0ListedTests -Lines @('module::case: test', '0 tests, 0 benchmarks')) -join '|') -ceq 'module::case')
+    & $add 'fixed test list compatibility helper validates benchmark rows/counts and returns only test names' ((@(Get-D32Phase0ListedTests -Lines @('module::case: test', 'module::benchmark: benchmark', '1 test, 1 benchmark')) -join '|') -ceq 'module::case')
     & $add 'ignored test parser returns exact listed names' ((@(Get-D32Phase0IgnoredTests -Lines @('module::ignored: test', '1 test, 0 benchmarks')) -join '|') -ceq 'module::ignored')
 
     $goodSummary = @(Get-D32Phase0Summaries -Lines @('test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 1 filtered out; finished in 0.03s'))
@@ -6329,19 +6353,25 @@ catch {
         $diagnosticPath = Join-Path $failureContext.EvidenceRoot $script:D32Phase0BlockedDiagnosticName
         if (-not (Test-D32Phase0DirectoryEntryExists -Path $diagnosticPath)) {
             try {
-                $lastProcessFailure = $script:D32Phase0LastProcessFailure
+                $includeCompletedCommandContext = $primaryFailure -match '^(TEST_INVENTORY_BLOCKED|TEST_INVENTORY_BASELINE_BLOCKED|PHASE0_TEST_INVENTORY_BLOCKED):'
+                if ($includeCompletedCommandContext) { $lastProcessFailure = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext }
+                else { $lastProcessFailure = Get-D32Phase0DiscoveryFailureEvidence }
+                $commandResult = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.CommandResult }
                 $command = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.Command }
                 $processIdentity = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.ProcessIdentity }
                 $rawTrace = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.RawV2Trace }
                 $nativeCleanup = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.NativeCleanup }
                 $stdoutPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StdoutPath }
                 $stderrPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StderrPath }
+                $stdoutReference = if ($null -eq $commandResult) { $null } else { $commandResult.stdout }
+                $stderrReference = if ($null -eq $commandResult) { $null } else { $commandResult.stderr }
                 $secondary = @()
                 if ($null -ne $lastProcessFailure -and -not [String]::IsNullOrWhiteSpace([string]$lastProcessFailure.PrimaryError) -and $lastProcessFailure.PrimaryError -cne $primaryFailure) {
                     $primaryFailure = [string]$lastProcessFailure.PrimaryError
                     $secondary = @($_.Exception.Message)
                 }
-                $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryFailure -SecondaryErrors $secondary -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup -StdoutPath $stdoutPath -StderrPath $stderrPath
+                $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryFailure -SecondaryErrors $secondary -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup -StdoutPath $stdoutPath -StderrPath $stderrPath `
+                    -ExpectedStdoutReference $stdoutReference -ExpectedStderrReference $stderrReference
             }
             catch { $primaryFailure += '; blocked diagnostic capture error=' + $_.Exception.Message }
         }

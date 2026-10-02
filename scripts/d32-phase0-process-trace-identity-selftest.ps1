@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
 $phase0Path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1'))
 $fixturePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
+$h7AuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-h7c-git-child-authority.ps1'))
 $profilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'))
 $moduleStart = @(Microsoft.PowerShell.Core\Get-Module | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Version, $_.Path } | Sort-Object)
 $global:D32PowerShellModuleImportAttempts = 0
@@ -132,6 +133,12 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0DirectoryEntryExists' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0ActualDebugCommandLine' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiscoveryFailureEvidence' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0ListedTests' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0IgnoredTests' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0ExactTestListOutput' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0Summaries' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0FixtureGitStates' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0FixtureFailurePayload' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertFrom-D32Phase0DebugProcess' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiagnosticPropertyValue' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Write-D32Phase0BlockedDiagnostic' },
@@ -140,6 +147,9 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0DebugProcessTraceDocument' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'New-D32Phase0SelfTestDebugTrace' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0DebugProcessTrace' },
+        [PSCustomObject]@{ Path = (Join-Path $PSScriptRoot 'd32-test-inventory-authority.ps1'); Name = 'Get-D32TestInventoryListOutput' },
+        [PSCustomObject]@{ Path = (Join-Path $PSScriptRoot 'd32-test-inventory-authority.ps1'); Name = 'Get-D32Phase0SuiteTestResultRows' },
+        [PSCustomObject]@{ Path = $h7AuthorityPath; Name = 'Get-D32H7CGitTestResults' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32ObjectFieldNames' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32FixtureExactProperties' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'New-D32ProcessIdentityRecord' },
@@ -148,6 +158,113 @@ foreach ($entry in @(
     )) {
     Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $entry.Path -Name $entry.Name)
 }
+
+function ConvertTo-D32TraceIdentityListLines {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $reader = [IO.StringReader]::new($Text)
+    try { while ($null -ne ($line = $reader.ReadLine())) { $lines.Add($line) } }
+    finally { $reader.Dispose() }
+    return @($lines.ToArray())
+}
+
+$inventoryRows = @(
+    'protocol::case_00: test', 'protocol::case_01: test', 'protocol::case_02: test', 'protocol::case_03: test',
+    'protocol::case_04: test', 'protocol::case_05: test', 'protocol::case_06: test', 'protocol::case_07: test',
+    'protocol::case_08: test', 'protocol::case_09: test', 'protocol::case_10: test', 'protocol::case_11: test',
+    'protocol::case_12: test', 'protocol::case_13: test', 'protocol::case_14: test', 'protocol::case_15: test'
+)
+$inventoryLfWithoutFinalNewline = ($inventoryRows -join "`n") + "`n`n16 tests, 0 benchmarks"
+$inventoryCrlfWithFinalNewline = ($inventoryRows -join "`r`n") + "`r`n`r`n16 tests, 0 benchmarks`r`n"
+$lfLines = ConvertTo-D32TraceIdentityListLines -Text $inventoryLfWithoutFinalNewline
+$crlfLines = ConvertTo-D32TraceIdentityListLines -Text $inventoryCrlfWithFinalNewline
+$lfParsed = Get-D32TestInventoryListOutput -Lines $lfLines -Package protocol -ListingKind all
+$crlfParsed = Get-D32TestInventoryListOutput -Lines $crlfLines -Package protocol -ListingKind all
+$noSeparatorParsed = Get-D32TestInventoryListOutput -Lines @($inventoryRows + @('16 tests, 0 benchmarks')) -Package protocol -ListingKind all
+$expectedInventoryNames = @(0..15 | ForEach-Object { 'protocol::case_{0:D2}' -f $_ })
+Add-D32TraceIdentitySelfTestCase -Name 'libtest list parser accepts one separator with LF/no-final-newline and CRLF/final-newline while preserving all sixteen exact rows' `
+    -Passed ($lfParsed.row_count -eq 16 -and $crlfParsed.row_count -eq 16 -and
+        ($lfParsed.rows.full_name -join "`0") -ceq ($expectedInventoryNames -join "`0") -and
+        $noSeparatorParsed.row_count -eq 16)
+$benchmarkParsed = Get-D32TestInventoryListOutput -Lines @('protocol::ordinary_a: test', 'protocol::ordinary_b: test', 'protocol::bench_a: benchmark', '', '2 tests, 1 benchmark') -Package protocol -ListingKind all
+$emptyIgnoredParsed = Get-D32TestInventoryListOutput -Lines @('0 tests, 0 benchmarks') -Package protocol -ListingKind ignored
+$legacyTestNames = @(Get-D32Phase0ListedTests -Lines @('protocol::ordinary_a: test', 'protocol::bench_a: benchmark', '1 test, 1 benchmark'))
+$legacyIgnoredNames = @(Get-D32Phase0IgnoredTests -Lines @('0 tests, 0 benchmarks'))
+$legacyBlankListRows = @()
+$legacyBlankListError = $null
+try { $legacyBlankListRows = @(Get-D32Phase0ListedTests -Lines @('protocol::ordinary_a: test', 'protocol::bench_a: benchmark', '', '1 test, 1 benchmark')) }
+catch { $legacyBlankListError = $_.Exception.Message }
+$legacyExactRowsAccepted = Test-D32Phase0ExactTestListOutput -Lines @('protocol::ordinary_a: test', 'protocol::bench_a: benchmark', '', '1 test, 1 benchmark') -Expected @('protocol::ordinary_a')
+$suiteRowsWithSeparator = Get-D32Phase0SuiteTestResultRows -Lines @('running 1 test', '', 'test protocol::ordinary_a ... ok', '', 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+$suiteSummariesWithSeparator = @(Get-D32Phase0Summaries -Lines @('test protocol::ordinary_a ... ok', '', 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'))
+$emptyAllRejected = $false
+try { $null = Get-D32TestInventoryListOutput -Lines @('0 tests, 0 benchmarks') -Package protocol -ListingKind all }
+catch { $emptyAllRejected = $_.Exception.Message -like 'TEST_INVENTORY_BLOCKED:*nonempty package inventory required*' }
+Add-D32TraceIdentitySelfTestCase -Name 'libtest benchmark summaries reconcile, empty ignored inventory is valid, and empty complete inventory is blocked' `
+    -Passed ($benchmarkParsed.row_count -eq 3 -and $benchmarkParsed.benchmark_count -eq 1 -and $emptyIgnoredParsed.row_count -eq 0 -and $emptyAllRejected -and
+        ($legacyTestNames -join '|') -ceq 'protocol::ordinary_a' -and $legacyIgnoredNames.Count -eq 0 -and $legacyExactRowsAccepted) `
+    -Detail ('benchmark_rows={0};benchmark_count={1};ignored_rows={2};empty_all_rejected={3};legacy_tests={4};legacy_ignored={5};legacy_blank_tests={6};legacy_blank_error={7};legacy_exact={8}' -f $benchmarkParsed.row_count, $benchmarkParsed.benchmark_count, $emptyIgnoredParsed.row_count, $emptyAllRejected, ($legacyTestNames -join '|'), $legacyIgnoredNames.Count, ($legacyBlankListRows -join '|'), $legacyBlankListError, $legacyExactRowsAccepted)
+Add-D32TraceIdentitySelfTestCase -Name 'suite, focused-summary, and compatibility readers accept blank libtest separators where their grammar already allows them' `
+    -Passed ($suiteRowsWithSeparator.rows.Count -eq 1 -and $suiteRowsWithSeparator.summaries.Count -eq 1 -and $suiteSummariesWithSeparator.Count -eq 1 -and $legacyExactRowsAccepted) `
+    -Detail ('suite_rows={0};suite_summaries={1};focused_summaries={2};legacy_exact={3}' -f $suiteRowsWithSeparator.rows.Count, $suiteRowsWithSeparator.summaries.Count, $suiteSummariesWithSeparator.Count, $legacyExactRowsAccepted)
+$script:D32H7CGitTestInventory = @(0..45 | ForEach-Object { 'synthetic_h7_{0:D2}' -f $_ })
+$h7SuiteLinesWithBlank = [System.Collections.Generic.List[string]]::new()
+for ($h7Index = 0; $h7Index -lt $script:D32H7CGitTestInventory.Count; $h7Index++) {
+    $h7SuiteLinesWithBlank.Add('test d29h7::tests::{0} ... ok' -f $script:D32H7CGitTestInventory[$h7Index])
+    if ($h7Index -eq 15) { $h7SuiteLinesWithBlank.Add('') }
+}
+$h7SuiteLinesWithBlank.Add('')
+$h7SuiteLinesWithBlank.Add('test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+$h7BlankParsed = @(Get-D32H7CGitTestResults -Lines ([string[]]$h7SuiteLinesWithBlank.ToArray()))
+$h7ParserTokens = $null; $h7ParserErrors = $null
+$h7ParserAst = [Management.Automation.Language.Parser]::ParseFile($h7AuthorityPath, [ref]$h7ParserTokens, [ref]$h7ParserErrors)
+$h7AttestationAst = $h7ParserAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32H7CGitChildAttestation' }, $true)
+$h7SuiteLinesParameter = if ($null -eq $h7AttestationAst) { $null } else { @($h7AttestationAst.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'SuiteLines' }) | Select-Object -First 1 }
+$h7SuiteLinesAllowsEmptyString = $false
+if ($null -ne $h7SuiteLinesParameter) {
+    $h7SuiteLinesAllowsEmptyString = @($h7SuiteLinesParameter.Attributes | Where-Object { $_.TypeName.FullName -ceq 'AllowEmptyString' }).Count -eq 1
+}
+$h7MissingRowRejected = $false
+$h7DuplicateRowRejected = $false
+try { $null = Get-D32H7CGitTestResults -Lines @($h7SuiteLinesWithBlank.ToArray() | Where-Object { $_ -notmatch 'synthetic_h7_15' }) }
+catch { $h7MissingRowRejected = $_.Exception.Message -like '*required H7-C test result is absent*' }
+try { $null = Get-D32H7CGitTestResults -Lines (@($h7SuiteLinesWithBlank.ToArray()) + 'test d29h7::tests::synthetic_h7_15 ... ok') }
+catch { $h7DuplicateRowRejected = $_.Exception.Message -like '*duplicate H7-C test result row*' }
+Add-D32TraceIdentitySelfTestCase -Name 'H7-C suite result consumer accepts real blank-line grammar while preserving required unique rows and the wrapper input contract' `
+    -Passed ($h7BlankParsed.Count -eq 46 -and $h7SuiteLinesAllowsEmptyString -and $h7ParserErrors.Count -eq 0 -and $h7MissingRowRejected -and $h7DuplicateRowRejected) `
+    -Detail ('rows={0};wrapper_allows_empty={1};missing_rejected={2};duplicate_rejected={3}' -f $h7BlankParsed.Count, $h7SuiteLinesAllowsEmptyString, $h7MissingRowRejected, $h7DuplicateRowRejected)
+$fixtureGitMarkersWithBlanks = @(Get-D32Phase0FixtureGitStates -Lines @('', 'D32_FIXTURE_GIT_STATE phase=1 edge=before head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa clean=true', '', 'D32_FIXTURE_GIT_STATE phase=1 edge=after head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa clean=true', '') -ExpectedCandidateSha ('a' * 40) -AllowPartial)
+$fixtureFailurePayloadWithoutMarker = Get-D32Phase0FixtureFailurePayload -Lines @('', 'ordinary fixture output') -Repository $repo -ExpectedCandidateSha ('a' * 40) -ValidatedProfile ([PSCustomObject]@{}) -ExpectedRunId ('b' * 32)
+$fixtureGitMarkerOrderRejected = $false
+try { $null = Get-D32Phase0FixtureGitStates -Lines @('', 'D32_FIXTURE_GIT_STATE phase=1 edge=after head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa clean=true', 'D32_FIXTURE_GIT_STATE phase=1 edge=before head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa clean=true') -ExpectedCandidateSha ('a' * 40) -AllowPartial }
+catch { $fixtureGitMarkerOrderRejected = $_.Exception.Message -like 'PHASE0_FIXTURE_STATE_BLOCKED:*' }
+Add-D32TraceIdentitySelfTestCase -Name 'Phase0 fixture stdout readers accept blank rows while preserving exact Git-state ordering and failure-payload filtering' `
+    -Passed ($fixtureGitMarkersWithBlanks.Count -eq 2 -and $null -eq $fixtureFailurePayloadWithoutMarker -and $fixtureGitMarkerOrderRejected) `
+    -Detail ('marker_count={0};unrelated_payload_null={1};order_negative={2}' -f $fixtureGitMarkersWithBlanks.Count, ($null -eq $fixtureFailurePayloadWithoutMarker), $fixtureGitMarkerOrderRejected)
+$malformedInventoryCases = @(
+    ,@('protocol::case_a: test', '', '', '1 test, 0 benchmarks'),
+    ,@('', 'protocol::case_a: test', '1 test, 0 benchmarks'),
+    ,@('protocol::case_a: test', '', 'protocol::case_b: test', '2 tests, 0 benchmarks'),
+    ,@('protocol::case_a: test', '1 test, 0 benchmarks', 'footer'),
+    ,@('protocol::case_a: test', '1 test, 0 benchmarks', '1 test, 0 benchmarks'),
+    ,@('protocol::case_a: test', '2 tests, 0 benchmarks'),
+    ,@('protocol::case_a: test', '01 tests, 0 benchmarks'),
+    ,@('protocol::case_a: test', '9223372036854775808 tests, 0 benchmarks'),
+    ,@('protocol::case_a: error', '0 tests, 0 benchmarks'),
+    ,@('protocol::case_a: test', '', '1 test, 0 benchmarks', ''),
+    ,@('protocol::case_a: test', '2 tests, 1 benchmark')
+)
+$malformedInventoryRejected = $true
+foreach ($badLines in $malformedInventoryCases) {
+    $rejected = $false
+    try { $null = Get-D32TestInventoryListOutput -Lines $badLines -Package protocol -ListingKind all }
+    catch { $rejected = $_.Exception.Message -like 'TEST_INVENTORY_BLOCKED:*' }
+    if (-not $rejected) { $malformedInventoryRejected = $false }
+}
+$strictCompatibilityParserRejectsMalformed = -not (Test-D32Phase0ExactTestListOutput -Lines @('protocol::case_a: test', 'unapproved footer') -Expected @('protocol::case_a'))
+Add-D32TraceIdentitySelfTestCase -Name 'libtest list parser and compatibility helpers reject repeated/interior separators, row-after-separator, duplicate/mismatched summaries, leading zeros, wrong categories, footers, and benchmark count drift' `
+    -Passed ($malformedInventoryRejected -and $strictCompatibilityParserRejectsMalformed)
+
 $script:D32Phase0BlockedDiagnosticName = 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
 
 $capturePath = [IO.Path]::GetFullPath('E:\d32\synthetic-cargo.exe')
@@ -311,6 +428,7 @@ if ([IO.Directory]::Exists($diagnosticRoot) -or [IO.File]::Exists($diagnosticRoo
 [void][IO.Directory]::CreateDirectory($diagnosticRoot)
 $diagnosticPath = Join-Path $diagnosticRoot $script:D32Phase0BlockedDiagnosticName
 $stdoutCapturePath = Join-Path $diagnosticRoot 'synthetic-fixed-command.stdout.log'
+$stderrCapturePath = Join-Path $diagnosticRoot 'synthetic-fixed-command.stderr.log'
 $oldFailureContextVariable = Get-Variable -Name D32Phase0FailureContext -Scope Script -ErrorAction SilentlyContinue
 $oldFailureContext = if ($null -eq $oldFailureContextVariable) { $null } else { $oldFailureContextVariable.Value }
 $script:D32Phase0BlockedDiagnosticType = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1'
@@ -343,8 +461,15 @@ $incompleteCleanup = [ordered]@{
     DebuggerAssociationQueryVerified = $true; DebuggerAssociationAbsent = $true
 }
 $script:D32Phase0LastProcessFailure = $null
+$successfulPriorCommandResult = [ordered]@{
+    name = 'completed-prior-command'; exit_code = 0
+    stdout = [ordered]@{ path = 'E:\d32\prior.stdout.log'; bytes = [Int64]0; sha256 = 'a' * 64; volume_serial_hex = '0000000000000001'; file_id_hex = '1' * 32 }
+    stderr = [ordered]@{ path = 'E:\d32\prior.stderr.log'; bytes = [Int64]0; sha256 = 'b' * 64; volume_serial_hex = '0000000000000001'; file_id_hex = '2' * 32 }
+}
 $script:D32Phase0LastProcessEvidence = [ordered]@{
     PrimaryError = $null
+    Completed = $true
+    CommandResult = $successfulPriorCommandResult
     Command = [ordered]@{ name = 'completed-prior-command' }
     ProcessIdentity = [ordered]@{ identity_verified = $true }
     RawV2Trace = [ordered]@{ event_chain_complete = $true }
@@ -352,11 +477,18 @@ $script:D32Phase0LastProcessEvidence = [ordered]@{
     StdoutPath = 'E:\d32\prior.stdout.log'
     StderrPath = 'E:\d32\prior.stderr.log'
 }
-$staleCommandEvidenceRejected = $null -eq (Get-D32Phase0DiscoveryFailureEvidence)
-$script:D32Phase0LastProcessFailure = [ordered]@{ PrimaryError = 'current fixed-command failure'; Command = [ordered]@{ name = 'current-failing-command' } }
-$currentCommandEvidenceRetained = (Get-D32Phase0DiscoveryFailureEvidence).Command.name -ceq 'current-failing-command'
-Add-D32TraceIdentitySelfTestCase -Name 'discovery failure context never misattributes a previously completed command but retains the current failed command' `
-    -Passed ($staleCommandEvidenceRejected -and $currentCommandEvidenceRetained)
+$unrequestedCompletedContextHidden = $null -eq (Get-D32Phase0DiscoveryFailureEvidence)
+$lastCompletedContextRetained = (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.name -ceq 'completed-prior-command' -and
+    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.exit_code -eq 0 -and
+    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.stdout.sha256 -ceq ('a' * 64)
+$script:D32Phase0LastProcessFailure = [ordered]@{
+    PrimaryError = 'current fixed-command failure'; Completed = $false; CommandResult = $null
+    Command = [ordered]@{ name = 'current-failing-command' }
+}
+$currentCommandEvidenceRetained = (Get-D32Phase0DiscoveryFailureEvidence).Command.name -ceq 'current-failing-command' -and
+    $null -eq (Get-D32Phase0DiscoveryFailureEvidence).CommandResult
+Add-D32TraceIdentitySelfTestCase -Name 'failure context retains a complete successful command result for later parser diagnostics and prefers an actual process failure' `
+    -Passed ($unrequestedCompletedContextHidden -and $lastCompletedContextRetained -and $currentCommandEvidenceRetained)
 try {
     $noDiagnosticAccepted = $false
     try { $noDiagnosticAccepted = Assert-D32Phase0DiscoveryNoBlockedDiagnostic -EvidenceRoot $diagnosticRoot }
@@ -432,6 +564,109 @@ try {
         -not [IO.File]::Exists($diagnosticPath)
     Add-D32TraceIdentitySelfTestCase -Name 'diagnostic capture failure is secondary and does not replace the primary failure or manufacture a sidecar' -Passed $captureFailurePreserved
 
+    $actualExpectedMismatchReference = Get-D32Phase0FileReference -Path $stdoutCapturePath
+    $tamperedExpectedMismatchReference = [ordered]@{
+        path = $actualExpectedMismatchReference.path; bytes = [Int64]$actualExpectedMismatchReference.bytes
+        sha256 = 'f' * 64; volume_serial_hex = $actualExpectedMismatchReference.volume_serial_hex
+        file_id_hex = $actualExpectedMismatchReference.file_id_hex
+    }
+    $referenceMismatchPrimary = 'TEST_INVENTORY_BLOCKED: synthetic parser primary'
+    $referenceMismatchSecondary = $null
+    try {
+        $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $referenceMismatchPrimary -Command $diagnosticCommand `
+            -ProcessIdentity $diagnosticIdentity -RawV2Trace $incompleteTrace -NativeCleanup $incompleteCleanup `
+            -StdoutPath $stdoutCapturePath -StderrPath $null -ExpectedStdoutReference $tamperedExpectedMismatchReference
+    }
+    catch { $referenceMismatchSecondary = 'blocked diagnostic capture failed: ' + $_.Exception.Message }
+    Add-D32TraceIdentitySelfTestCase -Name 'diagnostic output-reference mismatch is secondary to the parser primary and writes no sidecar' `
+        -Passed ($referenceMismatchPrimary -ceq 'TEST_INVENTORY_BLOCKED: synthetic parser primary' -and
+            $referenceMismatchSecondary -like 'blocked diagnostic capture failed: PHASE0_DIAGNOSTIC_BLOCKED:*stdout output changed*' -and
+            -not [IO.File]::Exists($diagnosticPath))
+
+    $stderrBytes = [Text.UTF8Encoding]::new($false).GetBytes('')
+    $stderrStream = [IO.File]::Open($stderrCapturePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $stderrStream.Write($stderrBytes, 0, $stderrBytes.Length); $stderrStream.Flush($true) } finally { $stderrStream.Dispose() }
+    $successfulTrace = [ordered]@{
+        dedicated_debugger_thread = $true; debugger_kill_on_exit_enabled = $true; debugger_thread_exited = $true
+        debugger_thread_joined = $true; retained_process_handles_signaled = $true; debugger_association_query_verified = $true
+        debugger_association_absent = $true; job_accounting_verified = $true; accounting_consistent = $true
+        event_chain_complete = $true; job_active_processes = 0
+        processes = @([ordered]@{ process_id = 41001; exit_code = 0 })
+    }
+    $successfulCleanup = [ordered]@{
+        CleanupSucceeded = $true; JobCloseSucceeded = $true; JobActiveProcessCountVerified = $true; JobActiveProcessCount = 0
+        DebuggerThreadJoined = $true; RetainedProcessHandlesSignaled = $true
+        DebuggerAssociationQueryVerified = $true; DebuggerAssociationAbsent = $true
+    }
+    $successfulProcessIdentity = [ordered]@{ process_id = 41001; parent_process_id = 41000; identity_verified = $true }
+    $successfulStdoutReference = Get-D32Phase0FileReference -Path $stdoutCapturePath
+    $successfulStderrReference = Get-D32Phase0FileReference -Path $stderrCapturePath
+    $successfulCommandResult = [ordered]@{
+        name = 'protocol-test-list'; timeout_seconds = [Int64]28800; started_at_utc = '2026-10-02T00:00:00.0000000+00:00'
+        completed_at_utc = '2026-10-02T00:00:01.0000000+00:00'; exit_code = 0
+        stdout = $successfulStdoutReference; stderr = $successfulStderrReference
+        process_trace = $successfulTrace; process_tree_cleanup = [ordered]@{ cleanup_succeeded = $true; active_process_count_verified = $true; active_process_count = [uint32]0 }
+    }
+    $script:D32Phase0LastProcessFailure = $null
+    $script:D32Phase0LastProcessEvidence = [ordered]@{
+        PrimaryError = $null; SecondaryErrors = @(); Completed = $true; CommandResult = $successfulCommandResult
+        Command = [ordered]@{ name = 'protocol-test-list'; arguments = @('test', '--list') }
+        ProcessIdentity = $successfulProcessIdentity; RawV2Trace = $successfulTrace; NativeCleanup = $successfulCleanup
+        StdoutPath = $stdoutCapturePath; StderrPath = $stderrCapturePath
+    }
+    $postCommandEvidence = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext
+    $postCommandContextPreserved = $null -ne $postCommandEvidence -and $postCommandEvidence.Completed -eq $true -and
+        $null -eq $postCommandEvidence.PrimaryError -and $postCommandEvidence.CommandResult.exit_code -eq 0 -and
+        $postCommandEvidence.CommandResult.name -ceq 'protocol-test-list' -and
+        $postCommandEvidence.CommandResult.timeout_seconds -eq 28800 -and
+        $postCommandEvidence.CommandResult.started_at_utc -ceq '2026-10-02T00:00:00.0000000+00:00' -and
+        $postCommandEvidence.CommandResult.completed_at_utc -ceq '2026-10-02T00:00:01.0000000+00:00' -and
+        $postCommandEvidence.CommandResult.process_trace.event_chain_complete -eq $true -and
+        $postCommandEvidence.CommandResult.process_tree_cleanup.cleanup_succeeded -eq $true -and
+        $postCommandEvidence.CommandResult.stdout.sha256 -ceq $successfulStdoutReference.sha256 -and
+        $postCommandEvidence.CommandResult.stderr.sha256 -ceq $successfulStderrReference.sha256
+    $postCommandDiagnosticFailure = $null
+    try {
+        $diagnosticPath = Write-D32Phase0BlockedDiagnostic -PrimaryError 'TEST_INVENTORY_BLOCKED: unexpected blank/truncated libtest list output' `
+            -Command $postCommandEvidence.Command -ProcessIdentity $postCommandEvidence.ProcessIdentity `
+            -RawV2Trace $postCommandEvidence.RawV2Trace -NativeCleanup $postCommandEvidence.NativeCleanup `
+            -StdoutPath $postCommandEvidence.StdoutPath -StderrPath $postCommandEvidence.StderrPath `
+            -ExpectedStdoutReference $postCommandEvidence.CommandResult.stdout -ExpectedStderrReference $postCommandEvidence.CommandResult.stderr
+    }
+    catch { $postCommandDiagnosticFailure = $_.Exception.Message }
+    $postCommandDiagnostic = if ($null -eq $postCommandDiagnosticFailure) { [IO.File]::ReadAllText($diagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null }
+    $postCommandDiagnosticPreserved = $null -ne $postCommandDiagnostic -and
+        $postCommandDiagnostic.status -ceq 'BLOCKED' -and $postCommandDiagnostic.gate_authority -ceq 'NONE' -and
+        $postCommandDiagnostic.primary_error -ceq 'TEST_INVENTORY_BLOCKED: unexpected blank/truncated libtest list output' -and
+        $postCommandDiagnostic.failing_fixed_command.name -ceq 'protocol-test-list' -and
+        (Test-D32Phase0ExactProperties -Object $postCommandDiagnostic.failing_fixed_command -Expected @('name', 'arguments')) -and
+        $postCommandDiagnostic.raw_v2_trace.processes[0].exit_code -eq 0 -and
+        $postCommandDiagnostic.raw_v2_trace.event_chain_complete -eq $true -and
+        $postCommandDiagnostic.job_debug_cleanup.verification -ceq 'VERIFIED' -and
+        $postCommandDiagnostic.ordered_stream_captures[0].reference.sha256 -ceq $successfulStdoutReference.sha256 -and
+        $postCommandDiagnostic.ordered_stream_captures[1].reference.sha256 -ceq $successfulStderrReference.sha256
+    Add-D32TraceIdentitySelfTestCase -Name 'post-command parser failure diagnostic keeps the parser primary, completed exit-zero command, V2 trace, cleanup, and exact raw stream references' `
+        -Passed ($postCommandContextPreserved -and $postCommandDiagnosticPreserved) -Detail $postCommandDiagnosticFailure
+
+    [IO.File]::Delete($diagnosticPath)
+    $unknownTraceUnverified = $false
+    $unknownCleanupUnverified = $false
+    try {
+        $diagnosticPath = Write-D32Phase0BlockedDiagnostic -PrimaryError 'TEST_INVENTORY_BLOCKED: synthetic parser error with unknown cleanup' `
+            -Command $postCommandEvidence.Command -ProcessIdentity $postCommandEvidence.ProcessIdentity `
+            -RawV2Trace ([ordered]@{ unexpected_trace_field = $true }) -NativeCleanup ([ordered]@{ unexpected_cleanup_field = $true }) `
+            -StdoutPath $postCommandEvidence.StdoutPath -StderrPath $postCommandEvidence.StderrPath `
+            -ExpectedStdoutReference $postCommandEvidence.CommandResult.stdout -ExpectedStderrReference $postCommandEvidence.CommandResult.stderr
+        $unknownDiagnostic = [IO.File]::ReadAllText($diagnosticPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $unknownTraceUnverified = $unknownDiagnostic.status -ceq 'BLOCKED' -and $unknownDiagnostic.gate_authority -ceq 'NONE' -and
+            $unknownDiagnostic.job_debug_cleanup.verification -ceq 'UNVERIFIED' -and $unknownDiagnostic.unverified_fields.Count -eq 0
+        $unknownCleanupUnverified = $unknownDiagnostic.job_debug_cleanup.unverified_fields.Count -ge 17 -and
+            @($unknownDiagnostic.job_debug_cleanup.unverified_fields | Where-Object { $_ -ceq 'cleanup.CleanupSucceeded' -or $_ -ceq 'cleanup.JobActiveProcessCountVerified' }).Count -eq 2
+    }
+    catch { $unknownTraceUnverified = $false; $unknownCleanupUnverified = $false }
+    Add-D32TraceIdentitySelfTestCase -Name 'unknown or missing trace/cleanup fields stay UNVERIFIED and cannot turn a parser failure into PASS' `
+        -Passed ($unknownTraceUnverified -and $unknownCleanupUnverified)
+
     $discoveryPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-test-inventory-discovery.ps1'))
     $discoverySource = [IO.File]::ReadAllText($discoveryPath, [Text.UTF8Encoding]::new($false, $true))
     $discoveryTokens = $null; $discoveryParseErrors = $null
@@ -441,10 +676,22 @@ try {
         $diagnosticCatch.Extent.Text.Contains('$secondaryErrors.Add(') -and
         $diagnosticCatch.Extent.Text.Contains('throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $primaryError"')
     Add-D32TraceIdentitySelfTestCase -Name 'discovery outer failure path records diagnostic-write exceptions as secondary while throwing the retained primary' -Passed $discoveryFailureHandlingBound
+    $phase0FailureCatch = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.CatchClauseAst] -and
+        $node.Extent.Text.Contains('Get-D32Phase0DiscoveryFailureEvidence') -and $node.Extent.Text.Contains('ExpectedStdoutReference') }, $true)
+    $pinnedProcessFunction = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32Phase0PinnedProcess' }, $true)
+    $postCommandDiagnosticBindingsComplete = $null -ne $phase0FailureCatch -and
+        $discoverySource.Contains('$evidence.CommandResult') -and $discoverySource.Contains('-IncludeCompletedCommandContext') -and
+        $discoverySource.Contains('-ExpectedStdoutReference $stdoutReference') -and
+        $phase0FailureCatch.Extent.Text.Contains('-IncludeCompletedCommandContext') -and
+        $null -ne $pinnedProcessFunction -and $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.CommandResult = $commandResult') -and
+        $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.Completed = $true')
+    Add-D32TraceIdentitySelfTestCase -Name 'completed fetch/list results are retained in memory and both discovery and Phase0 output-error catches bind their stream references to V1 diagnostics' `
+        -Passed $postCommandDiagnosticBindingsComplete
 }
 finally {
     if ([IO.File]::Exists($diagnosticPath)) { [IO.File]::Delete($diagnosticPath) }
     if ([IO.File]::Exists($stdoutCapturePath)) { [IO.File]::Delete($stdoutCapturePath) }
+    if ([IO.File]::Exists($stderrCapturePath)) { [IO.File]::Delete($stderrCapturePath) }
     if ([IO.Directory]::Exists($diagnosticRoot)) { [IO.Directory]::Delete($diagnosticRoot, $false) }
     $script:D32Phase0FailureContext = $oldFailureContext
 }

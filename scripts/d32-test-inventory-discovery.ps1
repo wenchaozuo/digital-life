@@ -226,7 +226,7 @@ $runId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
 $ownerRoot = New-D32Phase0FixtureOutputRoot -Path $output -Repository $repo -ExpectedCandidateSha $ExpectedCandidateSha -ValidatedProfile $profile -RunId $runId
 $output = [string]$ownerRoot.Path
 Set-D32Phase0FailureContext -Context ([PSCustomObject]@{
-    EvidenceRoot = $output; CandidateSha = $ExpectedCandidateSha; Profile = $profile; RunId = $runId
+    EvidenceRoot = $output; CandidateSha = $ExpectedCandidateSha; Profile = $profile; RunId = $runId; Repository = $repo
     RootIdentity = $ownerRoot.RootIdentity; OwnerMarker = $ownerRoot.OwnerMarker
 })
 
@@ -381,11 +381,8 @@ catch {
     $primaryError = $caughtError
     $secondaryErrors = [System.Collections.Generic.List[string]]::new()
     $evidence = $null
-    $includeCompletedCommandContext = $caughtError -match '^(TEST_INVENTORY_BLOCKED|TEST_INVENTORY_BASELINE_BLOCKED|PHASE0_TEST_INVENTORY_BLOCKED):' -or
-        $caughtError.StartsWith('TEST_INVENTORY_DISCOVERY_BLOCKED: captured raw list output differs from structured ', [StringComparison]::Ordinal)
     try {
-        if ($includeCompletedCommandContext) { $evidence = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext }
-        else { $evidence = Get-D32Phase0DiscoveryFailureEvidence }
+        $evidence = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext
     }
     catch { $secondaryErrors.Add('last fixed-command evidence retrieval failed: ' + $_.Exception.Message) }
     if ($null -ne $evidence) {

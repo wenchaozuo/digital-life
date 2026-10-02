@@ -1,24 +1,23 @@
 # AGENTS.md — 虚拟生命项目 Codex 根治理入口
 
-**Protocol:** v1.2
-
-**Scope:** 仓库根目录及全部子目录。  
+**Protocol:** v1.3 / 2026-10-02-efficiency-01
+**Scope:** 仓库根目录及全部子目录。
 **Full protocol:** `docs/governance/CODEX_DEVELOPMENT_PROTOCOL.md`
+
+**Execution rules / effective-source index:** `docs/governance/EXECUTION_EFFICIENCY_POLICY.md`。首次接手 MUST 完整读取。D32 历史 ADR/Stage Contract 在实际 Integration 目录，不能被此目录的历史空索引替代；不得在正式执行中修改其 exact-SHA candidate。
 
 ## 1. 当前模型映射
 
-本项目当前模型信号由用户配置为以下映射：
+本项目当前模型信号由用户配置为 GPT-6 系列：
 
-- **Coordinator:** GPT-6.1 Sol Medium
-- **Architect:** GPT-6.1 Sol Max
-- **Codex Worker:** GPT-6 Luna Max
-- **Independent Gate:** GPT-6 Luna High
+- **Coordinator:** Sol Medium / GPT-6.1
+- **Architect:** Sol Max / GPT-6.1
+- **Codex Worker:** Luna Max / GPT-6
+- **Independent Gate:** Luna High / GPT-6
 
 核心原则：
 
 > **Sol Medium 协调；Luna Max 执行；Sol Max 定架构与阶段；Luna High 独立门禁。**
-
-本映射只记录当前模型信号，不改变既有角色职责或开发流程，也不追溯改写历史 ADR、decision authority、阶段报告或 exact-SHA evidence。
 
 角色定义优先于未来具体模型名；模型名称变化时保持职责不变，除非用户明确更新治理规则。
 
@@ -36,6 +35,8 @@ Coordinator MUST：
 4. 确定 `CURRENT_STAGE` 与有效 Stage Contract；
 5. 拆分可并行任务，并为每个 Worker 选择执行模式；
 6. YELLOW/RED、架构争议、门禁或阶段切换时读取完整协议。
+
+首次接手与治理修订变化 MUST 完整读取；后续同修订按文件 fingerprints 核验变化和任务依赖，避免反复复制全部历史。运行状态缓存必须标明核验范围，不从过时状态页重做任务。
 
 `CURRENT_DEVELOPMENT_STATE.md` 只是缓存，不得覆盖 Git 与已验证证据。
 
@@ -83,7 +84,7 @@ Worker MUST NOT：
 
 ### Luna High / Independent Gate
 只负责最终 Integration Candidate 的独立 whole-candidate gate。
-不得参与 candidate 实现。  
+不得参与 candidate 实现。
 输出：
 - `PASS`
 - `BLOCKED_IMPLEMENTATION`
@@ -167,6 +168,8 @@ Coordinator MUST 指定单一 **Integration / Build Owner**（通常为 Luna Max
 
 普通 Patch Worktree 不编译。
 
+Build Owner 必须指定为 Luna Max；Coordinator 不默认接替实现/构建职责。按实际并发槽拆任务，四槽包含 Coordinator，最多三个并行 Luna；共享文件/接口只有一个写 owner。执行分层、census coverage、attempt ledger 与缓存边界见执行效率规则。
+
 除非技术上明确必要或用户要求：
 
 > **MUST NOT run `cargo clean` or equivalent cache-clearing operations.**
@@ -201,6 +204,8 @@ Sol Max MUST NOT 做：
 
 结果完成后再汇总处理。
 
+任务下发与完成后向用户回报；执行期被动等待保持会话。Coordinator 默认 90 分钟无结果事件后做一次异常检查，不做持续状态轮询；watchdog 不改变正式命令 timeout。Sol Max 只在架构触发或最终 closure 介入。
+
 ## 10. Gate 与 Git
 
 - Gate MUST 绑定 **Integration Tree exact candidate SHA**。
@@ -223,7 +228,7 @@ Candidate local evidence 完整后：
 
 - `BLOCKED_IMPLEMENTATION` → Coordinator 汇总并让 Luna Max 批量 repair → integrate → new candidate → re-gate
 - `BLOCKED_ARCHITECTURE` → Coordinator 汇总 → Sol Max
-- `PASS` → Coordinator 确认临时 Patch Worktree 已集成/清理，生成 Stage Closure Packet → Sol Max 做架构闭合并确立下一 Stage Contract
+- `PASS` → Coordinator 确认临时 Patch Worktree 已集成/清理，生成 Stage Closure Packet → Sol Max 做架构闭合；只有用户允许继续时才确立下一 Stage Contract。当前 D32 闭合、必要空间清理后停止，不进入 D33。
 
 ## 12. 完成定义
 
@@ -238,4 +243,4 @@ Candidate local evidence 完整后：
 - required Luna High gate completed；
 - unresolved architecture blocker = 0；
 - 临时 Patch Worktree 已集成或清理；
-- Sol Max 已完成需要的阶段架构闭合/下一阶段确立。
+- Sol Max 已完成需要的阶段架构闭合；仅用户允许继续时确立下一阶段。D32 完成和必要清理后停止，不进入 D33。

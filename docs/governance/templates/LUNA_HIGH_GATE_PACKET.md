@@ -1,58 +1,72 @@
 # LUNA HIGH GATE PACKET
 
-Task / Requirement:
-...
+Gate model: Luna High / GPT-6
 
+Stage / Task:
+Stage Contract:
 Frozen invariants:
-1. ...
-2. ...
 
+Integration branch:
 Base:
 Parent:
 Candidate:
-Merge-base:
+Integration working tree:
 
-Diff scope:
-...
+Governance revision / applicable D32 ADR supersessions:
+Reviewer independence (no candidate implementation):
+Required evidence checklist with exact candidate/reference hashes:
 
-Focused tests:
-...
+## Worktree integration status
+All Patch Worktrees integrated/cleared: YES/NO
+Outstanding unintegrated patches:
+- ...
 
-Regression:
-...
+## Diff scope
+- ...
 
-Full / broader suite:
-...
+## Focused tests
+- ...
 
-Real canary:
-...
+## Broader/full tests
+- ...
 
-Negative evidence:
-...
+## Real canary
+- ...
 
-Known limitations:
-...
+## Negative evidence
+- ...
 
-Requested verdict:
-PASS or BLOCKED only.
+## Known limitations
+- ...
 
-## Required Luna output
+## Gate instruction
+
+Review only the final Integration Candidate exact SHA.
+
+Do not treat Patch Worktree branch/commit evidence as a substitute for integrated candidate evidence.
+
+Perform a whole-candidate independent review.
+
+Do not stop at the first ordinary blocker if further safe review can find additional blockers.
+Return the complete blocker set you can establish in this pass.
+
+Return exactly one top-level verdict:
 
 ### PASS
-PASS
 
-Candidate:
-Scope:
-Evidence accepted:
-Residual non-blocking risks:
+### BLOCKED_IMPLEMENTATION
+Use when closure is possible without changing frozen architecture / Stage Contract.
 
-### BLOCKED
-BLOCKED
+### BLOCKED_ARCHITECTURE
+Use only when closure requires architecture/invariant/Stage Contract change.
 
-Candidate:
+For each blocker:
+- Requirement
+- Evidence
+- Failure
+- Required closure proof
+- Root-cause/dependency cluster and safely unreviewed scope
 
-B1:
-Requirement:
-Evidence:
-Failure:
-Required closure proof:
+Do not repeat every expensive command by default. Independently inspect evidence and run necessary authorized checks; record omissions. Required real/negative evidence cannot be replaced by focused/static tests. Old candidate PASS does not transfer.
+
+Return to Coordinator. Do not contact Sol Max directly.

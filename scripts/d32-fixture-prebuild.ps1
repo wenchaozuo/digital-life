@@ -2942,6 +2942,7 @@ public sealed class D32DebugProcessRecordV2
     // In-memory CREATE-event evidence only. The frozen D32_DEBUG_JOB_PROCESS_TRACE_V2
     // serializer deliberately does not project this object into the wire schema.
     public D32DebugCommandLineCaptureV1 CommandLineCapture { get; set; }
+    public bool CommandLineCaptureRequired { get; set; }
 }
 
 public sealed class D32DebugCommandLineCaptureV1
@@ -4699,7 +4700,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
     private static D32DebugCommandLineCaptureV1 CaptureDebugCommandLine(
         IntPtr eventProcessHandle, uint eventProcessId, long eventCreationFileTime,
-        uint eventParentProcessId, long eventParentCreationFileTime, DebugImageSnapshot openedImage)
+        uint eventParentProcessId, long eventParentCreationFileTime, DebugImageSnapshot openedImage,
+        bool requireActualCommandLine)
     {
         if (eventProcessHandle == IntPtr.Zero || eventProcessId == 0 || eventCreationFileTime <= 0 ||
             eventParentProcessId == 0 || eventParentCreationFileTime <= 0 || openedImage == null ||
@@ -4707,21 +4709,37 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             String.IsNullOrWhiteSpace(openedImage.Sha256) || String.IsNullOrWhiteSpace(openedImage.VolumeSerialHex) ||
             String.IsNullOrWhiteSpace(openedImage.FileIdHex))
             throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT command-line capture lacks exact event/image identity");
-        bool wow64;
-        if (IntPtr.Size != 8 || !IsWow64Process(eventProcessHandle, out wow64) || wow64)
-            throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT command-line PEB is not a readable native x64 process");
         DebugProcessBasicInformation information = GetDebugProcessBasicInformation(eventProcessHandle);
         uint handlePid = GetDebugProcessPid(information);
         uint handleParentPid = GetDebugParentPid(information);
         long handleCreation = GetDebugProcessCreationTime(eventProcessHandle);
         if (handlePid != eventProcessId || handleCreation != eventCreationFileTime || handleParentPid != eventParentProcessId)
             throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT command-line handle PID/creation/parent differs from the admitted event identity");
-        IntPtr parameters = ReadRemotePointer(eventProcessHandle, IntPtr.Add(information.PebBaseAddress, 0x20), "ProcessParameters");
-        string commandLine = ReadRemoteUnicodeString(eventProcessHandle, IntPtr.Add(parameters, 0x70), "CommandLine");
-        if (String.IsNullOrWhiteSpace(commandLine))
-            throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT actual PEB command line is empty or unavailable");
+        string source;
+        string commandLine;
+        if (requireActualCommandLine)
+        {
+            bool wow64;
+            if (IntPtr.Size != 8 || !IsWow64Process(eventProcessHandle, out wow64) || wow64)
+                throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT required command-line PEB is not a readable native x64 process");
+            if (information.PebBaseAddress == IntPtr.Zero)
+                throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT required command-line PEB base pointer is null");
+            IntPtr parameters = ReadRemotePointer(eventProcessHandle, IntPtr.Add(information.PebBaseAddress, 0x20), "ProcessParameters");
+            string actualCommandLine = ReadRemoteUnicodeString(eventProcessHandle, IntPtr.Add(parameters, 0x70), "CommandLine");
+            if (String.IsNullOrWhiteSpace(actualCommandLine))
+                throw new InvalidOperationException("CREATE_PROCESS_DEBUG_EVENT required actual PEB command line is empty or unavailable");
+            source = "CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine";
+            commandLine = actualCommandLine;
+        }
+        else
+        {
+            // Ordinary child argv is diagnostic-only. Keep the exact event/image identity and
+            // mark the command line explicitly unavailable instead of inventing expected argv.
+            source = "CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured";
+            commandLine = String.Empty;
+        }
         return new D32DebugCommandLineCaptureV1 {
-            Source = "CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine",
+            Source = source,
             ProcessId = handlePid,
             CreationFileTime = handleCreation,
             ParentProcessId = handleParentPid,
@@ -4790,7 +4808,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         Dictionary<uint, DebugActiveProcess> active, long debuggerCreation)
     {
         if (record == null || record.CommandLineCapture == null || !record.ImageVerified)
-            throw new InvalidOperationException("CREATE command-line/image capture is unavailable or unverified before ContinueDebugEvent");
+            throw new InvalidOperationException("CREATE process/image identity capture is unavailable or unverified before ContinueDebugEvent");
         DebugActiveProcess retainedCurrent;
         if (!active.TryGetValue(record.ProcessId, out retainedCurrent) || retainedCurrent == null || retainedCurrent.Record != record ||
             retainedCurrent.Handle == IntPtr.Zero)
@@ -4803,7 +4821,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             VolumeSerialHex = record.VolumeSerialHex, FileIdHex = record.FileIdHex
         };
         D32DebugCommandLineCaptureV1 current = CaptureDebugCommandLine(eventProcessHandle, record.ProcessId,
-            record.CreationFileTime, record.ParentProcessId, record.ParentCreationFileTime, openedImage);
+            record.CreationFileTime, record.ParentProcessId, record.ParentCreationFileTime, openedImage,
+            record.CommandLineCaptureRequired);
         D32DebugCommandLineCaptureV1 captured = record.CommandLineCapture;
         if (captured.Source != current.Source || captured.ProcessId != current.ProcessId ||
             captured.CreationFileTime != current.CreationFileTime || captured.ParentProcessId != current.ParentProcessId ||
@@ -4813,8 +4832,9 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             !String.Equals(captured.VolumeSerialHex, current.VolumeSerialHex, StringComparison.Ordinal) ||
             !String.Equals(captured.FileIdHex, current.FileIdHex, StringComparison.Ordinal) ||
             !String.Equals(captured.CommandLine, current.CommandLine, StringComparison.Ordinal))
-            throw new InvalidOperationException("CREATE actual command line or its PID/creation/parent/opened-image binding changed before ContinueDebugEvent");
-        if (record.CreateSequence == 1 && !String.Equals(current.CommandLine, _debugCoordinator.ExpectedRootCommandLine, StringComparison.Ordinal))
+            throw new InvalidOperationException("CREATE command-line diagnostic or its PID/creation/parent/opened-image binding changed before ContinueDebugEvent");
+        if (record.CommandLineCaptureRequired && record.CreateSequence == 1 &&
+            !String.Equals(current.CommandLine, _debugCoordinator.ExpectedRootCommandLine, StringComparison.Ordinal))
             throw new InvalidOperationException("root CREATE actual PEB command line differs from the exact requested CreateProcessW command line");
     }
 
@@ -4838,14 +4858,23 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         return new IntPtr(value);
     }
 
+    public static bool IsValidRemoteUnicodeStringBounds(uint length, uint maximumLength, ulong bufferAddress)
+    {
+        // UNICODE_STRING lengths are bytes. CreateProcessW caps command lines at 32,767
+        // UTF-16 code units including the terminator: at most 65,532 payload bytes.
+        return length > 0 && (length & 1U) == 0 && length <= 65532U &&
+            maximumLength >= length && maximumLength <= 65534U && (maximumLength & 1U) == 0 &&
+            bufferAddress != 0;
+    }
+
     private static string ReadRemoteUnicodeString(IntPtr process, IntPtr structure, string label)
     {
         byte[] header = ReadRemoteBytes(process, structure, 16, label + " UNICODE_STRING");
         ushort length = BitConverter.ToUInt16(header, 0);
         ushort maximumLength = BitConverter.ToUInt16(header, 2);
         long bufferAddress = BitConverter.ToInt64(header, 8);
-        if (length == 0 || (length & 1) != 0 || length > 32766 || maximumLength < length || bufferAddress == 0)
-            throw new InvalidOperationException("debugged process remote " + label + " UNICODE_STRING bounds are invalid");
+        if (bufferAddress <= 0 || !IsValidRemoteUnicodeStringBounds(length, maximumLength, unchecked((ulong)bufferAddress)))
+            throw new InvalidOperationException("debugged process remote " + label + " UNICODE_STRING byte bounds or user pointer are invalid");
         byte[] text = ReadRemoteBytes(process, new IntPtr(bufferAddress), length, label + " text");
         return Encoding.Unicode.GetString(text);
     }
@@ -5423,6 +5452,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                     D32DebugCommandLineCaptureV1 commandLineCapture = null;
                     string reason = null;
                     bool verified = false;
+                    bool requireActualCommandLine = false;
                     DebugActiveProcess parent = null;
                     DebugActiveProcess retained = null;
                     IntPtr retainedHandle = IntPtr.Zero;
@@ -5568,7 +5598,10 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 }
                                 verified = true;
                             }
-                        commandLineCapture = CaptureDebugCommandLine(created.Process, ev.ProcessId, creation, parentPid, parentCreation, image);
+                        requireActualCommandLine = trace.ProcessCreateEventCount == 1 ||
+                            reason == "narrow-caller-pinned-H7C-Git-child-v1";
+                        commandLineCapture = CaptureDebugCommandLine(created.Process, ev.ProcessId, creation,
+                            parentPid, parentCreation, image, requireActualCommandLine);
                         if (trace.ProcessCreateEventCount == 1 &&
                             !String.Equals(commandLineCapture.CommandLine, expectedRootCommandLine, StringComparison.Ordinal))
                             throw new InvalidOperationException("root CREATE actual PEB command line differs from the exact requested CreateProcessW command line");
@@ -5585,7 +5618,7 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                             VolumeSerialHex = image == null ? null : image.VolumeSerialHex, FileIdHex = image == null ? null : image.FileIdHex,
                             AllowedImageReason = reason, ImageVerified = verified, Exited = false, ExitCode = 0,
                             CreateSequence = createSequence, ExitSequence = 0, CreatedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), ExitedAtUtc = null,
-                            CommandLineCapture = commandLineCapture
+                            CommandLineCapture = commandLineCapture, CommandLineCaptureRequired = requireActualCommandLine
                         };
                         retained = new DebugActiveProcess { Record = record, Handle = retainedHandle };
                         if (!active.ContainsKey(ev.ProcessId)) active.Add(ev.ProcessId, retained);
@@ -6191,10 +6224,26 @@ function Get-D32FixtureDebugProcessCommandLine {
         throw 'DEBUG_PROCESS_TRACE_BLOCKED: actual CREATE command-line capture is missing'
     }
     $capture = $captureProperty.Value
+    $requiredCaptureProperty = $Process.PSObject.Properties['CommandLineCaptureRequired']
+    $commandLineRequired = $true
+    if ($null -ne $requiredCaptureProperty) {
+        if ($requiredCaptureProperty.Value -isnot [bool]) { throw 'DEBUG_PROCESS_TRACE_BLOCKED: command-line requirement marker has an invalid type' }
+        $commandLineRequired = [bool]$requiredCaptureProperty.Value
+    }
+    $expectedCaptureSource = if ($commandLineRequired) {
+        'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine'
+    } else {
+        'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+    }
+    $commandLineCaptureValid = if ($commandLineRequired) {
+        $capture.CommandLine -is [string] -and -not [String]::IsNullOrWhiteSpace([string]$capture.CommandLine)
+    } else {
+        -not $ExpectedCommandLineBound -and $capture.CommandLine -is [string] -and $capture.CommandLine.Length -eq 0
+    }
     $fields = @('Source', 'ProcessId', 'CreationFileTime', 'ParentProcessId', 'ParentCreationFileTime',
         'ImagePath', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex', 'CommandLine')
     if (-not (Test-D32FixtureExactProperties -Object $capture -Expected $fields) -or
-        $capture.Source -isnot [string] -or $capture.Source -cne 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine' -or
+        $capture.Source -isnot [string] -or $capture.Source -cne $expectedCaptureSource -or
         $Process.ProcessId -isnot [uint32] -or $Process.ParentProcessId -isnot [uint32] -or
         $Process.CreationFileTime -isnot [long] -or $Process.ParentCreationFileTime -isnot [long] -or
         $Process.Bytes -isnot [long] -or $Process.Exited -isnot [bool] -or -not $Process.Exited -or
@@ -6210,10 +6259,10 @@ function Get-D32FixtureDebugProcessCommandLine {
         $capture.Sha256 -isnot [string] -or $capture.Sha256 -cnotmatch '^[0-9a-f]{64}$' -or $capture.Sha256 -cne [string]$Process.Sha256 -or
         $capture.VolumeSerialHex -isnot [string] -or $capture.VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$' -or $capture.VolumeSerialHex -cne [string]$Process.VolumeSerialHex -or
         $capture.FileIdHex -isnot [string] -or $capture.FileIdHex -cnotmatch '^[0-9a-f]{32}$' -or $capture.FileIdHex -cne [string]$Process.FileIdHex -or
-        $capture.CommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($capture.CommandLine)) {
+        -not $commandLineCaptureValid) {
         throw 'DEBUG_PROCESS_TRACE_BLOCKED: actual PEB command line is not bound to exact CREATE PID/creation/parent/opened-image evidence'
     }
-    if ($ExpectedCommandLineBound -and ($ExpectedCommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($ExpectedCommandLine) -or
+    if ($commandLineRequired -and $ExpectedCommandLineBound -and ($ExpectedCommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($ExpectedCommandLine) -or
         -not [String]::Equals([string]$capture.CommandLine, $ExpectedCommandLine, [StringComparison]::Ordinal))) {
         throw 'DEBUG_PROCESS_TRACE_BLOCKED: actual PEB command line differs from the separately supplied fixed root command'
     }

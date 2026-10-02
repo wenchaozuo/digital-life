@@ -1,22 +1,21 @@
 # CODEX_DEVELOPMENT_PROTOCOL.md
 
-**Version:** 1.2
-
+**Version:** 1.3 / 2026-10-02-efficiency-01
 **Status:** Project Governance Baseline  
 **Scope:** 虚拟生命项目后续全部开发阶段。
+
+**强制执行补充与生效索引：** `EXECUTION_EFFICIENCY_POLICY.md`。本修订保留 v1.2 角色/工作区框架，补充可验收的 census、验证分层、attempt ledger 和静默窗口；D32 专项 frozen 条款不减。本文件同步通用治理规则；下方 D32 专项 supplement、既有 ADR/Frozen/SC-D32-V1 与 exact-SHA 历史仍按其各自 authority 管理。任何正式执行中的候选不得修改其 SHA 或 clean 状态。
 
 ## 0. 目的
 
 让多 Agent 真正并行进行调查和代码产出，同时避免大型 Rust/Tauri 项目因多 worktree 重复编译造成磁盘与时间浪费。
 
-当前模型映射（仅表示本次用户配置）：
+当前模型职责：
 
-- GPT-6.1 Sol Medium：Coordinator
-- GPT-6 Luna Max：Worker
-- GPT-6.1 Sol Max：Architect
-- GPT-6 Luna High：Independent Gate
-
-本映射不改变角色职责或开发流程，也不追溯改写既有 ADR、decision authority、阶段报告或 exact-SHA evidence。角色定义优先于模型名称；未来模型名称变化不改变本协议职责边界。
+- Sol Medium / GPT-6.1：Coordinator
+- Luna Max / GPT-6：Worker
+- Sol Max / GPT-6.1：Architect
+- Luna High / GPT-6：Independent Gate
 
 核心执行方式：
 
@@ -151,9 +150,8 @@ Task Packet 至少包括：
 默认原则：
 
 > **Sol Max 决定 WHAT MUST BE TRUE。**
->
+
 > **Sol Medium 决定 WHAT WORK NEEDS TO BE DONE。**
->
 > **Luna Max 决定 HOW TO DO IT。**
 
 只有以下情况 SHOULD 指明具体实现做法：
@@ -275,7 +273,7 @@ Luna High 只审 Integration Candidate，不审各 Patch Worktree branch。
 
 # 8. Integration / Build Owner
 
-Coordinator MUST 指定一个 Luna Max 作为当前 Build Owner，或由 Root 承担等价职责。
+Coordinator MUST 指定一个 Luna Max 作为当前唯一 Build Owner；Coordinator/Root 不默认代替 Worker 执行实现、构建或普通测试分析。
 
 推荐 Build Wave：
 
@@ -307,7 +305,7 @@ Sol Max 使用当前可用最高 Sol 推理等级，负责高信息密度架构�
 
 ## A. Stage Contract
 - 当前阶段没有有效 Contract；
-- 上一阶段闭合后需要确立下一阶段；
+- 上一阶段闭合且用户允许继续后需要确立下一阶段；
 - scope 已发生架构级变化。
 
 ## B. Architecture
@@ -331,7 +329,7 @@ Sol Max 使用当前可用最高 Sol 推理等级，负责高信息密度架构�
 - 判断 architecture obligations 是否闭合；
 - 明确哪些决定 frozen；
 - 判断是否需要 repair stage；
-- 确立下一 Stage Contract。
+- 用户允许继续时确立下一 Stage Contract；当前 D32 closure 后清理并停止，不建立 D33。
 
 Sol Max MUST NOT：
 - 跟踪 Worker/Luna 进度；
@@ -405,7 +403,7 @@ Coordinator：
 Coordinator：
 - 确认所有临时 Patch Worktree 已集成或清理；
 - 生成 Stage Closure & Next Stage Packet；
-- 交 Sol Max 做阶段架构闭合/下一阶段确立。
+- 交 Sol Max 做阶段架构闭合；仅用户允许继续时确立下一阶段，当前 D32 完成后停止。
 
 ---
 
@@ -539,7 +537,7 @@ cleanup/resolve temporary worktrees
         ↓
 Stage Closure Packet
         ↓
-Sol Max closes architecture + defines next stage
+Sol Max closes architecture + defines next stage only when continuation is authorized (D32: stop after closure and cleanup)
         ↓
 Coordinator executes next stage
 ```
@@ -564,7 +562,7 @@ Coordinator executes next stage
 
 # 20. D32 阶段专用补充协议（保留的 §16.1）
 
-以下内容只补充 D32 已批准 ADR 明确引用的聚合门槛与 release-evidence bootstrap 顺序。其余项目治理以本文件 0–19 节及 `AGENTS.md` v1.2 为准；模型信号映射见 `MODEL_ROUTING.md`，通用角色边界以当前 AGENTS.md 与本协议为准；如有冲突，遵循用户当前指令、已批准 ADR/Frozen Invariants/Stage Contract 和本协议的控制层级。
+以下内容只补充 D32 已批准 ADR 明确引用的聚合门槛与 release-evidence bootstrap 顺序。其余项目治理以本文件 0–19 节及 `AGENTS.md` v1.3 / `2026-10-02-efficiency-01` 为准；模型信号映射见 `MODEL_ROUTING.md`，通用角色边界以当前 AGENTS.md 与本协议为准；如有冲突，遵循用户当前指令、已批准 ADR/Frozen Invariants/Stage Contract 和本协议的控制层级。
 
 ## 16.1 阶段级与多门禁任务的批量修复纪律
 

@@ -1,7 +1,14 @@
 # WORKER TASK PACKET
 
-Prepared by: GPT-6.1 Sol Medium Coordinator
-Worker: GPT-6 Luna Max
+Prepared by: Sol Medium Coordinator
+
+Worker: Luna Max / GPT-6
+
+Governance revision / fingerprints:
+Integration path / observed SHA:
+Task ID / write owner / dependencies:
+Unique Build Owner (if relevant):
+Expected duration / watchdog: default 90 minutes; reconcile with approved command deadlines
 
 ## Role
 Scout / Implementer / Repair / Tester / Evidence / Red-Team / Integration-Build-Owner
@@ -40,6 +47,14 @@ Base:
 6. Assumptions / risks
 7. Complete blocker set
 
+## Census and validation scope
+- Entries / producers / consumers / nested references:
+- Parameter / serialization / path / identity / success / failure / cleanup coverage:
+- Uncovered scope and reason:
+- Impact map and L0/L1/L2 tests; required formal L3/L4 remain unchanged:
+- Existing raw captures available for replay:
+- Evidence authority: DEVELOPMENT_ONLY / FORMAL (only as authorized)
+
 ## Blocker policy
 - MUST NOT contact Sol Max directly.
 - Record blockers and continue safe, useful investigation.
@@ -51,6 +66,9 @@ Base:
 - PATCH_WORKTREE: no normal build/test/canary.
 - INTEGRATION: build/test only when assigned as Build Owner.
 - MUST NOT `cargo clean` unless explicitly justified.
+- No auto retry of expensive runs; record actual attempt ID/start count, exact inputs, last completed command, failing command and cleanup.
+- D32 fresh CargoHome/fixed commands/required tests stay frozen; developmental labels grant no startup/helper/network authority.
+- Use `EXECUTION_EFFICIENCY_POLICY.md` for batch repair, cache lifecycle and passive waiting; return the complete result, not periodic progress reports.
 
 ## Stop conditions
 Stop and return to Coordinator if:

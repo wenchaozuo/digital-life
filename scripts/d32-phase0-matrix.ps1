@@ -59,6 +59,7 @@ $script:D32Phase0BlockedDiagnosticType = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1'
 $script:D32Phase0FailureContext = $null
 $script:D32Phase0LastProcessFailure = $null
 $script:D32Phase0LastProcessEvidence = $null
+$script:D32Phase0LastCompletedCommandEvidence = $null
 $script:D32Phase0SelfTestSourcePatchAuthorityPath = $null
 $script:D32Phase0SelfTestSourcePatchAuthoritySha256 = $null
 $script:D32Phase0FixtureBuildSpecs = @(
@@ -639,10 +640,26 @@ function Get-D32Phase0ActualDebugCommandLine {
         throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual CREATE command-line capture is missing'
     }
     $capture = $captureProperty.Value
+    $requiredCaptureProperty = $Process.PSObject.Properties['CommandLineCaptureRequired']
+    $commandLineRequired = $true
+    if ($null -ne $requiredCaptureProperty) {
+        if ($requiredCaptureProperty.Value -isnot [bool]) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: command-line requirement marker has an invalid type' }
+        $commandLineRequired = [bool]$requiredCaptureProperty.Value
+    }
+    $expectedCaptureSource = if ($commandLineRequired) {
+        'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine'
+    } else {
+        'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+    }
+    $commandLineCaptureValid = if ($commandLineRequired) {
+        $capture.CommandLine -is [string] -and -not [String]::IsNullOrWhiteSpace([string]$capture.CommandLine)
+    } else {
+        -not $ExpectedCommandLineBound -and $capture.CommandLine -is [string] -and $capture.CommandLine.Length -eq 0
+    }
     $captureFields = @('Source', 'ProcessId', 'CreationFileTime', 'ParentProcessId', 'ParentCreationFileTime',
         'ImagePath', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex', 'CommandLine')
     if (-not (Test-D32Phase0ExactProperties -Object $capture -Expected $captureFields) -or
-        $capture.Source -isnot [string] -or $capture.Source -cne 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine' -or
+        $capture.Source -isnot [string] -or $capture.Source -cne $expectedCaptureSource -or
         $capture.ProcessId -isnot [uint32] -or $capture.CreationFileTime -isnot [Int64] -or
         $capture.ParentProcessId -isnot [uint32] -or $capture.ParentCreationFileTime -isnot [Int64] -or
         -not (Test-D32Phase0Integer -Value $capture.ProcessId -Positive) -or
@@ -659,7 +676,7 @@ function Get-D32Phase0ActualDebugCommandLine {
         $capture.Sha256 -isnot [string] -or $capture.Sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $capture.VolumeSerialHex -isnot [string] -or $capture.VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$' -or
         $capture.FileIdHex -isnot [string] -or $capture.FileIdHex -cnotmatch '^[0-9a-f]{32}$' -or
-        $capture.CommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($capture.CommandLine) -or
+        -not $commandLineCaptureValid -or
         -not (Test-D32Phase0Integer -Value $Process.ProcessId -Positive) -or
         -not (Test-D32Phase0Integer -Value $Process.ParentProcessId -Positive) -or
         -not (Test-D32Phase0Integer -Value $Process.CreationFileTime -Positive) -or
@@ -674,7 +691,7 @@ function Get-D32Phase0ActualDebugCommandLine {
         $capture.FileIdHex -cne [string]$Process.FileIdHex) {
         throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual PEB command line is not bound to the exact CREATE PID/creation/parent/opened-image identity'
     }
-    if ($ExpectedCommandLineBound -and
+    if ($commandLineRequired -and $ExpectedCommandLineBound -and
         ($ExpectedCommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($ExpectedCommandLine) -or
             -not [String]::Equals([string]$capture.CommandLine, $ExpectedCommandLine, [StringComparison]::Ordinal))) {
         throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual PEB command line differs from the separately supplied fixed root command'
@@ -684,17 +701,157 @@ function Get-D32Phase0ActualDebugCommandLine {
 
 function Set-D32Phase0FailureContext {
     param([AllowNull()][object]$Context)
+    $script:D32Phase0LastProcessFailure = $null
+    $script:D32Phase0LastProcessEvidence = $null
+    $script:D32Phase0LastCompletedCommandEvidence = $null
     $script:D32Phase0FailureContext = $Context
+}
+
+function ConvertTo-D32Phase0LastCompletedContextSecondary {
+    param([Parameter(Mandatory = $true)][object]$Evidence)
+    $context = $script:D32Phase0FailureContext
+    try {
+        if ($null -eq $context -or $Evidence.Completed -isnot [bool] -or -not $Evidence.Completed -or
+            $Evidence.RunId -cne [string]$context.RunId -or
+            $Evidence.CandidateSha -cne [string]$context.CandidateSha -or
+            $Evidence.ProfilePath -cne [string]$context.Profile.ProfilePath -or
+            $Evidence.ProfileSha256 -cne [string]$context.Profile.Digest -or
+            $Evidence.EvidenceRoot -cne [string]$context.EvidenceRoot -or
+            $context.Repository -isnot [string] -or
+            $null -eq $context.RootIdentity -or $null -eq $context.OwnerMarker -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$context.RootIdentity.Path) -Right ([string]$context.EvidenceRoot)) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$context.OwnerMarker.path) -Right (Join-Path ([string]$context.EvidenceRoot) $script:D32Phase0OwnerBindingName)) -or
+            [string]$context.RootIdentity.VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$' -or
+            [string]$context.RootIdentity.FileIdHex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$context.OwnerMarker.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$context.OwnerMarker.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+            [string]$context.OwnerMarker.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            $context.RunId -cnotmatch '^[0-9a-f]{32}$' -or $context.CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+            $context.Profile.Digest -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'last-completed context is not bound to the current candidate/profile/root/run'
+        }
+        $result = $Evidence.CommandResult
+        if ($null -eq $result -or $result.exit_code -isnot [int] -or $result.exit_code -ne 0 -or
+            $result.candidate_sha_before -cne [string]$context.CandidateSha -or
+            $result.candidate_sha_after -cne [string]$context.CandidateSha -or
+            $result.clean_before -isnot [bool] -or -not $result.clean_before -or
+            $result.clean_after -isnot [bool] -or -not $result.clean_after -or
+            $result.argv -isnot [Array] -or @($result.argv | Where-Object { $_ -isnot [string] }).Count -ne 0 -or
+            $result.arguments -isnot [Array] -or @($result.arguments | Where-Object { $_ -isnot [string] }).Count -ne 0 -or
+            $result.argv.Count -ne ($result.arguments.Count + 1) -or
+            $result.argv[0] -cne [string]$result.executable -or
+            ($result.argv -join "`0") -cne ((@([string]$result.executable) + @($result.arguments)) -join "`0") -or
+            $result.command_line -cne (ConvertTo-D32Phase0CommandLine -Arguments @($result.argv)) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$result.working_directory) -Right ([string]$context.Repository)) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$result.executable) -Right ([string]$context.Profile.Profile.toolchain.cargo.path)) -or
+            $result.executable_sha256 -cne [string]$context.Profile.Profile.toolchain.cargo.sha256 -or
+            [Int64]$result.executable_bytes -ne [Int64]$context.Profile.Profile.toolchain.cargo.bytes -or
+            $result.executable_volume_serial_hex -cne [string]$context.Profile.Profile.toolchain.cargo.volume_serial_hex -or
+            $result.executable_file_id_hex -cne [string]$context.Profile.Profile.toolchain.cargo.file_id_hex) {
+            throw 'last-completed command result is not a successful exact pinned Cargo command for the current candidate'
+        }
+        $commandEvidence = $Evidence.Command
+        if (-not (Test-D32Phase0ExactProperties -Object $commandEvidence -Expected @(
+                'name', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex',
+                'executable_file_id_hex', 'arguments', 'command_line', 'working_directory')) -or
+            $commandEvidence.name -cne [string]$result.name -or
+            $commandEvidence.executable -cne [string]$result.executable -or
+            $commandEvidence.executable_sha256 -cne [string]$result.executable_sha256 -or
+            [Int64]$commandEvidence.executable_bytes -ne [Int64]$result.executable_bytes -or
+            $commandEvidence.executable_volume_serial_hex -cne [string]$result.executable_volume_serial_hex -or
+            $commandEvidence.executable_file_id_hex -cne [string]$result.executable_file_id_hex -or
+            $commandEvidence.arguments -isnot [Array] -or
+            ($commandEvidence.arguments -join "`0") -cne ($result.arguments -join "`0") -or
+            $commandEvidence.command_line -cne [string]$result.command_line -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$commandEvidence.working_directory) -Right ([string]$result.working_directory))) {
+            throw 'last-completed command metadata differs from its exact argv/toolchain result'
+        }
+        $trace = $result.process_trace
+        $cleanup = $result.process_tree_cleanup
+        if ($null -eq $trace -or $trace.state -cne 'COMPLETED' -or $trace.event_chain_complete -isnot [bool] -or -not $trace.event_chain_complete -or
+            $trace.job_accounting_verified -isnot [bool] -or -not $trace.job_accounting_verified -or
+            $trace.accounting_consistent -isnot [bool] -or -not $trace.accounting_consistent -or
+            -not (Test-D32Phase0Integer -Value $trace.job_active_processes) -or [Int64]$trace.job_active_processes -ne 0 -or $null -eq $cleanup -or
+            $cleanup.cleanup_succeeded -isnot [bool] -or -not $cleanup.cleanup_succeeded -or
+            $cleanup.active_process_count_verified -isnot [bool] -or -not $cleanup.active_process_count_verified -or
+            -not (Test-D32Phase0Integer -Value $cleanup.active_process_count) -or [Int64]$cleanup.active_process_count -ne 0) {
+            throw 'last-completed command lacks complete V2 event-chain and native cleanup evidence'
+        }
+        if ($null -eq $Evidence.ProcessIdentity -or $null -eq $result.root_process -or
+            -not [String]::Equals((ConvertTo-Json -InputObject $Evidence.ProcessIdentity -Depth 40 -Compress),
+                (ConvertTo-Json -InputObject $result.root_process -Depth 40 -Compress), [StringComparison]::Ordinal) -or
+            $null -eq $Evidence.RawV2Trace -or
+            -not [String]::Equals((ConvertTo-Json -InputObject $Evidence.RawV2Trace -Depth 40 -Compress),
+                (ConvertTo-Json -InputObject $trace -Depth 40 -Compress), [StringComparison]::Ordinal) -or
+            $null -eq $Evidence.NativeCleanup -or
+            $Evidence.NativeCleanup.CleanupSucceeded -isnot [bool] -or $Evidence.NativeCleanup.CleanupSucceeded -ne $cleanup.cleanup_succeeded -or
+            $Evidence.NativeCleanup.JobActiveProcessCountVerified -isnot [bool] -or $Evidence.NativeCleanup.JobActiveProcessCountVerified -ne $cleanup.active_process_count_verified -or
+            -not (Test-D32Phase0Integer -Value $Evidence.NativeCleanup.JobActiveProcessCount) -or
+            [Int64]$Evidence.NativeCleanup.JobActiveProcessCount -ne [Int64]$cleanup.active_process_count) {
+            throw 'last-completed identity, raw trace, or native cleanup differs from the command result projection'
+        }
+        $stdout = Test-D32Phase0FileReference -Reference $result.stdout -AllowedRoot ([string]$context.EvidenceRoot)
+        $stderr = Test-D32Phase0FileReference -Reference $result.stderr -AllowedRoot ([string]$context.EvidenceRoot)
+        if (-not (Test-D32ProfilePathEqual -Left ([string]$Evidence.StdoutPath) -Right ([string]$result.stdout.path)) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$Evidence.StderrPath) -Right ([string]$result.stderr.path)) -or
+            $stdout.Bytes -ne [Int64]$result.stdout.bytes -or $stdout.Sha256 -cne [string]$result.stdout.sha256 -or
+            $stdout.VolumeSerialHex -cne [string]$result.stdout.volume_serial_hex -or $stdout.FileIdHex -cne [string]$result.stdout.file_id_hex -or
+            $stderr.Bytes -ne [Int64]$result.stderr.bytes -or $stderr.Sha256 -cne [string]$result.stderr.sha256 -or
+            $stderr.VolumeSerialHex -cne [string]$result.stderr.volume_serial_hex -or $stderr.FileIdHex -cne [string]$result.stderr.file_id_hex) {
+            throw 'last-completed command output references differ from the opened current-run stdout/stderr files'
+        }
+        $document = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_PHASE0_LAST_COMPLETED_COMMAND_CONTEXT_V1'
+            candidate_sha = [string]$context.CandidateSha
+            toolchain_profile = [ordered]@{
+                path = [string]$context.Profile.ProfilePath
+                sha256 = [string]$context.Profile.Digest
+                bytes = [Int64]$context.Profile.Identity.Bytes
+                volume_serial_hex = [string]$context.Profile.Identity.VolumeSerialHex
+                file_id_hex = [string]$context.Profile.Identity.FileIdHex
+            }
+            evidence_root = [ordered]@{
+                path = [string]$context.RootIdentity.Path
+                volume_serial_hex = [string]$context.RootIdentity.VolumeSerialHex
+                file_id_hex = [string]$context.RootIdentity.FileIdHex
+                owner_marker = $context.OwnerMarker
+            }
+            repository = [string]$context.Repository
+            run_id = [string]$context.RunId
+            secondary_errors = @($Evidence.SecondaryErrors)
+            command = $Evidence.Command
+            process_identity = $Evidence.ProcessIdentity
+            raw_v2_trace = $Evidence.RawV2Trace
+            native_cleanup = $Evidence.NativeCleanup
+            command_result = $result
+            stdout_reference = $result.stdout
+            stderr_reference = $result.stderr
+        }
+        return 'D32_PHASE0_LAST_COMPLETED_COMMAND_CONTEXT_V1:' + (ConvertTo-Json -InputObject $document -Depth 40 -Compress)
+    }
+    catch { return 'D32_PHASE0_LAST_COMPLETED_CONTEXT_CAPTURE_ERROR:' + $_.Exception.Message }
 }
 
 function Get-D32Phase0DiscoveryFailureEvidence {
     param([switch]$IncludeCompletedCommandContext)
-    if ($null -ne $script:D32Phase0LastProcessFailure) { return $script:D32Phase0LastProcessFailure }
-    if ($IncludeCompletedCommandContext -and $null -ne $script:D32Phase0LastProcessEvidence -and
-        $script:D32Phase0LastProcessEvidence.Completed -is [bool] -and $script:D32Phase0LastProcessEvidence.Completed -and
-        $null -ne $script:D32Phase0LastProcessEvidence.CommandResult) {
-        return $script:D32Phase0LastProcessEvidence
+    if ($null -ne $script:D32Phase0LastProcessFailure) {
+        if (-not $IncludeCompletedCommandContext -or $null -eq $script:D32Phase0LastCompletedCommandEvidence) {
+            return $script:D32Phase0LastProcessFailure
+        }
+        $copy = [ordered]@{}
+        foreach ($name in $script:D32Phase0LastProcessFailure.Keys) { $copy[[string]$name] = $script:D32Phase0LastProcessFailure[$name] }
+        $secondary = [System.Collections.Generic.List[string]]::new()
+        foreach ($message in @($script:D32Phase0LastProcessFailure.SecondaryErrors)) {
+            if (-not [String]::IsNullOrWhiteSpace([string]$message)) { $secondary.Add([string]$message) }
+        }
+        $secondary.Add((ConvertTo-D32Phase0LastCompletedContextSecondary -Evidence $script:D32Phase0LastCompletedCommandEvidence))
+        $copy.SecondaryErrors = @($secondary.ToArray())
+        return $copy
     }
+    if ($IncludeCompletedCommandContext -and $null -ne $script:D32Phase0LastCompletedCommandEvidence -and
+        $script:D32Phase0LastCompletedCommandEvidence.Completed -is [bool] -and $script:D32Phase0LastCompletedCommandEvidence.Completed -and
+        $null -ne $script:D32Phase0LastCompletedCommandEvidence.CommandResult) { return $script:D32Phase0LastCompletedCommandEvidence }
     return $null
 }
 
@@ -1452,6 +1609,27 @@ function Invoke-D32Phase0PinnedProcess {
     $script:D32Phase0LastProcessEvidence.CommandResult = $commandResult
     $script:D32Phase0LastProcessEvidence.Completed = $true
     $script:D32Phase0LastProcessFailure = $null
+    $currentFailureContext = $script:D32Phase0FailureContext
+    if ($null -ne $currentFailureContext) {
+        $script:D32Phase0LastCompletedCommandEvidence = [ordered]@{
+            Completed = $true
+            PrimaryError = $null
+            SecondaryErrors = @($captureSecondaryErrors.ToArray())
+            CandidateSha = [string]$currentFailureContext.CandidateSha
+            ProfilePath = [string]$currentFailureContext.Profile.ProfilePath
+            ProfileSha256 = [string]$currentFailureContext.Profile.Digest
+            EvidenceRoot = [string]$currentFailureContext.EvidenceRoot
+            RunId = [string]$currentFailureContext.RunId
+            Command = $script:D32Phase0LastProcessEvidence.Command
+            ProcessIdentity = $script:D32Phase0LastProcessEvidence.ProcessIdentity
+            RawV2Trace = $script:D32Phase0LastProcessEvidence.RawV2Trace
+            NativeCleanup = $script:D32Phase0LastProcessEvidence.NativeCleanup
+            CommandResult = $commandResult
+            StdoutPath = [string]$script:D32Phase0LastProcessEvidence.StdoutPath
+            StderrPath = [string]$script:D32Phase0LastProcessEvidence.StderrPath
+        }
+    }
+    else { $script:D32Phase0LastCompletedCommandEvidence = $null }
     return $commandResult
 }
 
@@ -3197,14 +3375,15 @@ function Invoke-D32Phase0Matrix {
     $script:D32Phase0FixtureBuildCapacity = $fixtureBuildCapacity
     $outputBinding = $fixtureAdmission.OutputRootBinding
     $output = [string]$outputBinding.Path
-    $script:D32Phase0FailureContext = [PSCustomObject]@{
+    Set-D32Phase0FailureContext -Context ([PSCustomObject]@{
         EvidenceRoot = $output
         CandidateSha = $ExpectedSha
         Profile = $profile
         RunId = $runId
         RootIdentity = $outputBinding.RootIdentity
         OwnerMarker = $outputBinding.OwnerMarker
-    }
+        Repository = $repo
+    })
     $started = [DateTimeOffset]::UtcNow
     $phaseCommands = [System.Collections.Generic.List[object]]::new()
     $fixtureScript = [IO.Path]::GetFullPath((Join-Path $script:D32Phase0ScriptRoot 'd32-fixture-prebuild.ps1'))
@@ -6347,35 +6526,43 @@ try {
     exit 1
 }
 catch {
-    $primaryFailure = $_.Exception.Message
+    $outerFailure = $_.Exception.Message
+    $primaryFailure = $outerFailure
+    $secondary = [System.Collections.Generic.List[string]]::new()
     $failureContext = $script:D32Phase0FailureContext
     if ($null -ne $failureContext) {
-        $diagnosticPath = Join-Path $failureContext.EvidenceRoot $script:D32Phase0BlockedDiagnosticName
-        if (-not (Test-D32Phase0DirectoryEntryExists -Path $diagnosticPath)) {
-            try {
-                $includeCompletedCommandContext = $primaryFailure -match '^(TEST_INVENTORY_BLOCKED|TEST_INVENTORY_BASELINE_BLOCKED|PHASE0_TEST_INVENTORY_BLOCKED):'
-                if ($includeCompletedCommandContext) { $lastProcessFailure = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext }
-                else { $lastProcessFailure = Get-D32Phase0DiscoveryFailureEvidence }
-                $commandResult = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.CommandResult }
-                $command = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.Command }
-                $processIdentity = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.ProcessIdentity }
-                $rawTrace = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.RawV2Trace }
-                $nativeCleanup = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.NativeCleanup }
-                $stdoutPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StdoutPath }
-                $stderrPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StderrPath }
-                $stdoutReference = if ($null -eq $commandResult) { $null } else { $commandResult.stdout }
-                $stderrReference = if ($null -eq $commandResult) { $null } else { $commandResult.stderr }
-                $secondary = @()
-                if ($null -ne $lastProcessFailure -and -not [String]::IsNullOrWhiteSpace([string]$lastProcessFailure.PrimaryError) -and $lastProcessFailure.PrimaryError -cne $primaryFailure) {
-                    $primaryFailure = [string]$lastProcessFailure.PrimaryError
-                    $secondary = @($_.Exception.Message)
+        try {
+            $diagnosticPath = Join-Path $failureContext.EvidenceRoot $script:D32Phase0BlockedDiagnosticName
+            if (-not (Test-D32Phase0DirectoryEntryExists -Path $diagnosticPath)) {
+                try {
+                    $lastProcessFailure = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext
+                    $commandResult = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.CommandResult }
+                    $command = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.Command }
+                    $processIdentity = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.ProcessIdentity }
+                    $rawTrace = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.RawV2Trace }
+                    $nativeCleanup = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.NativeCleanup }
+                    $stdoutPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StdoutPath }
+                    $stderrPath = if ($null -eq $lastProcessFailure) { $null } else { $lastProcessFailure.StderrPath }
+                    $stdoutReference = if ($null -eq $commandResult) { $null } else { $commandResult.stdout }
+                    $stderrReference = if ($null -eq $commandResult) { $null } else { $commandResult.stderr }
+                    if ($null -ne $lastProcessFailure -and -not [String]::IsNullOrWhiteSpace([string]$lastProcessFailure.PrimaryError) -and $lastProcessFailure.PrimaryError -cne $primaryFailure) {
+                        $primaryFailure = [string]$lastProcessFailure.PrimaryError
+                        $secondary.Add($outerFailure)
+                    }
+                    if ($null -ne $lastProcessFailure) {
+                        foreach ($secondaryError in @($lastProcessFailure.SecondaryErrors)) {
+                            if (-not [String]::IsNullOrWhiteSpace([string]$secondaryError)) { $secondary.Add([string]$secondaryError) }
+                        }
+                    }
+                    $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryFailure -SecondaryErrors @($secondary.ToArray()) -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup -StdoutPath $stdoutPath -StderrPath $stderrPath `
+                        -ExpectedStdoutReference $stdoutReference -ExpectedStderrReference $stderrReference
                 }
-                $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryFailure -SecondaryErrors $secondary -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup -StdoutPath $stdoutPath -StderrPath $stderrPath `
-                    -ExpectedStdoutReference $stdoutReference -ExpectedStderrReference $stderrReference
+                catch { $secondary.Add('blocked diagnostic capture failed: ' + $_.Exception.Message) }
             }
-            catch { $primaryFailure += '; blocked diagnostic capture error=' + $_.Exception.Message }
         }
+        catch { $secondary.Add('blocked diagnostic preflight failed: ' + $_.Exception.Message) }
     }
+    if ($secondary.Count -gt 0) { [Console]::Error.WriteLine('PHASE0_BLOCKED_DIAGNOSTIC_SECONDARY_ERRORS: ' + ($secondary -join ' | ')) }
     Write-Output "D32 Phase0: BLOCKED — $primaryFailure"
     exit 1
 }

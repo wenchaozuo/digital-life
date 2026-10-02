@@ -13,6 +13,8 @@ $moduleStart = @(Microsoft.PowerShell.Core\Get-Module | ForEach-Object { '{0}|{1
 $global:D32PowerShellModuleImportAttempts = 0
 $script:cases = [System.Collections.Generic.List[object]]::new()
 $script:failures = [System.Collections.Generic.List[string]]::new()
+$script:D32Phase0LastCompletedCommandEvidence = $null
+$script:D32Phase0OwnerBindingName = 'D32-PHASE0-OWNER.json'
 
 function Import-D32TraceIdentitySelfTestFunction {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Name)
@@ -85,6 +87,7 @@ function Copy-D32DebugCommandLineCaptureSelfTestShape {
         VolumeSerialHex = [string]$Value.VolumeSerialHex
         FileIdHex = [string]$Value.FileIdHex
         ImageVerified = [bool]$Value.ImageVerified
+        CommandLineCaptureRequired = [bool]$Value.CommandLineCaptureRequired
         Exited = [bool]$Value.Exited
         CreatedAtUtc = [string]$Value.CreatedAtUtc
         CommandLineCapture = [PSCustomObject][ordered]@{
@@ -133,6 +136,11 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0DirectoryEntryExists' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0ActualDebugCommandLine' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiscoveryFailureEvidence' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Set-D32Phase0FailureContext' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0LastCompletedContextSecondary' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0CommandLine' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0WindowsArgument' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0FileReference' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0ListedTests' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0IgnoredTests' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0ExactTestListOutput' },
@@ -157,6 +165,18 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertFrom-D32DebugProcessRecord' }
     )) {
     Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $entry.Path -Name $entry.Name)
+}
+
+function Get-D32ProfileFileSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-D32ProfileNoReparsePath -Path $full)) { throw 'SELFTEST_BLOCKED: synthetic completed-command output is missing or reparse-backed' }
+    $bytes = [IO.File]::ReadAllBytes($full)
+    return [PSCustomObject]@{
+        Path = $full; Bytes = [Int64]$bytes.LongLength
+        Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        VolumeSerialHex = '0000000000000001'; FileIdHex = '1' * 32
+    }
 }
 
 function ConvertTo-D32TraceIdentityListLines {
@@ -287,7 +307,7 @@ $nativeProcess = [PSCustomObject][ordered]@{
     CreationFileTime = [Int64]133000000000000001; ParentCreationFileTime = [Int64]133000000000000000
     ImagePath = $capturePath; Bytes = [Int64]100; Sha256 = 'a' * 64
     VolumeSerialHex = '0000000000000001'; FileIdHex = '1' * 32
-    ImageVerified = $true; Exited = $true; CreatedAtUtc = [DateTime]::FromFileTimeUtc(133000000000000001L).ToString('o')
+    ImageVerified = $true; CommandLineCaptureRequired = $true; Exited = $true; CreatedAtUtc = [DateTime]::FromFileTimeUtc(133000000000000001L).ToString('o')
     CommandLineCapture = $capture
 }
 $capturedChildCommandLine = $false
@@ -324,6 +344,48 @@ Add-D32TraceIdentitySelfTestCase -Name 'fixture root converter rejects caller co
 $fastExitRecord = ConvertFrom-D32DebugProcessRecord -Process $nativeProcess
 Add-D32TraceIdentitySelfTestCase -Name 'fast-exited child retains its pre-Continue captured command line and exact exited identity' `
     -Passed ($nativeProcess.Exited -and $fastExitRecord.IdentityVerified -and $fastExitRecord.CommandLine -ceq $captureLine)
+
+$optionalChild = Copy-D32DebugCommandLineCaptureSelfTestShape -Value $nativeProcess
+$optionalChild.CommandLineCaptureRequired = $false
+$optionalChild.CommandLineCapture.Source = 'CREATE_PROCESS_DEBUG_EVENT.identity-only/optional-command-line-not-captured'
+$optionalChild.CommandLineCapture.CommandLine = ''
+$optionalPhase0Line = $null
+$optionalFixtureRecord = $null
+try {
+    $optionalPhase0Line = Get-D32Phase0ActualDebugCommandLine -Process $optionalChild
+    $optionalFixtureRecord = ConvertFrom-D32DebugProcessRecord -Process $optionalChild
+}
+catch { }
+Add-D32TraceIdentitySelfTestCase -Name 'ordinary child retains exact PID/creation/parent/opened-image identity with an explicit empty optional argv diagnostic' `
+    -Passed ($optionalPhase0Line -ceq '' -and $null -ne $optionalFixtureRecord -and
+        $optionalFixtureRecord.CommandLine -ceq '' -and $optionalFixtureRecord.IdentityVerified)
+$optionalRootRejected = $false
+try { $null = ConvertFrom-D32Phase0DebugProcess -Process $optionalChild -ExpectedCommandLine $captureLine }
+catch { $optionalRootRejected = $_.Exception.Message -like 'PHASE0_PROCESS_IDENTITY_BLOCKED:*' }
+Add-D32TraceIdentitySelfTestCase -Name 'fixed root identity rejects an optional empty child command-line diagnostic' -Passed $optionalRootRejected
+foreach ($optionalCase in @(
+        [PSCustomObject]@{ Name = 'invented command line'; Mutate = { param($p) $p.CommandLineCapture.CommandLine = 'caller argv' } },
+        [PSCustomObject]@{ Name = 'actual-source claim'; Mutate = { param($p) $p.CommandLineCapture.Source = 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine' } },
+        [PSCustomObject]@{ Name = 'PID binding'; Mutate = { param($p) $p.CommandLineCapture.ProcessId++ } },
+        [PSCustomObject]@{ Name = 'opened image binding'; Mutate = { param($p) $p.CommandLineCapture.Sha256 = 'b' * 64 } }
+    )) {
+    $mutatedOptionalChild = Copy-D32DebugCommandLineCaptureSelfTestShape -Value $optionalChild
+    & $optionalCase.Mutate $mutatedOptionalChild
+    $phase0OptionalRejected = $false
+    $fixtureOptionalRejected = $false
+    try { $null = Get-D32Phase0ActualDebugCommandLine -Process $mutatedOptionalChild }
+    catch { $phase0OptionalRejected = $_.Exception.Message -like 'PHASE0_PROCESS_IDENTITY_BLOCKED:*' }
+    try { $null = Get-D32FixtureDebugProcessCommandLine -Process $mutatedOptionalChild }
+    catch { $fixtureOptionalRejected = $_.Exception.Message -like 'DEBUG_PROCESS_TRACE_BLOCKED:*' }
+    Add-D32TraceIdentitySelfTestCase -Name "ordinary child optional diagnostic rejects $($optionalCase.Name) drift" `
+        -Passed ($phase0OptionalRejected -and $fixtureOptionalRejected)
+}
+$wrongRequirementType = Copy-D32DebugCommandLineCaptureSelfTestShape -Value $nativeProcess
+$wrongRequirementType.CommandLineCaptureRequired = 'true'
+$wrongRequirementRejected = $false
+try { $null = Get-D32Phase0ActualDebugCommandLine -Process $wrongRequirementType }
+catch { $wrongRequirementRejected = $_.Exception.Message -like 'PHASE0_PROCESS_IDENTITY_BLOCKED:*requirement marker*' }
+Add-D32TraceIdentitySelfTestCase -Name 'command-line capture classification rejects a non-Boolean requirement marker' -Passed $wrongRequirementRejected
 
 foreach ($case in @(
         [PSCustomObject]@{ Name = 'PID'; Mutate = { param($p) $p.CommandLineCapture.ProcessId++ } },
@@ -402,7 +464,7 @@ Add-D32TraceIdentitySelfTestCase -Name 'fixture command-line capture rejects abs
 
 $fixtureSourcePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
 $fixtureSource = [IO.File]::ReadAllText($fixtureSourcePath, [Text.UTF8Encoding]::new($false, $true))
-$nativeCaptureIndex = $fixtureSource.IndexOf('commandLineCapture = CaptureDebugCommandLine(created.Process, ev.ProcessId, creation, parentPid, parentCreation, image)', [StringComparison]::Ordinal)
+$nativeCaptureIndex = $fixtureSource.IndexOf('requireActualCommandLine = trace.ProcessCreateEventCount == 1', [StringComparison]::Ordinal)
 $nativeBeforeContinueIndex = $fixtureSource.IndexOf('VerifyCreateCommandLineCaptureBeforeContinue(created.Process', [StringComparison]::Ordinal)
 $nativeContinueIndex = $fixtureSource.IndexOf('ContinueDebugEvent(ev.ProcessId, ev.ThreadId, continueStatus)', [StringComparison]::Ordinal)
 $serializerAstTokens = $null; $serializerAstErrors = $null
@@ -411,6 +473,27 @@ $traceSerializer = $fixtureAst.Find({ param($node) $node -is [System.Management.
 $phase0SourceTokens = $null; $phase0SourceErrors = $null
 $phase0Ast = [System.Management.Automation.Language.Parser]::ParseFile($phase0Path, [ref]$phase0SourceTokens, [ref]$phase0SourceErrors)
 $phase0Serializer = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'ConvertTo-D32Phase0DebugProcessTraceDocument' }, $true)
+$unicodeBoundsMatch = [regex]::Match($fixtureSource, '(?s)public static bool IsValidRemoteUnicodeStringBounds\(uint length, uint maximumLength, ulong bufferAddress\)\s*\{[^}]*\}')
+$unicodeBoundsCasesPassed = $false
+$unicodeBoundsFailure = $null
+if ($unicodeBoundsMatch.Success) {
+    try {
+        $boundsTypeName = 'D32RemoteUnicodeStringBoundsSelfTest_' + [Guid]::NewGuid().ToString('N')
+        $boundsType = Add-Type -TypeDefinition ('using System; public static class ' + $boundsTypeName + ' {' + $unicodeBoundsMatch.Value + '}') -PassThru -ErrorAction Stop
+        $boundsMethod = $boundsType[0].GetMethod('IsValidRemoteUnicodeStringBounds')
+        $checkBounds = { param([uint32]$Length, [uint32]$MaximumLength, [UInt64]$Buffer) [bool]$boundsMethod.Invoke($null, [object[]]@($Length, $MaximumLength, $Buffer)) }
+        $unicodeBoundsCasesPassed = (& $checkBounds 2 4 4096) -and (& $checkBounds 65532 65534 4096) -and
+            -not (& $checkBounds 65534 65534 4096) -and -not (& $checkBounds 0 0 4096) -and
+            -not (& $checkBounds 3 4 4096) -and -not (& $checkBounds 4 2 4096) -and
+            -not (& $checkBounds 2 3 4096) -and -not (& $checkBounds 2 65536 4096) -and
+            -not (& $checkBounds 2 4 0)
+    }
+    catch { $unicodeBoundsFailure = $_.Exception.Message }
+}
+$remoteUnicodeReader = [regex]::Match($fixtureSource, '(?s)private static string ReadRemoteUnicodeString\(IntPtr process, IntPtr structure, string label\)\s*\{.*?\n    \}')
+$remoteUnicodeReaderSafe = $remoteUnicodeReader.Success -and
+    $remoteUnicodeReader.Value.Contains('IsValidRemoteUnicodeStringBounds(length, maximumLength, unchecked((ulong)bufferAddress))') -and
+    $remoteUnicodeReader.Value.Contains('bufferAddress <= 0') -and $remoteUnicodeReader.Value -notmatch 'length\s*>\s*32766'
 $wireSerializersDoNotExtendV2 = $null -ne $traceSerializer -and $fixtureAst -and $fixtureAst.EndBlock.Statements.Count -gt 0 -and
     $null -ne $phase0Serializer -and $traceSerializer.Extent.Text -notmatch '(?i)CommandLineCapture|command_line' -and
     $phase0Serializer.Extent.Text -notmatch '(?i)CommandLineCapture|command_line' -and
@@ -418,10 +501,16 @@ $wireSerializersDoNotExtendV2 = $null -ne $traceSerializer -and $fixtureAst -and
     $fixtureSource.Contains('ReadRemoteUnicodeString(eventProcessHandle, IntPtr.Add(parameters, 0x70), "CommandLine")') -and
     $fixtureSource.Contains('VerifyRetainedDebugParentIdentity(retainedCurrent.Handle, record.ProcessId, record.CreationFileTime') -and
     $fixtureSource.Contains('CaptureDebugCommandLine(eventProcessHandle, record.ProcessId,') -and
-    $fixtureSource.Contains('record.ParentCreationFileTime, openedImage)') -and
+    $fixtureSource.Contains('record.ParentCreationFileTime, openedImage,') -and
+    $fixtureSource.Contains('record.CommandLineCaptureRequired)') -and
+    $fixtureSource.Contains('reason == "narrow-caller-pinned-H7C-Git-child-v1"') -and
+    $fixtureSource.Contains('identity-only/optional-command-line-not-captured') -and
     $fixtureSource.Contains('CREATE retained parent identity chain contains a cycle') -and
-    $fixtureSource.Contains('cursor.ParentCreationFileTime != debuggerCreation')
+    $fixtureSource.Contains('cursor.ParentCreationFileTime != debuggerCreation') -and
+    $remoteUnicodeReaderSafe -and $unicodeBoundsMatch.Success
 Add-D32TraceIdentitySelfTestCase -Name 'native CREATE PEB capture and retained child/parent revalidation precede Continue while frozen V2 wire schema stays unchanged' -Passed $wireSerializersDoNotExtendV2
+Add-D32TraceIdentitySelfTestCase -Name 'remote UNICODE_STRING byte-length boundary accepts a maximum valid Windows command line and rejects malformed length/maximum/pointer cases' `
+    -Passed ($unicodeBoundsCasesPassed -and $remoteUnicodeReaderSafe) -Detail $unicodeBoundsFailure
 
 $diagnosticRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('d32-phase0-diagnostic-probe-' + [Guid]::NewGuid().ToString('N'))))
 if ([IO.Directory]::Exists($diagnosticRoot) -or [IO.File]::Exists($diagnosticRoot)) { throw 'SELFTEST_BLOCKED: synthetic diagnostic probe root collision' }
@@ -432,10 +521,15 @@ $stderrCapturePath = Join-Path $diagnosticRoot 'synthetic-fixed-command.stderr.l
 $oldFailureContextVariable = Get-Variable -Name D32Phase0FailureContext -Scope Script -ErrorAction SilentlyContinue
 $oldFailureContext = if ($null -eq $oldFailureContextVariable) { $null } else { $oldFailureContextVariable.Value }
 $script:D32Phase0BlockedDiagnosticType = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1'
+$diagnosticCargo = [PSCustomObject]@{
+    path = 'E:\d32\synthetic-cargo.exe'; sha256 = 'e' * 64; bytes = [Int64]100
+    volume_serial_hex = '0000000000000001'; file_id_hex = '5' * 32
+}
 $diagnosticProfile = [PSCustomObject]@{
     ProfilePath = 'E:\d32\synthetic-profile.json'
     Digest = 'b' * 64
     Identity = [PSCustomObject]@{ Bytes = [Int64]100; VolumeSerialHex = '0000000000000001'; FileIdHex = '2' * 32 }
+    Profile = [PSCustomObject]@{ toolchain = [PSCustomObject]@{ cargo = $diagnosticCargo } }
 }
 $diagnosticRootIdentity = [PSCustomObject]@{
     Path = $diagnosticRoot; VolumeSerialHex = '0000000000000001'; FileIdHex = '3' * 32
@@ -446,7 +540,7 @@ $diagnosticOwnerMarker = [ordered]@{
 }
 $script:D32Phase0FailureContext = [PSCustomObject]@{
     EvidenceRoot = $diagnosticRoot; CandidateSha = 'a' * 40; Profile = $diagnosticProfile
-    RunId = 'd' * 32; RootIdentity = $diagnosticRootIdentity; OwnerMarker = $diagnosticOwnerMarker
+    RunId = 'd' * 32; RootIdentity = $diagnosticRootIdentity; OwnerMarker = $diagnosticOwnerMarker; Repository = $repo
 }
 $diagnosticCommand = [ordered]@{ name = 'selftest-fixed-fetch'; arguments = @('fetch', '--locked') }
 $diagnosticIdentity = [ordered]@{ process_id = 41001; parent_process_id = 41000; identity_verified = $false }
@@ -461,32 +555,26 @@ $incompleteCleanup = [ordered]@{
     DebuggerAssociationQueryVerified = $true; DebuggerAssociationAbsent = $true
 }
 $script:D32Phase0LastProcessFailure = $null
-$successfulPriorCommandResult = [ordered]@{
-    name = 'completed-prior-command'; exit_code = 0
-    stdout = [ordered]@{ path = 'E:\d32\prior.stdout.log'; bytes = [Int64]0; sha256 = 'a' * 64; volume_serial_hex = '0000000000000001'; file_id_hex = '1' * 32 }
-    stderr = [ordered]@{ path = 'E:\d32\prior.stderr.log'; bytes = [Int64]0; sha256 = 'b' * 64; volume_serial_hex = '0000000000000001'; file_id_hex = '2' * 32 }
-}
-$script:D32Phase0LastProcessEvidence = [ordered]@{
-    PrimaryError = $null
-    Completed = $true
+$successfulPriorCommandResult = [ordered]@{ name = 'completed-prior-command'; exit_code = 0 }
+$script:D32Phase0LastCompletedCommandEvidence = [ordered]@{
+    PrimaryError = $null; SecondaryErrors = @(); Completed = $true
     CommandResult = $successfulPriorCommandResult
     Command = [ordered]@{ name = 'completed-prior-command' }
     ProcessIdentity = [ordered]@{ identity_verified = $true }
     RawV2Trace = [ordered]@{ event_chain_complete = $true }
     NativeCleanup = [ordered]@{ CleanupSucceeded = $true }
-    StdoutPath = 'E:\d32\prior.stdout.log'
-    StderrPath = 'E:\d32\prior.stderr.log'
+    StdoutPath = 'synthetic-prior.stdout.log'; StderrPath = 'synthetic-prior.stderr.log'
 }
 $unrequestedCompletedContextHidden = $null -eq (Get-D32Phase0DiscoveryFailureEvidence)
 $lastCompletedContextRetained = (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.name -ceq 'completed-prior-command' -and
-    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.exit_code -eq 0 -and
-    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.stdout.sha256 -ceq ('a' * 64)
+    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).CommandResult.exit_code -eq 0
 $script:D32Phase0LastProcessFailure = [ordered]@{
-    PrimaryError = 'current fixed-command failure'; Completed = $false; CommandResult = $null
+    PrimaryError = 'current fixed-command failure'; SecondaryErrors = @('current cleanup detail'); Completed = $false; CommandResult = $null
     Command = [ordered]@{ name = 'current-failing-command' }
 }
 $currentCommandEvidenceRetained = (Get-D32Phase0DiscoveryFailureEvidence).Command.name -ceq 'current-failing-command' -and
-    $null -eq (Get-D32Phase0DiscoveryFailureEvidence).CommandResult
+$null -eq (Get-D32Phase0DiscoveryFailureEvidence).CommandResult -and
+    (Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).PrimaryError -ceq 'current fixed-command failure'
 Add-D32TraceIdentitySelfTestCase -Name 'failure context retains a complete successful command result for later parser diagnostics and prefers an actual process failure' `
     -Passed ($unrequestedCompletedContextHidden -and $lastCompletedContextRetained -and $currentCommandEvidenceRetained)
 try {
@@ -587,6 +675,7 @@ try {
     $stderrStream = [IO.File]::Open($stderrCapturePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try { $stderrStream.Write($stderrBytes, 0, $stderrBytes.Length); $stderrStream.Flush($true) } finally { $stderrStream.Dispose() }
     $successfulTrace = [ordered]@{
+        state = 'COMPLETED'
         dedicated_debugger_thread = $true; debugger_kill_on_exit_enabled = $true; debugger_thread_exited = $true
         debugger_thread_joined = $true; retained_process_handles_signaled = $true; debugger_association_query_verified = $true
         debugger_association_absent = $true; job_accounting_verified = $true; accounting_consistent = $true
@@ -601,19 +690,68 @@ try {
     $successfulProcessIdentity = [ordered]@{ process_id = 41001; parent_process_id = 41000; identity_verified = $true }
     $successfulStdoutReference = Get-D32Phase0FileReference -Path $stdoutCapturePath
     $successfulStderrReference = Get-D32Phase0FileReference -Path $stderrCapturePath
+    $successfulExecutable = [string]$diagnosticCargo.path
+    $successfulArguments = @('test', '--list')
+    $successfulArgv = @($successfulExecutable) + $successfulArguments
     $successfulCommandResult = [ordered]@{
-        name = 'protocol-test-list'; timeout_seconds = [Int64]28800; started_at_utc = '2026-10-02T00:00:00.0000000+00:00'
+        name = 'protocol-test-list'; timeout_seconds = [Int64]28800
+        executable = $successfulExecutable; executable_sha256 = [string]$diagnosticCargo.sha256
+        executable_bytes = [Int64]$diagnosticCargo.bytes; executable_volume_serial_hex = [string]$diagnosticCargo.volume_serial_hex
+        executable_file_id_hex = [string]$diagnosticCargo.file_id_hex
+        argv = $successfulArgv; arguments = $successfulArguments
+        command_line = ConvertTo-D32Phase0CommandLine -Arguments $successfulArgv
+        working_directory = $repo; candidate_sha_before = 'a' * 40; clean_before = $true
+        started_at_utc = '2026-10-02T00:00:00.0000000+00:00'
         completed_at_utc = '2026-10-02T00:00:01.0000000+00:00'; exit_code = 0
+        root_process = $successfulProcessIdentity
         stdout = $successfulStdoutReference; stderr = $successfulStderrReference
-        process_trace = $successfulTrace; process_tree_cleanup = [ordered]@{ cleanup_succeeded = $true; active_process_count_verified = $true; active_process_count = [uint32]0 }
+        process_trace = $successfulTrace
+        process_tree_cleanup = [ordered]@{ cleanup_succeeded = $true; active_process_count_verified = $true; active_process_count = [uint32]0 }
+        candidate_sha_after = 'a' * 40; clean_after = $true
     }
-    $script:D32Phase0LastProcessFailure = $null
-    $script:D32Phase0LastProcessEvidence = [ordered]@{
-        PrimaryError = $null; SecondaryErrors = @(); Completed = $true; CommandResult = $successfulCommandResult
-        Command = [ordered]@{ name = 'protocol-test-list'; arguments = @('test', '--list') }
+    $script:D32Phase0LastCompletedCommandEvidence = [ordered]@{
+        PrimaryError = $null; SecondaryErrors = @('synthetic capture warning'); Completed = $true
+        CandidateSha = 'a' * 40; ProfilePath = [string]$diagnosticProfile.ProfilePath; ProfileSha256 = [string]$diagnosticProfile.Digest
+        EvidenceRoot = $diagnosticRoot; RunId = 'd' * 32
+        CommandResult = $successfulCommandResult
+        Command = [ordered]@{
+            name = 'protocol-test-list'; executable = $successfulExecutable; executable_sha256 = [string]$diagnosticCargo.sha256
+            executable_bytes = [Int64]$diagnosticCargo.bytes; executable_volume_serial_hex = [string]$diagnosticCargo.volume_serial_hex
+            executable_file_id_hex = [string]$diagnosticCargo.file_id_hex; arguments = $successfulArguments
+            command_line = $successfulCommandResult.command_line; working_directory = $repo
+        }
         ProcessIdentity = $successfulProcessIdentity; RawV2Trace = $successfulTrace; NativeCleanup = $successfulCleanup
         StdoutPath = $stdoutCapturePath; StderrPath = $stderrCapturePath
     }
+    $script:D32Phase0LastProcessFailure = [ordered]@{
+        PrimaryError = 'TEST_INVENTORY_BLOCKED: synthetic post-command parser error'
+        SecondaryErrors = @('synthetic cleanup warning')
+        Completed = $false; CommandResult = $null; Command = [ordered]@{ name = 'later-command-failure' }
+    }
+    $failureEvidenceWithCompleted = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext
+    $completedContextText = [string](@($failureEvidenceWithCompleted.SecondaryErrors)[1])
+    $completedContextPrefix = 'D32_PHASE0_LAST_COMPLETED_COMMAND_CONTEXT_V1:'
+    $completedContextJson = if ($completedContextText.StartsWith($completedContextPrefix, [StringComparison]::Ordinal)) {
+        $completedContextText.Substring($completedContextPrefix.Length) | ConvertFrom-Json
+    } else { $null }
+    $failurePrimaryAndContextPreserved = $failureEvidenceWithCompleted.PrimaryError -ceq 'TEST_INVENTORY_BLOCKED: synthetic post-command parser error' -and
+        ($failureEvidenceWithCompleted.SecondaryErrors -join "`0") -ceq "synthetic cleanup warning`0$completedContextText" -and
+        $null -ne $completedContextJson -and $completedContextJson.candidate_sha -ceq ('a' * 40) -and
+        $completedContextJson.toolchain_profile.sha256 -ceq ('b' * 64) -and $completedContextJson.run_id -ceq ('d' * 32) -and
+        $completedContextJson.command_result.exit_code -eq 0 -and
+        $completedContextJson.secondary_errors[0] -ceq 'synthetic capture warning' -and
+        $completedContextJson.stdout_reference.sha256 -ceq $successfulStdoutReference.sha256 -and
+        $completedContextJson.stderr_reference.sha256 -ceq $successfulStderrReference.sha256 -and
+        $script:D32Phase0LastProcessFailure.PrimaryError -ceq 'TEST_INVENTORY_BLOCKED: synthetic post-command parser error'
+    $savedRunId = $script:D32Phase0LastCompletedCommandEvidence.RunId
+    $script:D32Phase0LastCompletedCommandEvidence.RunId = 'e' * 32
+    $unboundContextText = [string](@((Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext).SecondaryErrors)[1])
+    $script:D32Phase0LastCompletedCommandEvidence.RunId = $savedRunId
+    $contextDriftRejected = $unboundContextText.StartsWith('D32_PHASE0_LAST_COMPLETED_CONTEXT_CAPTURE_ERROR:', [StringComparison]::Ordinal)
+    Add-D32TraceIdentitySelfTestCase -Name 'post-command parser failure preserves prior primary and capture warnings while binding the successful command context to exact candidate/profile/root/run and streams' `
+        -Passed ($failurePrimaryAndContextPreserved -and $contextDriftRejected) `
+        -Detail ('bound={0};drift={1};marker={2};error={3}' -f $failurePrimaryAndContextPreserved, $contextDriftRejected, $completedContextText, $unboundContextText)
+    $script:D32Phase0LastProcessFailure = $null
     $postCommandEvidence = Get-D32Phase0DiscoveryFailureEvidence -IncludeCompletedCommandContext
     $postCommandContextPreserved = $null -ne $postCommandEvidence -and $postCommandEvidence.Completed -eq $true -and
         $null -eq $postCommandEvidence.PrimaryError -and $postCommandEvidence.CommandResult.exit_code -eq 0 -and
@@ -639,7 +777,9 @@ try {
         $postCommandDiagnostic.status -ceq 'BLOCKED' -and $postCommandDiagnostic.gate_authority -ceq 'NONE' -and
         $postCommandDiagnostic.primary_error -ceq 'TEST_INVENTORY_BLOCKED: unexpected blank/truncated libtest list output' -and
         $postCommandDiagnostic.failing_fixed_command.name -ceq 'protocol-test-list' -and
-        (Test-D32Phase0ExactProperties -Object $postCommandDiagnostic.failing_fixed_command -Expected @('name', 'arguments')) -and
+        (Test-D32Phase0ExactProperties -Object $postCommandDiagnostic.failing_fixed_command -Expected @(
+            'name', 'executable', 'executable_sha256', 'executable_bytes', 'executable_volume_serial_hex',
+            'executable_file_id_hex', 'arguments', 'command_line', 'working_directory')) -and
         $postCommandDiagnostic.raw_v2_trace.processes[0].exit_code -eq 0 -and
         $postCommandDiagnostic.raw_v2_trace.event_chain_complete -eq $true -and
         $postCommandDiagnostic.job_debug_cleanup.verification -ceq 'VERIFIED' -and
@@ -683,6 +823,10 @@ try {
         $discoverySource.Contains('$evidence.CommandResult') -and $discoverySource.Contains('-IncludeCompletedCommandContext') -and
         $discoverySource.Contains('-ExpectedStdoutReference $stdoutReference') -and
         $phase0FailureCatch.Extent.Text.Contains('-IncludeCompletedCommandContext') -and
+        $phase0FailureCatch.Extent.Text.Contains("`$secondary = [System.Collections.Generic.List[string]]::new()") -and
+        $phase0FailureCatch.Extent.Text.IndexOf('$secondary = [System.Collections.Generic.List[string]]::new()', [StringComparison]::Ordinal) -lt
+            $phase0FailureCatch.Extent.Text.IndexOf('if ($null -ne $failureContext)', [StringComparison]::Ordinal) -and
+        $phase0FailureCatch.Extent.Text.Contains('blocked diagnostic preflight failed:') -and
         $null -ne $pinnedProcessFunction -and $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.CommandResult = $commandResult') -and
         $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.Completed = $true')
     Add-D32TraceIdentitySelfTestCase -Name 'completed fetch/list results are retained in memory and both discovery and Phase0 output-error catches bind their stream references to V1 diagnostics' `

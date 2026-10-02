@@ -3721,6 +3721,7 @@ function Assert-D32PreflightTestInventoryBinding {
         -not (Test-D32ProfilePathEqual -Left $discovery.evidence_root_identity.path -Right $discoveryRoot)) {
         throw 'test-inventory discovery must retain its own external non-reparse owner-bound root'
     }
+    $null = Assert-D32Phase0DiscoveryNoBlockedDiagnostic -EvidenceRoot $discoveryRoot
     $null = Assert-D32TestInventoryRootsDisjoint -DiscoveryRoot $discoveryRoot -Phase0OutputRoot $Phase0OutputRoot
     if ((ConvertTo-Json -InputObject $discovery.source_patch_authority -Depth 6 -Compress) -cne
         (ConvertTo-Json -InputObject $Phase0Document.tauri_macros_source_patch -Depth 6 -Compress)) {
@@ -3791,15 +3792,35 @@ function New-D32PreflightSelfTestPhase0Command {
     }
     $rootTrace = $trace.processes[0]
     $process = [PSCustomObject]@{
-        ProcessId = [int]$rootTrace.process_id
-        ParentProcessId = [int]$rootTrace.parent_process_id
+        ProcessId = [uint32]$rootTrace.process_id
+        ParentProcessId = [uint32]$rootTrace.parent_process_id
         Name = [IO.Path]::GetFileName($executable)
         ImagePath = $executable
         CommandLine = $commandLine
         CreationFileTime = [Int64]$rootTrace.creation_filetime
+        ParentCreationFileTime = [Int64]$rootTrace.parent_creation_filetime
         CreatedAtUtc = [string]$rootTrace.created_at_utc
+        ImageVerified = [bool]$rootTrace.image_verified
+        Exited = [bool]$rootTrace.exited
+        Bytes = [Int64]$rootTrace.bytes
+        Sha256 = [string]$rootTrace.sha256
+        VolumeSerialHex = [string]$rootTrace.volume_serial_hex
+        FileIdHex = [string]$rootTrace.file_id_hex
+        CommandLineCapture = [PSCustomObject][ordered]@{
+            Source = 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine'
+            ProcessId = [uint32]$rootTrace.process_id
+            CreationFileTime = [Int64]$rootTrace.creation_filetime
+            ParentProcessId = [uint32]$rootTrace.parent_process_id
+            ParentCreationFileTime = [Int64]$rootTrace.parent_creation_filetime
+            ImagePath = [string]$rootTrace.image_path
+            Bytes = [Int64]$rootTrace.bytes
+            Sha256 = [string]$rootTrace.sha256
+            VolumeSerialHex = [string]$rootTrace.volume_serial_hex
+            FileIdHex = [string]$rootTrace.file_id_hex
+            CommandLine = $commandLine
+        }
     }
-    $rootProcess = ConvertFrom-D32Phase0DebugProcess -Process $process -CommandLine $commandLine
+    $rootProcess = ConvertFrom-D32Phase0DebugProcess -Process $process -ExpectedCommandLine $commandLine
     $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootProcess -ValidatedProfile $ValidatedProfile -Repository $Repository `
         -ExpectedRootPath $executable -VendoredProtocGrant $null -H7CGitRunGrant $null
     $started = if ([String]::IsNullOrWhiteSpace($StartedAtUtc)) { [string]$trace.started_at_utc } else { $StartedAtUtc }

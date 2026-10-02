@@ -225,6 +225,12 @@ $capacity = Get-D32Phase0FixtureBuildCapacity -Repository $repo -EvidenceRoot $o
 $runId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
 $ownerRoot = New-D32Phase0FixtureOutputRoot -Path $output -Repository $repo -ExpectedCandidateSha $ExpectedCandidateSha -ValidatedProfile $profile -RunId $runId
 $output = [string]$ownerRoot.Path
+Set-D32Phase0FailureContext -Context ([PSCustomObject]@{
+    EvidenceRoot = $output; CandidateSha = $ExpectedCandidateSha; Profile = $profile; RunId = $runId
+    RootIdentity = $ownerRoot.RootIdentity; OwnerMarker = $ownerRoot.OwnerMarker
+})
+
+try {
 
 $runRoot = Join-Path $output 'r'
 $cargoHome = Join-Path $runRoot 'c'
@@ -235,10 +241,6 @@ $logsRoot = Join-Path $output 'logs'
 $null = Test-D32CargoHome -Path $cargoHome -Repository $repo -RequireEmpty
 $null = Test-D32Phase0OwnerBinding -EvidenceRoot $output -ExpectedCandidateSha $ExpectedCandidateSha -ValidatedProfile $profile `
     -ExpectedRunId $runId -ExpectedRootIdentity $ownerRoot.RootIdentity -ExpectedMarkerReference $ownerRoot.OwnerMarker
-$script:D32Phase0FailureContext = [PSCustomObject]@{
-    EvidenceRoot = $output; CandidateSha = $ExpectedCandidateSha; Profile = $profile; RunId = $runId
-    RootIdentity = $ownerRoot.RootIdentity; OwnerMarker = $ownerRoot.OwnerMarker
-}
 
 $cargo = [string]$profile.Profile.toolchain.cargo.path
 $lockInputs = @(Get-D32BuildToolchainLockInputs -Repository $repo)
@@ -373,3 +375,51 @@ Write-Output 'inventory_discovery_gate_authority=NONE'
 Write-Output "inventory_discovery_candidate_sha=$ExpectedCandidateSha"
 Write-Output "inventory_discovery_path=$recordPath"
 Write-Output "inventory_discovery_sha256=$($reference.sha256)"
+}
+catch {
+    $caughtError = [string]$_.Exception.Message
+    $primaryError = $caughtError
+    $secondaryErrors = [System.Collections.Generic.List[string]]::new()
+    $evidence = $null
+    try { $evidence = Get-D32Phase0DiscoveryFailureEvidence }
+    catch { $secondaryErrors.Add('last fixed-command evidence retrieval failed: ' + $_.Exception.Message) }
+    if ($null -ne $evidence) {
+        if (-not [String]::IsNullOrWhiteSpace([string]$evidence.PrimaryError) -and [string]$evidence.PrimaryError -cne $caughtError) {
+            $primaryError = [string]$evidence.PrimaryError
+            $secondaryErrors.Add('discovery orchestration failure: ' + $caughtError)
+        }
+        foreach ($secondary in @($evidence.SecondaryErrors)) {
+            if (-not [String]::IsNullOrWhiteSpace([string]$secondary)) { $secondaryErrors.Add([string]$secondary) }
+        }
+    }
+    $command = if ($null -eq $evidence) { $null } else { $evidence.Command }
+    $processIdentity = if ($null -eq $evidence) { $null } else { $evidence.ProcessIdentity }
+    $rawTrace = if ($null -eq $evidence) { $null } else { $evidence.RawV2Trace }
+    $nativeCleanup = if ($null -eq $evidence) { $null } else { $evidence.NativeCleanup }
+    $stdoutPath = if ($null -eq $evidence) { $null } else { $evidence.StdoutPath }
+    $stderrPath = if ($null -eq $evidence) { $null } else { $evidence.StderrPath }
+    foreach ($capture in @([PSCustomObject]@{ Name = 'stdout'; Path = $stdoutPath }, [PSCustomObject]@{ Name = 'stderr'; Path = $stderrPath })) {
+        if ([String]::IsNullOrWhiteSpace([string]$capture.Path)) { continue }
+        try {
+            $captureParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath([string]$capture.Path))
+            if ([String]::IsNullOrWhiteSpace($captureParent) -or -not (Test-D32ProfileNoReparsePath -Path $captureParent)) {
+                $secondaryErrors.Add("$($capture.Name) capture parent is missing or reparse-backed; capture reference is explicitly unavailable")
+                if ($capture.Name -ceq 'stdout') { $stdoutPath = $null } else { $stderrPath = $null }
+            }
+        }
+        catch {
+            $secondaryErrors.Add("$($capture.Name) capture-path validation failed: $($_.Exception.Message)")
+            if ($capture.Name -ceq 'stdout') { $stdoutPath = $null } else { $stderrPath = $null }
+        }
+    }
+    try {
+        $null = Write-D32Phase0BlockedDiagnostic -PrimaryError $primaryError -SecondaryErrors @($secondaryErrors.ToArray()) `
+            -Command $command -ProcessIdentity $processIdentity -RawV2Trace $rawTrace -NativeCleanup $nativeCleanup `
+            -StdoutPath $stdoutPath -StderrPath $stderrPath
+    }
+    catch { $secondaryErrors.Add('blocked diagnostic capture failed: ' + $_.Exception.Message) }
+    if ($secondaryErrors.Count -gt 0) {
+        [Console]::Error.WriteLine('TEST_INVENTORY_DISCOVERY_SECONDARY_ERRORS: ' + ($secondaryErrors -join ' | '))
+    }
+    throw "TEST_INVENTORY_DISCOVERY_BLOCKED: $primaryError"
+}

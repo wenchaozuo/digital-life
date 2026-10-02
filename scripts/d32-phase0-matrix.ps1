@@ -58,6 +58,7 @@ $script:D32Phase0BlockedDiagnosticName = 'D32-PHASE0-BLOCKED-DIAGNOSTIC.json'
 $script:D32Phase0BlockedDiagnosticType = 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1'
 $script:D32Phase0FailureContext = $null
 $script:D32Phase0LastProcessFailure = $null
+$script:D32Phase0LastProcessEvidence = $null
 $script:D32Phase0SelfTestSourcePatchAuthorityPath = $null
 $script:D32Phase0SelfTestSourcePatchAuthoritySha256 = $null
 $script:D32Phase0FixtureBuildSpecs = @(
@@ -611,18 +612,96 @@ function ConvertTo-D32Phase0DebugProcessTraceDocument {
 }
 
 function ConvertFrom-D32Phase0DebugProcess {
-    param([Parameter(Mandatory = $true)][object]$Process, [AllowEmptyString()][string]$CommandLine = '')
+    param([Parameter(Mandatory = $true)][object]$Process, [AllowNull()][string]$ExpectedCommandLine)
+    $commandLine = Get-D32Phase0ActualDebugCommandLine -Process $Process -ExpectedCommandLine $ExpectedCommandLine `
+        -ExpectedCommandLineBound:($PSBoundParameters.ContainsKey('ExpectedCommandLine'))
     $created = if ([Int64]$Process.CreationFileTime -gt 0) { [DateTime]::FromFileTimeUtc([Int64]$Process.CreationFileTime).ToString('o') } else { $null }
     $proxy = [PSCustomObject]@{
         process_id = [int]$Process.ProcessId
         parent_process_id = [int]$Process.ParentProcessId
         name = [IO.Path]::GetFileName([string]$Process.ImagePath)
         image_path = [string]$Process.ImagePath
-        command_line = $CommandLine
+        command_line = $commandLine
         creation_date = $created
         observed_at_utc = [string]$Process.CreatedAtUtc
     }
     return $proxy
+}
+
+function Get-D32Phase0ActualDebugCommandLine {
+    param(
+        [Parameter(Mandatory = $true)][object]$Process,
+        [AllowNull()][string]$ExpectedCommandLine,
+        [bool]$ExpectedCommandLineBound = $false
+    )
+    $captureProperty = $Process.PSObject.Properties['CommandLineCapture']
+    if ($null -eq $captureProperty -or $null -eq $captureProperty.Value) {
+        throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual CREATE command-line capture is missing'
+    }
+    $capture = $captureProperty.Value
+    $captureFields = @('Source', 'ProcessId', 'CreationFileTime', 'ParentProcessId', 'ParentCreationFileTime',
+        'ImagePath', 'Bytes', 'Sha256', 'VolumeSerialHex', 'FileIdHex', 'CommandLine')
+    if (-not (Test-D32Phase0ExactProperties -Object $capture -Expected $captureFields) -or
+        $capture.Source -isnot [string] -or $capture.Source -cne 'CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine' -or
+        $capture.ProcessId -isnot [uint32] -or $capture.CreationFileTime -isnot [Int64] -or
+        $capture.ParentProcessId -isnot [uint32] -or $capture.ParentCreationFileTime -isnot [Int64] -or
+        -not (Test-D32Phase0Integer -Value $capture.ProcessId -Positive) -or
+        -not (Test-D32Phase0Integer -Value $capture.CreationFileTime -Positive) -or
+        -not (Test-D32Phase0Integer -Value $capture.ParentProcessId -Positive) -or
+        -not (Test-D32Phase0Integer -Value $capture.ParentCreationFileTime -Positive) -or
+        $Process.ProcessId -isnot [uint32] -or $Process.ParentProcessId -isnot [uint32] -or
+        $Process.CreationFileTime -isnot [Int64] -or $Process.ParentCreationFileTime -isnot [Int64] -or
+        $Process.Bytes -isnot [Int64] -or $Process.Exited -isnot [bool] -or -not $Process.Exited -or
+        $Process.ImagePath -isnot [string] -or $Process.Sha256 -isnot [string] -or
+        $Process.VolumeSerialHex -isnot [string] -or $Process.FileIdHex -isnot [string] -or
+        -not (Test-D32Phase0Integer -Value $capture.Bytes -Positive) -or
+        $capture.ImagePath -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $capture.ImagePath) -or
+        $capture.Sha256 -isnot [string] -or $capture.Sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $capture.VolumeSerialHex -isnot [string] -or $capture.VolumeSerialHex -cnotmatch '^[0-9a-f]{16}$' -or
+        $capture.FileIdHex -isnot [string] -or $capture.FileIdHex -cnotmatch '^[0-9a-f]{32}$' -or
+        $capture.CommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($capture.CommandLine) -or
+        -not (Test-D32Phase0Integer -Value $Process.ProcessId -Positive) -or
+        -not (Test-D32Phase0Integer -Value $Process.ParentProcessId -Positive) -or
+        -not (Test-D32Phase0Integer -Value $Process.CreationFileTime -Positive) -or
+        $Process.ImageVerified -isnot [bool] -or -not $Process.ImageVerified -or
+        $capture.ProcessId -ne $Process.ProcessId -or $capture.CreationFileTime -ne $Process.CreationFileTime -or
+        $capture.ParentProcessId -ne $Process.ParentProcessId -or
+        -not (Test-D32Phase0Integer -Value $Process.ParentCreationFileTime -Positive) -or
+        $capture.ParentCreationFileTime -ne $Process.ParentCreationFileTime -or
+        $capture.ImagePath -cne [string]$Process.ImagePath -or $capture.Bytes -ne [Int64]$Process.Bytes -or
+        $capture.Sha256 -cne [string]$Process.Sha256 -or
+        $capture.VolumeSerialHex -cne [string]$Process.VolumeSerialHex -or
+        $capture.FileIdHex -cne [string]$Process.FileIdHex) {
+        throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual PEB command line is not bound to the exact CREATE PID/creation/parent/opened-image identity'
+    }
+    if ($ExpectedCommandLineBound -and
+        ($ExpectedCommandLine -isnot [string] -or [String]::IsNullOrWhiteSpace($ExpectedCommandLine) -or
+            -not [String]::Equals([string]$capture.CommandLine, $ExpectedCommandLine, [StringComparison]::Ordinal))) {
+        throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: actual PEB command line differs from the separately supplied fixed root command'
+    }
+    return [string]$capture.CommandLine
+}
+
+function Set-D32Phase0FailureContext {
+    param([AllowNull()][object]$Context)
+    $script:D32Phase0FailureContext = $Context
+}
+
+function Get-D32Phase0DiscoveryFailureEvidence {
+    if ($null -ne $script:D32Phase0LastProcessFailure) { return $script:D32Phase0LastProcessFailure }
+    # A prior successful command is not evidence for the command that failed in
+    # later orchestration. Keep the failure-only sidecar's command/identity/trace
+    # fields truthful instead of attributing the last success to a new failure.
+    return $null
+}
+
+function Assert-D32Phase0DiscoveryNoBlockedDiagnostic {
+    param([Parameter(Mandatory = $true)][string]$EvidenceRoot)
+    $diagnosticPath = Join-Path ([IO.Path]::GetFullPath($EvidenceRoot)) $script:D32Phase0BlockedDiagnosticName
+    if (Test-D32Phase0DirectoryEntryExists -Path $diagnosticPath) {
+        throw 'TEST_INVENTORY_DISCOVERY_BLOCKED: failure-only blocked-diagnostic sidecar exists in the discovery root'
+    }
+    return $true
 }
 
 function ConvertTo-D32Phase0ExpectedRootIdentity {
@@ -1073,6 +1152,7 @@ function Invoke-D32Phase0PinnedProcess {
     )
     $script:D32Phase0LastProcessFailure = [ordered]@{
         PrimaryError = $null
+        SecondaryErrors = @()
         Command = [ordered]@{
             name = $Name
             executable = [IO.Path]::GetFullPath($Executable)
@@ -1080,6 +1160,16 @@ function Invoke-D32Phase0PinnedProcess {
             command_line = ConvertTo-D32Phase0CommandLine -Arguments (@($Executable) + @($Arguments))
             working_directory = [IO.Path]::GetFullPath($WorkingDirectory)
         }
+        ProcessIdentity = $null
+        RawV2Trace = $null
+        NativeCleanup = $null
+        StdoutPath = "$LogPath.stdout.log"
+        StderrPath = "$LogPath.stderr.log"
+    }
+    $script:D32Phase0LastProcessEvidence = [ordered]@{
+        PrimaryError = $null
+        SecondaryErrors = @()
+        Command = $script:D32Phase0LastProcessFailure.Command
         ProcessIdentity = $null
         RawV2Trace = $null
         NativeCleanup = $null
@@ -1106,6 +1196,7 @@ function Invoke-D32Phase0PinnedProcess {
         command_line = ConvertTo-D32Phase0CommandLine -Arguments (@($Executable) + @($Arguments))
         working_directory = [IO.Path]::GetFullPath($WorkingDirectory)
     }
+    $script:D32Phase0LastProcessEvidence.Command = $script:D32Phase0LastProcessFailure.Command
     if (Test-Path -LiteralPath $LogPath) { throw "PHASE0_LOG_BLOCKED: refusing to overwrite command output: $LogPath" }
     $stdoutPath = "$LogPath.stdout.log"
     $stderrPath = "$LogPath.stderr.log"
@@ -1180,6 +1271,7 @@ function Invoke-D32Phase0PinnedProcess {
     $exitCode = $null
     $timedOut = $false
     $failure = $null
+    $captureSecondaryErrors = [System.Collections.Generic.List[string]]::new()
     try {
         $native = [D32FixtureNativeProcessV2]::StartDebug($Executable, $commandLine, $WorkingDirectory, $environmentBlock)
         $stdoutTarget = [IO.File]::Open($stdoutPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
@@ -1234,7 +1326,7 @@ function Invoke-D32Phase0PinnedProcess {
         $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository -VendoredProtocGrant $grantForProcess -H7CGitAuthority $H7CGitAuthority -H7CGitRunGrant $H7CGitRunGrant
         if ($traceNative.State -cne 'COMPLETED' -or -not $traceNative.AccountingConsistent) { throw "PHASE0_PROCESS_TRACE_BLOCKED: $($traceNative.BlockReason)" }
         if ($traceNative.Processes.Count -eq 0) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: root CREATE_PROCESS_DEBUG_EVENT is absent' }
-        $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -CommandLine $commandLine
+        $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -ExpectedCommandLine $commandLine
         if ($rootSnapshot.parent_process_id -ne $PID) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: fixed command parent is not the exact runner identity' }
         $rootRecord = ConvertTo-D32Phase0ProcessRecord -Process $rootSnapshot -ValidatedProfile $currentProfile -Repository $Repository -ExpectedRootPath $Executable -VendoredProtocGrant $grantForProcess -H7CGitRunGrant $H7CGitRunGrant
         if (-not (Test-D32ProfilePathEqual -Left $rootRecord.image_path -Right $image.Path) -or $rootRecord.sha256 -cne $image.Sha256 -or
@@ -1265,16 +1357,37 @@ function Invoke-D32Phase0PinnedProcess {
     }
     finally {
         foreach ($stream in @($stdoutStream, $stderrStream, $stdoutTarget, $stderrTarget)) {
-            if ($null -ne $stream) { try { $stream.Dispose() } catch { if ($null -eq $failure) { $failure = 'PHASE0_LOG_BLOCKED: stream close failed' } } }
+            if ($null -ne $stream) {
+                try { $stream.Dispose() }
+                catch {
+                    $detail = 'PHASE0_LOG_BLOCKED: stream close failed: ' + $_.Exception.Message
+                    if ($null -eq $failure) { $failure = $detail } else { $captureSecondaryErrors.Add($detail) }
+                }
+            }
         }
-        if ($null -ne $native) { try { $native.Dispose() } catch { if ($null -eq $failure) { $failure = 'PHASE0_PROCESS_TREE_BLOCKED: native launcher close failed' } } }
+        if ($null -ne $native) {
+            try { $native.Dispose() }
+            catch {
+                $detail = 'PHASE0_PROCESS_TREE_BLOCKED: native launcher close failed: ' + $_.Exception.Message
+                if ($null -eq $failure) { $failure = $detail } else { $captureSecondaryErrors.Add($detail) }
+            }
+        }
     }
     $script:D32Phase0LastProcessFailure.RawV2Trace = $processTrace
     $script:D32Phase0LastProcessFailure.NativeCleanup = $cleanup
     $script:D32Phase0LastProcessFailure.ProcessIdentity = $rootRecord
+    $script:D32Phase0LastProcessEvidence.RawV2Trace = $processTrace
+    $script:D32Phase0LastProcessEvidence.NativeCleanup = $cleanup
+    $script:D32Phase0LastProcessEvidence.ProcessIdentity = $rootRecord
+    $script:D32Phase0LastProcessFailure.SecondaryErrors = @($captureSecondaryErrors.ToArray())
+    $script:D32Phase0LastProcessEvidence.SecondaryErrors = @($captureSecondaryErrors.ToArray())
     if ($null -ne $failure) { $script:D32Phase0LastProcessFailure.PrimaryError = [string]$failure }
     if ($null -eq $cleanup -or -not [bool]$cleanup.CleanupSucceeded -or [uint32]$cleanup.JobActiveProcessCount -ne 0) {
-        $script:D32Phase0LastProcessFailure.PrimaryError = 'PHASE0_PROCESS_TREE_BLOCKED: no completed Job Object process-tree cleanup evidence'
+        $cleanupFailure = 'PHASE0_PROCESS_TREE_BLOCKED: no completed Job Object process-tree cleanup evidence'
+        if ([String]::IsNullOrWhiteSpace([string]$script:D32Phase0LastProcessFailure.PrimaryError)) {
+            $script:D32Phase0LastProcessFailure.PrimaryError = $cleanupFailure
+        }
+        else { $script:D32Phase0LastProcessFailure.SecondaryErrors += $cleanupFailure }
         throw [string]$script:D32Phase0LastProcessFailure.PrimaryError
     }
     $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
@@ -1284,6 +1397,8 @@ function Invoke-D32Phase0PinnedProcess {
     if ($exitCode -ne 0) { $script:D32Phase0LastProcessFailure.PrimaryError = "PHASE0_COMMAND_FAILED: $Name exit_code=$exitCode"; throw [string]$script:D32Phase0LastProcessFailure.PrimaryError }
     $stdoutRef = Get-D32Phase0FileReference -Path $stdoutPath
     $stderrRef = Get-D32Phase0FileReference -Path $stderrPath
+    $script:D32Phase0LastProcessEvidence.PrimaryError = $null
+    $script:D32Phase0LastProcessEvidence.SecondaryErrors = @($captureSecondaryErrors.ToArray())
     $script:D32Phase0LastProcessFailure = $null
     return [ordered]@{
         name = $Name

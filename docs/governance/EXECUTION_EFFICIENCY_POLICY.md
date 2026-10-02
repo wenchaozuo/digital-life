@@ -9,11 +9,11 @@
 
 - `AGENTS.md` 是短入口，完整职责见 `CODEX_DEVELOPMENT_PROTOCOL.md`；当前模型只以 `MODEL_ROUTING.md` 为配置事实源。
 - 本文件是 v1.3 执行补充，取代通用规则中允许 Coordinator/Root 默认代替 Luna Build Owner 的兜底，以及要求 D32 闭合后自动建立下一阶段的通用表述。其他 frozen product/security/authority 语义不变。
-- 当前原始目录：`E:\project\digital-life`，本次优化在此维护。该目录既有 dirty/untracked 内容不得当作可丢弃文件。
-- 当前 D32 Integration：`E:\project\digital-life-d32-final-gate-13d40b8`。2026-10-02 本次只读核验 HEAD 为 `9b7125a8945137fb207a7d38c07af3538136db63`，tracked tree clean；此记录不是 Gate/PASS，也不保证之后 HEAD 不变。
+- 原始目录：`E:\project\digital-life`，v1.3 通用治理文本的来源副本；其既有 dirty/untracked 内容不得当作可丢弃文件。本轮获准的调度澄清仅集成在唯一 Integration，不写原始目录。
+- 当前 D32 Integration：`E:\project\digital-life-d32-final-gate-13d40b8`。2026-10-02 对 `9b7125a8945137fb207a7d38c07af3538136db63` 的只读核验是历史观察，发生在后续集成之前；它不是当前 HEAD、Gate 或 PASS。恢复任务时以 Git 重新核验当前 exact SHA 与 clean 状态。
 - D32 已批准的完整 ADR、F-01 至 F-17、`SC-D32-V1.md` 和 §16.1.1–§16.1.5 supplement 以该 Integration 中的历史记录为准。原始目录的 ADR 空索引与不同 F-ID 列表不能替代它们；不按编号跨副本合并不变量。
 - 既有 `ADR-D32-GOVERNANCE-V12-RECONCILIATION` 已将历史通用 no-worktree 引用更新为受控 Patch Worktree + 唯一 Integration；保留历史文字并读取 supersession，不重写旧决定。
-- 本次不修改正在使用的 Integration candidate。下一受控集成节点同步本次治理变更、核对 diff、产生新候选并明确受影响证据；不得在正式执行中临时改文档、保持旧 SHA 却声称新候选，或继承旧 PASS。
+- v1.3 治理同步已在先前受控集成节点完成，状态缓存记录为 COMPLETE 且不预填自身 commit SHA。本次获准的调度澄清在非正式执行节点单独集成；以后仍不得在正式执行中临时改文档、保持旧 SHA 却声称新候选，或继承旧 PASS。
 - 通用规则与 D32 专项约束冲突时，用户当前指令和有效已批准架构/Stage Contract 控制；无法消解的架构冲突合并提交 Architect，普通工程问题批量交 Worker。
 
 ### D32 当前有效约束速查（不是替代原文）
@@ -98,9 +98,9 @@ D32 discovery/Phase0 的 fresh empty CargoHome、fixed paths/commands、no cache
 
 ## 8. 静默窗口、汇报与异常干预
 
-任务下发和完成后向用户简报目标/产物、验证范围、blocker 与下一步。执行期采用事件返回/被动等待保持会话，不轮询状态，不索要中间报告，不重复审查 partial findings。
+任务下发和完成后向用户简报目标/产物、验证范围、blocker 与下一步。执行期采用事件返回/被动等待保持会话，不轮询状态，不索要中间报告，不重复审查 partial findings。使用 `wait_agent` 被动等待时，每次最长 10 分钟，收到事件可提前唤醒；此等待粒度不是状态轮询。
 
-Coordinator 默认 90 分钟没有完成/阻塞事件后允许一次异常检查；长任务按已批准 command deadline 和 worker packet 指定保守 watchdog。该检查只判断卡死、资源、权限和进程所有权，不是周期进度跟踪；在合理执行时继续被动等待。停止/重启前保留日志，核验属于本任务的进程，并遵守授权边界。watchdog 不扩大或缩小 frozen timeout。
+Coordinator 默认 90 分钟没有完成/阻塞事件后允许一次异常检查；该异常检查窗口保持不变。长任务按已批准 command deadline 和 worker packet 指定保守 watchdog。该检查只判断卡死、资源、权限和进程所有权，不是周期进度跟踪；在合理执行时继续被动等待。停止/重启前保留日志，核验属于本任务的进程，并遵守授权边界。watchdog 不扩大或缩小 frozen timeout。
 
 HIGH 实现/门禁期间 Sol Max 保持 inactive；仅架构触发、Luna High BLOCKED_ARCHITECTURE、用户改变 frozen requirement、高可信架构失效证据或 PASS 后 final closure 介入。普通 implementation blockers 经 Coordinator 回 Luna Max，不升级 Architect。
 

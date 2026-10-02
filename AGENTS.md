@@ -204,7 +204,7 @@ Sol Max MUST NOT 做：
 
 结果完成后再汇总处理。
 
-任务下发与完成后向用户回报；执行期被动等待保持会话。Coordinator 默认 90 分钟无结果事件后做一次异常检查，不做持续状态轮询；watchdog 不改变正式命令 timeout。Sol Max 只在架构触发或最终 closure 介入。
+任务下发与完成后向用户回报；执行期被动等待保持会话。使用 `wait_agent` 时每次最多等待 10 分钟，事件可提前唤醒；这是等待粒度，不是状态轮询。Coordinator 默认 90 分钟无结果事件后做一次异常检查，不做持续状态轮询；watchdog 不改变正式命令 timeout。Sol Max 只在架构触发或最终 closure 介入。
 
 ## 10. Gate 与 Git
 

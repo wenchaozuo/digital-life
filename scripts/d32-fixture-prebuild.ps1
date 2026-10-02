@@ -15,8 +15,10 @@ Optional D31 recovery-helper build:
 The fixed build is `cargo build --quiet --locked --manifest-path
 <repo>/vita-agent/Cargo.toml --bin vita-agent --features d29-h9-test-helper
 --target-dir <OutputRoot>\d31-recovery-seeder-target`. The script writes the
-sibling `d31-recovery-seeder-build.json` and reports its path, SHA-256, and a
-unique run ID; pass them independently to the D31 test as
+sibling `d31-recovery-seeder-build.json` while retaining D31 provenance V2, and
+`d31-recovery-seeder-companion.json` with D32-only helper-auth/trace evidence.
+It reports both paths/SHA-256 values and a unique run ID; pass record pins to
+the D31 test as
 D31_RECOVERY_SEEDER_RECORD_PATH, D31_RECOVERY_SEEDER_RECORD_SHA256, and
 D31_RECOVERY_SEEDER_RUN_ID.
 
@@ -165,7 +167,7 @@ function Assert-D32FixtureBuildModeAuthority {
     switch ($Mode) {
         'Phase0' { return }
         'Standalone' { throw 'STANDALONE_FIXTURE_AUTHORITY_BLOCKED: the current locked source/image grants are Phase0/Phase1-only; a standalone run must not reuse them or emit Phase0 provenance' }
-        'D31Seeder' { throw 'D31_RECOVERY_SEEDER_AUTHORITY_BLOCKED: the post-aggregate seeder requires its separate fresh run/home owner marker, per-run grant, and D32 companion attestation; Phase0 authority cannot be reused' }
+        'D31Seeder' { return }
     }
 }
 
@@ -358,6 +360,950 @@ function Get-D32D31RecoverySeederPaths {
     return [ordered]@{
         target = $target
         record = $record
+    }
+}
+
+function New-D32D31RecoverySeederOwnerMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    if ($RunId -cnotmatch '^[0-9a-f]{32}$') { throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: fresh seeder run ID is malformed' }
+    $runRoot = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot "d31-recovery-seeder-run-$RunId") -AllowMissingLeaf
+    if (Test-D32PathWithin -Path $runRoot -Root $Repository) { throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: seeder run root must be external to the repository' }
+    if (Test-Path -LiteralPath $runRoot) { throw "D31_RECOVERY_SEEDER_OWNER_NOT_NEW: refusing to reuse a seeder run root: $runRoot" }
+    [void](New-D32ProfileDirectoryCreateNew -Path $runRoot)
+    $rootIdentity = Get-D32ProfileDirectoryIdentity -Path $runRoot
+    $ownerPath = Join-Path $runRoot 'D32-D31-RECOVERY-SEEDER-OWNER.json'
+    $ownerDocument = [ordered]@{
+        schema_version = 1
+        record_type = 'D32_D31_RECOVERY_SEEDER_OWNER_V1'
+        candidate_sha = $CandidateSha
+        toolchain_profile_path = [string]$ValidatedProfile.ProfilePath
+        toolchain_profile_sha256 = [string]$ValidatedProfile.Digest
+        toolchain_profile_bytes = [Int64]$ValidatedProfile.Identity.Bytes
+        toolchain_profile_volume_serial_hex = [string]$ValidatedProfile.Identity.VolumeSerialHex
+        toolchain_profile_file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex
+        run_root_path = [string]$rootIdentity.Path
+        run_root_volume_serial_hex = [string]$rootIdentity.VolumeSerialHex
+        run_root_file_id_hex = [string]$rootIdentity.FileIdHex
+        run_id = $RunId
+        runner_process_id = [Int64]$PID
+    }
+    $ownerReference = Write-D32VendoredProtocAuthorityCreateNew -Path $ownerPath -Document $ownerDocument
+    $owner = Test-D32D31RecoverySeederOwnerMarker -Reference $ownerReference -Repository $Repository -CandidateSha $CandidateSha `
+        -ValidatedProfile $ValidatedProfile -RunRoot $runRoot -RunId $RunId -RunnerProcessId ([int]$PID)
+    return [PSCustomObject]@{ RunRoot = $runRoot; Owner = $owner }
+}
+
+function Get-D32D31RecoverySeederFileReference {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $artifact = Get-D32BoundArtifactWithFileId -Path $Path
+    return [ordered]@{
+        path = [string]$artifact.path
+        bytes = [uint64]$artifact.bytes
+        sha256 = [string]$artifact.sha256
+        volume_serial_hex = [string]$artifact.volume_serial_hex
+        file_id_hex = [string]$artifact.file_id_hex
+        file_identity = $artifact.file_identity
+    }
+}
+
+function Get-D32D31RecoverySeederOptionalFileReference {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { return Get-D32D31RecoverySeederFileReference -Path $Path }
+    catch { return $null }
+}
+
+function Assert-D32D31RecoverySeederOptionalPhaseLogs {
+    param([Parameter(Mandatory = $true)][object]$Phase, [switch]$RequireComplete)
+    foreach ($streamName in @('stdout', 'stderr')) {
+        $pathField = "${streamName}_log"
+        $referenceField = "${streamName}_log_ref"
+        $reference = $Phase[$referenceField]
+        if ($null -eq $reference) {
+            if ($RequireComplete -and [string]$Phase.status -ceq 'succeeded') {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: successful $streamName log lacks a bound file reference"
+            }
+            continue
+        }
+        if (-not (Test-D32FixtureExactProperties -Object $reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex', 'file_identity')) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$reference.path) -Right ([string]$Phase[$pathField])) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $reference.bytes) -or
+            [string]$reference.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            -not (Test-D32FixtureExactProperties -Object $reference.file_identity -Expected @('volume_serial', 'file_index', 'file_size', 'directory', 'reparse')) -or
+            [uint64]$reference.file_identity.file_size -ne [uint64]$reference.bytes -or
+            [bool]$reference.file_identity.directory -or [bool]$reference.file_identity.reparse) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $streamName log reference shape or file identity is malformed"
+        }
+        $opened = Get-D32BoundArtifactWithFileId -Path ([string]$reference.path)
+        if ($opened.bytes -ne [uint64]$reference.bytes -or $opened.sha256 -cne [string]$reference.sha256 -or
+            $opened.volume_serial_hex -cne [string]$reference.volume_serial_hex -or $opened.file_id_hex -cne [string]$reference.file_id_hex -or
+            -not (Test-D32SameArtifactFileIdentity -Left $opened.file_identity -Right $reference.file_identity)) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $streamName log opened identity/hash differs from its companion reference"
+        }
+    }
+}
+
+function Write-D32D31RecoverySeederCompanion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document
+    )
+    $full = Assert-D32NoReparsePath -Path $Path -AllowMissingLeaf
+    if (Test-Path -LiteralPath $full) { throw "D31_RECOVERY_SEEDER_COMPANION_NOT_NEW: refusing to overwrite companion: $full" }
+    $parent = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: companion parent must already exist' }
+    [void](Assert-D32NoReparsePath -Path $parent)
+    $json = ConvertTo-Json -InputObject $Document -Depth 40
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($full, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+    finally { $stream.Dispose() }
+    return Get-D32D31RecoverySeederFileReference -Path $full
+}
+
+function Assert-D32D31RecoverySeederCompanionShape {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][object]$ExpectedModuleAdmission
+    )
+    $expectedFields = @('schema_version', 'record_type', 'status', 'candidate_sha', 'source_repo', 'run_id', 'runner_process_id',
+        'toolchain_profile', 'powershell_module_admission', 'source_protoc_authority', 'owner_marker', 'protoc_run_grant',
+        'run_root', 'cargo_home', 'temp_root', 'fetch_phases', 'build_phase', 'seeder_record', 'artifact', 'process_cleanup', 'blocked_reason')
+    $actualFields = @(Get-D32ObjectFieldNames -Object $Document)
+    if ($actualFields.Count -ne $expectedFields.Count -or
+        @($actualFields | Where-Object { $_ -notin $expectedFields }).Count -ne 0 -or
+        @($expectedFields | Where-Object { $_ -notin $actualFields }).Count -ne 0 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Document.schema_version) -or [Int64]$Document.schema_version -ne 1 -or
+        [string]$Document.record_type -cne 'D32_D31_RECOVERY_SEEDER_COMPANION_V1' -or
+        [string]$Document.status -notin @('succeeded', 'blocked') -or
+        [string]$Document.candidate_sha -cne $CandidateSha -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.source_repo) -Right $Repository) -or
+        [string]$Document.run_id -cnotmatch '^[0-9a-f]{32}$' -or
+        [Int64]$Document.runner_process_id -ne [Int64]$PID -or
+        -not (Test-D32ProfilePathEqual -Left $Path -Right (Join-Path $OutputRoot 'd31-recovery-seeder-companion.json')) -or
+        (Test-D32PathWithin -Path $Path -Root $Repository)) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: strict D32-only companion version, candidate, runner, status, or fixed path is invalid'
+    }
+    $profileFields = @('path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex')
+    if (-not (Test-D32FixtureExactProperties -Object $Document.toolchain_profile -Expected $profileFields) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.toolchain_profile.path) -Right ([string]$ValidatedProfile.ProfilePath)) -or
+        $Document.toolchain_profile.sha256 -cne [string]$ValidatedProfile.Digest -or
+        [Int64]$Document.toolchain_profile.bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $Document.toolchain_profile.volume_serial_hex -cne [string]$ValidatedProfile.Identity.VolumeSerialHex -or
+        $Document.toolchain_profile.file_id_hex -cne [string]$ValidatedProfile.Identity.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: caller-pinned Profile V2 identity does not match companion'
+    }
+    if (-not (Test-D32PowerShellModuleAdmissionRecord -Document $Document.powershell_module_admission -CandidateSha $CandidateSha -Repository $Repository -ExpectedContext $ExpectedModuleAdmission) -or
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $Document.powershell_module_admission) -cne (ConvertTo-D32PowerShellAuthorityJsonText -Value $ExpectedModuleAdmission) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Document.powershell_module_admission.entry_script_path) -Right (Join-Path $Repository 'scripts/d32-fixture-prebuild.ps1')) -or
+        [Int64]$Document.powershell_module_admission.runner_process.process_id -ne [Int64]$Document.runner_process_id) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: exact admitted D31 fixture-prebuild runner context is missing or stale'
+    }
+    if (-not (Test-D32FixtureExactProperties -Object $Document.process_cleanup -Expected @('status', 'checked_at_utc', 'relevant_pattern', 'residual_identities', 'error')) -or
+        [string]$Document.process_cleanup.status -notin @('succeeded', 'failed', 'not_run') -or
+        $Document.process_cleanup.residual_identities -isnot [Array]) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: process cleanup attestation is malformed'
+    }
+    foreach ($directoryName in @('run_root', 'cargo_home', 'temp_root')) {
+        $expectedPath = switch ($directoryName) {
+            'run_root' { Join-Path $OutputRoot "d31-recovery-seeder-run-$($Document.run_id)"; break }
+            'cargo_home' { Join-Path (Join-Path $OutputRoot "d31-recovery-seeder-run-$($Document.run_id)") 'cargo-home'; break }
+            'temp_root' { Join-Path (Join-Path $OutputRoot "d31-recovery-seeder-run-$($Document.run_id)") 'temp'; break }
+        }
+        $reference = $Document[$directoryName]
+        $exists = Test-Path -LiteralPath $expectedPath -PathType Container
+        if ($Document.status -ceq 'succeeded' -and -not $exists) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: successful fixed $directoryName is missing"
+        }
+        if ($null -eq $reference) {
+            if ($Document.status -ceq 'succeeded') {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: successful fixed $directoryName identity reference is missing"
+            }
+            continue
+        }
+        if (-not $exists -or -not (Test-D32FixtureExactProperties -Object $reference -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$reference.path) -Right $expectedPath)) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: fixed $directoryName binding is malformed"
+        }
+        [void](Assert-D32NoReparsePath -Path $expectedPath)
+        $identity = Get-D32ProfileDirectoryIdentity -Path $expectedPath
+        if ($reference.volume_serial_hex -cne [string]$identity.VolumeSerialHex -or $reference.file_id_hex -cne [string]$identity.FileIdHex) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: opened $directoryName identity changed"
+        }
+    }
+    $expectedRecordPath = Join-Path $OutputRoot 'd31-recovery-seeder-build.json'
+    $expectedArtifactPath = Join-Path $OutputRoot 'd31-recovery-seeder-target/debug/vita-agent.exe'
+    if ($Document.status -ceq 'succeeded') {
+        if ($null -ne $Document.blocked_reason -or $Document.fetch_phases -isnot [Array] -or $Document.fetch_phases.Count -ne 3 -or
+            $null -eq $Document.build_phase -or $null -eq $Document.seeder_record -or $null -eq $Document.artifact -or
+            [string]$Document.process_cleanup.status -cne 'succeeded' -or $Document.process_cleanup.residual_identities.Count -ne 0 -or
+            $null -ne $Document.process_cleanup.error -or $null -eq $Document.process_cleanup.checked_at_utc -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$Document.seeder_record.path) -Right $expectedRecordPath) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$Document.artifact.path) -Right $expectedArtifactPath)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: success requires three fetches, fixed record/artifact bindings and verified empty process cleanup'
+        }
+        foreach ($referenceName in @('seeder_record', 'artifact')) {
+            if (-not (Test-D32FixtureExactProperties -Object $Document[$referenceName] -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex', 'file_identity')) -or
+                [Int64]$Document[$referenceName].bytes -le 0 -or [string]$Document[$referenceName].sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                -not (Test-D32FixtureExactProperties -Object $Document[$referenceName].file_identity -Expected @('volume_serial', 'file_index', 'file_size', 'directory', 'reparse')) -or
+                [uint64]$Document[$referenceName].file_identity.file_size -ne [uint64]$Document[$referenceName].bytes -or
+                [bool]$Document[$referenceName].file_identity.directory -or [bool]$Document[$referenceName].file_identity.reparse) {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $referenceName file identity reference is malformed"
+            }
+        }
+        foreach ($referenceName in @('source_protoc_authority', 'owner_marker', 'protoc_run_grant')) {
+            $reference = $Document[$referenceName]
+            if (-not (Test-D32FixtureExactProperties -Object $reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+                [Int64]$reference.bytes -le 0 -or [string]$reference.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $referenceName file reference is malformed"
+            }
+            $opened = Get-D32BoundArtifactWithFileId -Path ([string]$reference.path)
+            if ($opened.bytes -ne [uint64]$reference.bytes -or $opened.sha256 -cne [string]$reference.sha256 -or
+                $opened.volume_serial_hex -cne [string]$reference.volume_serial_hex -or $opened.file_id_hex -cne [string]$reference.file_id_hex) {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $referenceName opened identity/hash differs from companion"
+            }
+        }
+        $owner = Test-D32D31RecoverySeederOwnerMarker -Reference $Document.owner_marker -Repository $Repository -CandidateSha $CandidateSha `
+            -ValidatedProfile $ValidatedProfile -RunRoot ([string]$Document.run_root.path) -RunId ([string]$Document.run_id) -RunnerProcessId ([int]$PID)
+        $sourceAuthority = Get-D32D31RecoverySeederSourceAuthority -AuthorityPath ([string]$Document.source_protoc_authority.path) `
+            -AuthoritySha256 ([string]$Document.source_protoc_authority.sha256) -Repository $Repository -CandidateSha $CandidateSha `
+            -ValidatedProfile $ValidatedProfile -SeederEvidenceRoot ([string]$Document.run_root.path)
+        if ((ConvertTo-Json -InputObject $sourceAuthority.Reference -Depth 5 -Compress) -cne
+            (ConvertTo-Json -InputObject $Document.source_protoc_authority -Depth 5 -Compress)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: source protoc authority reference differs from caller-pinned immutable source'
+        }
+        $grant = Test-D32D31RecoverySeederProtocRunGrant -Reference $Document.protoc_run_grant -Repository $Repository -CandidateSha $CandidateSha `
+            -ValidatedProfile $ValidatedProfile -RunRoot ([string]$Document.run_root.path) -ExpectedRunId ([string]$Document.run_id) `
+            -ExpectedRunnerProcessId ([int]$PID) -CargoHome ([string]$Document.cargo_home.path) -TempRoot ([string]$Document.temp_root.path) `
+            -AuthorityPath ([string]$Document.source_protoc_authority.path) -AuthoritySha256 ([string]$Document.source_protoc_authority.sha256) `
+            -OwnerMarkerReference $Document.owner_marker
+        if ((ConvertTo-Json -InputObject $owner.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $Document.owner_marker -Depth 5 -Compress) -or
+            (ConvertTo-Json -InputObject $grant.Reference -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $Document.protoc_run_grant -Depth 5 -Compress)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: owner/protoc grant replay does not bind the companion references'
+        }
+        for ($index = 0; $index -lt 3; $index++) {
+            $phase = $Document.fetch_phases[$index]
+            $lockInput = $ValidatedProfile.LockInputs[$index]
+            $expectedName = 'd31-seeder-{0:D2}-fetch' -f ($index + 1)
+            $expectedArguments = @('fetch', '--locked', '--manifest-path', [string]$lockInput.ManifestFullPath,
+                '--target', [string]$ValidatedProfile.Profile.target_triple)
+            if ([string]$phase.name -cne $expectedName -or
+                -not (Test-D32ProfilePathEqual -Left ([string]$phase.manifest_path) -Right ([string]$lockInput.ManifestPath)) -or
+                [string]$phase.lock_sha256 -cne [string]$lockInput.LockSha256 -or
+                @($phase.command | ForEach-Object { [string]$_ }).Count -ne $expectedArguments.Count -or
+                (@($phase.command | ForEach-Object { [string]$_ }) -join "`0") -cne ($expectedArguments -join "`0")) {
+                throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: locked fetch command/lock binding differs at index $index"
+            }
+            Assert-D32D31RecoverySeederProcessPhase -Phase $phase -ExpectedName $expectedName -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) `
+                -Arguments $expectedArguments -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path)
+        }
+        $expectedBuildArguments = @('build', '--quiet', '--locked', '--manifest-path', (Get-D32FullPath (Join-Path $Repository 'vita-agent/Cargo.toml')),
+            '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', (Join-Path $OutputRoot 'd31-recovery-seeder-target'))
+        if ([string]$Document.build_phase.name -cne 'd31-recovery-seeder' -or
+            @($Document.build_phase.command | ForEach-Object { [string]$_ }).Count -ne $expectedBuildArguments.Count -or
+            (@($Document.build_phase.command | ForEach-Object { [string]$_ }) -join "`0") -cne ($expectedBuildArguments -join "`0")) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: seeder Cargo argv differs from the fixed D31 V2 command'
+        }
+        Assert-D32D31RecoverySeederProcessPhase -Phase $Document.build_phase -ExpectedName 'd31-recovery-seeder' `
+            -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) -Arguments $expectedBuildArguments `
+            -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path)
+        $recordArtifact = Get-D32BoundArtifactWithFileId -Path ([string]$Document.seeder_record.path)
+        if ($recordArtifact.bytes -ne [uint64]$Document.seeder_record.bytes -or $recordArtifact.sha256 -cne [string]$Document.seeder_record.sha256 -or
+            $recordArtifact.volume_serial_hex -cne [string]$Document.seeder_record.volume_serial_hex -or $recordArtifact.file_id_hex -cne [string]$Document.seeder_record.file_id_hex -or
+            -not (Test-D32SameArtifactFileIdentity -Left $recordArtifact.file_identity -Right $Document.seeder_record.file_identity)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: strict V2 record opened identity/hash differs from companion'
+        }
+        $recordBytesBefore = Get-D32BoundArtifactWithFileId -Path $expectedRecordPath
+        $recordRaw = [IO.File]::ReadAllText($expectedRecordPath, [Text.Encoding]::UTF8)
+        $recordDocumentNode = [System.Text.Json.JsonDocument]::Parse($recordRaw)
+        try { if (Test-D32ProfileJsonElementDuplicates -Element $recordDocumentNode.RootElement) { throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: V2 record contains duplicate JSON fields' } }
+        finally { $recordDocumentNode.Dispose() }
+        $recordDocument = $recordRaw | ConvertFrom-Json -AsHashtable
+        $recordBytesAfter = Get-D32BoundArtifactWithFileId -Path $expectedRecordPath
+        if ($recordBytesAfter.bytes -ne [uint64]$recordBytesBefore.bytes -or $recordBytesAfter.sha256 -cne [string]$recordBytesBefore.sha256 -or
+            $recordBytesAfter.volume_serial_hex -cne [string]$recordBytesBefore.volume_serial_hex -or $recordBytesAfter.file_id_hex -cne [string]$recordBytesBefore.file_id_hex -or
+            -not (Test-D32SameArtifactFileIdentity -Left $recordBytesAfter.file_identity -Right $Document.seeder_record.file_identity)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: strict V2 record changed while validating its bytes'
+        }
+        Assert-D32D31RecoverySeederRecordShape -Document $recordDocument -Path $expectedRecordPath -OutputRoot $OutputRoot
+        if ([string]$recordDocument.run_id -cne [string]$Document.run_id -or [string]$recordDocument.candidate_sha -cne $CandidateSha) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: V2 record run/candidate differs from D32 companion'
+        }
+        $artifact = Get-D32BoundArtifactWithFileId -Path ([string]$Document.artifact.path)
+        if ($artifact.bytes -ne [uint64]$Document.artifact.bytes -or $artifact.sha256 -cne [string]$Document.artifact.sha256 -or
+            $artifact.volume_serial_hex -cne [string]$Document.artifact.volume_serial_hex -or $artifact.file_id_hex -cne [string]$Document.artifact.file_id_hex -or
+            -not (Test-D32SameArtifactFileIdentity -Left $artifact.file_identity -Right $Document.artifact.file_identity) -or
+            -not (Test-D32SameArtifactFileIdentity -Left $artifact.file_identity -Right $recordDocument.artifact.file_identity)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: artifact opened identity/hash differs from V2 record'
+        }
+    }
+    elseif ([string]$Document.status -ceq 'blocked') {
+        if ([string]::IsNullOrWhiteSpace([string]$Document.blocked_reason) -or
+            ([string]$Document.process_cleanup.status -ceq 'succeeded' -and @($Document.process_cleanup.residual_identities).Count -ne 0)) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked companion must preserve a reason and cannot contradict cleanup evidence'
+        }
+        if ($Document.fetch_phases -isnot [Array] -or @($Document.fetch_phases).Count -gt 3 -or
+            ($Document.process_cleanup.status -ceq 'not_run' -and (@($Document.fetch_phases).Count -gt 0 -or $null -ne $Document.build_phase)) -or
+            ($Document.process_cleanup.status -ceq 'succeeded' -and ($null -eq $Document.process_cleanup.checked_at_utc -or
+                $null -ne $Document.process_cleanup.error)) -or
+            ($Document.process_cleanup.status -ceq 'failed' -and ([string]::IsNullOrWhiteSpace([string]$Document.process_cleanup.error) -or
+                $null -eq $Document.process_cleanup.checked_at_utc))) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked phase and cleanup state is inconsistent'
+        }
+        foreach ($phase in (@($Document.fetch_phases) + @($Document.build_phase) | Where-Object { $null -ne $_ })) {
+            $phaseFields = @(Get-D32ObjectFieldNames -Object $phase)
+            if ($phaseFields -notcontains 'stdout_log_ref' -or $phaseFields -notcontains 'stderr_log_ref') {
+                throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked phase omitted the log-reference fields'
+            }
+            Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $phase
+        }
+        foreach ($referenceName in @('source_protoc_authority', 'owner_marker', 'protoc_run_grant', 'seeder_record', 'artifact')) {
+            $reference = $Document[$referenceName]
+            $expectedReferenceFields = if ($referenceName -in @('seeder_record', 'artifact')) {
+                @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex', 'file_identity')
+            }
+            else { @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex') }
+            if ($null -ne $reference) {
+                if (-not (Test-D32FixtureExactProperties -Object $reference -Expected $expectedReferenceFields) -or
+                    [Int64]$reference.bytes -le 0 -or [string]$reference.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                    throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: optional blocked $referenceName reference is malformed"
+                }
+                if ($referenceName -in @('seeder_record', 'artifact') -and
+                    (-not (Test-D32FixtureExactProperties -Object $reference.file_identity -Expected @('volume_serial', 'file_index', 'file_size', 'directory', 'reparse')) -or
+                        [uint64]$reference.file_identity.file_size -ne [uint64]$reference.bytes -or
+                        [bool]$reference.file_identity.directory -or [bool]$reference.file_identity.reparse)) {
+                    throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: optional blocked $referenceName native file identity is malformed"
+                }
+                $opened = Get-D32BoundArtifactWithFileId -Path ([string]$reference.path)
+                if ($opened.bytes -ne [uint64]$reference.bytes -or $opened.sha256 -cne [string]$reference.sha256 -or
+                    $opened.volume_serial_hex -cne [string]$reference.volume_serial_hex -or $opened.file_id_hex -cne [string]$reference.file_id_hex -or
+                    ($referenceName -in @('seeder_record', 'artifact') -and -not (Test-D32SameArtifactFileIdentity -Left $opened.file_identity -Right $reference.file_identity))) {
+                    throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: optional blocked $referenceName opened identity/hash differs"
+                }
+                if ($referenceName -ceq 'seeder_record' -and -not (Test-D32ProfilePathEqual -Left ([string]$reference.path) -Right $expectedRecordPath)) {
+                    throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked record reference escaped the fixed sibling path'
+                }
+                if ($referenceName -ceq 'artifact' -and -not (Test-D32ProfilePathEqual -Left ([string]$reference.path) -Right $expectedArtifactPath)) {
+                    throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked artifact reference escaped the fixed seeder target'
+                }
+            }
+        }
+    }
+}
+
+function Assert-D32D31RecoverySeederProcessPhase {
+    param(
+        [Parameter(Mandatory = $true)][object]$Phase,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][string]$CargoPath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$RunRoot
+    )
+    $expectedPhaseFields = if ($ExpectedName -ceq 'd31-recovery-seeder') {
+        @('name', 'executable', 'command', 'command_line', 'working_directory', 'status', 'exit_code', 'process_identity',
+            'root_record', 'descendant_records', 'process_trace', 'native_cleanup', 'reap', 'phase_log', 'stdout_log', 'stderr_log',
+            'stdout_log_ref', 'stderr_log_ref')
+    }
+    else {
+        @('name', 'executable', 'manifest_path', 'lock_sha256', 'command', 'command_line', 'working_directory', 'status',
+            'exit_code', 'process_identity', 'root_record', 'descendant_records', 'process_trace', 'native_cleanup', 'reap',
+            'phase_log', 'stdout_log', 'stderr_log', 'stdout_log_ref', 'stderr_log_ref')
+    }
+    $identityFields = @('process_id', 'parent_process_id', 'name', 'image_path', 'creation_date', 'command_line', 'observed_at_utc', 'identity_verified')
+    $traceFields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id',
+        'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id', 'dedicated_debugger_thread',
+        'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit', 'debugger_thread_exited', 'debugger_thread_joined',
+        'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent',
+        'debugger_creation_filetime', 'debugger_created_at_utc', 'started_at_utc', 'completed_at_utc', 'debug_event_count',
+        'process_create_event_count', 'process_exit_event_count', 'process_event_count', 'thread_create_event_count', 'thread_exit_event_count',
+        'image_load_event_count', 'image_unload_event_count', 'exception_event_count', 'debug_string_event_count', 'wait_timeout_count',
+        'debug_api_error_count', 'event_chain_complete', 'job_accounting_verified', 'job_total_processes', 'job_active_processes',
+        'accounting_consistent', 'injected_interruption', 'process_events', 'processes')
+    $processEventFields = @('sequence', 'kind', 'process_id', 'parent_process_id', 'creation_filetime', 'parent_creation_filetime', 'exit_code')
+    $traceProcessFields = @('process_id', 'parent_process_id', 'creation_filetime', 'parent_creation_filetime', 'image_path', 'bytes', 'sha256',
+        'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'image_verified', 'exited', 'exit_code', 'create_sequence', 'exit_sequence',
+        'created_at_utc', 'exited_at_utc')
+    $cleanupFields = @('job_terminate_call_succeeded', 'job_terminate_last_error', 'process_was_already_signaled', 'process_wait_signaled',
+        'job_active_process_count_verified', 'job_active_process_count', 'job_active_process_count_last_error', 'job_close_succeeded',
+        'cleanup_succeeded', 'already_closed', 'detail')
+    if (-not (Test-D32FixtureExactProperties -Object $Phase -Expected $expectedPhaseFields) -or
+        $Phase.command -isnot [Array] -or $Phase.descendant_records -isnot [Array] -or
+        -not (Test-D32FixtureExactProperties -Object $Phase.root_record -Expected $identityFields) -or
+        -not (Test-D32FixtureExactProperties -Object $Phase.process_identity -Expected $identityFields) -or
+        -not (Test-D32FixtureExactProperties -Object $Phase.process_trace -Expected $traceFields) -or
+        $Phase.process_trace.process_events -isnot [Array] -or $Phase.process_trace.processes -isnot [Array] -or
+        -not (Test-D32FixtureExactProperties -Object $Phase.native_cleanup -Expected $cleanupFields)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName nested phase schema or array types are invalid"
+    }
+    $trace = $Phase.process_trace
+    if ([string]$trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or [int]$trace.schema_version -ne 2 -or
+        [string]$trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or
+        [string]$trace.state -cne 'COMPLETED' -or $null -ne $trace.block_reason -or
+        [Int64]$trace.debugger_process_id -ne [Int64]$PID -or [uint32]$trace.debugger_thread_id -eq 0 -or
+        -not [bool]$trace.dedicated_debugger_thread -or -not [bool]$trace.debugger_kill_on_exit_enabled -or
+        -not [bool]$trace.root_resumed_after_kill_on_exit -or -not [bool]$trace.debugger_thread_exited -or
+        -not [bool]$trace.debugger_thread_joined -or -not [bool]$trace.retained_process_handles_signaled -or
+        -not [bool]$trace.debugger_association_query_verified -or -not [bool]$trace.debugger_association_absent -or
+        [uint32]$trace.uncontinued_create_process_id -ne 0 -or [int]$trace.uncontinued_create_continue_call_count -ne 0 -or
+        [int]$trace.process_create_event_count -lt 1 -or [int]$trace.process_exit_event_count -ne [int]$trace.process_create_event_count -or
+        [int]$trace.process_event_count -ne (2 * [int]$trace.process_create_event_count) -or
+        [int]$trace.job_total_processes -ne [int]$trace.process_create_event_count -or
+        [int]$trace.processes.Count -ne [int]$trace.process_create_event_count -or
+        [int]$trace.process_events.Count -ne [int]$trace.process_event_count -or
+        [uint32]$trace.job_active_processes -ne 0 -or -not [bool]$trace.job_accounting_verified -or
+        -not [bool]$trace.event_chain_complete -or -not [bool]$trace.accounting_consistent -or
+        [int]$trace.debug_api_error_count -ne 0 -or [int]$trace.wait_timeout_count -ne 0 -or [bool]$trace.injected_interruption -or
+        @($trace.process_events | Where-Object { -not (Test-D32FixtureExactProperties -Object $_ -Expected $processEventFields) }).Count -ne 0 -or
+        @($trace.processes | Where-Object {
+            -not (Test-D32FixtureExactProperties -Object $_ -Expected $traceProcessFields) -or
+            -not [bool]$_.image_verified -or -not [bool]$_.exited -or [Int64]$_.bytes -le 0 -or
+            [string]$_.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$_.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+            [string]$_.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or [string]::IsNullOrWhiteSpace([string]$_.allowed_image_reason)
+        }).Count -ne 0 -or
+        @($Phase.descendant_records | Where-Object { -not (Test-D32FixtureExactProperties -Object $_ -Expected $identityFields) }).Count -ne 0) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName trace is incomplete, malformed, or not a completed native Job trace"
+    }
+    if ([string]$Phase.name -cne $ExpectedName -or [string]$Phase.status -cne 'succeeded' -or [int]$Phase.exit_code -ne 0 -or
+        $null -eq $Phase.root_record -or $null -eq $Phase.process_identity -or $null -eq $Phase.process_trace -or
+        $Phase.process_trace.processes -isnot [Array] -or $Phase.process_trace.processes.Count -lt 1 -or
+        [string]$Phase.process_trace.state -cne 'COMPLETED' -or -not [bool]$Phase.process_trace.event_chain_complete -or
+        -not [bool]$Phase.process_trace.accounting_consistent -or -not [bool]$Phase.process_trace.job_accounting_verified -or
+        [uint32]$Phase.process_trace.job_active_processes -ne 0 -or
+        -not [bool]$Phase.process_trace.debugger_kill_on_exit_enabled -or -not [bool]$Phase.process_trace.debugger_thread_exited -or
+        -not [bool]$Phase.process_trace.debugger_thread_joined -or -not [bool]$Phase.process_trace.retained_process_handles_signaled -or
+        -not [bool]$Phase.process_trace.debugger_association_absent -or
+        @($Phase.process_trace.processes | Where-Object { -not [bool]$_.image_verified -or -not [bool]$_.exited }).Count -ne 0 -or
+        -not [bool]$Phase.root_record.identity_verified -or [Int64]$Phase.root_record.process_id -le 0 -or
+        [Int64]$Phase.root_record.parent_process_id -ne [Int64]$PID -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Phase.root_record.image_path) -Right $CargoPath) -or
+        [string]$Phase.root_record.name -cne 'cargo.exe' -or
+        -not [bool]$Phase.root_record.identity_verified -or [String]::IsNullOrWhiteSpace([string]$Phase.root_record.creation_date) -or
+        [string]::IsNullOrWhiteSpace([string]$Phase.root_record.command_line) -or
+        [string]$Phase.root_record.command_line -cne (ConvertTo-D32CommandLine (@($CargoPath) + $Arguments)) -or
+        [Int64]$Phase.process_identity.process_id -ne [Int64]$Phase.root_record.process_id -or
+        [Int64]$Phase.process_identity.parent_process_id -ne [Int64]$PID -or
+        [string]$Phase.process_identity.name -cne 'cargo.exe' -or -not [bool]$Phase.process_identity.identity_verified -or
+        [Int64]$Phase.process_identity.process_id -ne [Int64]$Phase.root_record.process_id -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Phase.process_identity.image_path) -Right $CargoPath) -or
+        ($Phase.process_identity | ConvertTo-Json -Depth 5 -Compress) -cne ($Phase.root_record | ConvertTo-Json -Depth 5 -Compress) -or
+        [Int64]$Phase.process_trace.processes[0].process_id -ne [Int64]$Phase.root_record.process_id -or
+        [Int64]$Phase.process_trace.processes[0].parent_process_id -ne [Int64]$PID -or
+        [Int64]$Phase.process_trace.processes[0].creation_filetime -le 0 -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Phase.process_trace.processes[0].image_path) -Right $CargoPath) -or
+        [string]$Phase.process_trace.processes[0].allowed_image_reason -cne 'exact-caller-pinned-fixed-root-image' -or
+        @($Phase.descendant_records | ForEach-Object { [Int64]$_.process_id } | Sort-Object) -join ',' -cne
+            (@($Phase.process_trace.processes | Select-Object -Skip 1 | ForEach-Object { [Int64]$_.process_id } | Sort-Object) -join ',') -or
+        $null -eq $Phase.native_cleanup -or -not [bool]$Phase.native_cleanup.job_terminate_call_succeeded -or -not [bool]$Phase.native_cleanup.cleanup_succeeded -or
+        -not [bool]$Phase.native_cleanup.job_close_succeeded -or -not [bool]$Phase.native_cleanup.process_wait_signaled -or
+        -not [bool]$Phase.native_cleanup.job_active_process_count_verified -or [uint32]$Phase.native_cleanup.job_active_process_count -ne 0 -or
+        $null -ne $Phase.reap) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName lacks exact Cargo identity, complete trace, or verified native cleanup"
+    }
+    $expectedCommandLine = ConvertTo-D32CommandLine (@($CargoPath) + $Arguments)
+    $phaseFields = Get-D32ObjectFieldNames -Object $Phase
+    if (($phaseFields -contains 'executable' -and -not (Test-D32ProfilePathEqual -Left ([string]$Phase.executable) -Right $CargoPath)) -or
+        ($phaseFields -contains 'working_directory' -and -not (Test-D32ProfilePathEqual -Left ([string]$Phase.working_directory) -Right $WorkingDirectory)) -or
+        ($phaseFields -contains 'command_line' -and [string]$Phase.command_line -cne $expectedCommandLine)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName executable, working directory, or launch command line differs from caller pins"
+    }
+    $expectedPhaseLog = [IO.Path]::GetFullPath((Join-Path (Join-Path $RunRoot 'logs') $ExpectedName))
+    if (-not [string]::Equals([IO.Path]::GetFullPath([string]$Phase.phase_log), $expectedPhaseLog, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$Phase.stdout_log), ($expectedPhaseLog + '.stdout.log'), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$Phase.stderr_log), ($expectedPhaseLog + '.stderr.log'), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [IO.Path]::IsPathRooted([string]$Phase.phase_log) -or
+        -not [IO.Path]::IsPathRooted([string]$Phase.stdout_log) -or -not [IO.Path]::IsPathRooted([string]$Phase.stderr_log)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName trace root or stream path is not bound to this runner"
+    }
+    if (-not (Test-D32ProfilePathEqual -Left ([string]$Phase.stdout_log) -Right ([string]$Phase.phase_log + '.stdout.log')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$Phase.stderr_log) -Right ([string]$Phase.phase_log + '.stderr.log')) -or
+        -not (Test-Path -LiteralPath ([string]$Phase.stdout_log) -PathType Leaf) -or
+        -not (Test-Path -LiteralPath ([string]$Phase.stderr_log) -PathType Leaf)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName ordered stream log references are missing or mismatched"
+    }
+    [void](Assert-D32NoReparsePath -Path (Join-Path $RunRoot 'logs'))
+    [void](Assert-D32NoReparsePath -Path ([string]$Phase.stdout_log))
+    [void](Assert-D32NoReparsePath -Path ([string]$Phase.stderr_log))
+    Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $Phase -RequireComplete
+    $expectedProtocPath = Join-Path (Join-Path (Join-Path (Join-Path $CargoHome 'registry/src') 'index.crates.io-1949cf8c6b5b557f') 'protoc-bin-vendored-win32-3.2.0') 'bin/protoc.exe'
+    foreach ($process in $Phase.process_trace.processes) {
+        $isVctip = ([IO.Path]::GetFileName([string]$process.image_path) -ieq 'vctip.exe') -or
+            ([Int64]$process.bytes -eq 335328 -and [string]$process.sha256 -ceq 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996')
+        if ($isVctip) { throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: VCTIP was observed in the D31-only process trace for $ExpectedName" }
+        $isProtoc = [IO.Path]::GetFileName([string]$process.image_path) -ieq 'protoc.exe'
+        if ($isProtoc -and $ExpectedName -cne 'd31-recovery-seeder') {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: protoc is not authorized during locked fetch phase $ExpectedName"
+        }
+        if ($isProtoc -and (-not (Test-D32ProfilePathEqual -Left ([string]$process.image_path) -Right $expectedProtocPath) -or
+            [Int64]$process.bytes -ne 11934496 -or [string]$process.sha256 -cne 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2' -or
+            [string]$process.allowed_image_reason -cne 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root')) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: non-exact protoc child observed in $ExpectedName trace"
+        }
+    }
+    if ([string]$Phase.root_record.command_line -cne $expectedCommandLine) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName fixed root command line differs from caller pins"
+    }
+}
+
+function ConvertTo-D32D31RecoverySeederDirectoryReference {
+    param([Parameter(Mandatory = $true)][object]$Identity)
+    return [ordered]@{
+        path = [string]$Identity.Path
+        volume_serial_hex = [string]$Identity.VolumeSerialHex
+        file_id_hex = [string]$Identity.FileIdHex
+    }
+}
+
+function ConvertTo-D32D31RecoverySeederFetchPhase {
+    param(
+        [Parameter(Mandatory = $true)][object]$Fetch,
+        [Parameter(Mandatory = $true)][object]$Evidence
+    )
+    return [ordered]@{
+        name = [string]$Evidence.name
+        executable = [string]$Evidence.executable
+        manifest_path = [string]$Fetch.manifest_path
+        lock_sha256 = [string]$Fetch.lock_sha256
+        command = @($Fetch.command | ForEach-Object { [string]$_ })
+        command_line = [string]$Evidence.command_line
+        working_directory = [string]$Evidence.working_directory
+        status = [string]$Fetch.status
+        exit_code = $Fetch.exit_code
+        process_identity = $Fetch.process_identity
+        root_record = ConvertTo-D32D31ProcessIdentityDocument $Evidence.root_record
+        descendant_records = @($Evidence.descendant_records | ForEach-Object { ConvertTo-D32D31ProcessIdentityDocument $_ })
+        process_trace = $Evidence.process_trace
+        native_cleanup = $Evidence.native_cleanup
+        reap = $Evidence.reap
+        phase_log = [string]$Evidence.stdout_log -replace '\.stdout\.log$', ''
+        stdout_log = [string]$Evidence.stdout_log
+        stderr_log = [string]$Evidence.stderr_log
+        stdout_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path ([string]$Evidence.stdout_log)
+        stderr_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path ([string]$Evidence.stderr_log)
+    }
+}
+
+function ConvertTo-D32D31RecoverySeederBuildPhase {
+    param([Parameter(Mandatory = $true)][object]$Build, [Parameter(Mandatory = $true)][string]$CargoPath)
+    $command = @($Build.raw_debug_job_evidence.launch_request.arguments | ForEach-Object { [string]$_ })
+    return [ordered]@{
+        name = 'd31-recovery-seeder'
+        executable = [IO.Path]::GetFullPath($CargoPath)
+        command = $command
+        command_line = ConvertTo-D32CommandLine (@($CargoPath) + $command)
+        working_directory = [string]$Build.raw_debug_job_evidence.launch_request.working_directory
+        status = [string]$Build.status
+        exit_code = $Build.exit_code
+        process_identity = ConvertTo-D32D31ProcessIdentityDocument $Build.root_identity_record
+        root_record = ConvertTo-D32D31ProcessIdentityDocument $Build.root_identity_record
+        descendant_records = @($Build.captured_descendant_records | ForEach-Object { ConvertTo-D32D31ProcessIdentityDocument $_ })
+        process_trace = $Build.process_trace
+        native_cleanup = $Build.native_cleanup
+        reap = $Build.reap
+        phase_log = [string]$Build.phase_log
+        stdout_log = [string]$Build.stdout_log
+        stderr_log = [string]$Build.stderr_log
+        stdout_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path ([string]$Build.stdout_log)
+        stderr_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path ([string]$Build.stderr_log)
+    }
+}
+
+function Invoke-D32D31RecoverySeeder {
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$OutputRoot,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$CargoPath,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][object]$ModuleAdmission
+    )
+    $paths = Get-D32D31RecoverySeederPaths -OutputRoot $OutputRoot
+    $companionPath = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot 'd31-recovery-seeder-companion.json') -AllowMissingLeaf
+    foreach ($destination in @($paths.target, $paths.record, $companionPath)) {
+        if (Test-Path -LiteralPath $destination) { throw "D31_RECOVERY_SEEDER_OUTPUT_NOT_NEW: refusing to reuse an existing seeder output: $destination" }
+        if (Test-D32PathWithin -Path $destination -Root $Repository) { throw 'D31_RECOVERY_SEEDER_OUTPUT_INVALID: every fixed D31 output must be external to the candidate repository' }
+    }
+    if ((Split-Path -Parent $paths.target) -cne (Split-Path -Parent $paths.record) -or
+        (Split-Path -Parent $paths.record) -cne (Split-Path -Parent $companionPath)) {
+        throw 'D31_RECOVERY_SEEDER_OUTPUT_INVALID: V2 record, target, and companion must be fixed siblings beneath the same attempt root'
+    }
+
+    $runId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
+    $runRoot = $null
+    $phaseLogRoot = $null
+    $cargoHome = $null
+    $tempRoot = $null
+    $ownerReference = $null
+    $cargoHomeReference = $null
+    $tempRootReference = $null
+    $runRootReference = $null
+    $fetchPhases = @()
+    $buildPhase = $null
+    $seederRecordReference = $null
+    $artifactReference = $null
+    $sourceAuthority = $null
+    $protocGrant = $null
+    $cleanupAttestation = [ordered]@{
+        status = 'not_run'
+        checked_at_utc = $null
+        relevant_pattern = $null
+        residual_identities = @()
+        error = $null
+    }
+    $cleanupAttempted = $false
+    $phaseEvidence = [System.Collections.Generic.List[object]]::new()
+    $seederBuild = $null
+
+    try {
+        $runRoot = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot "d31-recovery-seeder-run-$runId") -AllowMissingLeaf
+        $ownerContext = New-D32D31RecoverySeederOwnerMarker -OutputRoot $OutputRoot -Repository $Repository `
+            -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -RunId $runId
+        if (-not (Test-D32ProfilePathEqual -Left $runRoot -Right ([string]$ownerContext.RunRoot))) {
+            throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: create-new owner context changed the prebound fresh run root'
+        }
+        $ownerReference = $ownerContext.Owner.Reference
+        $runRootReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity (Get-D32ProfileDirectoryIdentity -Path $runRoot)
+        $phaseLogRoot = Join-Path $runRoot 'logs'
+        $null = New-D32ProfileDirectoryCreateNew -Path $phaseLogRoot
+        $cargoHome = Join-Path $runRoot 'cargo-home'
+        $tempRoot = Join-Path $runRoot 'temp'
+        $cargoHomeIdentity = New-D32ProfileDirectoryCreateNew -Path $cargoHome
+        $cargoHomeReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity $cargoHomeIdentity
+        $tempIdentity = New-D32ProfileDirectoryCreateNew -Path $tempRoot
+        $tempRootReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity $tempIdentity
+        $null = Test-D32CargoHome -Path $cargoHome -Repository $Repository -RequireEmpty
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+        $sourceAuthority = Get-D32D31RecoverySeederSourceAuthority -AuthorityPath $AuthorityPath -AuthoritySha256 $AuthoritySha256 `
+            -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -SeederEvidenceRoot $runRoot
+        if (@($ValidatedProfile.LockInputs).Count -ne 3) { throw 'D31_RECOVERY_SEEDER_LOCK_INPUTS_BLOCKED: exactly the three caller-pinned locked manifests are required' }
+        $fetchResults = Invoke-D32LockedCargoFetches `
+            -ValidatedProfile $ValidatedProfile `
+            -CargoPath $CargoPath `
+            -CargoHome $cargoHome `
+            -TempRoot $tempRoot `
+            -RepoRoot $Repository `
+            -LogRoot $phaseLogRoot `
+            -TimeoutSeconds $TimeoutSeconds `
+            -LogPrefix 'd31-seeder' `
+            -PhaseEvidence $phaseEvidence `
+            -D31RecoverySeeder
+        if (@($fetchResults).Count -ne 3) { throw 'D31_RECOVERY_SEEDER_FETCH_BLOCKED: three locked fetches did not complete' }
+        $fetchNames = @('d31-seeder-01-fetch', 'd31-seeder-02-fetch', 'd31-seeder-03-fetch')
+        $fetchEvidence = @($phaseEvidence.ToArray() | Where-Object { [string]$_.name -in $fetchNames })
+        if ($fetchEvidence.Count -ne 3) { throw 'D31_RECOVERY_SEEDER_FETCH_BLOCKED: three bounded process evidence records are required' }
+        $fetchPhases = @(
+            for ($index = 0; $index -lt 3; $index++) {
+                $summary = $fetchResults[$index]
+                $evidence = @($fetchEvidence | Where-Object { [string]$_.name -ceq $fetchNames[$index] })
+                if ($evidence.Count -ne 1) { throw "D31_RECOVERY_SEEDER_FETCH_BLOCKED: missing or duplicate process evidence for $($fetchNames[$index])" }
+                ConvertTo-D32D31RecoverySeederFetchPhase -Fetch $summary -Evidence $evidence[0]
+            }
+        )
+        foreach ($fetch in $fetchPhases) {
+            if ([string]$fetch.status -cne 'succeeded' -or [int]$fetch.exit_code -ne 0) {
+                throw "D31_RECOVERY_SEEDER_FETCH_BLOCKED: $($fetch.name) did not complete successfully"
+            }
+        }
+        $null = Test-D32CargoHome -Path $cargoHome -Repository $Repository
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+        $protocGrant = New-D32D31RecoverySeederProtocRunGrant -AuthorityPath $AuthorityPath -AuthoritySha256 $AuthoritySha256 `
+            -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -RunRoot $runRoot `
+            -RunId $runId -RunnerProcessId ([int]$PID) -CargoHome $cargoHome -TempRoot $tempRoot -OwnerMarkerReference $ownerReference
+        $protocGrant = Test-D32D31RecoverySeederProtocRunGrant -Reference $protocGrant.Reference -Repository $Repository `
+            -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -RunRoot $runRoot -ExpectedRunId $runId `
+            -ExpectedRunnerProcessId ([int]$PID) -CargoHome $cargoHome -TempRoot $tempRoot -AuthorityPath $AuthorityPath `
+            -AuthoritySha256 $AuthoritySha256 -OwnerMarkerReference $ownerReference
+        $offlineEnvironment = Get-D32BuildToolchainEnvironment -ValidatedProfile $ValidatedProfile -CargoHome $cargoHome -TempRoot $tempRoot -Offline $true
+        if ($offlineEnvironment.Contains('PROTOC') -or $offlineEnvironment.Contains('VCTIP') -or
+            [string]$offlineEnvironment['CARGO_NET_OFFLINE'] -cne 'true' -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$offlineEnvironment['CARGO_HOME']) -Right $cargoHome) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$offlineEnvironment['TEMP']) -Right $tempRoot) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$offlineEnvironment['TMP']) -Right $tempRoot)) {
+            throw 'D31_RECOVERY_SEEDER_ENVIRONMENT_BLOCKED: seeder must be offline under its fresh home/temp with no ambient PROTOC or VCTIP variable'
+        }
+        [void](Assert-D32NoReparsePath -Path $paths.target -AllowMissingLeaf)
+        $seederManifest = Get-D32FullPath (Join-Path $Repository 'vita-agent/Cargo.toml')
+        $seederArtifactPath = Join-Path $paths.target 'debug/vita-agent.exe'
+        $seederArguments = @('build', '--quiet', '--locked', '--manifest-path', $seederManifest, '--bin', 'vita-agent',
+            '--features', 'd29-h9-test-helper', '--target-dir', $paths.target)
+        $seederPhaseLog = Join-Path $phaseLogRoot 'd31-recovery-seeder'
+        Write-Host "D32_FIXTURE_PHASE=seeder name=d31-recovery-seeder candidate=$CandidateSha run_id=$runId"
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+        $seederBuild = Invoke-D32BoundedProcess -FilePath $CargoPath -Arguments $seederArguments -WorkingDirectory $Repository `
+            -PhaseLog $seederPhaseLog -TimeoutSeconds $TimeoutSeconds -ChildEnvironment $offlineEnvironment -RequireDebugEvents `
+            -VendoredProtocRunGrant $protocGrant `
+            -CandidateImageRoots @((Get-D32DebugCandidateTargetRoots -Repository $Repository) + $paths.target)
+        $buildEvidence = [ordered]@{
+            name = 'd31-recovery-seeder'
+            executable = [IO.Path]::GetFullPath($CargoPath)
+            arguments = @($seederArguments)
+            command_line = ConvertTo-D32CommandLine (@($CargoPath) + $seederArguments)
+            working_directory = [IO.Path]::GetFullPath($Repository)
+            root_record = $seederBuild.root_identity_record
+            descendant_records = @($seederBuild.captured_descendant_records)
+            process_trace = $seederBuild.process_trace
+            native_cleanup = $seederBuild.native_cleanup
+            reap = $seederBuild.reap
+            status = [string]$seederBuild.status
+            exit_code = $seederBuild.exit_code
+            stdout_log = [string]$seederBuild.stdout_log
+            stderr_log = [string]$seederBuild.stderr_log
+            phase_log = [string]$seederBuild.phase_log
+        }
+        $phaseEvidence.Add([PSCustomObject]$buildEvidence)
+        $buildPhase = ConvertTo-D32D31RecoverySeederBuildPhase -Build $seederBuild -CargoPath $CargoPath
+        if ($null -ne $seederBuild.root_identity_record) {
+            Assert-D32PinnedCargoProcessIdentity -ProcessIdentity $seederBuild.root_identity_record -CargoPath $CargoPath `
+                -Arguments $seederArguments -ValidatedProfile $ValidatedProfile -ProcessResult $seederBuild
+        }
+        else { throw 'D31_RECOVERY_SEEDER_BUILD_BLOCKED: bounded process trace did not produce a verified root Cargo identity' }
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+        if ($seederBuild.status -cne 'succeeded' -or $seederBuild.exit_code -ne 0) {
+            throw "D31_RECOVERY_SEEDER_BUILD_FAILED: status=$($seederBuild.status) exit=$($seederBuild.exit_code); see $($seederBuild.phase_log)"
+        }
+        [void](Assert-D32NoReparsePath -Path $paths.target)
+        if (Test-D32PathWithin -Path $paths.target -Root $Repository) { throw 'D31_RECOVERY_SEEDER_TARGET_INVALID: target moved inside the candidate repository' }
+        $seederArtifact = Get-D32BoundArtifact -Path $seederArtifactPath
+        $cleanupAttempted = $true
+        try {
+            $cleanupResult = Test-D32NoOwnedCargoDescendants -PhaseEvidence @($phaseEvidence.ToArray()) -CheckName 'D31 recovery seeder final cleanup'
+            $cleanupAttestation = [ordered]@{
+                status = 'succeeded'
+                checked_at_utc = [string]$cleanupResult.checked_at_utc
+                relevant_pattern = [string]$cleanupResult.relevant_pattern
+                residual_identities = @($cleanupResult.residual_identities)
+                error = $null
+            }
+        }
+        catch {
+            $cleanupAttestation = [ordered]@{
+                status = 'failed'
+                checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+                relevant_pattern = '(?i)(cargo|rustc|rustup|lld-link|(^|[-_])link([-.]|$)|fixture)'
+                residual_identities = @()
+                error = [string]$_.Exception.Message
+            }
+            throw
+        }
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+
+        $seederRecord = [ordered]@{
+            schema_version = 2
+            purpose = 'd31-recovery-seeder-test-helper'
+            run_id = $runId
+            candidate_sha = $CandidateSha
+            runner_process_id = [int]$PID
+            source_repo = $Repository
+            manifest_path = $seederManifest
+            feature = 'd29-h9-test-helper'
+            command = @($seederArguments)
+            target_dir = $paths.target
+            run_root = $runRoot
+            cargo_home = $cargoHome
+            temp_root = $tempRoot
+            toolchain_profile_path = [string]$ValidatedProfile.ProfilePath
+            toolchain_profile_sha256 = [string]$ValidatedProfile.Digest
+            target_triple = [string]$ValidatedProfile.Profile.target_triple
+            powershell = $ValidatedProfile.Profile.powershell
+            toolchain = $ValidatedProfile.Profile.toolchain
+            fetch_manifests = @($ValidatedProfile.LockInputs | ForEach-Object {
+                [ordered]@{ manifest_path = [string]$_.ManifestPath; lock_sha256 = [string]$_.LockSha256 }
+            })
+            fetch_phases = @($fetchResults | ForEach-Object {
+                [ordered]@{
+                    manifest_path = [string]$_.manifest_path
+                    lock_sha256 = [string]$_.lock_sha256
+                    command = @($_.command)
+                    status = [string]$_.status
+                    exit_code = [int]$_.exit_code
+                    process_identity = $_.process_identity
+                }
+            })
+            cargo_path = $CargoPath
+            process_identity = ConvertTo-D32D31ProcessIdentityDocument $seederBuild.root_identity_record
+            status = [string]$seederBuild.status
+            exit_code = [int]$seederBuild.exit_code
+            artifact = $seederArtifact
+        }
+        Assert-D32D31RecoverySeederRecordShape -Document $seederRecord -Path ([string]$paths.record) -OutputRoot $OutputRoot
+        $recordDigest = Write-D32NewRecoverySeederBuildRecord -Path ([string]$paths.record) -Document $seederRecord
+        $seederRecordReference = Get-D32D31RecoverySeederFileReference -Path ([string]$paths.record)
+        $artifactReference = Get-D32D31RecoverySeederFileReference -Path $seederArtifactPath
+        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
+        $null = Assert-D32PinnedCleanCandidate -Root $Repository
+        $successCompanion = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V1'
+            status = 'succeeded'
+            candidate_sha = $CandidateSha
+            source_repo = $Repository
+            run_id = $runId
+            runner_process_id = [Int64]$PID
+            toolchain_profile = [ordered]@{ path = [string]$ValidatedProfile.ProfilePath; sha256 = [string]$ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes; volume_serial_hex = [string]$ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex }
+            powershell_module_admission = $ModuleAdmission
+            source_protoc_authority = $sourceAuthority.Reference
+            owner_marker = $ownerReference
+            protoc_run_grant = $protocGrant.Reference
+            run_root = $runRootReference
+            cargo_home = $cargoHomeReference
+            temp_root = $tempRootReference
+            fetch_phases = @($fetchPhases)
+            build_phase = $buildPhase
+            seeder_record = $seederRecordReference
+            artifact = $artifactReference
+            process_cleanup = $cleanupAttestation
+            blocked_reason = $null
+        }
+        Assert-D32D31RecoverySeederCompanionShape -Document $successCompanion -Path $companionPath -OutputRoot $OutputRoot `
+            -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ModuleAdmission
+        $companionReference = Write-D32D31RecoverySeederCompanion -Path $companionPath -Document $successCompanion
+        Write-Host "D31_RECOVERY_SEEDER_RECORD_PATH=$($paths.record)"
+        Write-Host "D31_RECOVERY_SEEDER_RECORD_SHA256=$($recordDigest.sha256)"
+        Write-Host "D31_RECOVERY_SEEDER_RUN_ID=$runId"
+        Write-Host "D31_RECOVERY_SEEDER_PATH=$($seederArtifact.path)"
+        Write-Host "D31_RECOVERY_SEEDER_SHA256=$($seederArtifact.sha256)"
+        Write-Host "D31_RECOVERY_SEEDER_COMPANION_PATH=$companionPath"
+        Write-Host "D31_RECOVERY_SEEDER_COMPANION_SHA256=$($companionReference.sha256)"
+        return
+    }
+    catch {
+        $primaryFailure = [string]$_.Exception.Message
+        try {
+            if ($null -ne $runRoot -and (Test-Path -LiteralPath $runRoot -PathType Container)) {
+                if ($null -eq $runRootReference) {
+                    $runRootReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity (Get-D32ProfileDirectoryIdentity -Path $runRoot)
+                }
+                $ownerPath = Join-Path $runRoot 'D32-D31-RECOVERY-SEEDER-OWNER.json'
+                if ($null -eq $ownerReference -and (Test-Path -LiteralPath $ownerPath -PathType Leaf)) {
+                    $ownerReference = Get-D32VendoredFileReference -Path $ownerPath
+                }
+                foreach ($directory in @(
+                    [PSCustomObject]@{ Path = (Join-Path $runRoot 'cargo-home'); Property = 'cargoHomeReference' },
+                    [PSCustomObject]@{ Path = (Join-Path $runRoot 'temp'); Property = 'tempRootReference' }
+                )) {
+                    if (Test-Path -LiteralPath $directory.Path -PathType Container) {
+                        [void](Assert-D32NoReparsePath -Path $directory.Path)
+                        $identity = Get-D32ProfileDirectoryIdentity -Path $directory.Path
+                        if ($directory.Property -ceq 'cargoHomeReference' -and $null -eq $cargoHomeReference) {
+                            $cargoHomeReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity $identity
+                        }
+                        elseif ($directory.Property -ceq 'tempRootReference' -and $null -eq $tempRootReference) {
+                            $tempRootReference = ConvertTo-D32D31RecoverySeederDirectoryReference -Identity $identity
+                        }
+                    }
+                }
+                $grantPath = Join-Path $runRoot 'D32-D31-RECOVERY-SEEDER-PROTOC-RUN-GRANT.json'
+                if ($null -eq $protocGrant -and (Test-Path -LiteralPath $grantPath -PathType Leaf)) {
+                    $protocGrant = [PSCustomObject]@{ Reference = (Get-D32VendoredFileReference -Path $grantPath) }
+                }
+            }
+            if ($null -eq $seederRecordReference -and (Test-Path -LiteralPath $paths.record -PathType Leaf)) {
+                $seederRecordReference = Get-D32D31RecoverySeederFileReference -Path ([string]$paths.record)
+            }
+            $partialArtifactPath = Join-Path $paths.target 'debug/vita-agent.exe'
+            if ($null -eq $artifactReference -and (Test-Path -LiteralPath $partialArtifactPath -PathType Leaf)) {
+                $artifactReference = Get-D32D31RecoverySeederFileReference -Path $partialArtifactPath
+            }
+        }
+        catch { $primaryFailure += '; blocked-reference-capture=' + $_.Exception.Message }
+        if ($fetchPhases.Count -eq 0 -and @($ValidatedProfile.LockInputs).Count -eq 3) {
+            $capturedFetchEvidence = @($phaseEvidence.ToArray() | Where-Object { [string]$_.name -match '^d31-seeder-[0-9]{2}-fetch$' })
+            $partialFetches = [System.Collections.Generic.List[object]]::new()
+            foreach ($evidence in $capturedFetchEvidence) {
+                $indexMatch = [regex]::Match([string]$evidence.name, '^d31-seeder-([0-9]{2})-fetch$')
+                if (-not $indexMatch.Success) { continue }
+                $lockIndex = [int]$indexMatch.Groups[1].Value - 1
+                if ($lockIndex -lt 0 -or $lockIndex -ge 3) { continue }
+                $lockInput = $ValidatedProfile.LockInputs[$lockIndex]
+                $fetchSummary = [ordered]@{
+                    manifest_path = [string]$lockInput.ManifestPath
+                    lock_sha256 = [string]$lockInput.LockSha256
+                    command = @($evidence.arguments | ForEach-Object { [string]$_ })
+                    status = [string]$evidence.status
+                    exit_code = $evidence.exit_code
+                    process_identity = ConvertTo-D32D31ProcessIdentityDocument $evidence.root_record
+                }
+                $partialFetches.Add((ConvertTo-D32D31RecoverySeederFetchPhase -Fetch $fetchSummary -Evidence $evidence))
+            }
+            $fetchPhases = @($partialFetches.ToArray())
+        }
+        if (-not $cleanupAttempted) {
+            $cleanupAttempted = $true
+            try {
+                if ($phaseEvidence.Count -gt 0) {
+                    $cleanupResult = Test-D32NoOwnedCargoDescendants -PhaseEvidence @($phaseEvidence.ToArray()) -CheckName 'blocked D31 recovery seeder cleanup'
+                    $cleanupAttestation = [ordered]@{
+                        status = 'succeeded'
+                        checked_at_utc = [string]$cleanupResult.checked_at_utc
+                        relevant_pattern = [string]$cleanupResult.relevant_pattern
+                        residual_identities = @($cleanupResult.residual_identities)
+                        error = $null
+                    }
+                }
+            }
+            catch {
+                $cleanupAttestation = [ordered]@{
+                    status = 'failed'
+                    checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+                    relevant_pattern = '(?i)(cargo|rustc|rustup|lld-link|(^|[-_])link([-.]|$)|fixture)'
+                    residual_identities = @()
+                    error = [string]$_.Exception.Message
+                }
+                $primaryFailure += '; cleanup=' + $cleanupAttestation.error
+            }
+        }
+        $blockedCompanion = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V1'
+            status = 'blocked'
+            candidate_sha = $CandidateSha
+            source_repo = $Repository
+            run_id = $runId
+            runner_process_id = [Int64]$PID
+            toolchain_profile = [ordered]@{ path = [string]$ValidatedProfile.ProfilePath; sha256 = [string]$ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes; volume_serial_hex = [string]$ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = [string]$ValidatedProfile.Identity.FileIdHex }
+            powershell_module_admission = $ModuleAdmission
+            source_protoc_authority = if ($null -eq $sourceAuthority) { $null } else { $sourceAuthority.Reference }
+            owner_marker = $ownerReference
+            protoc_run_grant = if ($null -eq $protocGrant) { $null } else { $protocGrant.Reference }
+            run_root = $runRootReference
+            cargo_home = $cargoHomeReference
+            temp_root = $tempRootReference
+            fetch_phases = @($fetchPhases)
+            build_phase = $buildPhase
+            seeder_record = $seederRecordReference
+            artifact = $artifactReference
+            process_cleanup = $cleanupAttestation
+            blocked_reason = $primaryFailure
+        }
+        try {
+            Assert-D32D31RecoverySeederCompanionShape -Document $blockedCompanion -Path $companionPath -OutputRoot $OutputRoot `
+                -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ModuleAdmission
+            $blockedReference = Write-D32D31RecoverySeederCompanion -Path $companionPath -Document $blockedCompanion
+            Write-Host "D31_RECOVERY_SEEDER_COMPANION_PATH=$companionPath"
+            Write-Host "D31_RECOVERY_SEEDER_COMPANION_SHA256=$($blockedReference.sha256)"
+        }
+        catch { $primaryFailure += '; companion-capture=' + $_.Exception.Message }
+        throw "D31_RECOVERY_SEEDER_BLOCKED: $primaryFailure"
     }
 }
 
@@ -1771,7 +2717,8 @@ function Invoke-D32LockedCargoFetches {
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][string]$LogPrefix,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$PhaseEvidence,
-        [switch]$AllowPinnedCargoVctip
+        [switch]$AllowPinnedCargoVctip,
+        [switch]$D31RecoverySeeder
     )
 
     $fetchEnvironment = New-D32ProfileChildEnvironment `
@@ -1779,6 +2726,13 @@ function Invoke-D32LockedCargoFetches {
         -CargoHome $CargoHome `
         -TempRoot $TempRoot `
         -Offline $false
+    if ($D31RecoverySeeder -and ($fetchEnvironment.Contains('PROTOC') -or $fetchEnvironment.Contains('VCTIP') -or
+        [string]$fetchEnvironment['CARGO_NET_OFFLINE'] -cne 'false' -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$fetchEnvironment['CARGO_HOME']) -Right $CargoHome) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$fetchEnvironment['TEMP']) -Right $TempRoot) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$fetchEnvironment['TMP']) -Right $TempRoot))) {
+        throw 'D31_RECOVERY_SEEDER_ENVIRONMENT_BLOCKED: locked fetch requires the fresh owner home/temp, online fetch phase, and no ambient PROTOC/VCTIP variable'
+    }
     $results = [System.Collections.Generic.List[object]]::new()
     $index = 0
     foreach ($lock in $ValidatedProfile.LockInputs) {
@@ -1797,7 +2751,7 @@ function Invoke-D32LockedCargoFetches {
             -ChildEnvironment $fetchEnvironment `
             -RequireDebugEvents `
             -AllowPinnedCargoVctip:$AllowPinnedCargoVctip
-        $PhaseEvidence.Add([pscustomobject]@{
+        $phaseEvidenceRecord = [ordered]@{
                 name = $phaseName
                 executable = [IO.Path]::GetFullPath($CargoPath)
                 arguments = @($arguments)
@@ -1806,13 +2760,24 @@ function Invoke-D32LockedCargoFetches {
                 root_record = $result.root_identity_record
                 descendant_records = @($result.captured_descendant_records)
                 process_trace = $result.process_trace
-            })
+            }
+        if ($D31RecoverySeeder) {
+            $phaseEvidenceRecord.status = [string]$result.status
+            $phaseEvidenceRecord.exit_code = $result.exit_code
+            $phaseEvidenceRecord.native_cleanup = $result.native_cleanup
+            $phaseEvidenceRecord.reap = $result.reap
+            $phaseEvidenceRecord.stdout_log = [string]$result.stdout_log
+            $phaseEvidenceRecord.stderr_log = [string]$result.stderr_log
+        }
+        $PhaseEvidence.Add([pscustomobject]$phaseEvidenceRecord)
         if ($result.status -ne 'succeeded' -or $result.exit_code -ne 0) {
             $failure = "CARGO_FETCH_FAILED: manifest=$($lock.ManifestPath) status=$($result.status) exit=$($result.exit_code); process_error=$($result.error); see $($result.phase_log)"
-            try {
-                Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+            if (-not $D31RecoverySeeder) {
+                try {
+                    Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+                }
+                catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
             }
-            catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
             throw $failure
         }
         try {
@@ -1825,10 +2790,12 @@ function Invoke-D32LockedCargoFetches {
         }
         catch {
             $failure = $_.Exception.Message
-            try {
-                Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+            if (-not $D31RecoverySeeder) {
+                try {
+                    Write-D32FixturePhase0FailurePayload -Name $phaseName -Executable $CargoPath -Arguments $arguments -WorkingDirectory $RepoRoot -ProcessResult $result -PrimaryError $failure -PhaseLogPath (Join-Path $LogRoot $phaseName)
+                }
+                catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
             }
-            catch { $failure += '; phase0 failure-capture error=' + $_.Exception.Message }
             throw $failure
         }
         $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $ValidatedProfile
@@ -2935,6 +3902,26 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         catch { return false; }
     }
 
+    public static bool IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration(string expectedRootPin, string[] approvedImagePins, string expectedCargoHome, string vendoredProtocPin)
+    {
+        try
+        {
+            string[] root = ParseDebugPin(expectedRootPin);
+            if (!String.Equals(Path.GetFileName(root[0]), "cargo.exe", StringComparison.OrdinalIgnoreCase) || approvedImagePins == null || String.IsNullOrWhiteSpace(expectedCargoHome)) return false;
+            string[] grantPin = ParseDebugPin(vendoredProtocPin);
+            if (!IsExactPinnedVendoredProtocPin(grantPin, expectedCargoHome)) return false;
+            List<string[]> protocPins = new List<string[]>();
+            for (int i = 0; i < approvedImagePins.Length; i++)
+            {
+                string[] pin = ParseDebugPin(approvedImagePins[i]);
+                if (String.Equals(Path.GetFileName(pin[0]), "protoc.exe", StringComparison.OrdinalIgnoreCase) || IsPinnedVendoredProtocContentIdentity(pin[1], pin[2]))
+                    protocPins.Add(pin);
+            }
+            return protocPins.Count == 1 && DebugImagePinsEqual(protocPins[0], grantPin);
+        }
+        catch { return false; }
+    }
+
     public static bool IsPinnedCargoVendoredProtocChildAllowed(
         string expectedRootPath,
         bool allowPinnedVendoredProtoc,
@@ -3040,6 +4027,16 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             throw new InvalidOperationException("VENDORED_PROTOC_GRANT_BLOCKED: native CREATE continuation requires the unique exact per-run locked protoc image pin beneath the fixed Cargo root");
         ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
             false, false, null, false, true, true, expectedCargoHome, vendoredProtocPin, null);
+    }
+
+    public void ConfigureD31RecoverySeederCargoDebugCaptureWithVendoredProtoc(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds, string expectedCargoHome, string vendoredProtocPin)
+    {
+        if (!IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration(expectedRootPin, approvedImagePins, expectedCargoHome, vendoredProtocPin))
+            throw new InvalidOperationException("D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: native CREATE continuation requires the exact D31-only per-run protoc grant under the fixed Cargo root");
+        // D31 is authorized for the exact locked protoc image only. The
+        // phase-specific VCTIP flag remains false on this independent route.
+        ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+            false, false, null, false, false, true, expectedCargoHome, vendoredProtocPin, null);
     }
 
     public void ConfigurePinnedCargoDebugCaptureWithVendoredProtocAndH7CGit(
@@ -5724,11 +6721,39 @@ function Invoke-D32BoundedProcess {
     }
     $vendoredProtocBeforeStart = $null
     if ($null -ne $VendoredProtocRunGrant) {
-        if (-not $RequireDebugEvents -or -not $AllowPinnedCargoVctip -or
+        $isD31RecoverySeederGrant = [string]$VendoredProtocRunGrant.Document.record_type -ceq 'D32_D31_RECOVERY_SEEDER_PROTOC_RUN_GRANT_V1'
+        $isPhase0Grant = [string]$VendoredProtocRunGrant.Document.record_type -ceq 'D32_PHASE0_VENDORED_PROTOC_RUN_GRANT_V1'
+        if ($isD31RecoverySeederGrant) {
+            if ($null -eq $script:ValidatedToolchainProfile -or -not [bool]$script:ValidatedToolchainProfile.IsValid -or
+                [string]$VendoredProtocRunGrant.Document.candidate_sha -cne [string]$script:ExpectedCandidateSha -or
+                [Int64]$VendoredProtocRunGrant.Document.runner_process_id -ne [Int64]$PID -or
+                $null -eq $VendoredProtocRunGrant.Document.source_authority -or
+                $null -eq $VendoredProtocRunGrant.Document.owner_marker) {
+                throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: grant is not bound to this current D31 candidate/runner and complete independent owner/source references'
+            }
+            $VendoredProtocRunGrant = Test-D32D31RecoverySeederProtocRunGrant `
+                -Reference $VendoredProtocRunGrant.Reference `
+                -Repository ([string]$script:ValidatedToolchainProfile.Repository) `
+                -CandidateSha ([string]$script:ExpectedCandidateSha) `
+                -ValidatedProfile $script:ValidatedToolchainProfile `
+                -RunRoot ([string]$VendoredProtocRunGrant.Document.run_root.path) `
+                -ExpectedRunId ([string]$VendoredProtocRunGrant.Document.run_id) `
+                -ExpectedRunnerProcessId ([int]$PID) `
+                -CargoHome ([string]$VendoredProtocRunGrant.Document.cargo_home.path) `
+                -TempRoot ([string]$VendoredProtocRunGrant.Document.temp_root.path) `
+                -AuthorityPath ([string]$VendoredProtocRunGrant.Document.source_authority.path) `
+                -AuthoritySha256 ([string]$VendoredProtocRunGrant.Document.source_authority.sha256) `
+                -OwnerMarkerReference $VendoredProtocRunGrant.Document.owner_marker
+        }
+        if (-not $RequireDebugEvents -or (-not $isD31RecoverySeederGrant -and -not $isPhase0Grant) -or
+            ($isPhase0Grant -and -not $AllowPinnedCargoVctip) -or ($isD31RecoverySeederGrant -and $AllowPinnedCargoVctip) -or
             $null -eq $script:ValidatedToolchainProfile -or -not [bool]$script:ValidatedToolchainProfile.IsValid -or
             -not (Test-D32ProfilePathEqual -Left $FilePath -Right ([string]$script:ValidatedToolchainProfile.Profile.toolchain.cargo.path)) -or
             $null -eq $ChildEnvironment -or -not $ChildEnvironment.Contains('CARGO_HOME') -or
             -not (Test-D32ProfilePathEqual -Left ([string]$ChildEnvironment['CARGO_HOME']) -Right ([string]$VendoredProtocRunGrant.Document.cargo_home.path))) {
+            if ($isD31RecoverySeederGrant) {
+                throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: exact D31 grant requires debug capture, VCTIP denial, and this fresh owner-bound CargoHome before process creation'
+            }
             throw 'VENDORED_PROTOC_GRANT_BLOCKED: exact grant requires debug capture under the fixed Cargo root, pinned VCTIP policy, and the same fresh owner-bound CargoHome before process creation'
         }
         $vendoredProtocBeforeStart = Get-D32ProfileFileSnapshot -Path ([string]$VendoredProtocRunGrant.Image.Path)
@@ -5897,7 +6922,12 @@ function Invoke-D32BoundedProcess {
                 $targetRoots = if ($CandidateImageRoots) { @($CandidateImageRoots | ForEach-Object { [IO.Path]::GetFullPath($_) }) } else { @(Get-D32DebugCandidateTargetRoots -Repository $profileCurrent.Repository) }
                 $rootPinText = ConvertTo-D32DebugImagePinText -Image $rootImage
                 $traceTimeout = [int][Math]::Min([int]::MaxValue, ([long]$TimeoutSeconds * 1000))
-                if ($AllowPinnedCargoVctip) {
+                if ($null -ne $VendoredProtocRunGrant -and [string]$VendoredProtocRunGrant.Document.record_type -ceq 'D32_D31_RECOVERY_SEEDER_PROTOC_RUN_GRANT_V1') {
+                    $protocPinText = ConvertTo-D32DebugImagePinText -Image $currentProtoc
+                    $nativeProcess.ConfigureD31RecoverySeederCargoDebugCaptureWithVendoredProtoc($rootPinText, [string[]]$approvedPinText, [string[]]$targetRoots, $traceTimeout,
+                        [string]$VendoredProtocRunGrant.Document.cargo_home.path, $protocPinText)
+                }
+                elseif ($AllowPinnedCargoVctip) {
                     if (-not (Test-D32ProfilePathEqual -Left $rootImage.Path -Right ([string]$profileCurrent.Profile.toolchain.cargo.path))) {
                         throw 'D32_VCTIP_PROFILE_PIN_BLOCKED: VCTIP descendant authority is restricted to the exact caller-pinned Cargo root'
                     }
@@ -6782,9 +7812,9 @@ function Invoke-D32SelfTest {
             throw 'SELFTEST_FAILED: fixture build mode classification is not exclusive'
         }
         Assert-D32FixtureBuildModeAuthority -Mode 'Phase0'
+        Assert-D32FixtureBuildModeAuthority -Mode 'D31Seeder'
         foreach ($blockedMode in @(
-                [PSCustomObject]@{ Mode = 'Standalone'; Prefix = 'STANDALONE_FIXTURE_AUTHORITY_BLOCKED:' },
-                [PSCustomObject]@{ Mode = 'D31Seeder'; Prefix = 'D31_RECOVERY_SEEDER_AUTHORITY_BLOCKED:' }
+                [PSCustomObject]@{ Mode = 'Standalone'; Prefix = 'STANDALONE_FIXTURE_AUTHORITY_BLOCKED:' }
             )) {
             $modeBlocked = $false
             try { Assert-D32FixtureBuildModeAuthority -Mode $blockedMode.Mode }
@@ -6816,13 +7846,17 @@ function Invoke-D32SelfTest {
         $ownedDirectoryClaims = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Ensure-D32OwnedDirectory' })
         $phase0StorageClaims = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Initialize-D32FixturePhase0Storage' })
         $fixtureFetchBoundaries = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Invoke-D32FixturePreCargoBoundary' })
+        $d31SeederEntryClaims = @($productionRuntimeCommands | Where-Object { $_.GetCommandName() -ceq 'Invoke-D32D31RecoverySeeder' })
         if ($productionModeCalls.Count -ne 1 -or $outputRootClaims.Count -ne 1 -or $ownedDirectoryClaims.Count -eq 0 -or
             $phase0StorageClaims.Count -ne 1 -or $fixtureFetchBoundaries.Count -ne 1 -or
+            $d31SeederEntryClaims.Count -ne 1 -or
             @($ownedDirectoryClaims | Where-Object { $_.Extent.StartOffset -le $productionModeCalls[0].Extent.StartOffset }).Count -gt 0 -or
             $productionModeCalls[0].Extent.StartOffset -ge $outputRootClaims[0].Extent.StartOffset -or
             $productionModeCalls[0].Extent.StartOffset -ge $phase0StorageClaims[0].Extent.StartOffset -or
-            $productionModeCalls[0].Extent.StartOffset -ge $fixtureFetchBoundaries[0].Extent.StartOffset) {
-            throw 'SELFTEST_FAILED: non-Phase0 fixture modes must stop before output-root creation and any Cargo fetch/build boundary'
+            $productionModeCalls[0].Extent.StartOffset -ge $fixtureFetchBoundaries[0].Extent.StartOffset -or
+            $d31SeederEntryClaims[0].Extent.StartOffset -ge $phase0StorageClaims[0].Extent.StartOffset -or
+            $d31SeederEntryClaims[0].Extent.StartOffset -ge $fixtureFetchBoundaries[0].Extent.StartOffset) {
+            throw 'SELFTEST_FAILED: standalone mode must stop before output creation and D31 mode must use its independent entry before any Phase0 storage/fetch boundary'
         }
         $passed++
 
@@ -7163,6 +8197,43 @@ function Invoke-D32SelfTest {
             (Split-Path -Leaf $fixedSeederPaths.record) -ne 'd31-recovery-seeder-build.json') {
             throw 'SELFTEST_FAILED: D31 seeder target and record must be fixed canonical siblings'
         }
+        $passed++
+
+        $d31EmptyStdoutLog = Join-Path $root 'd31-empty.stdout.log'
+        $d31EmptyStderrLog = Join-Path $root 'd31-empty.stderr.log'
+        [IO.File]::WriteAllBytes($d31EmptyStdoutLog, [byte[]]@())
+        [IO.File]::WriteAllBytes($d31EmptyStderrLog, [byte[]]@())
+        $d31EmptyLogPhase = [ordered]@{
+            status = 'succeeded'
+            stdout_log = $d31EmptyStdoutLog
+            stderr_log = $d31EmptyStderrLog
+            stdout_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path $d31EmptyStdoutLog
+            stderr_log_ref = Get-D32D31RecoverySeederOptionalFileReference -Path $d31EmptyStderrLog
+        }
+        Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $d31EmptyLogPhase -RequireComplete
+        $passed++
+        [IO.File]::WriteAllText($d31EmptyStdoutLog, 'changed-after-reference', [Text.UTF8Encoding]::new($false))
+        $d31ChangedLogRejected = $false
+        try {
+            Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $d31EmptyLogPhase -RequireComplete
+        }
+        catch { $d31ChangedLogRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*' }
+        if (-not $d31ChangedLogRejected) { throw 'SELFTEST_FAILED: D31 companion accepted stdout bytes changed after the log reference was captured' }
+        $passed++
+        $d31MissingSuccessLogRejected = $false
+        $d31EmptyLogPhase.stdout_log_ref = $null
+        try { Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $d31EmptyLogPhase -RequireComplete }
+        catch { $d31MissingSuccessLogRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*' }
+        if (-not $d31MissingSuccessLogRejected) { throw 'SELFTEST_FAILED: successful D31 phase without stdout log reference was accepted' }
+        $passed++
+        $d31BlockedEmptyLogPhase = [ordered]@{
+            status = 'blocked'
+            stdout_log = $d31EmptyStdoutLog
+            stderr_log = $d31EmptyStderrLog
+            stdout_log_ref = $null
+            stderr_log_ref = $null
+        }
+        Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $d31BlockedEmptyLogPhase
         $passed++
 
         $quotedArguments = ConvertTo-D32CommandLine @(
@@ -7574,6 +8645,19 @@ public static class D32DebugSelfTestLauncher
         $exactProtocChildAccepted = [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed(
             $cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256,
             $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin)
+        $exactD31ProtocConfigAccepted = [D32FixtureNativeProcessV2]::IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration(
+            $cargoPolicyPin, [string[]]$protocPolicyPins, $protocPolicyCargoHome, $protocPolicyPin)
+        $exactD31ProtocChildAccepted = [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed(
+            $cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256,
+            $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin)
+        $d31ProtocNegatives = @(
+            -not [D32FixtureNativeProcessV2]::IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]]$protocPolicyPins, (Join-Path $root 'stale-d31-cargo-home'), $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]](@($protocPolicyPins) + @($protocPolicyPin)), $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsApprovedD31RecoverySeederCargoVendoredProtocConfiguration((ConvertTo-D32DebugImagePinText -Image ([PSCustomObject]@{ Path = (Join-Path $root 'not-cargo.exe'); Bytes = 1L; Sha256 = ('0' * 64); VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef' })), [string[]]$protocPolicyPins, $protocPolicyCargoHome, $protocPolicyPin),
+            -not [D32FixtureNativeProcessV2]::IsPinnedCargoVctipChildAllowed($cargoPolicyRoot, $false,
+                $vctipPolicyPath, 335328, 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996',
+                '749614a1961465c0', '0b5d2000000001000000000000000000', @($vctipPolicyPin))
+        )
         $protocPolicyNegatives = @(
             -not [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]]$protocPolicyPins, (Join-Path $root 'stale-cargo-home'), $protocPolicyPin),
             -not [D32FixtureNativeProcessV2]::IsApprovedPinnedCargoVendoredProtocConfiguration($cargoPolicyPin, [string[]](@($protocPolicyPins) + @($protocPolicyPin)), $protocPolicyCargoHome, $protocPolicyPin),
@@ -7585,10 +8669,12 @@ public static class D32DebugSelfTestLauncher
             -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath, [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, '0123456789abcdef0123456789abcdef1', $protocPolicyCargoHome, $protocPolicyPin),
             -not [D32FixtureNativeProcessV2]::IsPinnedCargoVendoredProtocChildAllowed($cargoPolicyRoot, $true, $protocPolicyPath.Replace('protoc.exe', 'protoc-copy.exe'), [Int64]$protocPolicyImage.Bytes, $protocPolicyImage.Sha256, $protocPolicyImage.VolumeSerialHex, $protocPolicyImage.FileIdHex, $protocPolicyCargoHome, $protocPolicyPin)
         )
-        if (-not $exactProtocConfigAccepted -or -not $exactProtocChildAccepted -or @($protocPolicyNegatives | Where-Object { -not $_ }).Count -ne 0) {
-            throw "SELFTEST_FAILED: locked protoc native admission was not unique, exact-home, exact-image, and fail-closed (config=$exactProtocConfigAccepted child=$exactProtocChildAccepted negatives=$(@($protocPolicyNegatives | Where-Object { -not $_ }).Count))"
+        if (-not $exactProtocConfigAccepted -or -not $exactProtocChildAccepted -or -not $exactD31ProtocConfigAccepted -or
+            -not $exactD31ProtocChildAccepted -or
+            @($d31ProtocNegatives | Where-Object { -not $_ }).Count -ne 0 -or @($protocPolicyNegatives | Where-Object { -not $_ }).Count -ne 0) {
+            throw "SELFTEST_FAILED: locked protoc native admission was not unique and exact-home/image or D31 did not preserve VCTIP denial (phase0_config=$exactProtocConfigAccepted phase0_child=$exactProtocChildAccepted d31_config=$exactD31ProtocConfigAccepted d31_child=$exactD31ProtocChildAccepted d31_negatives=$(@($d31ProtocNegatives | Where-Object { -not $_ }).Count) protoc_negatives=$(@($protocPolicyNegatives | Where-Object { -not $_ }).Count))"
         }
-        Write-Host 'D32_VENDORED_PROTOC_POLICY=PASS exact_per_run_CargoHome_and_opened_identity_only; stale_home_duplicate_alias_drift_wrong_root_and_unpermitted_denied'
+        Write-Host 'D32_VENDORED_PROTOC_POLICY=PASS phase0_and_D31_use_exact_per_run_CargoHome_and_opened_identity; exact_D31_protoc_child_allowed; D31_VCTIP_denied; stale_home_duplicate_alias_drift_wrong_root_and_unpermitted_denied'
         $passed++
         $h7NativeType = [D32FixtureNativeProcessV2]
         $h7SlotType = $h7NativeType.GetNestedType('H7CGitSlotPolicy', [System.Reflection.BindingFlags]::NonPublic)
@@ -9465,7 +10551,7 @@ if ([String]::IsNullOrWhiteSpace($ManifestPath)) {
 $ManifestPath = Assert-D32ManifestDestination -Path $ManifestPath -OwnedRoot $OutputRoot
 $ManifestPath = Assert-D32NoReparsePath -Path $ManifestPath -AllowMissingLeaf
 $fixtureProvenancePath = Assert-D32NoReparsePath -Path (Join-Path $OutputRoot 'fixture-build-provenance.json') -AllowMissingLeaf
-if (Test-Path -LiteralPath $fixtureProvenancePath) {
+if (-not $BuildD31RecoverySeeder -and (Test-Path -LiteralPath $fixtureProvenancePath)) {
     throw "FIXTURE_PROVENANCE_NOT_NEW: refusing to reuse an existing fixture build provenance sidecar: $fixtureProvenancePath"
 }
 $logRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot 'logs')
@@ -9480,6 +10566,24 @@ if (-not [bool]$validatedToolchainProfile.IsValid) {
     throw "TOOLCHAIN_PROFILE_BLOCKED: $($validatedToolchainProfile.Failure)"
 }
 $script:ValidatedToolchainProfile = $validatedToolchainProfile
+if ($BuildD31RecoverySeeder) {
+    $moduleAdmission = if ($null -eq $global:D32PowerShellModuleAuthorityState) { $null } else { $global:D32PowerShellModuleAuthorityState.Admission }
+    if ($null -eq $moduleAdmission) { throw 'D31_RECOVERY_SEEDER_MODULE_ADMISSION_BLOCKED: exact shared PowerShell module V2 admission is unavailable' }
+    $d31Cargo = Assert-D32NoReparsePath -Path ([string]$validatedToolchainProfile.Profile.toolchain.cargo.path)
+    $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
+    $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
+    Invoke-D32D31RecoverySeeder `
+        -Repository $RepoRoot `
+        -OutputRoot $OutputRoot `
+        -CandidateSha $candidateSha `
+        -ValidatedProfile $validatedToolchainProfile `
+        -CargoPath $d31Cargo `
+        -TimeoutSeconds $TimeoutSeconds `
+        -AuthorityPath $VendoredProtocAuthorityPath `
+        -AuthoritySha256 $ExpectedVendoredProtocAuthoritySha256 `
+        -ModuleAdmission $moduleAdmission
+    exit 0
+}
 if ($null -eq $Phase0OwnerBinding) { throw 'PHASE0_OWNER_BLOCKED: Phase0 fixture builds require the fixed Phase0 runner owner binding' }
 $script:D32TauriMacrosSourcePatchAuthority = Test-D32TauriMacrosSourcePatchAuthority `
     -AuthorityPath $TauriMacrosSourceAuthorityPath `
@@ -9566,30 +10670,6 @@ Write-Host "D32_BUILD_TOOLCHAIN_PROFILE_PATH=$($validatedToolchainProfile.Profil
 Write-Host "D32_EXPECTED_TOOLCHAIN_PROFILE_SHA256=$($validatedToolchainProfile.Digest)"
 Write-Host "D32_BUILD_TOOLCHAIN_RUN_ID=$toolchainRunId"
 
-$seederTargetDir = $null
-$seederRecordPath = $null
-$seederRunId = $null
-if ($BuildD31RecoverySeeder) {
-    $seederPaths = Get-D32D31RecoverySeederPaths -OutputRoot $OutputRoot
-    $seederTargetDir = $seederPaths.target
-    if (Test-Path -LiteralPath $seederTargetDir) {
-        throw "D31_RECOVERY_SEEDER_TARGET_NOT_NEW: refusing to reuse an existing external Cargo target directory: $seederTargetDir"
-    }
-    if (Test-D32PathWithin -Path $seederTargetDir -Root $RepoRoot) {
-        throw 'D31_RECOVERY_SEEDER_TARGET_INVALID: recovery-seeder target must be external to the repository'
-    }
-    $seederRecordPath = $seederPaths.record
-    if (Test-Path -LiteralPath $seederRecordPath) {
-        throw "D31_RECOVERY_SEEDER_RECORD_NOT_NEW: refusing to overwrite a D31 seeder record: $seederRecordPath"
-    }
-    if (Test-D32PathWithin -Path $seederRecordPath -Root $RepoRoot) {
-        throw 'D31_RECOVERY_SEEDER_RECORD_INVALID: record must be external to the repository'
-    }
-    if ((Split-Path -Parent $seederTargetDir) -ne (Split-Path -Parent $seederRecordPath)) {
-        throw 'D31_RECOVERY_SEEDER_OUTPUT_INVALID: target and build record must be siblings beneath OutputRoot'
-    }
-    $seederRunId = [Guid]::NewGuid().ToString('N').ToLowerInvariant()
-}
 $results = @()
 $pendingFixtureFailures = [System.Collections.Generic.List[object]]::new()
 $startedAt = [DateTimeOffset]::UtcNow
@@ -9720,121 +10800,6 @@ try {
         }
     }
 
-    if ($BuildD31RecoverySeeder) {
-        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
-        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
-        if (Test-Path -LiteralPath $seederTargetDir) {
-            throw 'D31_RECOVERY_SEEDER_TARGET_NOT_NEW: external target appeared before the pinned build'
-        }
-        [void](Assert-D32NoReparsePath -Path $seederTargetDir -AllowMissingLeaf)
-        $seederManifest = Get-D32FullPath (Join-Path $RepoRoot 'vita-agent/Cargo.toml')
-        $seederRunRoot = Ensure-D32OwnedDirectory (Join-Path $OutputRoot "d31-recovery-seeder-run-$seederRunId")
-        $seederCargoHome = New-D32FreshCargoHome -RunRoot $seederRunRoot -Repository $RepoRoot
-        $seederTempRoot = Join-Path $seederRunRoot 'temp'
-        [void][IO.Directory]::CreateDirectory($seederTempRoot)
-        $seederTempRoot = Assert-D32NoReparsePath -Path $seederTempRoot
-        $seederFetches = Invoke-D32LockedCargoFetches `
-            -ValidatedProfile $validatedToolchainProfile `
-            -CargoPath $cargo `
-            -CargoHome $seederCargoHome `
-            -TempRoot $seederTempRoot `
-            -RepoRoot $RepoRoot `
-            -LogRoot $logRoot `
-            -TimeoutSeconds $TimeoutSeconds `
-            -LogPrefix 'd31-seeder' `
-            -PhaseEvidence $phaseEvidence
-        $null = Test-D32CargoHome -Path $seederCargoHome -Repository $RepoRoot
-        $offlineSeederEnvironment = Get-D32BuildToolchainEnvironment `
-            -ValidatedProfile $validatedToolchainProfile `
-            -CargoHome $seederCargoHome `
-            -TempRoot $seederTempRoot `
-            -Offline $true
-        $seederArtifactPath = Join-Path $seederTargetDir 'debug/vita-agent.exe'
-        $seederArguments = @(
-            'build', '--quiet', '--locked',
-            '--manifest-path', $seederManifest,
-            '--bin', 'vita-agent',
-            '--features', 'd29-h9-test-helper',
-            '--target-dir', $seederTargetDir
-        )
-        $seederPhaseLog = Join-Path $logRoot 'd31-recovery-seeder'
-        Write-Host "D32_FIXTURE_PHASE=seeder name=d31-recovery-seeder candidate=$candidateSha run_id=$seederRunId"
-        $seederBuild = Invoke-D32BoundedProcess `
-            -FilePath $cargo `
-            -Arguments $seederArguments `
-            -WorkingDirectory $RepoRoot `
-            -PhaseLog $seederPhaseLog `
-            -TimeoutSeconds $TimeoutSeconds `
-            -ChildEnvironment $offlineSeederEnvironment `
-            -RequireDebugEvents `
-            -CandidateImageRoots @((Get-D32DebugCandidateTargetRoots -Repository $RepoRoot) + $seederTargetDir)
-        if ($null -ne $seederBuild.root_identity_record) {
-            Assert-D32PinnedCargoProcessIdentity `
-                -ProcessIdentity $seederBuild.root_identity_record `
-                -CargoPath $cargo `
-                -Arguments $seederArguments `
-                -ValidatedProfile $validatedToolchainProfile `
-                -ProcessResult $seederBuild
-        }
-        $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile
-        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
-        $phaseEvidence.Add([pscustomobject]@{
-            name = 'd31-recovery-seeder'
-            executable = [IO.Path]::GetFullPath($cargo)
-            arguments = @($seederArguments)
-            command_line = ConvertTo-D32CommandLine (@($cargo) + $seederArguments)
-            working_directory = [IO.Path]::GetFullPath($RepoRoot)
-            root_record = $seederBuild.root_identity_record
-            descendant_records = @($seederBuild.captured_descendant_records)
-            process_trace = $seederBuild.process_trace
-        })
-        if ($seederBuild.status -ne 'succeeded' -or $seederBuild.exit_code -ne 0) {
-            throw "D31_RECOVERY_SEEDER_BUILD_FAILED: status=$($seederBuild.status) exit=$($seederBuild.exit_code); see $($seederBuild.phase_log)"
-        }
-        $null = Assert-D32PinnedCleanCandidate -Root $RepoRoot
-        [void](Assert-D32NoReparsePath -Path $seederTargetDir)
-        if (Test-D32PathWithin -Path $seederTargetDir -Root $RepoRoot) {
-            throw 'D31_RECOVERY_SEEDER_TARGET_INVALID: recovery-seeder target moved inside the repository'
-        }
-        $seederArtifact = Get-D32BoundArtifact -Path $seederArtifactPath
-        $producerIdentityRecord = $seederBuild.root_identity_record
-        $seederRecord = [ordered]@{
-            schema_version = 2
-            purpose = 'd31-recovery-seeder-test-helper'
-            run_id = $seederRunId
-            candidate_sha = $candidateSha
-            runner_process_id = [int]$PID
-            source_repo = $RepoRoot
-            manifest_path = $seederManifest
-            feature = 'd29-h9-test-helper'
-            command = @($seederArguments)
-            target_dir = $seederTargetDir
-            run_root = $seederRunRoot
-            cargo_home = $seederCargoHome
-            temp_root = $seederTempRoot
-            toolchain_profile_path = [string]$validatedToolchainProfile.ProfilePath
-            toolchain_profile_sha256 = [string]$validatedToolchainProfile.Digest
-            target_triple = [string]$validatedToolchainProfile.Profile.target_triple
-            powershell = $validatedToolchainProfile.Profile.powershell
-            toolchain = $validatedToolchainProfile.Profile.toolchain
-            fetch_manifests = @($validatedToolchainProfile.LockInputs | ForEach-Object {
-                    [ordered]@{ manifest_path = [string]$_.ManifestPath; lock_sha256 = [string]$_.LockSha256 }
-                })
-            fetch_phases = @($seederFetches)
-            cargo_path = $cargo
-            process_identity = ConvertTo-D32D31ProcessIdentityDocument $producerIdentityRecord
-            status = $seederBuild.status
-            exit_code = $seederBuild.exit_code
-            artifact = $seederArtifact
-        }
-        Assert-D32D31RecoverySeederRecordShape -Document $seederRecord -Path $seederRecordPath -OutputRoot $OutputRoot
-        $seederRecordDigest = Write-D32NewRecoverySeederBuildRecord -Path $seederRecordPath -Document $seederRecord
-        Write-Host "D31_RECOVERY_SEEDER_RECORD_PATH=$seederRecordPath"
-        Write-Host "D31_RECOVERY_SEEDER_RECORD_SHA256=$($seederRecordDigest.sha256)"
-        Write-Host "D31_RECOVERY_SEEDER_RUN_ID=$seederRunId"
-        Write-Host "D31_RECOVERY_SEEDER_PATH=$($seederArtifact.path)"
-        Write-Host "D31_RECOVERY_SEEDER_SHA256=$($seederArtifact.sha256)"
-    }
 }
 finally {
     $null = Assert-D32BuildToolchainProfileCurrent -ValidatedProfile $validatedToolchainProfile

@@ -3,6 +3,7 @@
 
 $script:D32VendoredProtocAuthorityType = 'D32_VENDORED_PROTOC_AUTHORITY_V1'
 $script:D32VendoredProtocRunGrantType = 'D32_PHASE0_VENDORED_PROTOC_RUN_GRANT_V1'
+$script:D32D31RecoverySeederProtocRunGrantType = 'D32_D31_RECOVERY_SEEDER_PROTOC_RUN_GRANT_V1'
 $script:D32VendoredProtocUmbrellaChecksum = 'd1c381df33c98266b5f08186583660090a4ffa0889e76c7e9a5e175f645a67fa'
 $script:D32VendoredProtocWin32Checksum = '95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3'
 $script:D32VendoredProtocImageSha256 = 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2'
@@ -919,6 +920,299 @@ function Test-D32VendoredProtocRunGrant {
         throw 'VENDORED_PROTOC_GRANT_BLOCKED: grant bytes/opened identity changed during end-to-end validation'
     }
     return [PSCustomObject]@{ Document = $doc; Reference = $Reference; Snapshot = $grantSnapshot; Authority = $authority; Image = $protoc; Archive = $archive; SourcePath = $sourcePath }
+}
+
+function Get-D32D31RecoverySeederSourceAuthority {
+    param(
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$SeederEvidenceRoot
+    )
+
+    # The caller-pinned Phase0 authority is consulted only as the immutable
+    # locked package/image source pin. Its Phase0 run grant is never consumed,
+    # and none of its root/home/run authority is copied into the D31 grant.
+    if ($AuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not (Test-D32ProfileCanonicalPathString -Path $AuthorityPath) -or
+        -not (Test-D32ProfileNoReparsePath -Path $AuthorityPath) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child $AuthorityPath -Parent $SeederEvidenceRoot)) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: source pin must be caller-pinned and external to repository and seeder run'
+    }
+    $snapshot = Get-D32ProfileFileSnapshot -Path $AuthorityPath
+    if ($snapshot.Sha256 -cne $AuthoritySha256) { throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: source pin differs from the independent caller SHA-256' }
+    $raw = [IO.File]::ReadAllText($AuthorityPath, [Text.Encoding]::UTF8)
+    $afterRead = Get-D32ProfileFileSnapshot -Path $AuthorityPath
+    if ($afterRead.Bytes -ne $snapshot.Bytes -or $afterRead.Sha256 -cne $snapshot.Sha256 -or
+        $afterRead.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $afterRead.FileIdHex -cne $snapshot.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: caller-pinned source pin changed while reading its bounded authority root'
+    }
+    $json = [System.Text.Json.JsonDocument]::Parse($raw)
+    try { if (Test-D32ProfileJsonElementDuplicates -Element $json.RootElement) { throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: source pin contains duplicate JSON keys' } }
+    finally { $json.Dispose() }
+    $candidate = $raw | ConvertFrom-Json -DateKind String
+    if ($candidate.record_type -cne $script:D32VendoredProtocAuthorityType -or
+        $candidate.scope -cne 'D32_PHASE0_PHASE1_ONLY' -or
+        $candidate.evidence_root_path -isnot [string] -or
+        -not (Test-D32ProfileCanonicalPathString -Path ([string]$candidate.evidence_root_path))) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: source pin is not the exact approved immutable D32 vendored-protoc authority'
+    }
+    $authority = Test-D32VendoredProtocAuthority `
+        -AuthorityPath $AuthorityPath `
+        -ExpectedAuthoritySha256 $AuthoritySha256 `
+        -Repository $Repository `
+        -CandidateSha $CandidateSha `
+        -ValidatedProfile $ValidatedProfile `
+        -EvidenceRoot ([string]$candidate.evidence_root_path) `
+        -ExpectedScope 'D32_PHASE0_PHASE1_ONLY'
+    if ((Test-D32ProfilePathEqual -Left ([string]$authority.Document.evidence_root_path) -Right $SeederEvidenceRoot) -or
+        (Test-D32ProfilePathEqual -Left ([string]$authority.Document.cargo_home_path) -Right (Join-Path $SeederEvidenceRoot 'cargo-home')) -or
+        (Test-D32ProfilePathEqual -Left ([string]$authority.Document.temp_root_path) -Right (Join-Path $SeederEvidenceRoot 'temp'))) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: exact Phase0 evidence root/home/temp may not be reused as the independent seeder run'
+    }
+    $final = Get-D32ProfileFileSnapshot -Path $AuthorityPath
+    if ($final.Bytes -ne $snapshot.Bytes -or $final.Sha256 -cne $snapshot.Sha256 -or
+        $final.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $final.FileIdHex -cne $snapshot.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_AUTHORITY_BLOCKED: source pin identity changed during validation'
+    }
+    return $authority
+}
+
+function Test-D32D31RecoverySeederOwnerMarker {
+    param(
+        [Parameter(Mandatory = $true)][object]$Reference,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][int]$RunnerProcessId
+    )
+    $expectedPath = Join-Path $RunRoot 'D32-D31-RECOVERY-SEEDER-OWNER.json'
+    $snapshot = Assert-D32VendoredFileReference -Reference $Reference -AllowedRoot $RunRoot -ExpectedPath $expectedPath
+    $stream = [IO.File]::Open($expectedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $before = Get-D32ProfileFileSnapshot -Path $expectedPath
+        if ($before.Bytes -ne $snapshot.Bytes -or $before.Sha256 -cne $snapshot.Sha256 -or
+            $before.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $before.FileIdHex -cne $snapshot.FileIdHex) {
+            throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: owner marker opened identity differs from its retained reference'
+        }
+        $stream.Position = 0
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+        try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $after = Get-D32ProfileFileSnapshot -Path $expectedPath
+        if ($after.Bytes -ne $snapshot.Bytes -or $after.Sha256 -cne $snapshot.Sha256 -or
+            $after.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $after.FileIdHex -cne $snapshot.FileIdHex) {
+            throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: owner marker changed while parsing its run binding'
+        }
+    }
+    finally { $stream.Dispose() }
+    $json = [System.Text.Json.JsonDocument]::Parse($raw)
+    try { if (Test-D32ProfileJsonElementDuplicates -Element $json.RootElement) { throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: duplicate owner marker JSON keys' } }
+    finally { $json.Dispose() }
+    $owner = $raw | ConvertFrom-Json -DateKind String
+    $fields = @('schema_version', 'record_type', 'candidate_sha', 'toolchain_profile_path', 'toolchain_profile_sha256',
+        'toolchain_profile_bytes', 'toolchain_profile_volume_serial_hex', 'toolchain_profile_file_id_hex',
+        'run_root_path', 'run_root_volume_serial_hex', 'run_root_file_id_hex', 'run_id', 'runner_process_id')
+    $actualFields = @($owner.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $rootIdentity = Get-D32ProfileDirectoryIdentity -Path $RunRoot
+    if ($actualFields.Count -ne $fields.Count -or @($actualFields | Where-Object { $_ -notin $fields }).Count -ne 0 -or
+        @($fields | Where-Object { $_ -notin $actualFields }).Count -ne 0 -or
+        -not (Test-D32VendoredInteger -Value $owner.schema_version) -or [Int64]$owner.schema_version -ne 1 -or
+        $owner.record_type -cne 'D32_D31_RECOVERY_SEEDER_OWNER_V1' -or
+        $owner.candidate_sha -cne $CandidateSha -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$owner.toolchain_profile_path) -Right ([string]$ValidatedProfile.ProfilePath)) -or
+        $owner.toolchain_profile_sha256 -cne [string]$ValidatedProfile.Digest -or
+        [Int64]$owner.toolchain_profile_bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $owner.toolchain_profile_volume_serial_hex -cne [string]$ValidatedProfile.Identity.VolumeSerialHex -or
+        $owner.toolchain_profile_file_id_hex -cne [string]$ValidatedProfile.Identity.FileIdHex -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$owner.run_root_path) -Right $RunRoot) -or
+        $owner.run_root_volume_serial_hex -cne [string]$rootIdentity.VolumeSerialHex -or
+        $owner.run_root_file_id_hex -cne [string]$rootIdentity.FileIdHex -or
+        $owner.run_id -cne $RunId -or [Int64]$owner.runner_process_id -ne [Int64]$RunnerProcessId -or
+        $RunnerProcessId -le 0 -or $RunId -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'D31_RECOVERY_SEEDER_OWNER_BLOCKED: strict create-new owner marker is not bound to this candidate/profile/root/run/runner'
+    }
+    return [PSCustomObject]@{ Document = $owner; Reference = $Reference; Snapshot = $snapshot; RootIdentity = $rootIdentity }
+}
+
+function New-D32D31RecoverySeederProtocRunGrant {
+    param(
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][int]$RunnerProcessId,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$TempRoot,
+        [Parameter(Mandatory = $true)][object]$OwnerMarkerReference
+    )
+    if ($RunId -cnotmatch '^[0-9a-f]{32}$' -or $RunnerProcessId -le 0 -or
+        -not (Test-D32ProfilePathEqual -Left $RunRoot -Right (Join-Path (Split-Path -Parent $RunRoot) "d31-recovery-seeder-run-$RunId")) -or
+        -not (Test-D32ProfilePathEqual -Left $CargoHome -Right (Join-Path $RunRoot 'cargo-home')) -or
+        -not (Test-D32ProfilePathEqual -Left $TempRoot -Right (Join-Path $RunRoot 'temp')) -or
+        (Test-D32ProfilePathWithin -Child $RunRoot -Parent $Repository) -or
+        (Test-D32ProfilePathWithin -Child $Repository -Parent $RunRoot)) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: fresh run/home/temp layout or external root is invalid'
+    }
+    $sourceAuthority = Get-D32D31RecoverySeederSourceAuthority `
+        -AuthorityPath $AuthorityPath -AuthoritySha256 $AuthoritySha256 -Repository $Repository `
+        -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -SeederEvidenceRoot $RunRoot
+    $owner = Test-D32D31RecoverySeederOwnerMarker `
+        -Reference $OwnerMarkerReference -Repository $Repository -CandidateSha $CandidateSha `
+        -ValidatedProfile $ValidatedProfile -RunRoot $RunRoot -RunId $RunId -RunnerProcessId $RunnerProcessId
+    $rootIdentity = $owner.RootIdentity
+    $cargoHomeIdentity = Get-D32ProfileDirectoryIdentity -Path $CargoHome
+    $tempIdentity = Get-D32ProfileDirectoryIdentity -Path $TempRoot
+    $materialized = Ensure-D32VendoredProtocSource -CargoHome $CargoHome -Authority $sourceAuthority
+    $lock = Get-D32VendoredLockPackageRecords -Repository $Repository
+    $document = [ordered]@{
+        schema_version = 1
+        record_type = $script:D32D31RecoverySeederProtocRunGrantType
+        scope = 'D32_D31_RECOVERY_SEEDER_ONLY'
+        source_authority = $sourceAuthority.Reference
+        candidate_sha = $CandidateSha
+        toolchain_profile = [ordered]@{ path = $ValidatedProfile.ProfilePath; sha256 = $ValidatedProfile.Digest; bytes = [Int64]$ValidatedProfile.Identity.Bytes; volume_serial_hex = $ValidatedProfile.Identity.VolumeSerialHex; file_id_hex = $ValidatedProfile.Identity.FileIdHex }
+        run_root = [ordered]@{ path = $rootIdentity.Path; volume_serial_hex = $rootIdentity.VolumeSerialHex; file_id_hex = $rootIdentity.FileIdHex }
+        owner_marker = $owner.Reference
+        run_id = $RunId
+        runner_process_id = [Int64]$RunnerProcessId
+        cargo_home = [ordered]@{ path = $cargoHomeIdentity.Path; volume_serial_hex = $cargoHomeIdentity.VolumeSerialHex; file_id_hex = $cargoHomeIdentity.FileIdHex }
+        temp_root = [ordered]@{ path = $tempIdentity.Path; volume_serial_hex = $tempIdentity.VolumeSerialHex; file_id_hex = $tempIdentity.FileIdHex }
+        vita_cargo_lock = Get-D32VendoredFileReference -Path $lock.Path
+        cargo_archive = Get-D32VendoredFileReference -Path $materialized.Archive.Path
+        source_directory = [ordered]@{ path = $materialized.SourceIdentity.Path; volume_serial_hex = $materialized.SourceIdentity.VolumeSerialHex; file_id_hex = $materialized.SourceIdentity.FileIdHex }
+        protoc_image = [ordered]@{ path = $materialized.Image.Path; bytes = [Int64]$materialized.Image.Bytes; sha256 = [string]$materialized.Image.Sha256; volume_serial_hex = [string]$materialized.Image.VolumeSerialHex; file_id_hex = [string]$materialized.Image.FileIdHex }
+    }
+    $grantPath = Join-Path $RunRoot 'D32-D31-RECOVERY-SEEDER-PROTOC-RUN-GRANT.json'
+    $grantReference = Write-D32VendoredProtocAuthorityCreateNew -Path $grantPath -Document $document
+    return Test-D32D31RecoverySeederProtocRunGrant `
+        -Reference $grantReference -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile `
+        -RunRoot $RunRoot -ExpectedRunId $RunId -ExpectedRunnerProcessId $RunnerProcessId -CargoHome $CargoHome -TempRoot $TempRoot `
+        -AuthorityPath $AuthorityPath -AuthoritySha256 $AuthoritySha256 -OwnerMarkerReference $OwnerMarkerReference
+}
+
+function Test-D32D31RecoverySeederProtocRunGrant {
+    param(
+        [Parameter(Mandatory = $true)][object]$Reference,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedRunId,
+        [Parameter(Mandatory = $true)][int]$ExpectedRunnerProcessId,
+        [Parameter(Mandatory = $true)][string]$CargoHome,
+        [Parameter(Mandatory = $true)][string]$TempRoot,
+        [Parameter(Mandatory = $true)][string]$AuthorityPath,
+        [Parameter(Mandatory = $true)][string]$AuthoritySha256,
+        [Parameter(Mandatory = $true)][object]$OwnerMarkerReference
+    )
+    $grantPath = Join-Path $RunRoot 'D32-D31-RECOVERY-SEEDER-PROTOC-RUN-GRANT.json'
+    $grantSnapshot = Assert-D32VendoredFileReference -Reference $Reference -AllowedRoot $RunRoot -ExpectedPath $grantPath
+    $grantStream = [IO.File]::Open($grantPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $before = Get-D32ProfileFileSnapshot -Path $grantPath
+        if ($before.Bytes -ne $grantSnapshot.Bytes -or $before.Sha256 -cne $grantSnapshot.Sha256 -or
+            $before.VolumeSerialHex -cne $grantSnapshot.VolumeSerialHex -or $before.FileIdHex -cne $grantSnapshot.FileIdHex) {
+            throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: grant opened identity differs from its retained reference'
+        }
+        $grantStream.Position = 0
+        $reader = [IO.StreamReader]::new($grantStream, [Text.Encoding]::UTF8, $true, 4096, $true)
+        try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        $after = Get-D32ProfileFileSnapshot -Path $grantPath
+        if ($after.Bytes -ne $grantSnapshot.Bytes -or $after.Sha256 -cne $grantSnapshot.Sha256 -or
+            $after.VolumeSerialHex -cne $grantSnapshot.VolumeSerialHex -or $after.FileIdHex -cne $grantSnapshot.FileIdHex) {
+            throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: grant changed while parsing its strict run binding'
+        }
+    }
+    finally { $grantStream.Dispose() }
+    $json = [System.Text.Json.JsonDocument]::Parse($raw)
+    try { if (Test-D32ProfileJsonElementDuplicates -Element $json.RootElement) { throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: duplicate grant JSON keys' } }
+    finally { $json.Dispose() }
+    $doc = $raw | ConvertFrom-Json -DateKind String
+    $fields = @('schema_version', 'record_type', 'scope', 'source_authority', 'candidate_sha', 'toolchain_profile', 'run_root',
+        'owner_marker', 'run_id', 'runner_process_id', 'cargo_home', 'temp_root', 'vita_cargo_lock', 'cargo_archive', 'source_directory', 'protoc_image')
+    $actualFields = @($doc.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($actualFields.Count -ne $fields.Count -or @($actualFields | Where-Object { $_ -notin $fields }).Count -ne 0 -or
+        @($fields | Where-Object { $_ -notin $actualFields }).Count -ne 0 -or
+        -not (Test-D32VendoredInteger -Value $doc.schema_version) -or [Int64]$doc.schema_version -ne 1 -or
+        $doc.record_type -cne $script:D32D31RecoverySeederProtocRunGrantType -or
+        $doc.scope -cne 'D32_D31_RECOVERY_SEEDER_ONLY' -or
+        $doc.candidate_sha -cne $CandidateSha -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+        $doc.run_id -cne $ExpectedRunId -or $ExpectedRunId -cnotmatch '^[0-9a-f]{32}$' -or
+        [Int64]$doc.runner_process_id -ne [Int64]$ExpectedRunnerProcessId -or $ExpectedRunnerProcessId -le 0) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: strict D31 grant schema/candidate/run/runner scope mismatch'
+    }
+    if (-not (Test-D32VendoredObjectExactProperties -Object $doc.toolchain_profile -Expected @('path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$doc.toolchain_profile.path) -Right $ValidatedProfile.ProfilePath) -or
+        $doc.toolchain_profile.sha256 -cne [string]$ValidatedProfile.Digest -or
+        [Int64]$doc.toolchain_profile.bytes -ne [Int64]$ValidatedProfile.Identity.Bytes -or
+        $doc.toolchain_profile.volume_serial_hex -cne [string]$ValidatedProfile.Identity.VolumeSerialHex -or
+        $doc.toolchain_profile.file_id_hex -cne [string]$ValidatedProfile.Identity.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: caller-pinned profile binding mismatch'
+    }
+    $rootIdentity = Get-D32ProfileDirectoryIdentity -Path $RunRoot
+    $cargoHomeIdentity = Get-D32ProfileDirectoryIdentity -Path $CargoHome
+    $tempIdentity = Get-D32ProfileDirectoryIdentity -Path $TempRoot
+    foreach ($binding in @(
+        [PSCustomObject]@{ Name = 'run_root'; Document = $doc.run_root; Identity = $rootIdentity; Path = $RunRoot },
+        [PSCustomObject]@{ Name = 'cargo_home'; Document = $doc.cargo_home; Identity = $cargoHomeIdentity; Path = $CargoHome },
+        [PSCustomObject]@{ Name = 'temp_root'; Document = $doc.temp_root; Identity = $tempIdentity; Path = $TempRoot }
+    )) {
+        if (-not (Test-D32VendoredObjectExactProperties -Object $binding.Document -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$binding.Document.path) -Right $binding.Path) -or
+            $binding.Document.volume_serial_hex -cne [string]$binding.Identity.VolumeSerialHex -or
+            $binding.Document.file_id_hex -cne [string]$binding.Identity.FileIdHex) {
+            throw "D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: opened $($binding.Name) identity binding mismatch"
+        }
+    }
+    if (-not (Test-D32ProfilePathEqual -Left $RunRoot -Right (Join-Path (Split-Path -Parent $RunRoot) "d31-recovery-seeder-run-$ExpectedRunId")) -or
+        -not (Test-D32ProfilePathEqual -Left $CargoHome -Right (Join-Path $RunRoot 'cargo-home')) -or
+        -not (Test-D32ProfilePathEqual -Left $TempRoot -Right (Join-Path $RunRoot 'temp')) -or
+        (Test-D32ProfilePathWithin -Child $RunRoot -Parent $Repository) -or (Test-D32ProfilePathWithin -Child $Repository -Parent $RunRoot)) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: run/home/temp layout is not the unique external D31 owner tree'
+    }
+    $owner = Test-D32D31RecoverySeederOwnerMarker -Reference $OwnerMarkerReference -Repository $Repository -CandidateSha $CandidateSha `
+        -ValidatedProfile $ValidatedProfile -RunRoot $RunRoot -RunId $ExpectedRunId -RunnerProcessId $ExpectedRunnerProcessId
+    if ((ConvertTo-Json -InputObject $doc.owner_marker -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $owner.Reference -Depth 5 -Compress)) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: owner marker reference differs from current create-new owner binding'
+    }
+    $sourceAuthority = Get-D32D31RecoverySeederSourceAuthority -AuthorityPath $AuthorityPath -AuthoritySha256 $AuthoritySha256 `
+        -Repository $Repository -CandidateSha $CandidateSha -ValidatedProfile $ValidatedProfile -SeederEvidenceRoot $RunRoot
+    if ((ConvertTo-Json -InputObject $doc.source_authority -Depth 5 -Compress) -cne (ConvertTo-Json -InputObject $sourceAuthority.Reference -Depth 5 -Compress)) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: independent immutable source-authority reference changed'
+    }
+    $lock = Get-D32VendoredLockPackageRecords -Repository $Repository
+    $lockRef = Assert-D32VendoredFileReference -Reference $doc.vita_cargo_lock -AllowedRoot $Repository -ExpectedPath $lock.Path
+    if ($lockRef.Sha256 -cne $lock.Snapshot.Sha256) { throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: current Vita Cargo.lock differs from the grant' }
+    $archivePath = Join-Path $CargoHome $script:D32VendoredProtocArchiveRelativePath
+    $archive = Assert-D32VendoredFileReference -Reference $doc.cargo_archive -AllowedRoot $CargoHome -ExpectedPath $archivePath
+    if ($archive.Bytes -ne $script:D32VendoredProtocArchiveBytes -or $archive.Sha256 -cne $script:D32VendoredProtocWin32Checksum) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: archive identity/hash is not the exact locked crate in the fresh seeder home'
+    }
+    $materialized = Ensure-D32VendoredProtocSource -CargoHome $CargoHome -Authority $sourceAuthority
+    if (-not (Test-D32VendoredObjectExactProperties -Object $doc.source_directory -Expected @('path', 'volume_serial_hex', 'file_id_hex')) -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$doc.source_directory.path) -Right $materialized.SourceIdentity.Path) -or
+        $doc.source_directory.volume_serial_hex -cne [string]$materialized.SourceIdentity.VolumeSerialHex -or
+        $doc.source_directory.file_id_hex -cne [string]$materialized.SourceIdentity.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: materialized exact source directory identity differs from the grant'
+    }
+    $image = Assert-D32VendoredFileReference -Reference $doc.protoc_image -AllowedRoot $CargoHome -ExpectedPath (Join-Path $materialized.SourcePath 'bin\protoc.exe')
+    if ($image.Bytes -ne $script:D32VendoredProtocImageBytes -or $image.Sha256 -cne $script:D32VendoredProtocImageSha256) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: opened image identity/hash is not the exact immutable protoc image'
+    }
+    $grantFinal = Get-D32ProfileFileSnapshot -Path $grantPath
+    if ($grantFinal.Bytes -ne $grantSnapshot.Bytes -or $grantFinal.Sha256 -cne $grantSnapshot.Sha256 -or
+        $grantFinal.VolumeSerialHex -cne $grantSnapshot.VolumeSerialHex -or $grantFinal.FileIdHex -cne $grantSnapshot.FileIdHex) {
+        throw 'D31_RECOVERY_SEEDER_PROTOC_GRANT_BLOCKED: grant bytes/identity changed during validation'
+    }
+    return [PSCustomObject]@{ Document = $doc; Reference = $Reference; Snapshot = $grantSnapshot; Authority = $sourceAuthority; Image = $image; Archive = $archive; SourcePath = $materialized.SourcePath }
 }
 
 function New-D32VendoredProtocEnvironment {

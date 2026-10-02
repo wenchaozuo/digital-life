@@ -985,6 +985,35 @@ function ConvertTo-D32Phase0ExpectedRootIdentity {
     }
 }
 
+function Get-D32Phase0NativeTraceFailureMessage {
+    param([AllowNull()][object]$Trace)
+
+    if ($null -eq $Trace) { return 'PHASE0_PROCESS_TRACE_BLOCKED: native V2 trace unavailable' }
+    $stateProperty = $Trace.PSObject.Properties['State']
+    if ($null -eq $stateProperty) { $stateProperty = $Trace.PSObject.Properties['state'] }
+    $blockReasonProperty = $Trace.PSObject.Properties['BlockReason']
+    if ($null -eq $blockReasonProperty) { $blockReasonProperty = $Trace.PSObject.Properties['block_reason'] }
+    $eventChainProperty = $Trace.PSObject.Properties['EventChainComplete']
+    if ($null -eq $eventChainProperty) { $eventChainProperty = $Trace.PSObject.Properties['event_chain_complete'] }
+    $accountingProperty = $Trace.PSObject.Properties['AccountingConsistent']
+    if ($null -eq $accountingProperty) { $accountingProperty = $Trace.PSObject.Properties['accounting_consistent'] }
+
+    $blockReasonWasSet = $null -ne $blockReasonProperty -and $null -ne $blockReasonProperty.Value
+    $traceIsIncomplete = $null -eq $stateProperty -or $stateProperty.Value -cne 'COMPLETED' -or
+        $null -eq $eventChainProperty -or $eventChainProperty.Value -isnot [bool] -or -not $eventChainProperty.Value -or
+        $null -eq $accountingProperty -or $accountingProperty.Value -isnot [bool] -or -not $accountingProperty.Value -or
+        $blockReasonWasSet
+    if (-not $traceIsIncomplete) { return $null }
+
+    $reason = if ($null -ne $blockReasonProperty -and $blockReasonProperty.Value -is [string] -and
+        -not [String]::IsNullOrWhiteSpace([string]$blockReasonProperty.Value)) {
+        [string]$blockReasonProperty.Value
+    } else {
+        'native V2 trace is blocked or incomplete; block_reason unavailable'
+    }
+    return "PHASE0_PROCESS_TRACE_BLOCKED: $reason"
+}
+
 function Test-D32Phase0DebugProcessTrace {
     param(
         [Parameter(Mandatory = $true)][object]$Trace,
@@ -1515,8 +1544,9 @@ function Invoke-D32Phase0PinnedProcess {
         $traceNative = $native.WaitForDebugTrace($traceJoinTimeout)
         if ($null -ne $H7CGitRunGrant) { $script:D32Phase0ObservedH7CGitChildren = @($native.GetH7CGitChildObservations() | ForEach-Object { ConvertTo-D32H7CGitObservationDocument -Observation $_ }) }
         $processTrace = ConvertTo-D32Phase0DebugProcessTraceDocument -Trace $traceNative
+        $nativeTraceFailure = Get-D32Phase0NativeTraceFailureMessage -Trace $traceNative
+        if ($null -ne $nativeTraceFailure) { throw $nativeTraceFailure }
         $null = Test-D32Phase0DebugProcessTrace -Trace $processTrace -ExpectedRootPath $Executable -ExpectedRootIdentity $image -ExpectedParentProcessId $PID -ValidatedProfile $currentProfile -Repository $Repository -VendoredProtocGrant $grantForProcess -H7CGitAuthority $H7CGitAuthority -H7CGitRunGrant $H7CGitRunGrant
-        if ($traceNative.State -cne 'COMPLETED' -or -not $traceNative.AccountingConsistent) { throw "PHASE0_PROCESS_TRACE_BLOCKED: $($traceNative.BlockReason)" }
         if ($traceNative.Processes.Count -eq 0) { throw 'PHASE0_PROCESS_TRACE_BLOCKED: root CREATE_PROCESS_DEBUG_EVENT is absent' }
         $rootSnapshot = ConvertFrom-D32Phase0DebugProcess -Process $traceNative.Processes[0] -ExpectedCommandLine $commandLine
         if ($rootSnapshot.parent_process_id -ne $PID) { throw 'PHASE0_PROCESS_IDENTITY_BLOCKED: fixed command parent is not the exact runner identity' }

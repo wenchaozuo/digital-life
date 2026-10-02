@@ -1,6 +1,9 @@
 # Module-free focused regression checks for the V2 debug-trace root identity boundary.
 [CmdletBinding()]
-param([string]$ReplayPhase0DiagnosticPath)
+param(
+    [string]$ReplayPhase0DiagnosticPath,
+    [string]$ReplayBlockedPhase0DiagnosticPath
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -181,6 +184,7 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0ProcessRecord' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Test-D32Phase0InventoryProcessRecord' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0DiagnosticPropertyValue' },
+        [PSCustomObject]@{ Path = $phase0Path; Name = 'Get-D32Phase0NativeTraceFailureMessage' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Write-D32Phase0BlockedDiagnostic' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'Assert-D32Phase0DiscoveryNoBlockedDiagnostic' },
         [PSCustomObject]@{ Path = $phase0Path; Name = 'ConvertTo-D32Phase0ExpectedRootIdentity' },
@@ -693,6 +697,67 @@ Add-D32TraceIdentitySelfTestCase -Name 'production Phase0 converter rejects null
     -Passed ($phase0OptionalConverterNegatives.Count -eq 0 -and $rootEmptyConverterRejected) `
     -Detail ('optional_rejected={0};root_empty_rejected={1}' -f ($phase0OptionalConverterNegatives -join '|'), $rootEmptyConverterRejected)
 
+if (-not [String]::IsNullOrWhiteSpace($ReplayBlockedPhase0DiagnosticPath)) {
+    $blockedReplayPassed = $false
+    $blockedReplayFailure = $null
+    $blockedReplayDetail = $null
+    try {
+        $blockedPath = [IO.Path]::GetFullPath($ReplayBlockedPhase0DiagnosticPath)
+        $blockedRoot = [IO.Path]::GetDirectoryName($blockedPath)
+        if (-not (Test-D32ProfileNoReparsePath -Path $blockedRoot) -or -not (Test-D32ProfileNoReparsePath -Path $blockedPath) -or
+            (Test-D32ProfilePathWithin -Child $blockedRoot -Parent $repo) -or (Test-D32ProfilePathWithin -Child $repo -Parent $blockedRoot)) {
+            throw 'SELFTEST_BLOCKED: blocked replay diagnostic must be an external non-reparse evidence file'
+        }
+        $blockedBytes = [IO.File]::ReadAllBytes($blockedPath)
+        $blockedSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($blockedBytes)).ToLowerInvariant()
+        $blockedReplay = [Text.UTF8Encoding]::new($false, $true).GetString($blockedBytes) | ConvertFrom-Json -Depth 100 -DateKind String
+        $blockedTrace = $blockedReplay.raw_v2_trace
+        $blockedFailureMessage = Get-D32Phase0NativeTraceFailureMessage -Trace $blockedTrace
+        $lastContextPrefix = 'D32_PHASE0_LAST_COMPLETED_COMMAND_CONTEXT_V1:'
+        $lastContextEntries = @($blockedReplay.secondary_errors | Where-Object { $_ -is [string] -and $_.StartsWith($lastContextPrefix, [StringComparison]::Ordinal) })
+        $lastContext = if ($lastContextEntries.Count -eq 1) { $lastContextEntries[0].Substring($lastContextPrefix.Length) | ConvertFrom-Json -Depth 100 -DateKind String } else { $null }
+        $rawCleanup = $blockedReplay.job_debug_cleanup.raw_native_cleanup
+        $explicitNoAttribution = [string]$blockedTrace.block_reason -notmatch '(?i)(process_id|thread_id|active_create_identity)='
+        $blockedReplayPassed = $blockedReplay.record_type -ceq 'D32_PHASE0_BLOCKED_DIAGNOSTIC_V1' -and
+            $blockedReplay.status -ceq 'BLOCKED' -and $blockedReplay.gate_authority -ceq 'NONE' -and
+            $blockedReplay.phase1_allowed -is [bool] -and -not $blockedReplay.phase1_allowed -and
+            $blockedReplay.aggregate_allowed -is [bool] -and -not $blockedReplay.aggregate_allowed -and
+            $blockedBytes.LongLength -eq 2119432 -and $blockedSha -ceq '167131c5b1400a9b6b6e7dc544cfee290cd54df9f6a868a77a2c7fb8e6cd01d8' -and
+            $blockedReplay.candidate_sha -ceq 'b5b7ec7ebeee135c0e0275deacf2aa2a0c79bdd5' -and
+            $blockedReplay.evidence_root.path -ceq 'E:\d32\inv6' -and
+            $blockedReplay.run_id -ceq '5bb566837bb74193ac0349e38b02b05f' -and
+            $blockedReplay.failing_fixed_command.name -ceq 'vita-test-list' -and
+            $blockedReplay.primary_error -ceq 'PROCESS_TRACE_BLOCKED: trace type/version, event-chain state, or independent Job accounting is invalid' -and
+            $null -eq $blockedReplay.process_identity -and @($blockedReplay.unverified_fields | Where-Object { $_ -ceq 'process_identity' }).Count -eq 1 -and
+            $blockedTrace.state -ceq 'BLOCKED' -and $blockedTrace.block_reason -ceq 'second-chance debug exception 0xc0000409' -and
+            $explicitNoAttribution -and
+            $blockedTrace.process_event_count -eq ($blockedTrace.process_create_event_count + $blockedTrace.process_exit_event_count) -and
+            $blockedTrace.process_create_event_count -gt $blockedTrace.process_exit_event_count -and
+            $blockedTrace.event_chain_complete -is [bool] -and -not $blockedTrace.event_chain_complete -and
+            $blockedTrace.accounting_consistent -is [bool] -and -not $blockedTrace.accounting_consistent -and
+            $blockedTrace.job_active_processes -eq 0 -and
+            $blockedReplay.job_debug_cleanup.verification -ceq 'UNVERIFIED' -and
+            $rawCleanup.CleanupSucceeded -is [bool] -and $rawCleanup.CleanupSucceeded -and
+            $rawCleanup.JobCloseSucceeded -is [bool] -and $rawCleanup.JobCloseSucceeded -and
+            $rawCleanup.JobActiveProcessCount -eq 0 -and
+            $blockedFailureMessage -ceq 'PHASE0_PROCESS_TRACE_BLOCKED: second-chance debug exception 0xc0000409' -and
+            $lastContextEntries.Count -eq 1 -and $null -ne $lastContext -and
+            $lastContext.run_id -ceq $blockedReplay.run_id -and $lastContext.candidate_sha -ceq $blockedReplay.candidate_sha -and
+            $lastContext.command.name -ceq 'protocol-ignored-list' -and $lastContext.command_result.name -ceq 'protocol-ignored-list' -and
+            $lastContext.command_result.exit_code -eq 0 -and $lastContext.command_result.process_trace.event_chain_complete -and
+            $lastContext.command_result.process_tree_cleanup.cleanup_succeeded
+        if (-not $blockedReplayPassed) { throw 'SELFTEST_BLOCKED: immutable inv6 exception failure lost its primary reason, strict BLOCKED state, cleanup distinction, or last-completed binding' }
+        $blockedReplayDetail = 'source=immutable-inv6-diagnostic; bytes={0}; sha256={1}; candidate={2}; command={3}; trace=BLOCKED/{4}; creates={5}; exits={6}; cleanup_raw={7}; cleanup_summary={8}; last_completed={9}; helper_primary={10}' -f `
+            $blockedBytes.LongLength, $blockedSha, $blockedReplay.candidate_sha, $blockedReplay.failing_fixed_command.name, $blockedTrace.block_reason,
+            $blockedTrace.process_create_event_count, $blockedTrace.process_exit_event_count, $rawCleanup.CleanupSucceeded,
+            $blockedReplay.job_debug_cleanup.verification, $lastContext.command.name, $blockedFailureMessage
+    }
+    catch { $blockedReplayFailure = $_.Exception.Message }
+    Add-D32TraceIdentitySelfTestCase -Name 'immutable inv6 exception replay preserves exact blocked reason without inventing process identity, keeps raw cleanup separate, and binds only the prior completed command as secondary context' `
+        -Passed ($blockedReplayPassed -and $null -eq $blockedReplayFailure) `
+        -Detail $(if ($null -ne $blockedReplayFailure) { $blockedReplayFailure } else { $blockedReplayDetail })
+}
+
 if (-not [String]::IsNullOrWhiteSpace($ReplayPhase0DiagnosticPath)) {
     $replayPassed = $false
     $replayFailure = $null
@@ -1072,6 +1137,82 @@ $remoteUnicodeReader = [regex]::Match($fixtureSource, '(?s)private static string
 $remoteUnicodeReaderSafe = $remoteUnicodeReader.Success -and
     $remoteUnicodeReader.Value.Contains('IsValidRemoteUnicodeStringBounds(length, maximumLength, unchecked((ulong)bufferAddress))') -and
     $remoteUnicodeReader.Value.Contains('bufferAddress <= 0') -and $remoteUnicodeReader.Value -notmatch 'length\s*>\s*32766'
+$secondChanceFormatterMatch = [regex]::Match($fixtureSource, '(?s)private static string FormatSecondChanceExceptionBlockReason\(uint exceptionCode, uint processId, uint threadId, D32DebugProcessRecordV2 activeRecord\)\s*\{[^}]*\}')
+$secondChanceFormatterCasesPassed = $false
+$secondChanceFormatterFailure = $null
+if ($secondChanceFormatterMatch.Success) {
+    try {
+        $formatterTypeName = 'D32SecondChanceFormatterSelfTest_' + [Guid]::NewGuid().ToString('N')
+        $formatterRecordTypeName = $formatterTypeName + 'Record'
+        $formatterMethodText = $secondChanceFormatterMatch.Value.Replace('D32DebugProcessRecordV2', $formatterRecordTypeName)
+        $formatterSource = @"
+using System;
+using System.Globalization;
+public sealed class $formatterRecordTypeName
+{
+    public uint ProcessId; public uint ParentProcessId; public long CreationFileTime; public long ParentCreationFileTime;
+    public string ImagePath; public long Bytes; public string Sha256; public string VolumeSerialHex; public string FileIdHex;
+    public string AllowedImageReason; public bool ImageVerified; public bool Exited; public long CreateSequence;
+}
+public static class $formatterTypeName
+{
+$formatterMethodText
+}
+"@
+        $formatterTypes = @(Add-Type -TypeDefinition $formatterSource -PassThru -ErrorAction Stop)
+        $formatterType = @($formatterTypes | Where-Object { $_.Name -ceq $formatterTypeName })[0]
+        $formatterRecordType = @($formatterTypes | Where-Object { $_.Name -ceq $formatterRecordTypeName })[0]
+        $formatterMethod = $formatterType.GetMethod('FormatSecondChanceExceptionBlockReason', [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
+        $activeRecord = [Activator]::CreateInstance($formatterRecordType)
+        $activeRecord.ProcessId = [uint32]41002; $activeRecord.ParentProcessId = [uint32]41001
+        $activeRecord.CreationFileTime = [Int64]134354251087640178; $activeRecord.ParentCreationFileTime = [Int64]134354234455227259
+        $activeRecord.ImagePath = 'C:\Windows\System32\conhost.exe'; $activeRecord.Bytes = [Int64]1003520
+        $activeRecord.Sha256 = 'a' * 64; $activeRecord.VolumeSerialHex = '0000000000000001'; $activeRecord.FileIdHex = '1' * 32
+        $activeRecord.AllowedImageReason = 'caller-pinned-toolchain-native-or-Windows-image'; $activeRecord.ImageVerified = $true
+        $activeRecord.Exited = $false; $activeRecord.CreateSequence = [Int64]2
+        $secondChanceCode = [uint32]3221226505
+        $validReason = [string]$formatterMethod.Invoke($null, [object[]]@($secondChanceCode, [uint32]41002, [uint32]4199, $activeRecord))
+        $unknownReason = [string]$formatterMethod.Invoke($null, [object[]]@($secondChanceCode, [uint32]41003, [uint32]4200, $null))
+        $staleRecordReason = [string]$formatterMethod.Invoke($null, [object[]]@($secondChanceCode, [uint32]41003, [uint32]4201, $activeRecord))
+        $activeRecord.Exited = $true
+        $exitedRecordReason = [string]$formatterMethod.Invoke($null, [object[]]@($secondChanceCode, [uint32]41002, [uint32]4202, $activeRecord))
+        $activeRecord.Exited = $false; $activeRecord.ImageVerified = $false
+        $unverifiedRecordReason = [string]$formatterMethod.Invoke($null, [object[]]@($secondChanceCode, [uint32]41002, [uint32]4203, $activeRecord))
+        $secondChanceFormatterCasesPassed = $validReason.StartsWith('second-chance debug exception 0xc0000409 process_id=41002 thread_id=4199 active_create_identity=verified ', [StringComparison]::Ordinal) -and
+            $validReason.Contains('create_sequence=2') -and $validReason.Contains('creation_filetime=134354251087640178') -and
+            $validReason.Contains('parent_process_id=41001') -and $validReason.Contains('parent_creation_filetime=134354234455227259') -and
+            $validReason.Contains('image_path=C:\Windows\System32\conhost.exe') -and $validReason.Contains('bytes=1003520') -and
+            $validReason.Contains('sha256=' + ('a' * 64)) -and $validReason.Contains('volume_serial_hex=0000000000000001') -and
+            $validReason.Contains('file_id_hex=' + ('1' * 32)) -and $validReason.Contains('allowed_image_reason=caller-pinned-toolchain-native-or-Windows-image') -and
+            $validReason -notmatch '(?i)command.?line|argv' -and
+            $unknownReason -ceq 'second-chance debug exception 0xc0000409 process_id=41003 thread_id=4200 active_create_identity=unavailable' -and
+            $staleRecordReason.EndsWith('active_create_identity=unavailable', [StringComparison]::Ordinal) -and
+            $exitedRecordReason.EndsWith('active_create_identity=unavailable', [StringComparison]::Ordinal) -and
+            $unverifiedRecordReason.EndsWith('active_create_identity=unavailable', [StringComparison]::Ordinal)
+    }
+    catch { $secondChanceFormatterFailure = $_.Exception.Message }
+}
+$secondChanceHandlerBound = $secondChanceFormatterMatch.Success -and
+    $fixtureSource.Contains('active.TryGetValue(ev.ProcessId, out exceptionOwner)') -and
+    $fixtureSource.Contains('FormatSecondChanceExceptionBlockReason(exception.Exception.ExceptionCode, ev.ProcessId, ev.ThreadId, activeExceptionRecord)')
+$nativeFailureHelperCasesPassed = $true
+$blockedHelperMessage = Get-D32Phase0NativeTraceFailureMessage -Trace ([PSCustomObject]@{
+        State = 'BLOCKED'; BlockReason = 'second-chance debug exception 0xc0000409 process_id=41002 thread_id=4199 active_create_identity=verified'
+        EventChainComplete = $false; AccountingConsistent = $false
+    })
+$unavailableHelperMessage = Get-D32Phase0NativeTraceFailureMessage -Trace ([PSCustomObject]@{
+        State = 'BLOCKED'; BlockReason = $null; EventChainComplete = $false; AccountingConsistent = $false
+    })
+$completedButIncompleteHelperMessage = Get-D32Phase0NativeTraceFailureMessage -Trace ([PSCustomObject]@{
+        State = 'COMPLETED'; BlockReason = $null; EventChainComplete = $false; AccountingConsistent = $false
+    })
+$strictCompletedHelperMessage = Get-D32Phase0NativeTraceFailureMessage -Trace ([PSCustomObject]@{
+        State = 'COMPLETED'; BlockReason = $null; EventChainComplete = $true; AccountingConsistent = $true
+    })
+$nativeFailureHelperCasesPassed = $blockedHelperMessage -ceq 'PHASE0_PROCESS_TRACE_BLOCKED: second-chance debug exception 0xc0000409 process_id=41002 thread_id=4199 active_create_identity=verified' -and
+    $unavailableHelperMessage -ceq 'PHASE0_PROCESS_TRACE_BLOCKED: native V2 trace is blocked or incomplete; block_reason unavailable' -and
+    $completedButIncompleteHelperMessage -ceq 'PHASE0_PROCESS_TRACE_BLOCKED: native V2 trace is blocked or incomplete; block_reason unavailable' -and
+    $null -eq $strictCompletedHelperMessage
 $wireSerializersDoNotExtendV2 = $null -ne $traceSerializer -and $fixtureAst -and $fixtureAst.EndBlock.Statements.Count -gt 0 -and
     $null -ne $phase0Serializer -and $traceSerializer.Extent.Text -notmatch '(?i)CommandLineCapture|command_line' -and
     $phase0Serializer.Extent.Text -notmatch '(?i)CommandLineCapture|command_line' -and
@@ -1085,8 +1226,14 @@ $wireSerializersDoNotExtendV2 = $null -ne $traceSerializer -and $fixtureAst -and
     $fixtureSource.Contains('identity-only/optional-command-line-not-captured') -and
     $fixtureSource.Contains('CREATE retained parent identity chain contains a cycle') -and
     $fixtureSource.Contains('cursor.ParentCreationFileTime != debuggerCreation') -and
-    $remoteUnicodeReaderSafe -and $unicodeBoundsMatch.Success
+    $remoteUnicodeReaderSafe -and $unicodeBoundsMatch.Success -and $secondChanceHandlerBound
 Add-D32TraceIdentitySelfTestCase -Name 'native CREATE PEB capture and retained child/parent revalidation precede Continue while frozen V2 wire schema stays unchanged' -Passed $wireSerializersDoNotExtendV2
+Add-D32TraceIdentitySelfTestCase -Name 'native second-chance exception block reason records exact event PID/TID and only a matching verified active CREATE identity' `
+    -Passed ($secondChanceFormatterCasesPassed -and $secondChanceHandlerBound -and $null -eq $secondChanceFormatterFailure) `
+    -Detail $(if ($null -ne $secondChanceFormatterFailure) { $secondChanceFormatterFailure } else { 'matching, unknown PID, stale identity, exited identity, and unverified identity checked' })
+Add-D32TraceIdentitySelfTestCase -Name 'Phase0 native-trace failure projection preserves a block reason and remains fail-closed for missing, incomplete, or forged-complete traces' `
+    -Passed $nativeFailureHelperCasesPassed -Detail ('blocked={0};unavailable={1};completed_incomplete={2};valid={3}' -f `
+        $blockedHelperMessage, $unavailableHelperMessage, $completedButIncompleteHelperMessage, $strictCompletedHelperMessage)
 $inventoryProcessReaderAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0InventoryProcessRecord' }, $true)
 $phase0ReleaseReaderAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0MatrixRecord' }, $true)
 $optionalChildCommandLineAst = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32Phase0OptionalChildCommandLine' }, $true)
@@ -1434,6 +1581,8 @@ try {
     $phase0FailureCatch = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.CatchClauseAst] -and
         $node.Extent.Text.Contains('Get-D32Phase0DiscoveryFailureEvidence') -and $node.Extent.Text.Contains('ExpectedStdoutReference') }, $true)
     $pinnedProcessFunction = $phase0Ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32Phase0PinnedProcess' }, $true)
+    $nativeFailureHelperIndex = if ($null -ne $pinnedProcessFunction) { $pinnedProcessFunction.Extent.Text.IndexOf('Get-D32Phase0NativeTraceFailureMessage', [StringComparison]::Ordinal) } else { -1 }
+    $strictTraceReaderIndex = if ($null -ne $pinnedProcessFunction) { $pinnedProcessFunction.Extent.Text.IndexOf('Test-D32Phase0DebugProcessTrace', [StringComparison]::Ordinal) } else { -1 }
     $postCommandDiagnosticBindingsComplete = $null -ne $phase0FailureCatch -and
         $discoverySource.Contains('$evidence.CommandResult') -and $discoverySource.Contains('-IncludeCompletedCommandContext') -and
         $discoverySource.Contains('-ExpectedStdoutReference $stdoutReference') -and
@@ -1443,7 +1592,8 @@ try {
             $phase0FailureCatch.Extent.Text.IndexOf('if ($null -ne $failureContext)', [StringComparison]::Ordinal) -and
         $phase0FailureCatch.Extent.Text.Contains('blocked diagnostic preflight failed:') -and
         $null -ne $pinnedProcessFunction -and $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.CommandResult = $commandResult') -and
-        $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.Completed = $true')
+        $pinnedProcessFunction.Extent.Text.Contains('$script:D32Phase0LastProcessEvidence.Completed = $true') -and
+        $nativeFailureHelperIndex -ge 0 -and $strictTraceReaderIndex -gt $nativeFailureHelperIndex
     Add-D32TraceIdentitySelfTestCase -Name 'completed fetch/list results are retained in memory and both discovery and Phase0 output-error catches bind their stream references to V1 diagnostics' `
         -Passed $postCommandDiagnosticBindingsComplete
 }

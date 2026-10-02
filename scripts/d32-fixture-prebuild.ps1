@@ -5699,6 +5699,28 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         trace.State = "BLOCKED";
     }
 
+    private static string FormatSecondChanceExceptionBlockReason(uint exceptionCode, uint processId, uint threadId, D32DebugProcessRecordV2 activeRecord)
+    {
+        bool hasMatchingActiveCreate = activeRecord != null && activeRecord.ProcessId == processId && activeRecord.ImageVerified && !activeRecord.Exited &&
+            activeRecord.CreateSequence > 0 && activeRecord.CreationFileTime > 0 && activeRecord.ParentProcessId > 0 && activeRecord.ParentCreationFileTime > 0 &&
+            !String.IsNullOrWhiteSpace(activeRecord.ImagePath) && activeRecord.Bytes > 0 && !String.IsNullOrWhiteSpace(activeRecord.Sha256) &&
+            !String.IsNullOrWhiteSpace(activeRecord.VolumeSerialHex) && !String.IsNullOrWhiteSpace(activeRecord.FileIdHex) &&
+            !String.IsNullOrWhiteSpace(activeRecord.AllowedImageReason);
+        string activeCreateIdentity = hasMatchingActiveCreate
+            ? "active_create_identity=verified create_sequence=" + activeRecord.CreateSequence.ToString(CultureInfo.InvariantCulture) +
+                " process_id=" + activeRecord.ProcessId.ToString(CultureInfo.InvariantCulture) +
+                " creation_filetime=" + activeRecord.CreationFileTime.ToString(CultureInfo.InvariantCulture) +
+                " parent_process_id=" + activeRecord.ParentProcessId.ToString(CultureInfo.InvariantCulture) +
+                " parent_creation_filetime=" + activeRecord.ParentCreationFileTime.ToString(CultureInfo.InvariantCulture) +
+                " image_path=" + activeRecord.ImagePath + " bytes=" + activeRecord.Bytes.ToString(CultureInfo.InvariantCulture) +
+                " sha256=" + activeRecord.Sha256 + " volume_serial_hex=" + activeRecord.VolumeSerialHex +
+                " file_id_hex=" + activeRecord.FileIdHex + " allowed_image_reason=" + activeRecord.AllowedImageReason
+            : "active_create_identity=unavailable";
+        return "second-chance debug exception 0x" + exceptionCode.ToString("x8", CultureInfo.InvariantCulture) +
+            " process_id=" + processId.ToString(CultureInfo.InvariantCulture) +
+            " thread_id=" + threadId.ToString(CultureInfo.InvariantCulture) + " " + activeCreateIdentity;
+    }
+
     private void TraceCloseHandle(IntPtr handle, D32DebugProcessTraceV2 trace, string label)
     {
         if (handle != IntPtr.Zero)
@@ -6123,7 +6145,11 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                     }
                     else
                     {
-                        TraceBlock(trace, "second-chance debug exception 0x" + exception.Exception.ExceptionCode.ToString("x8", CultureInfo.InvariantCulture));
+                        DebugActiveProcess exceptionOwner;
+                        D32DebugProcessRecordV2 activeExceptionRecord = active.TryGetValue(ev.ProcessId, out exceptionOwner) && exceptionOwner != null
+                            ? exceptionOwner.Record
+                            : null;
+                        TraceBlock(trace, FormatSecondChanceExceptionBlockReason(exception.Exception.ExceptionCode, ev.ProcessId, ev.ThreadId, activeExceptionRecord));
                         if (!TerminateJobObject(_job, 0xD3201006)) trace.DebugApiErrorCount++;
                         continueStatus = DebugExceptionNotHandled;
                     }

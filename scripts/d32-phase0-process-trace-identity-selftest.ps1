@@ -9,6 +9,7 @@ $phase0Path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-phase0-matrix
 $fixturePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-fixture-prebuild.ps1'))
 $h7AuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-h7c-git-child-authority.ps1'))
 $profilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'))
+$moduleAuthorityPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'))
 $moduleStart = @(Microsoft.PowerShell.Core\Get-Module | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Version, $_.Path } | Sort-Object)
 $global:D32PowerShellModuleImportAttempts = 0
 $script:cases = [System.Collections.Generic.List[object]]::new()
@@ -159,12 +160,49 @@ foreach ($entry in @(
         [PSCustomObject]@{ Path = (Join-Path $PSScriptRoot 'd32-test-inventory-authority.ps1'); Name = 'Get-D32Phase0SuiteTestResultRows' },
         [PSCustomObject]@{ Path = $h7AuthorityPath; Name = 'Get-D32H7CGitTestResults' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32ObjectFieldNames' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32FullPath' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32FixtureExactProperties' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32FixtureBuildBudgetInteger' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32PathWithin' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederCleanup' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederOptionalPhaseLogs' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederProcessPhase' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederChildImage' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederRecordShape' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32D31RecoverySeederFileReference' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32FixtureFieldValue' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertTo-D32FixtureAuthorityHashtable' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32FixtureDebugProcessTraceLedger' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32D31RecoverySeederCompanionShape' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Assert-D32NoReparsePath' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32BoundArtifactWithFileId' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32BoundArtifact' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32NativeFileIdentity' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32NativeFileIdInfo' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertTo-D32FileIdentityRecord' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32SameNativeFileIdentity' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Test-D32SameArtifactFileIdentity' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'Initialize-D32ArtifactIdentityType' },
+        [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertTo-D32CommandLine' },
+        [PSCustomObject]@{ Path = $moduleAuthorityPath; Name = 'ConvertTo-D32PowerShellAuthorityJsonText' },
+        [PSCustomObject]@{ Path = $moduleAuthorityPath; Name = 'ConvertFrom-D32PowerShellAuthorityJsonElement' },
+        [PSCustomObject]@{ Path = $moduleAuthorityPath; Name = 'Copy-D32PowerShellAuthorityJsonShape' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'New-D32ProcessIdentityRecord' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'Get-D32FixtureDebugProcessCommandLine' },
         [PSCustomObject]@{ Path = $fixturePath; Name = 'ConvertFrom-D32DebugProcessRecord' }
     )) {
     Set-Item -Path ('Function:script:{0}' -f $entry.Name) -Value (Import-D32TraceIdentitySelfTestFunction -Path $entry.Path -Name $entry.Name)
+}
+
+# This fixture isolates the companion envelope's delegation boundary; the
+# production V2 module-admission validator remains covered by its own L0 suite.
+function Test-D32PowerShellModuleAdmissionRecord {
+    param([object]$Document, [string]$CandidateSha, [string]$Repository, [object]$ExpectedContext)
+    return $null -ne $Document -and $null -ne $ExpectedContext -and
+        $CandidateSha -ceq [string]$ExpectedContext.candidate_sha -and
+        (Test-D32ProfilePathEqual -Left $Repository -Right ([string]$ExpectedContext.source_repo)) -and
+        (ConvertTo-D32PowerShellAuthorityJsonText -Value $Document) -ceq
+            (ConvertTo-D32PowerShellAuthorityJsonText -Value $ExpectedContext)
 }
 
 function Get-D32ProfileFileSnapshot {
@@ -917,6 +955,153 @@ $null = Test-D32Phase0DebugProcessTrace -Trace $nativeWireTrace -ExpectedRootPat
     -ExpectedParentProcessId $PID -ValidatedProfile $validatedProfile -Repository $repo
 Add-D32TraceIdentitySelfTestCase -Name 'actual V2 reader accepts native snapshot after the production trace-writer and expected-pin mappings' -Passed $true
 
+$runnerProcessForLedger = [Diagnostics.Process]::GetCurrentProcess()
+try { $runnerCreationForLedger = [DateTime]$runnerProcessForLedger.StartTime.ToUniversalTime() }
+finally { $runnerProcessForLedger.Dispose() }
+$runnerCreationFileTimeForLedger = $runnerCreationForLedger.ToFileTimeUtc()
+$ledgerAccepted = $false
+$ledgerFailure = $null
+try {
+    $null = Assert-D32FixtureDebugProcessTraceLedger -Trace $nativeWireTrace -ExpectedRootPath $cargoPath -ExpectedRootIdentity $cargoWire `
+        -ExpectedRunnerProcessId $PID -ExpectedRunnerCreationFileTime $runnerCreationFileTimeForLedger -ErrorPrefix 'TRACE_LEDGER_BLOCKED'
+    $ledgerAccepted = $true
+}
+catch { $ledgerFailure = $_.Exception.Message }
+Add-D32TraceIdentitySelfTestCase -Name 'D31 producer ledger reader accepts the exact native V2 single-root trace bound to current runner creation and root image pins' `
+    -Passed $ledgerAccepted -Detail $ledgerFailure
+
+foreach ($ledgerMutation in @(
+        [PSCustomObject]@{ Name = 'debugger runner PID'; Mutate = { param($value) $value.debugger_process_id++ } },
+        [PSCustomObject]@{ Name = 'runner creation FILETIME'; Mutate = { param($value) $value.debugger_creation_filetime++ } },
+        [PSCustomObject]@{ Name = 'root parent PID'; Mutate = { param($value) $value.process_events[0].parent_process_id++ } },
+        [PSCustomObject]@{ Name = 'root parent creation'; Mutate = { param($value) $value.processes[0].parent_creation_filetime++ } },
+        [PSCustomObject]@{ Name = 'root image file identity'; Mutate = { param($value) $value.processes[0].file_id_hex = '2' * 32 } },
+        [PSCustomObject]@{ Name = 'CREATE/EXIT order'; Mutate = { param($value) $swap = $value.process_events[0]; $value.process_events[0] = $value.process_events[1]; $value.process_events[1] = $swap } },
+        [PSCustomObject]@{ Name = 'duplicate sequence'; Mutate = { param($value) $value.process_events[1].sequence = $value.process_events[0].sequence } },
+        [PSCustomObject]@{ Name = 'missing EXIT'; Mutate = { param($value) $value.process_events = @($value.process_events[0]) } }
+    )) {
+    $mutatedLedger = Copy-D32PowerShellAuthorityJsonShape -Value $nativeWireTrace
+    & $ledgerMutation.Mutate $mutatedLedger
+    $ledgerRejected = $false
+    try {
+        $null = Assert-D32FixtureDebugProcessTraceLedger -Trace $mutatedLedger -ExpectedRootPath $cargoPath -ExpectedRootIdentity $cargoWire `
+            -ExpectedRunnerProcessId $PID -ExpectedRunnerCreationFileTime $runnerCreationFileTimeForLedger -ErrorPrefix 'TRACE_LEDGER_BLOCKED'
+    }
+    catch { $ledgerRejected = $_.Exception.Message -like 'TRACE_LEDGER_BLOCKED:*' }
+    Add-D32TraceIdentitySelfTestCase -Name "D31 producer ledger rejects $($ledgerMutation.Name) tampering" -Passed $ledgerRejected
+}
+
+$cleanupPositiveCases = @(
+    [PSCustomObject]@{ Name = 'succeeded'; Value = [ordered]@{ status = 'succeeded'; checked_at_utc = '2026-10-02T00:00:00.0000000Z'; relevant_pattern = 'd31-recovery-seeder'; residual_identities = @(); error = $null }; Phases = 1 },
+    [PSCustomObject]@{ Name = 'failed'; Value = [ordered]@{ status = 'failed'; checked_at_utc = '2026-10-02T00:00:00.0000000Z'; relevant_pattern = 'd31-recovery-seeder'; residual_identities = @([ordered]@{ process_id = 70001 }); error = 'synthetic cleanup error' }; Phases = 1 },
+    [PSCustomObject]@{ Name = 'not_run'; Value = [ordered]@{ status = 'not_run'; checked_at_utc = $null; relevant_pattern = $null; residual_identities = @(); error = $null }; Phases = 0 }
+)
+$cleanupPositive = $true
+foreach ($cleanupCase in $cleanupPositiveCases) {
+    try { Assert-D32D31RecoverySeederCleanup -Cleanup $cleanupCase.Value -ObservedPhaseCount $cleanupCase.Phases }
+    catch { $cleanupPositive = $false }
+}
+Add-D32TraceIdentitySelfTestCase -Name 'D31 cleanup shape accepts succeeded/failed outcomes only with UTC time and pattern, and not_run only with zero phases and null observations' `
+    -Passed $cleanupPositive
+
+$cleanupNegativeCases = @(
+    [PSCustomObject]@{ Name = 'non-UTC offset'; Mutate = { param($value) $value.checked_at_utc = '2026-10-02T01:00:00.0000000+01:00' }; Status = 'succeeded'; Phases = 1 },
+    [PSCustomObject]@{ Name = 'empty relevant pattern'; Mutate = { param($value) $value.relevant_pattern = '  ' }; Status = 'succeeded'; Phases = 1 },
+    [PSCustomObject]@{ Name = 'succeeded with residual process'; Mutate = { param($value) $value.residual_identities = @([ordered]@{ process_id = 70001 }) }; Status = 'succeeded'; Phases = 1 },
+    [PSCustomObject]@{ Name = 'failed without primary error'; Mutate = { param($value) $value.error = $null }; Status = 'failed'; Phases = 1 },
+    [PSCustomObject]@{ Name = 'not_run invents cleanup time'; Mutate = { param($value) $value.checked_at_utc = '2026-10-02T00:00:00.0000000Z' }; Status = 'not_run'; Phases = 0 },
+    [PSCustomObject]@{ Name = 'not_run contradicts observed phase'; Mutate = { param($value) $value.error = 'phase observed' }; Status = 'not_run'; Phases = 1 },
+    [PSCustomObject]@{ Name = 'extra field'; Mutate = { param($value) if ($value -is [System.Collections.IDictionary]) { $value['unapproved'] = $true } else { $value | Add-Member -NotePropertyName unapproved -NotePropertyValue $true -Force } }; Status = 'succeeded'; Phases = 1 }
+)
+foreach ($cleanupCase in $cleanupNegativeCases) {
+    $cleanupShape = [ordered]@{
+        status = [string]$cleanupCase.Status
+        checked_at_utc = if ($cleanupCase.Status -ceq 'not_run') { $null } else { '2026-10-02T00:00:00.0000000Z' }
+        relevant_pattern = if ($cleanupCase.Status -ceq 'not_run') { $null } else { 'd31-recovery-seeder' }
+        residual_identities = @()
+        error = if ($cleanupCase.Status -ceq 'failed') { 'synthetic cleanup error' } else { $null }
+    }
+    & $cleanupCase.Mutate $cleanupShape
+    $cleanupRejected = $false
+    try { Assert-D32D31RecoverySeederCleanup -Cleanup $cleanupShape -ObservedPhaseCount $cleanupCase.Phases }
+    catch { $cleanupRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*' }
+    Add-D32TraceIdentitySelfTestCase -Name "D31 cleanup shape rejects $($cleanupCase.Name)" -Passed $cleanupRejected
+}
+
+$companionCandidate = '0123456789abcdef0123456789abcdef01234567'
+$companionOutputRoot = [IO.Path]::GetFullPath('E:\d32\synthetic-companion-selftest')
+$companionProfilePath = [IO.Path]::GetFullPath('E:\d32\synthetic-companion-profile.json')
+$companionProfileSha = 'c' * 64
+$companionProfileIdentity = [PSCustomObject]@{ Bytes = [Int64]100; VolumeSerialHex = '0000000000000001'; FileIdHex = '5' * 32 }
+$companionValidatedProfile = [PSCustomObject]@{
+    ProfilePath = $companionProfilePath; Digest = $companionProfileSha; Identity = $companionProfileIdentity
+}
+$companionEntryPath = [IO.Path]::GetFullPath((Join-Path $repo 'scripts/d32-fixture-prebuild.ps1'))
+$companionAdmission = [ordered]@{
+    candidate_sha = $companionCandidate
+    source_repo = $repo
+    entry_script_path = $companionEntryPath
+    runner_process = [ordered]@{ process_id = [int]$PID }
+}
+$companionPath = Join-Path $companionOutputRoot 'd31-recovery-seeder-companion.json'
+$newBlockedCompanionFixture = {
+    return [ordered]@{
+        schema_version = 1
+        record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V1'
+        status = 'blocked'
+        candidate_sha = $companionCandidate
+        source_repo = $repo
+        run_id = '1234567890abcdef1234567890abcdef'
+        runner_process_id = [int]$PID
+        toolchain_profile = [ordered]@{
+            path = $companionProfilePath; sha256 = $companionProfileSha; bytes = [Int64]100
+            volume_serial_hex = '0000000000000001'; file_id_hex = '5' * 32
+        }
+        powershell_module_admission = $companionAdmission
+        source_protoc_authority = $null; owner_marker = $null; protoc_run_grant = $null
+        run_root = $null; cargo_home = $null; temp_root = $null
+        fetch_phases = @(); build_phase = $null; seeder_record = $null; artifact = $null
+        process_cleanup = [ordered]@{ status = 'not_run'; checked_at_utc = $null; relevant_pattern = $null; residual_identities = @(); error = $null }
+        blocked_reason = 'synthetic pre-owner blocked companion fixture; no process or output exists'
+    }
+}.GetNewClosure()
+$validBlockedCompanion = & $newBlockedCompanionFixture
+$blockedCompanionAccepted = $false
+$blockedCompanionFailure = $null
+try {
+    Assert-D32D31RecoverySeederCompanionShape -Document $validBlockedCompanion -Path $companionPath -OutputRoot $companionOutputRoot `
+        -Repository $repo -CandidateSha $companionCandidate -ValidatedProfile $companionValidatedProfile -ExpectedModuleAdmission $companionAdmission
+    $blockedCompanionAccepted = $true
+}
+catch { $blockedCompanionFailure = $_.Exception.Message }
+Add-D32TraceIdentitySelfTestCase -Name 'D31 V1 companion envelope accepts an exact blocked-before-owner document while preserving strict V2 module-admission payload equality' `
+    -Passed $blockedCompanionAccepted -Detail $blockedCompanionFailure
+
+foreach ($companionMutation in @(
+        [PSCustomObject]@{ Name = 'runner PID'; Mutate = { param($value) $value.runner_process_id++ } },
+        [PSCustomObject]@{ Name = 'candidate SHA'; Mutate = { param($value) $value.candidate_sha = 'f' * 40 } },
+        [PSCustomObject]@{ Name = 'Profile V2 file ID'; Mutate = { param($value) $value.toolchain_profile.file_id_hex = '6' * 32 } },
+        [PSCustomObject]@{ Name = 'module admission context'; Mutate = { param($value) $value.powershell_module_admission.runner_process.process_id++ } },
+        [PSCustomObject]@{ Name = 'unknown outer field'; Mutate = { param($value) if ($value -is [System.Collections.IDictionary]) { $value['unapproved'] = $true } else { $value | Add-Member -NotePropertyName unapproved -NotePropertyValue $true -Force } } },
+        [PSCustomObject]@{ Name = 'invented not_run cleanup'; Mutate = { param($value) $value.process_cleanup.checked_at_utc = '2026-10-02T00:00:00.0000000Z' } },
+        [PSCustomObject]@{ Name = 'observed phase with not_run cleanup'; Mutate = { param($value) $value.fetch_phases = @([ordered]@{}) } },
+        [PSCustomObject]@{ Name = 'unknown companion version'; Mutate = { param($value) $value.schema_version = 2; $value.record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V2' } }
+    )) {
+    $mutatedCompanion = ConvertTo-D32FixtureAuthorityHashtable -Value (& $newBlockedCompanionFixture)
+    & $companionMutation.Mutate $mutatedCompanion
+    $companionRejected = $false
+    $companionFailure = $null
+    try {
+        Assert-D32D31RecoverySeederCompanionShape -Document $mutatedCompanion -Path $companionPath -OutputRoot $companionOutputRoot `
+            -Repository $repo -CandidateSha $companionCandidate -ValidatedProfile $companionValidatedProfile -ExpectedModuleAdmission $companionAdmission
+    }
+    catch {
+        $companionRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*'
+        $companionFailure = $_.Exception.Message
+    }
+    Add-D32TraceIdentitySelfTestCase -Name "D31 companion shape rejects $($companionMutation.Name) tampering" -Passed $companionRejected -Detail $companionFailure
+}
+
 foreach ($case in @(
         [PSCustomObject]@{ Name = 'missing file ID'; Mutate = { param($value) $null = $value.Remove('file_id_hex') } },
         [PSCustomObject]@{ Name = 'extra identity field'; Mutate = { param($value) $value.unapproved_identity_alias = '1' * 32 } },
@@ -1052,6 +1237,154 @@ $childIdentityDriftRejected = $false
 try { $null = Test-D32Phase0DebugProcessTrace -Trace $childIdentityDrift -ExpectedRootPath $cargoPath -ExpectedRootIdentity $cargoSnapshot -ExpectedParentProcessId $PID -ValidatedProfile $childProfile -Repository $repo }
 catch { $childIdentityDriftRejected = $_.Exception.Message -like 'PROCESS_TRACE_BLOCKED:*' }
 Add-D32TraceIdentitySelfTestCase -Name 'actual V2 reader rejects a pinned child opened-file identity drift' -Passed $childIdentityDriftRejected
+
+$phaseFixtureRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('d32-d31-process-phase-selftest-' + [Guid]::NewGuid().ToString('N'))))
+$phaseTestPassed = $false
+$phaseTestDetail = $null
+try {
+    $phaseLogs = Join-Path (Join-Path $phaseFixtureRoot 'run') 'logs'
+    [void][IO.Directory]::CreateDirectory($phaseLogs)
+    $phaseName = 'd31-seeder-01-fetch'
+    $phaseLog = Join-Path $phaseLogs $phaseName
+    $stdoutPath = $phaseLog + '.stdout.log'
+    $stderrPath = $phaseLog + '.stderr.log'
+    [IO.File]::WriteAllText($stdoutPath, 'synthetic stdout' + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($stderrPath, '', [Text.UTF8Encoding]::new($false))
+    $phaseArguments = @('fetch', '--locked', '--manifest-path', (Join-Path $repo 'vita-agent/Cargo.toml'), '--target', 'x86_64-pc-windows-msvc')
+    $phaseTrace = ConvertTo-D32FixtureAuthorityHashtable -Value $twoProcessTrace
+    $phaseTrace.processes[1].allowed_image_reason = 'caller-pinned-toolchain-native-or-Windows-image'
+    $phaseRoot = $phaseTrace.processes[0]
+    $phaseChild = $phaseTrace.processes[1]
+    $phaseRootDate = [DateTime]::FromFileTimeUtc([Int64]$phaseRoot.creation_filetime).ToString('o')
+    $phaseChildDate = [DateTime]::FromFileTimeUtc([Int64]$phaseChild.creation_filetime).ToString('o')
+    $phaseCommandLine = ConvertTo-D32CommandLine (@($cargoPath) + $phaseArguments)
+    $phaseRootRecord = [ordered]@{
+        process_id = [Int64]$phaseRoot.process_id; parent_process_id = [Int64]$phaseRoot.parent_process_id
+        name = 'cargo.exe'; image_path = [string]$phaseRoot.image_path; creation_date = $phaseRootDate
+        command_line = $phaseCommandLine; observed_at_utc = [string]$phaseRoot.created_at_utc; identity_verified = $true
+    }
+    $phaseCleanup = [ordered]@{
+        job_terminate_call_succeeded = $true; job_terminate_last_error = 0; process_was_already_signaled = $false
+        process_wait_signaled = $true; job_active_process_count_verified = $true; job_active_process_count = 0
+        job_active_process_count_last_error = 0; job_close_succeeded = $true; cleanup_succeeded = $true
+        already_closed = $false; detail = 'synthetic module-free trace fixture'
+    }
+    $phaseDocument = [ordered]@{
+        name = $phaseName; executable = $cargoPath; manifest_path = $phaseArguments[3]; lock_sha256 = 'f' * 64
+        command = $phaseArguments; command_line = $phaseCommandLine; working_directory = $repo; status = 'succeeded'; exit_code = 0
+        process_identity = $phaseRootRecord; root_record = $phaseRootRecord
+        descendant_records = @([ordered]@{
+            process_id = [Int64]$phaseChild.process_id; parent_process_id = [Int64]$phaseChild.parent_process_id
+            name = [IO.Path]::GetFileName([string]$phaseChild.image_path); image_path = [string]$phaseChild.image_path
+            creation_date = $phaseChildDate; command_line = 'synthetic-child.exe --no-network'
+            observed_at_utc = [string]$phaseChild.created_at_utc; identity_verified = $true
+        })
+        process_trace = $phaseTrace; native_cleanup = $phaseCleanup; reap = $null
+        phase_log = $phaseLog; stdout_log = $stdoutPath; stderr_log = $stderrPath
+        stdout_log_ref = Get-D32D31RecoverySeederFileReference -Path $stdoutPath
+        stderr_log_ref = Get-D32D31RecoverySeederFileReference -Path $stderrPath
+    }
+    $phaseAdmission = [ordered]@{ runner_process = [ordered]@{ process_id = [Int64]$PID; start_time_utc_ticks = [Int64]$runnerCreationForLedger.Ticks } }
+    $phaseParams = @{
+        ExpectedName = $phaseName; CargoPath = $cargoPath; Arguments = $phaseArguments; WorkingDirectory = $repo
+        CargoHome = (Join-Path $phaseFixtureRoot 'run/cargo-home'); RunRoot = (Join-Path $phaseFixtureRoot 'run')
+        Repository = $repo; ValidatedProfile = $childProfile; ExpectedModuleAdmission = $phaseAdmission
+        ProtocGrant = $null; ExpectedTargetRoot = $null
+    }
+    $null = Assert-D32D31RecoverySeederProcessPhase -Phase $phaseDocument @phaseParams
+    $phaseTestPassed = $true
+    foreach ($phaseMutation in @(
+            [PSCustomObject]@{ Name = 'root parent creation'; Mutate = { param($value) $value.process_trace.process_events[0].parent_creation_filetime++ } },
+            [PSCustomObject]@{ Name = 'CREATE/EXIT order'; Mutate = { param($value) $swap = $value.process_trace.process_events[1]; $value.process_trace.process_events[1] = $value.process_trace.process_events[2]; $value.process_trace.process_events[2] = $swap } },
+            [PSCustomObject]@{ Name = 'child image path'; Mutate = { param($value) $value.process_trace.processes[1].image_path = 'E:\d32\unapproved-child.exe' } },
+            [PSCustomObject]@{ Name = 'child opened file ID'; Mutate = { param($value) $value.process_trace.processes[1].file_id_hex = '9' * 32 } },
+            [PSCustomObject]@{ Name = 'descendant PID'; Mutate = { param($value) $value.descendant_records[0].process_id++ } },
+            [PSCustomObject]@{ Name = 'fixed command line'; Mutate = { param($value) $value.root_record.command_line += ' --offline' } },
+            [PSCustomObject]@{ Name = 'cleanup active process count'; Mutate = { param($value) $value.native_cleanup.job_active_process_count = 1 } },
+            [PSCustomObject]@{ Name = 'stdout reference hash'; Mutate = { param($value) $value.stdout_log_ref.sha256 = '0' * 64 } },
+            [PSCustomObject]@{ Name = 'unknown V2 trace field'; Mutate = { param($value) $value.process_trace['unapproved'] = $true } }
+        )) {
+        $badPhase = ConvertTo-D32FixtureAuthorityHashtable -Value $phaseDocument
+        & $phaseMutation.Mutate $badPhase
+        $phaseRejected = $false
+        $phaseFailure = $null
+        try { $null = Assert-D32D31RecoverySeederProcessPhase -Phase $badPhase @phaseParams }
+        catch {
+            $phaseRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*'
+            $phaseFailure = $_.Exception.Message
+        }
+        Add-D32TraceIdentitySelfTestCase -Name "D31 producer ProcessPhase rejects $($phaseMutation.Name) tampering" `
+            -Passed $phaseRejected -Detail $phaseFailure
+    }
+}
+catch { $phaseTestDetail = $_.Exception.Message }
+finally {
+    if ([IO.Directory]::Exists($phaseFixtureRoot) -and [IO.Path]::GetFileName($phaseFixtureRoot).StartsWith('d32-d31-process-phase-selftest-', [StringComparison]::Ordinal)) {
+        [IO.Directory]::Delete($phaseFixtureRoot, $true)
+    }
+}
+Add-D32TraceIdentitySelfTestCase -Name 'D31 producer ProcessPhase accepts a complete ordered child ledger bound to the admitted runner, caller-pinned child image, native cleanup, and opened stream refs' `
+    -Passed $phaseTestPassed -Detail $phaseTestDetail
+
+$recordFixtureRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('d32-d31-record-selftest-' + [Guid]::NewGuid().ToString('N'))))
+$recordSuitePassed = $false
+$recordSuiteDetail = $null
+try {
+    [void][IO.Directory]::CreateDirectory($recordFixtureRoot)
+    $recordPath = Join-Path $recordFixtureRoot 'd31-recovery-seeder-build.json'
+    $recordTarget = Join-Path $recordFixtureRoot 'd31-recovery-seeder-target'
+    $recordManifest = Get-D32FullPath (Join-Path $repo 'vita-agent/Cargo.toml')
+    $recordArguments = @('build', '--quiet', '--locked', '--manifest-path', $recordManifest, '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', $recordTarget)
+    $recordCandidate = '1234567890abcdef1234567890abcdef12345678'
+    $recordDocument = [ordered]@{
+        schema_version = 2; purpose = 'd31-recovery-seeder-test-helper'; run_id = 'abcdef0123456789abcdef0123456789'
+        candidate_sha = $recordCandidate; runner_process_id = [Int64]$PID; source_repo = $repo; manifest_path = $recordManifest
+        feature = 'd29-h9-test-helper'; command = $recordArguments; target_dir = $recordTarget
+        run_root = (Join-Path $recordFixtureRoot 'run'); cargo_home = (Join-Path $recordFixtureRoot 'run/cargo-home')
+        temp_root = (Join-Path $recordFixtureRoot 'run/temp'); toolchain_profile_path = $companionProfilePath
+        toolchain_profile_sha256 = 'c' * 64; target_triple = 'x86_64-pc-windows-msvc'
+        powershell = [ordered]@{}; toolchain = [ordered]@{}; fetch_manifests = @(); fetch_phases = @()
+        cargo_path = $cargoPath
+        process_identity = [ordered]@{
+            process_id = [Int64]($PID + 1100); parent_process_id = [Int64]$PID; name = 'cargo.exe'; image_path = $cargoPath
+            creation_date = [DateTimeOffset]::UtcNow.ToString('o'); command_line = ConvertTo-D32CommandLine (@($cargoPath) + $recordArguments)
+            observed_at_utc = [DateTimeOffset]::UtcNow.ToString('o'); identity_verified = $true
+        }
+        status = 'succeeded'; exit_code = 0
+        artifact = [ordered]@{
+            path = (Join-Path $recordTarget 'debug/vita-agent.exe'); bytes = [Int64]100; sha256 = 'd' * 64
+            file_identity = [ordered]@{}
+        }
+    }
+    $recordAccepted = $false
+    try { Assert-D32D31RecoverySeederRecordShape -Document $recordDocument -Path $recordPath -OutputRoot $recordFixtureRoot; $recordAccepted = $true }
+    catch { $recordSuiteDetail = $_.Exception.Message }
+    if (-not $recordAccepted) { throw "synthetic exact V2 record was rejected: $recordSuiteDetail" }
+    $recordNegativeResults = [System.Collections.Generic.List[bool]]::new()
+    foreach ($recordMutation in @(
+            [PSCustomObject]@{ Name = 'wrong parent'; Mutate = { param($value) $value.process_identity.parent_process_id++ } },
+            [PSCustomObject]@{ Name = 'fixed argv gained offline'; Mutate = { param($value) $value.command = @($value.command) + @('--offline') } },
+            [PSCustomObject]@{ Name = 'old V1 schema version'; Mutate = { param($value) $value.schema_version = 1 } },
+            [PSCustomObject]@{ Name = 'extra field'; Mutate = { param($value) $value['unapproved'] = $true } },
+            [PSCustomObject]@{ Name = 'artifact escaped fixed target'; Mutate = { param($value) $value.artifact.path = Join-Path $recordFixtureRoot 'other.exe' } }
+        )) {
+        $badRecord = ConvertTo-D32FixtureAuthorityHashtable -Value $recordDocument
+        & $recordMutation.Mutate $badRecord
+        $rejected = $false
+        try { Assert-D32D31RecoverySeederRecordShape -Document $badRecord -Path $recordPath -OutputRoot $recordFixtureRoot }
+        catch { $rejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_RECORD_INVALID:*' }
+        $recordNegativeResults.Add($rejected)
+    }
+    $recordSuitePassed = $recordAccepted -and @($recordNegativeResults | Where-Object { -not $_ }).Count -eq 0
+}
+catch { $recordSuiteDetail = $_.Exception.Message }
+finally {
+    if ([IO.Directory]::Exists($recordFixtureRoot) -and [IO.Path]::GetFileName($recordFixtureRoot).StartsWith('d32-d31-record-selftest-', [StringComparison]::Ordinal)) {
+        [IO.Directory]::Delete($recordFixtureRoot, $true)
+    }
+}
+Add-D32TraceIdentitySelfTestCase -Name 'historical D31 record V2 remains accepted while fixed argv, runner parent, schema, field set, and artifact path tampering are rejected' `
+    -Passed $recordSuitePassed -Detail $recordSuiteDetail
 
 if ($global:D32PowerShellModuleImportAttempts -ne 0) { throw 'SELFTEST_BLOCKED: module import attempts were not zero' }
 $moduleEnd = @(Microsoft.PowerShell.Core\Get-Module | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Version, $_.Path } | Sort-Object)

@@ -467,6 +467,309 @@ function Write-D32D31RecoverySeederCompanion {
     return Get-D32D31RecoverySeederFileReference -Path $full
 }
 
+function Assert-D32D31RecoverySeederCleanup {
+    param(
+        [Parameter(Mandatory = $true)][object]$Cleanup,
+        [Parameter(Mandatory = $true)][int]$ObservedPhaseCount
+    )
+    if (-not (Test-D32FixtureExactProperties -Object $Cleanup -Expected @('status', 'checked_at_utc', 'relevant_pattern', 'residual_identities', 'error')) -or
+        $Cleanup.status -isnot [string] -or $Cleanup.status -cnotin @('succeeded', 'failed', 'not_run') -or
+        $Cleanup.residual_identities -isnot [Array] -or $ObservedPhaseCount -lt 0) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: process cleanup attestation is malformed'
+    }
+
+    if ($Cleanup.status -ceq 'not_run') {
+        if ($ObservedPhaseCount -ne 0 -or $null -ne $Cleanup.checked_at_utc -or $null -ne $Cleanup.relevant_pattern -or
+            $Cleanup.residual_identities.Count -ne 0 -or $null -ne $Cleanup.error) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: not-run cleanup contradicts observed process phases or carries invented cleanup results'
+        }
+        return
+    }
+
+    $checkedAt = [DateTimeOffset]::MinValue
+    if ($Cleanup.checked_at_utc -isnot [string] -or
+        -not [DateTimeOffset]::TryParse([string]$Cleanup.checked_at_utc, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$checkedAt) -or $checkedAt.Offset -ne [TimeSpan]::Zero -or
+        $Cleanup.relevant_pattern -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Cleanup.relevant_pattern)) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: attempted cleanup requires a valid UTC timestamp and non-empty process pattern'
+    }
+    if ($Cleanup.status -ceq 'succeeded') {
+        if ($Cleanup.residual_identities.Count -ne 0 -or $null -ne $Cleanup.error) {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: successful process cleanup must prove no residual identities or errors'
+        }
+        return
+    }
+    if ($Cleanup.error -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Cleanup.error)) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: failed process cleanup must retain its primary cleanup error'
+    }
+}
+
+function Get-D32FixtureFieldValue {
+    param([Parameter(Mandatory = $true)][object]$Value, [Parameter(Mandatory = $true)][string]$Name)
+    if ($Value -is [System.Collections.IDictionary]) { return $Value[$Name] }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function ConvertTo-D32FixtureAuthorityHashtable {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = [ordered]@{}
+        foreach ($key in $Value.Keys) { $copy[[string]$key] = ConvertTo-D32FixtureAuthorityHashtable -Value $Value[$key] }
+        return ,$copy
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $copy = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $copy[[string]$property.Name] = ConvertTo-D32FixtureAuthorityHashtable -Value $property.Value
+        }
+        return ,$copy
+    }
+    if ($Value -is [Array]) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) { $items.Add((ConvertTo-D32FixtureAuthorityHashtable -Value $item)) }
+        return ,$items.ToArray()
+    }
+    return $Value
+}
+
+function Assert-D32FixtureDebugProcessTraceLedger {
+    param(
+        [Parameter(Mandatory = $true)][object]$Trace,
+        [Parameter(Mandatory = $true)][string]$ExpectedRootPath,
+        [Parameter(Mandatory = $true)][object]$ExpectedRootIdentity,
+        [Parameter(Mandatory = $true)][int]$ExpectedRunnerProcessId,
+        [Parameter(Mandatory = $true)][long]$ExpectedRunnerCreationFileTime,
+        [string]$ErrorPrefix = 'D31_RECOVERY_SEEDER_COMPANION_INVALID'
+    )
+    $traceFields = @('record_type', 'schema_version', 'event_source', 'state', 'block_reason', 'debugger_process_id',
+        'uncontinued_create_process_id', 'uncontinued_create_continue_call_count', 'debugger_thread_id', 'dedicated_debugger_thread',
+        'debugger_kill_on_exit_enabled', 'root_resumed_after_kill_on_exit', 'debugger_thread_exited', 'debugger_thread_joined',
+        'retained_process_handle_count', 'retained_process_handles_signaled', 'debugger_association_query_verified', 'debugger_association_absent',
+        'debugger_creation_filetime', 'debugger_created_at_utc', 'started_at_utc', 'completed_at_utc', 'debug_event_count',
+        'process_create_event_count', 'process_exit_event_count', 'process_event_count', 'thread_create_event_count', 'thread_exit_event_count',
+        'image_load_event_count', 'image_unload_event_count', 'exception_event_count', 'debug_string_event_count', 'wait_timeout_count',
+        'debug_api_error_count', 'event_chain_complete', 'job_accounting_verified', 'job_total_processes', 'job_active_processes',
+        'accounting_consistent', 'injected_interruption', 'process_events', 'processes')
+    $eventFields = @('sequence', 'kind', 'process_id', 'parent_process_id', 'creation_filetime', 'parent_creation_filetime', 'exit_code')
+    $processFields = @('process_id', 'parent_process_id', 'creation_filetime', 'parent_creation_filetime', 'image_path', 'bytes', 'sha256',
+        'volume_serial_hex', 'file_id_hex', 'allowed_image_reason', 'image_verified', 'exited', 'exit_code', 'create_sequence', 'exit_sequence',
+        'created_at_utc', 'exited_at_utc')
+    $counterFields = @('debug_event_count', 'process_create_event_count', 'process_exit_event_count', 'process_event_count',
+        'thread_create_event_count', 'thread_exit_event_count', 'image_load_event_count', 'image_unload_event_count',
+        'exception_event_count', 'debug_string_event_count', 'wait_timeout_count', 'debug_api_error_count',
+        'job_total_processes', 'job_active_processes')
+    foreach ($counterField in $counterFields) {
+        $counterValue = Get-D32FixtureFieldValue -Value $Trace -Name $counterField
+        if (-not (Test-D32FixtureBuildBudgetInteger -Value $counterValue) -or [Int64]$counterValue -lt 0) {
+            throw "${ErrorPrefix}: trace counter $counterField is not a non-negative integer"
+        }
+    }
+    if (-not (Test-D32FixtureExactProperties -Object $Trace -Expected $traceFields) -or
+        $Trace.record_type -isnot [string] -or $Trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.schema_version) -or [Int64]$Trace.schema_version -ne 2 -or
+        $Trace.event_source -isnot [string] -or $Trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or
+        $Trace.state -isnot [string] -or $Trace.state -cne 'COMPLETED' -or $null -ne $Trace.block_reason -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.debugger_process_id) -or [Int64]$Trace.debugger_process_id -ne $ExpectedRunnerProcessId -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.debugger_creation_filetime) -or
+        [Int64]$Trace.debugger_creation_filetime -ne $ExpectedRunnerCreationFileTime -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.debugger_thread_id) -or [Int64]$Trace.debugger_thread_id -le 0 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.uncontinued_create_process_id) -or [Int64]$Trace.uncontinued_create_process_id -ne 0 -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.uncontinued_create_continue_call_count) -or [Int64]$Trace.uncontinued_create_continue_call_count -ne 0 -or
+        $Trace.dedicated_debugger_thread -isnot [bool] -or -not $Trace.dedicated_debugger_thread -or
+        $Trace.debugger_kill_on_exit_enabled -isnot [bool] -or -not $Trace.debugger_kill_on_exit_enabled -or
+        $Trace.root_resumed_after_kill_on_exit -isnot [bool] -or -not $Trace.root_resumed_after_kill_on_exit -or
+        $Trace.debugger_thread_exited -isnot [bool] -or -not $Trace.debugger_thread_exited -or
+        $Trace.debugger_thread_joined -isnot [bool] -or -not $Trace.debugger_thread_joined -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $Trace.retained_process_handle_count) -or
+        [Int64]$Trace.retained_process_handle_count -le 0 -or
+        $Trace.retained_process_handles_signaled -isnot [bool] -or -not $Trace.retained_process_handles_signaled -or
+        $Trace.debugger_association_query_verified -isnot [bool] -or -not $Trace.debugger_association_query_verified -or
+        $Trace.debugger_association_absent -isnot [bool] -or -not $Trace.debugger_association_absent -or
+        $Trace.event_chain_complete -isnot [bool] -or -not $Trace.event_chain_complete -or
+        $Trace.job_accounting_verified -isnot [bool] -or -not $Trace.job_accounting_verified -or
+        $Trace.accounting_consistent -isnot [bool] -or -not $Trace.accounting_consistent -or
+        $Trace.injected_interruption -isnot [bool] -or $Trace.injected_interruption -or
+        $Trace.process_events -isnot [Array] -or $Trace.processes -isnot [Array]) {
+        throw "${ErrorPrefix}: V2 process trace schema, runner identity, or completed Job state is invalid"
+    }
+    $createCount = [Int64]$Trace.process_create_event_count
+    $exitCount = [Int64]$Trace.process_exit_event_count
+    $eventCount = [Int64]$Trace.process_event_count
+    if ($createCount -le 0 -or $createCount -ne $exitCount -or $eventCount -ne ($createCount + $exitCount) -or
+        [Int64]$Trace.process_events.Count -ne $eventCount -or [Int64]$Trace.processes.Count -ne $createCount -or
+        [Int64]$Trace.job_total_processes -ne $createCount -or [Int64]$Trace.job_active_processes -ne 0 -or
+        [Int64]$Trace.retained_process_handle_count -lt ($createCount + 1) -or
+        [Int64]$Trace.debug_api_error_count -ne 0 -or [Int64]$Trace.wait_timeout_count -ne 0 -or
+        [Int64]$Trace.debug_event_count -ne ($eventCount + [Int64]$Trace.thread_create_event_count + [Int64]$Trace.thread_exit_event_count +
+            [Int64]$Trace.image_load_event_count + [Int64]$Trace.image_unload_event_count + [Int64]$Trace.exception_event_count +
+            [Int64]$Trace.debug_string_event_count)) {
+        throw "${ErrorPrefix}: process-event totals do not reconcile with the completed V2 Job trace"
+    }
+
+    $traceTimes = @{}
+    foreach ($timeName in @('debugger_created_at_utc', 'started_at_utc', 'completed_at_utc')) {
+        $timeValue = Get-D32FixtureFieldValue -Value $Trace -Name $timeName
+        $parsed = [DateTimeOffset]::MinValue
+        if ($timeValue -isnot [string] -or
+            -not [DateTimeOffset]::TryParse([string]$timeValue, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+            throw "${ErrorPrefix}: $timeName is not a round-trip timestamp"
+        }
+        $traceTimes[$timeName] = $parsed
+    }
+    $debuggerTime = [DateTime]::FromFileTimeUtc([Int64]$Trace.debugger_creation_filetime)
+    if ([Math]::Abs(($traceTimes.debugger_created_at_utc - [DateTimeOffset]$debuggerTime).TotalSeconds) -gt 1 -or
+        $traceTimes.started_at_utc -lt $traceTimes.debugger_created_at_utc -or
+        $traceTimes.completed_at_utc -lt $traceTimes.started_at_utc) {
+        throw "${ErrorPrefix}: debugger creation, trace start, and completion timestamps do not reconcile"
+    }
+
+    $active = @{}
+    $seenIdentities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $eventByIdentity = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $createOrder = [System.Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $Trace.process_events.Count; $index++) {
+        $event = $Trace.process_events[$index]
+        if (-not (Test-D32FixtureExactProperties -Object $event -Expected $eventFields) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.sequence) -or [Int64]$event.sequence -ne ($index + 1) -or
+            $event.kind -isnot [string] -or $event.kind -cnotin @('CREATE', 'EXIT') -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.process_id) -or [Int64]$event.process_id -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.parent_process_id) -or [Int64]$event.parent_process_id -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.creation_filetime) -or [Int64]$event.creation_filetime -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.parent_creation_filetime) -or [Int64]$event.parent_creation_filetime -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $event.exit_code)) {
+            throw "${ErrorPrefix}: process event[$index] schema/identity is invalid"
+        }
+        $identityKey = '{0}|{1}' -f [Int64]$event.process_id, [Int64]$event.creation_filetime
+        if ($event.kind -ceq 'CREATE') {
+            if ([Int64]$event.exit_code -ne 0 -or $active.ContainsKey([uint32]$event.process_id) -or -not $seenIdentities.Add($identityKey)) {
+                throw "${ErrorPrefix}: CREATE event carries exit data or duplicates an active/reused identity at event $index"
+            }
+            if ($index -eq 0) {
+                if ([Int64]$event.creation_filetime -le $ExpectedRunnerCreationFileTime -or
+                    [Int64]$event.parent_process_id -ne $ExpectedRunnerProcessId -or
+                    [Int64]$event.parent_creation_filetime -ne $ExpectedRunnerCreationFileTime) {
+                    throw "${ErrorPrefix}: root CREATE parent PID/creation identity differs from the admitted runner"
+                }
+            }
+            elseif (-not $active.ContainsKey([uint32]$event.parent_process_id) -or
+                [Int64]$active[[uint32]$event.parent_process_id].creation_filetime -ne [Int64]$event.parent_creation_filetime) {
+                throw "${ErrorPrefix}: child CREATE parent is unknown, exited, or has the wrong creation identity at event $index"
+            }
+            $active[[uint32]$event.process_id] = [PSCustomObject]@{
+                creation_filetime = [Int64]$event.creation_filetime
+                parent_process_id = [uint32]$event.parent_process_id
+                parent_creation_filetime = [Int64]$event.parent_creation_filetime
+                create_sequence = [Int64]$event.sequence
+                exit_sequence = 0L
+                exit_code = 0L
+            }
+            $eventByIdentity.Add($identityKey, [PSCustomObject]@{ create = $event; exit = $null })
+            $createOrder.Add($identityKey)
+        }
+        else {
+            if (-not $active.ContainsKey([uint32]$event.process_id)) {
+                throw "${ErrorPrefix}: EXIT has no active CREATE identity at event $index"
+            }
+            $activeRecord = $active[[uint32]$event.process_id]
+            if ([Int64]$activeRecord.creation_filetime -ne [Int64]$event.creation_filetime -or
+                [Int64]$activeRecord.parent_process_id -ne [Int64]$event.parent_process_id -or
+                [Int64]$activeRecord.parent_creation_filetime -ne [Int64]$event.parent_creation_filetime) {
+                throw "${ErrorPrefix}: EXIT identity differs from its active CREATE identity at event $index"
+            }
+            $activeRecord.exit_sequence = [Int64]$event.sequence
+            $activeRecord.exit_code = [Int64]$event.exit_code
+            $eventByIdentity[$identityKey].exit = $event
+            $active.Remove([uint32]$event.process_id)
+        }
+    }
+    if ($active.Count -ne 0 -or $createOrder.Count -ne $Trace.processes.Count) {
+        throw "${ErrorPrefix}: process event ledger ends with active identities or an incomplete process table"
+    }
+
+    $processByIdentity = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $Trace.processes.Count; $index++) {
+        $process = $Trace.processes[$index]
+        if (-not (Test-D32FixtureExactProperties -Object $process -Expected $processFields) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.process_id) -or [Int64]$process.process_id -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.parent_process_id) -or [Int64]$process.parent_process_id -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.creation_filetime) -or [Int64]$process.creation_filetime -le 0 -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.parent_creation_filetime) -or [Int64]$process.parent_creation_filetime -le 0 -or
+            $process.image_path -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path $process.image_path) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.bytes) -or [Int64]$process.bytes -le 0 -or
+            $process.sha256 -isnot [string] -or $process.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $process.volume_serial_hex -isnot [string] -or $process.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
+            $process.file_id_hex -isnot [string] -or $process.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            $process.allowed_image_reason -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$process.allowed_image_reason) -or
+            $process.image_verified -isnot [bool] -or -not $process.image_verified -or
+            $process.exited -isnot [bool] -or -not $process.exited -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.exit_code) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.create_sequence) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $process.exit_sequence)) {
+            throw "${ErrorPrefix}: process image/exit record[$index] is malformed or unverified"
+        }
+        $identityKey = '{0}|{1}' -f [Int64]$process.process_id, [Int64]$process.creation_filetime
+        if ($processByIdentity.ContainsKey($identityKey) -or -not $eventByIdentity.ContainsKey($identityKey) -or
+            $identityKey -cne $createOrder[$index]) {
+            throw "${ErrorPrefix}: process record[$index] is duplicate, missing, or out of CREATE order"
+        }
+        $pair = $eventByIdentity[$identityKey]
+        if ($null -eq $pair.exit -or
+            [Int64]$process.parent_process_id -ne [Int64]$pair.create.parent_process_id -or
+            [Int64]$process.parent_creation_filetime -ne [Int64]$pair.create.parent_creation_filetime -or
+            [Int64]$process.create_sequence -ne [Int64]$pair.create.sequence -or
+            [Int64]$process.exit_sequence -ne [Int64]$pair.exit.sequence -or
+            [Int64]$process.exit_code -ne [Int64]$pair.exit.exit_code) {
+            throw "${ErrorPrefix}: process record[$index] does not reconcile with its ordered CREATE/EXIT pair"
+        }
+        foreach ($timeName in @('created_at_utc', 'exited_at_utc')) {
+            $timeValue = Get-D32FixtureFieldValue -Value $process -Name $timeName
+            $parsed = [DateTimeOffset]::MinValue
+            if ($timeValue -isnot [string] -or
+                -not [DateTimeOffset]::TryParse([string]$timeValue, [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+                throw "${ErrorPrefix}: process record[$index] $timeName is not a round-trip timestamp"
+            }
+        }
+        if ([DateTimeOffset]::Parse([string]$process.exited_at_utc) -lt [DateTimeOffset]::Parse([string]$process.created_at_utc)) {
+            throw "${ErrorPrefix}: process record[$index] exit precedes its CREATE timestamp"
+        }
+        $processByIdentity.Add($identityKey, $process)
+    }
+    $root = $Trace.processes[0]
+    foreach ($field in @('path', 'sha256', 'bytes', 'volume_serial_hex', 'file_id_hex')) {
+        $expectedProperty = $ExpectedRootIdentity.PSObject.Properties[$field]
+        $expectedValue = if ($ExpectedRootIdentity -is [System.Collections.IDictionary]) {
+            $ExpectedRootIdentity[$field]
+        }
+        elseif ($null -ne $expectedProperty) {
+            $expectedProperty.Value
+        }
+        else { $null }
+        if ($null -eq $expectedValue -and $field -cne 'path') {
+            throw "${ErrorPrefix}: caller-pinned root image omits $field"
+        }
+        if ($field -ceq 'path') {
+            if ($expectedValue -isnot [string] -or -not (Test-D32ProfilePathEqual -Left ([string]$root.image_path) -Right ([string]$ExpectedRootPath)) -or
+                -not (Test-D32ProfilePathEqual -Left ([string]$ExpectedRootPath) -Right $expectedValue)) {
+                throw "${ErrorPrefix}: root image path differs from the exact caller-pinned Cargo image"
+            }
+        }
+        elseif ([string]$root.$field -cne [string]$expectedValue) {
+            throw "${ErrorPrefix}: root image $field differs from the exact caller-pinned Cargo image"
+        }
+    }
+    if ([Int64]$root.parent_process_id -ne $ExpectedRunnerProcessId -or
+        [Int64]$root.parent_creation_filetime -ne $ExpectedRunnerCreationFileTime -or
+        [string]$root.allowed_image_reason -cne 'exact-caller-pinned-fixed-root-image') {
+        throw "${ErrorPrefix}: root process record does not bind the admitted runner and fixed Cargo image"
+    }
+    return $Trace
+}
+
 function Assert-D32D31RecoverySeederCompanionShape {
     param(
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Document,
@@ -510,11 +813,9 @@ function Assert-D32D31RecoverySeederCompanionShape {
         [Int64]$Document.powershell_module_admission.runner_process.process_id -ne [Int64]$Document.runner_process_id) {
         throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: exact admitted D31 fixture-prebuild runner context is missing or stale'
     }
-    if (-not (Test-D32FixtureExactProperties -Object $Document.process_cleanup -Expected @('status', 'checked_at_utc', 'relevant_pattern', 'residual_identities', 'error')) -or
-        [string]$Document.process_cleanup.status -notin @('succeeded', 'failed', 'not_run') -or
-        $Document.process_cleanup.residual_identities -isnot [Array]) {
-        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: process cleanup attestation is malformed'
-    }
+    $observedPhaseCount = if ($Document.fetch_phases -is [Array]) { [int]$Document.fetch_phases.Count } else { 0 }
+    if ($null -ne $Document.build_phase) { $observedPhaseCount++ }
+    Assert-D32D31RecoverySeederCleanup -Cleanup $Document.process_cleanup -ObservedPhaseCount $observedPhaseCount
     foreach ($directoryName in @('run_root', 'cargo_home', 'temp_root')) {
         $expectedPath = switch ($directoryName) {
             'run_root' { Join-Path $OutputRoot "d31-recovery-seeder-run-$($Document.run_id)"; break }
@@ -606,7 +907,9 @@ function Assert-D32D31RecoverySeederCompanionShape {
                 throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: locked fetch command/lock binding differs at index $index"
             }
             Assert-D32D31RecoverySeederProcessPhase -Phase $phase -ExpectedName $expectedName -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) `
-                -Arguments $expectedArguments -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path)
+                -Arguments $expectedArguments -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path) `
+                -Repository $Repository -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ExpectedModuleAdmission `
+                -ProtocGrant $grant -ExpectedTargetRoot $null
         }
         $expectedBuildArguments = @('build', '--quiet', '--locked', '--manifest-path', (Get-D32FullPath (Join-Path $Repository 'vita-agent/Cargo.toml')),
             '--bin', 'vita-agent', '--features', 'd29-h9-test-helper', '--target-dir', (Join-Path $OutputRoot 'd31-recovery-seeder-target'))
@@ -617,7 +920,9 @@ function Assert-D32D31RecoverySeederCompanionShape {
         }
         Assert-D32D31RecoverySeederProcessPhase -Phase $Document.build_phase -ExpectedName 'd31-recovery-seeder' `
             -CargoPath ([string]$ValidatedProfile.Profile.toolchain.cargo.path) -Arguments $expectedBuildArguments `
-            -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path)
+            -WorkingDirectory $Repository -CargoHome ([string]$Document.cargo_home.path) -RunRoot ([string]$Document.run_root.path) `
+            -Repository $Repository -ValidatedProfile $ValidatedProfile -ExpectedModuleAdmission $ExpectedModuleAdmission `
+            -ProtocGrant $grant -ExpectedTargetRoot (Join-Path $OutputRoot 'd31-recovery-seeder-target')
         $recordArtifact = Get-D32BoundArtifactWithFileId -Path ([string]$Document.seeder_record.path)
         if ($recordArtifact.bytes -ne [uint64]$Document.seeder_record.bytes -or $recordArtifact.sha256 -cne [string]$Document.seeder_record.sha256 -or
             $recordArtifact.volume_serial_hex -cne [string]$Document.seeder_record.volume_serial_hex -or $recordArtifact.file_id_hex -cne [string]$Document.seeder_record.file_id_hex -or
@@ -653,12 +958,7 @@ function Assert-D32D31RecoverySeederCompanionShape {
             ([string]$Document.process_cleanup.status -ceq 'succeeded' -and @($Document.process_cleanup.residual_identities).Count -ne 0)) {
             throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked companion must preserve a reason and cannot contradict cleanup evidence'
         }
-        if ($Document.fetch_phases -isnot [Array] -or @($Document.fetch_phases).Count -gt 3 -or
-            ($Document.process_cleanup.status -ceq 'not_run' -and (@($Document.fetch_phases).Count -gt 0 -or $null -ne $Document.build_phase)) -or
-            ($Document.process_cleanup.status -ceq 'succeeded' -and ($null -eq $Document.process_cleanup.checked_at_utc -or
-                $null -ne $Document.process_cleanup.error)) -or
-            ($Document.process_cleanup.status -ceq 'failed' -and ([string]::IsNullOrWhiteSpace([string]$Document.process_cleanup.error) -or
-                $null -eq $Document.process_cleanup.checked_at_utc))) {
+        if ($Document.fetch_phases -isnot [Array] -or @($Document.fetch_phases).Count -gt 3) {
             throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: blocked phase and cleanup state is inconsistent'
         }
         foreach ($phase in (@($Document.fetch_phases) + @($Document.build_phase) | Where-Object { $null -ne $_ })) {
@@ -702,6 +1002,84 @@ function Assert-D32D31RecoverySeederCompanionShape {
     }
 }
 
+function Assert-D32D31RecoverySeederChildImage {
+    param(
+        [Parameter(Mandatory = $true)][object]$Process,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [AllowNull()][object]$ProtocGrant,
+        [AllowNull()][string]$ExpectedTargetRoot
+    )
+    $imagePath = [string]$Process.image_path
+    $imageName = [IO.Path]::GetFileName($imagePath).ToLowerInvariant()
+    $imageBytes = [Int64]$Process.bytes
+    $imageSha256 = [string]$Process.sha256
+    if ([IO.Path]::GetExtension($imagePath).ToLowerInvariant() -in @('.bat', '.cmd') -or
+        $imageName -in @('cmd.exe', 'command.com', 'cscript.exe', 'wscript.exe', 'mshta.exe', 'bash.exe', 'sh.exe', 'dash.exe', 'zsh.exe', 'fish.exe', 'nu.exe', 'pageant.exe') -or
+        $imageName.StartsWith('powershell', [StringComparison]::Ordinal) -or $imageName.StartsWith('pwsh', [StringComparison]::Ordinal) -or
+        $imageName.StartsWith('wsl', [StringComparison]::Ordinal) -or $imageName -ceq 'git.exe' -or
+        $imageName.StartsWith('git-bash', [StringComparison]::Ordinal) -or $imageName.StartsWith('git-cmd', [StringComparison]::Ordinal) -or
+        $imageName.StartsWith('git-lfs', [StringComparison]::Ordinal) -or $imageName.StartsWith('git-remote-', [StringComparison]::Ordinal) -or
+        $imageName.StartsWith('git-credential', [StringComparison]::Ordinal) -or $imageName.Contains('credential') -or
+        $imageName.StartsWith('ssh', [StringComparison]::Ordinal) -or $imageName.StartsWith('plink', [StringComparison]::Ordinal) -or
+        $imageName.StartsWith('putty', [StringComparison]::Ordinal) -or $imageName.StartsWith('tortoiseplink', [StringComparison]::Ordinal)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: hard-denied shell/Git/credential helper image in ${ExpectedName}: $imagePath"
+    }
+
+    $isVctip = $imageName -ceq 'vctip.exe' -or
+        ($imageBytes -eq 335328 -and $imageSha256 -ceq 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996')
+    if ($isVctip) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: VCTIP is not authorized for the D31 seeder trace: $imagePath"
+    }
+
+    $isProtoc = $imageName -ceq 'protoc.exe' -or
+        ($imageBytes -eq 11934496 -and $imageSha256 -ceq 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2')
+    if ($isProtoc) {
+        if ($imageName -cne 'protoc.exe' -or $ExpectedName -cne 'd31-recovery-seeder' -or $null -eq $ProtocGrant -or
+            $null -eq $ProtocGrant.Image -or $null -eq $ProtocGrant.Document) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: protoc is not authorized in $ExpectedName"
+        }
+        $expectedProtoc = $ProtocGrant.Image
+        $cargoHome = [string]$ProtocGrant.Document.cargo_home.path
+        $expectedProtocPath = Join-Path (Join-Path (Join-Path (Join-Path $cargoHome 'registry/src') 'index.crates.io-1949cf8c6b5b557f') 'protoc-bin-vendored-win32-3.2.0') 'bin/protoc.exe'
+        if (-not (Test-D32ProfilePathEqual -Left ([string]$expectedProtoc.Path) -Right $expectedProtocPath) -or
+            -not (Test-D32ProfilePathEqual -Left $imagePath -Right ([string]$expectedProtoc.Path)) -or
+            $imageBytes -ne [Int64]$expectedProtoc.Bytes -or $imageSha256 -cne [string]$expectedProtoc.Sha256 -or
+            [string]$Process.volume_serial_hex -cne [string]$expectedProtoc.VolumeSerialHex -or
+            [string]$Process.file_id_hex -cne [string]$expectedProtoc.FileIdHex -or
+            [string]$Process.allowed_image_reason -cne 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root') {
+            throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: protoc image differs from the exact opened per-run grant'
+        }
+        return
+    }
+
+    $allProfileImages = @($ValidatedProfile.ExecutableInventory) + @($ValidatedProfile.WindowsImageInventory)
+    $profileImages = @($allProfileImages | Where-Object {
+        Test-D32ProfilePathEqual -Left ([string]$_.Path) -Right $imagePath
+    })
+    if ($profileImages.Count -gt 1) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: caller-pinned child image is ambiguous in ${ExpectedName}: $imagePath"
+    }
+    if ($profileImages.Count -eq 1) {
+        $pin = $profileImages[0]
+        if ($imageBytes -ne [Int64]$pin.Bytes -or $imageSha256 -cne [string]$pin.Sha256 -or
+            [string]$Process.volume_serial_hex -cne [string]$pin.VolumeSerialHex -or
+            [string]$Process.file_id_hex -cne [string]$pin.FileIdHex -or
+            [string]$Process.allowed_image_reason -cne 'caller-pinned-toolchain-native-or-Windows-image') {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: caller-pinned child opened identity/reason drifted in ${ExpectedName}: $imagePath"
+        }
+        return
+    }
+
+    if ($ExpectedName -ceq 'd31-recovery-seeder' -and -not [string]::IsNullOrWhiteSpace($ExpectedTargetRoot) -and
+        [IO.Path]::GetExtension($imagePath).Equals('.exe', [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-D32ProfilePathWithin -Child $imagePath -Parent $ExpectedTargetRoot) -and
+        [string]$Process.allowed_image_reason -ceq 'candidate-owned-target-image-observed-by-opened-handle') {
+        return
+    }
+    throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: unknown child/helper image outside caller-pinned toolchain, exact protoc grant, and seeder target: $imagePath"
+}
+
 function Assert-D32D31RecoverySeederProcessPhase {
     param(
         [Parameter(Mandatory = $true)][object]$Phase,
@@ -710,7 +1088,12 @@ function Assert-D32D31RecoverySeederProcessPhase {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$CargoHome,
-        [Parameter(Mandatory = $true)][string]$RunRoot
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][object]$ValidatedProfile,
+        [Parameter(Mandatory = $true)][object]$ExpectedModuleAdmission,
+        [AllowNull()][object]$ProtocGrant,
+        [AllowNull()][string]$ExpectedTargetRoot
     )
     $expectedPhaseFields = if ($ExpectedName -ceq 'd31-recovery-seeder') {
         @('name', 'executable', 'command', 'command_line', 'working_directory', 'status', 'exit_code', 'process_identity',
@@ -749,6 +1132,47 @@ function Assert-D32D31RecoverySeederProcessPhase {
         throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName nested phase schema or array types are invalid"
     }
     $trace = $Phase.process_trace
+    $runnerContext = $ExpectedModuleAdmission.runner_process
+    if (-not (Test-D32FixtureBuildBudgetInteger -Value $runnerContext.process_id) -or [Int64]$runnerContext.process_id -ne [Int64]$PID -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $runnerContext.start_time_utc_ticks) -or [Int64]$runnerContext.start_time_utc_ticks -le 0) {
+        throw 'D31_RECOVERY_SEEDER_COMPANION_INVALID: current module admission lacks the exact active runner PID/creation context'
+    }
+    $expectedRunnerCreationFileTime = [DateTime]::new([Int64]$runnerContext.start_time_utc_ticks, [DateTimeKind]::Utc).ToFileTimeUtc()
+    Assert-D32FixtureDebugProcessTraceLedger -Trace $trace -ExpectedRootPath $CargoPath `
+        -ExpectedRootIdentity $ValidatedProfile.Profile.toolchain.cargo -ExpectedRunnerProcessId ([int]$PID) `
+        -ExpectedRunnerCreationFileTime $expectedRunnerCreationFileTime
+    foreach ($childProcess in @($trace.processes | Select-Object -Skip 1)) {
+        Assert-D32D31RecoverySeederChildImage -Process $childProcess -ExpectedName $ExpectedName -ValidatedProfile $ValidatedProfile `
+            -ProtocGrant $ProtocGrant -ExpectedTargetRoot $ExpectedTargetRoot
+    }
+    $traceDescendants = @($trace.processes | Select-Object -Skip 1)
+    if ($Phase.descendant_records.Count -ne $traceDescendants.Count) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName descendant process-identity table is incomplete"
+    }
+    for ($descendantIndex = 0; $descendantIndex -lt $traceDescendants.Count; $descendantIndex++) {
+        $traceIdentity = $traceDescendants[$descendantIndex]
+        $descendant = $Phase.descendant_records[$descendantIndex]
+        $creation = [DateTimeOffset]::MinValue
+        if (-not [bool]$descendant.identity_verified -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $descendant.process_id) -or
+            -not (Test-D32FixtureBuildBudgetInteger -Value $descendant.parent_process_id) -or
+            [Int64]$descendant.process_id -ne [Int64]$traceIdentity.process_id -or
+            [Int64]$descendant.parent_process_id -ne [Int64]$traceIdentity.parent_process_id -or
+            $descendant.name -isnot [string] -or [string]$descendant.name -cne [IO.Path]::GetFileName([string]$traceIdentity.image_path) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$descendant.image_path) -Right ([string]$traceIdentity.image_path)) -or
+            $descendant.creation_date -isnot [string] -or
+            -not [DateTimeOffset]::TryParse([string]$descendant.creation_date, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$creation) -or
+            $creation.UtcDateTime.ToFileTimeUtc() -ne [Int64]$traceIdentity.creation_filetime) {
+            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName descendant[$descendantIndex] does not match its ordered CREATE identity"
+        }
+    }
+    $rootCreation = [DateTimeOffset]::MinValue
+    if ($Phase.root_record.creation_date -isnot [string] -or
+        -not [DateTimeOffset]::TryParse([string]$Phase.root_record.creation_date, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$rootCreation)) {
+        throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName root creation date is malformed"
+    }
     if ([string]$trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or [int]$trace.schema_version -ne 2 -or
         [string]$trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or
         [string]$trace.state -cne 'COMPLETED' -or $null -ne $trace.block_reason -or
@@ -804,8 +1228,10 @@ function Assert-D32D31RecoverySeederProcessPhase {
         [Int64]$Phase.process_trace.processes[0].creation_filetime -le 0 -or
         -not (Test-D32ProfilePathEqual -Left ([string]$Phase.process_trace.processes[0].image_path) -Right $CargoPath) -or
         [string]$Phase.process_trace.processes[0].allowed_image_reason -cne 'exact-caller-pinned-fixed-root-image' -or
-        @($Phase.descendant_records | ForEach-Object { [Int64]$_.process_id } | Sort-Object) -join ',' -cne
-            (@($Phase.process_trace.processes | Select-Object -Skip 1 | ForEach-Object { [Int64]$_.process_id } | Sort-Object) -join ',') -or
+        [Int64]$Phase.root_record.process_id -ne [Int64]$Phase.process_trace.processes[0].process_id -or
+        [Int64]$Phase.root_record.parent_process_id -ne [Int64]$Phase.process_trace.processes[0].parent_process_id -or
+        [Int64]$rootCreation.UtcDateTime.ToFileTimeUtc() -ne [Int64]$Phase.process_trace.processes[0].creation_filetime -or
+        [Int64]$Phase.exit_code -ne [Int64]$Phase.process_trace.processes[0].exit_code -or
         $null -eq $Phase.native_cleanup -or -not [bool]$Phase.native_cleanup.job_terminate_call_succeeded -or -not [bool]$Phase.native_cleanup.cleanup_succeeded -or
         -not [bool]$Phase.native_cleanup.job_close_succeeded -or -not [bool]$Phase.native_cleanup.process_wait_signaled -or
         -not [bool]$Phase.native_cleanup.job_active_process_count_verified -or [uint32]$Phase.native_cleanup.job_active_process_count -ne 0 -or
@@ -837,21 +1263,6 @@ function Assert-D32D31RecoverySeederProcessPhase {
     [void](Assert-D32NoReparsePath -Path ([string]$Phase.stdout_log))
     [void](Assert-D32NoReparsePath -Path ([string]$Phase.stderr_log))
     Assert-D32D31RecoverySeederOptionalPhaseLogs -Phase $Phase -RequireComplete
-    $expectedProtocPath = Join-Path (Join-Path (Join-Path (Join-Path $CargoHome 'registry/src') 'index.crates.io-1949cf8c6b5b557f') 'protoc-bin-vendored-win32-3.2.0') 'bin/protoc.exe'
-    foreach ($process in $Phase.process_trace.processes) {
-        $isVctip = ([IO.Path]::GetFileName([string]$process.image_path) -ieq 'vctip.exe') -or
-            ([Int64]$process.bytes -eq 335328 -and [string]$process.sha256 -ceq 'e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996')
-        if ($isVctip) { throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: VCTIP was observed in the D31-only process trace for $ExpectedName" }
-        $isProtoc = [IO.Path]::GetFileName([string]$process.image_path) -ieq 'protoc.exe'
-        if ($isProtoc -and $ExpectedName -cne 'd31-recovery-seeder') {
-            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: protoc is not authorized during locked fetch phase $ExpectedName"
-        }
-        if ($isProtoc -and (-not (Test-D32ProfilePathEqual -Left ([string]$process.image_path) -Right $expectedProtocPath) -or
-            [Int64]$process.bytes -ne 11934496 -or [string]$process.sha256 -cne 'cbd1ca1fd6afd1bb6ddd1c09c118ecd4c50f928980857f16fe6fc23704ea17e2' -or
-            [string]$process.allowed_image_reason -cne 'caller-pinned-locked-vendored-protoc-descendant-of-fixed-cargo-root')) {
-            throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: non-exact protoc child observed in $ExpectedName trace"
-        }
-    }
     if ([string]$Phase.root_record.command_line -cne $expectedCommandLine) {
         throw "D31_RECOVERY_SEEDER_COMPANION_INVALID: $ExpectedName fixed root command line differs from caller pins"
     }
@@ -1050,7 +1461,7 @@ function Invoke-D32D31RecoverySeeder {
         $seederBuild = Invoke-D32BoundedProcess -FilePath $CargoPath -Arguments $seederArguments -WorkingDirectory $Repository `
             -PhaseLog $seederPhaseLog -TimeoutSeconds $TimeoutSeconds -ChildEnvironment $offlineEnvironment -RequireDebugEvents `
             -VendoredProtocRunGrant $protocGrant `
-            -CandidateImageRoots @((Get-D32DebugCandidateTargetRoots -Repository $Repository) + $paths.target)
+            -CandidateImageRoots @($paths.target)
         $buildEvidence = [ordered]@{
             name = 'd31-recovery-seeder'
             executable = [IO.Path]::GetFullPath($CargoPath)
@@ -7427,7 +7838,14 @@ function Write-D32NewFixtureBuildProvenance {
 }
 
 function Assert-D32FixtureDebugTraceShape {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Traces)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Traces,
+        [AllowNull()][object]$ExpectedRootIdentity,
+        [int]$ExpectedRunnerProcessId = 0,
+        [long]$ExpectedRunnerCreationFileTime = 0,
+        [AllowNull()][object[]]$ExpectedFetchManifests,
+        [AllowNull()][string]$ExpectedWorkingDirectory
+    )
 
     $expectedNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch',
         'd29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
@@ -7450,25 +7868,46 @@ function Assert-D32FixtureDebugTraceShape {
             throw "FIXTURE_PROVENANCE_INVALID: process trace wrapper schema/name is invalid at index $i"
         }
         if ($entry.command_line -cne (ConvertTo-D32CommandLine (@([string]$entry.executable) + @($entry.arguments)))) { throw "FIXTURE_PROVENANCE_INVALID: trace root command line does not match argv at index $i" }
-        $trace = $entry.process_trace
-        $traceActualFields = @(Get-D32ObjectFieldNames -Object $trace)
-        if ($traceActualFields.Count -ne $traceFields.Count -or @($traceActualFields | Where-Object { $_ -notin $traceFields }).Count -ne 0 -or @($traceFields | Where-Object { $_ -notin $traceActualFields }).Count -ne 0 -or
-            $trace.record_type -cne 'D32_DEBUG_JOB_PROCESS_TRACE_V2' -or [int]$trace.schema_version -ne 2 -or
-            $trace.event_source -cne 'Win32-WaitForDebugEvent-dedicated-OS-thread' -or $trace.state -cne 'COMPLETED' -or $null -ne $trace.block_reason -or
-            [int]$trace.debugger_thread_id -le 0 -or -not [bool]$trace.dedicated_debugger_thread -or
-            [uint32]$trace.uncontinued_create_process_id -ne 0 -or [int]$trace.uncontinued_create_continue_call_count -ne 0 -or
-            -not [bool]$trace.debugger_kill_on_exit_enabled -or -not [bool]$trace.root_resumed_after_kill_on_exit -or
-            -not [bool]$trace.debugger_thread_exited -or -not [bool]$trace.debugger_thread_joined -or
-            [int]$trace.retained_process_handle_count -lt ([int]$trace.process_create_event_count + 1) -or
-            -not [bool]$trace.retained_process_handles_signaled -or -not [bool]$trace.debugger_association_query_verified -or -not [bool]$trace.debugger_association_absent -or
-            [int]$trace.debug_api_error_count -ne 0 -or -not [bool]$trace.event_chain_complete -or -not [bool]$trace.job_accounting_verified -or
-            -not [bool]$trace.accounting_consistent -or [bool]$trace.injected_interruption -or
-            [int]$trace.process_create_event_count -le 0 -or [int]$trace.process_exit_event_count -ne [int]$trace.process_create_event_count -or
-            [int]$trace.job_total_processes -ne [int]$trace.process_create_event_count -or [int]$trace.job_active_processes -ne 0 -or
-            $trace.process_events -isnot [Array] -or $trace.processes -isnot [Array] -or
-            $trace.process_events.Count -ne [int]$trace.process_event_count -or $trace.processes.Count -ne [int]$trace.process_create_event_count -or
-            $trace.processes.Count -eq 0 -or -not (Test-D32ProfilePathEqual -Left $trace.processes[0].image_path -Right $entry.executable)) {
-            throw "FIXTURE_PROVENANCE_INVALID: synchronized debug process trace is malformed or incomplete at index $i"
+        if ($null -eq $ExpectedRootIdentity -or $ExpectedRunnerProcessId -le 0 -or $ExpectedRunnerCreationFileTime -le 0 -or
+            [string]::IsNullOrWhiteSpace($ExpectedWorkingDirectory) -or $ExpectedFetchManifests -isnot [Array] -or $ExpectedFetchManifests.Count -ne 3 -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$entry.executable) -Right ([string]$ExpectedRootIdentity.path)) -or
+            -not (Test-D32ProfilePathEqual -Left ([string]$entry.working_directory) -Right $ExpectedWorkingDirectory)) {
+            throw "FIXTURE_PROVENANCE_INVALID: exact current caller root/runner/fetch context is required at trace index $i"
+        }
+        $trace = Assert-D32FixtureDebugProcessTraceLedger -Trace $entry.process_trace -ExpectedRootPath ([string]$entry.executable) `
+            -ExpectedRootIdentity $ExpectedRootIdentity -ExpectedRunnerProcessId $ExpectedRunnerProcessId `
+            -ExpectedRunnerCreationFileTime $ExpectedRunnerCreationFileTime -ErrorPrefix 'FIXTURE_PROVENANCE_INVALID'
+        if ([string]$entry.command_line -cne (ConvertTo-D32CommandLine (@([string]$entry.executable) + @($entry.arguments)))) {
+            throw "FIXTURE_PROVENANCE_INVALID: trace wrapper command line no longer matches its exact argv at index $i"
+        }
+        if ($i -lt 3) {
+            $fetch = $ExpectedFetchManifests[$i]
+            $fetchIdentity = if ($null -eq $fetch) { $null } else { $fetch.process_identity }
+            $root = $trace.processes[0]
+            $observedCreation = [DateTime]::MinValue
+            $observedAt = [DateTimeOffset]::MinValue
+            if ($null -eq $fetch -or $fetch.command -isnot [Array] -or
+                (@($fetch.command | ForEach-Object { [string]$_ }) -join "`0") -cne (@($entry.arguments | ForEach-Object { [string]$_ }) -join "`0") -or
+                $null -eq $fetchIdentity -or
+                -not (Test-D32FixtureExactProperties -Object $fetchIdentity -Expected @('process_id','parent_process_id','name','image_path','creation_date','command_line','observed_at_utc','identity_verified')) -or
+                -not (Test-D32FixtureBuildBudgetInteger -Value $fetchIdentity.process_id) -or [Int64]$fetchIdentity.process_id -ne [Int64]$root.process_id -or
+                -not (Test-D32FixtureBuildBudgetInteger -Value $fetchIdentity.parent_process_id) -or [Int64]$fetchIdentity.parent_process_id -ne $ExpectedRunnerProcessId -or
+                $fetchIdentity.name -isnot [string] -or $fetchIdentity.name -cne 'cargo.exe' -or
+                $fetchIdentity.image_path -isnot [string] -or -not (Test-D32ProfilePathEqual -Left ([string]$fetchIdentity.image_path) -Right ([string]$entry.executable)) -or
+                $fetchIdentity.creation_date -isnot [string] -or
+                -not [DateTime]::TryParse([string]$fetchIdentity.creation_date, [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$observedCreation) -or
+                $observedCreation.Kind -ne [DateTimeKind]::Utc -or
+                [Math]::Abs(($observedCreation.ToUniversalTime().ToFileTimeUtc() - [Int64]$root.creation_filetime)) -gt [TimeSpan]::TicksPerMillisecond -or
+                $fetchIdentity.command_line -isnot [string] -or $fetchIdentity.command_line -cne [string]$entry.command_line -or
+                $fetchIdentity.observed_at_utc -isnot [string] -or
+                -not [DateTimeOffset]::TryParse([string]$fetchIdentity.observed_at_utc, [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$observedAt) -or
+                $observedAt.UtcDateTime -lt $observedCreation.ToUniversalTime() -or
+                $fetchIdentity.identity_verified -isnot [bool] -or -not $fetchIdentity.identity_verified -or
+                [Int64]$root.exit_code -ne 0) {
+                throw "FIXTURE_PROVENANCE_INVALID: locked fetch[$i] process identity is not bound to its native root CREATE/EXIT trace"
+            }
         }
     }
 }
@@ -7517,7 +7956,6 @@ function Assert-D32FixtureBuildProvenanceShape {
         $sourcePatch.file_id_hex -isnot [string] -or $sourcePatch.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
         throw 'FIXTURE_PROVENANCE_INVALID: strict candidate/Profile-bound source-patch authority reference is malformed'
     }
-    Assert-D32FixtureDebugTraceShape -Traces $Document.process_traces
     $environmentFields = @('toolchain_profile_path', 'toolchain_profile_sha256', 'target_triple', 'env_policy',
         'cargo_policy', 'cargo_home', 'temp_root', 'run_id', 'fetch_manifests', 'offline_after_fetch')
     $environmentKeys = @($Document.environment.Keys | ForEach-Object { [string]$_ })
@@ -7629,6 +8067,30 @@ function Assert-D32FixtureBuildProvenanceShape {
             throw 'FIXTURE_PROVENANCE_INVALID: sidecar Cargo process identity is malformed or unverified'
         }
     }
+    $profile = $script:ValidatedToolchainProfile
+    if ($null -eq $profile -or -not [bool]$profile.IsValid -or
+        -not (Test-D32ProfilePathEqual -Left ([string]$profile.ProfilePath) -Right ([string]$Document.environment.toolchain_profile_path)) -or
+        [string]$profile.Digest -cne [string]$Document.environment.toolchain_profile_sha256) {
+        throw 'FIXTURE_PROVENANCE_INVALID: trace roots require the exact current caller-pinned Profile V2 toolchain'
+    }
+    $runner = $Document.powershell_module_admission.runner_process
+    if (-not (Test-D32FixtureBuildBudgetInteger -Value $runner.process_id) -or [Int64]$runner.process_id -ne [Int64]$PID -or
+        -not (Test-D32FixtureBuildBudgetInteger -Value $runner.start_time_utc_ticks) -or [Int64]$runner.start_time_utc_ticks -le 0) {
+        throw 'FIXTURE_PROVENANCE_INVALID: strict current module admission lacks the actual active runner identity'
+    }
+    $currentRunner = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $actualRunnerStartTicks = [Int64]$currentRunner.StartTime.ToUniversalTime().Ticks
+        if ([Int64]$currentRunner.Id -ne [Int64]$runner.process_id -or $actualRunnerStartTicks -ne [Int64]$runner.start_time_utc_ticks) {
+            throw 'FIXTURE_PROVENANCE_INVALID: module-admission runner PID/creation time differs from the executing process'
+        }
+    }
+    finally { $currentRunner.Dispose() }
+    $runnerCreationFileTime = [DateTime]::new([Int64]$runner.start_time_utc_ticks, [DateTimeKind]::Utc).ToFileTimeUtc()
+    Assert-D32FixtureDebugTraceShape -Traces $Document.process_traces `
+        -ExpectedRootIdentity $profile.Profile.toolchain.cargo -ExpectedRunnerProcessId ([int]$runner.process_id) `
+        -ExpectedRunnerCreationFileTime $runnerCreationFileTime -ExpectedFetchManifests $Document.environment.fetch_manifests `
+        -ExpectedWorkingDirectory ([string]$Document.source_repo)
 }
 
 function Write-D32NewRecoverySeederBuildRecord {
@@ -9630,14 +10092,22 @@ public static class D32DebugSelfTestLauncher
         }
         catch { if ($_.Exception.Message -notlike 'FIXTURE_MANIFEST_ENVIRONMENT_INVALID:*') { throw } }
 
+        $provenanceProfileVariable = Get-Variable -Name ValidatedToolchainProfile -Scope Script -ErrorAction SilentlyContinue
+        $hadProvenanceProfile = $null -ne $provenanceProfileVariable
+        $priorProvenanceProfile = if ($hadProvenanceProfile) { $provenanceProfileVariable.Value } else { $null }
         $provenanceCargoPath = Join-Path $root 'cargo.exe'
         $provenanceManifestPath = Join-Path $fakeRepo 'vita-agent/Cargo.toml'
         $provenanceEvidenceRoot = Join-Path $root 'evidence'
         $provenanceRunRoot = Join-Path $provenanceEvidenceRoot 'r'
         $provenanceCargoHome = Join-Path $provenanceRunRoot 'c'
         $provenanceTempRoot = Join-Path $provenanceRunRoot 't'
-        $syntheticRunnerProcessId = 2000000002
-        $syntheticRunnerStartTicks = [Int64]638949002000000000
+        $syntheticRunner = [Diagnostics.Process]::GetCurrentProcess()
+        try {
+            $syntheticRunnerProcessId = [int]$syntheticRunner.Id
+            $syntheticRunnerStartTicks = [Int64]$syntheticRunner.StartTime.ToUniversalTime().Ticks
+        }
+        finally { $syntheticRunner.Dispose() }
+        $syntheticRunnerCreationFileTime = [DateTime]::new($syntheticRunnerStartTicks, [DateTimeKind]::Utc).ToFileTimeUtc()
         $syntheticEntryScriptPath = Get-D32FullPath (Join-Path $fakeRepo 'scripts/d32-fixture-prebuild.ps1')
         $syntheticProfilePath = Join-Path $root 'profile.json'
         $syntheticAuthorityPath = Join-Path $root 'selftest-only-module-authority-reference.txt'
@@ -9685,6 +10155,20 @@ public static class D32DebugSelfTestLauncher
             file_id_hex = [string]$syntheticEntryArtifact.file_id_hex
         }
         $fixtureSyntheticAdmission.startup.file_operand = $syntheticEntryScriptPath
+        $syntheticCargoIdentity = [ordered]@{
+            path = [IO.Path]::GetFullPath($provenanceCargoPath)
+            bytes = [Int64]100
+            sha256 = 'a' * 64
+            volume_serial_hex = 'bbbbbbbbbbbbbbbb'
+            file_id_hex = 'cccccccccccccccccccccccccccccccc'
+        }
+        $syntheticValidatedProfile = [PSCustomObject]@{
+            IsValid = $true
+            ProfilePath = [string]$syntheticProfileArtifact.path
+            Digest = [string]$syntheticProfileArtifact.sha256
+            Identity = $syntheticProfileArtifact
+            Profile = [ordered]@{ toolchain = [ordered]@{ cargo = $syntheticCargoIdentity } }
+        }
         $provenanceLockManifests = @('vita-agent-protocol/Cargo.toml', 'vita-agent/Cargo.toml', 'src-tauri/Cargo.toml')
         $provenanceFetchManifests = [System.Collections.Generic.List[object]]::new()
         $provenanceFetchArguments = [System.Collections.Generic.List[object]]::new()
@@ -9723,61 +10207,6 @@ public static class D32DebugSelfTestLauncher
             fetch_manifests = @($provenanceFetchManifests.ToArray())
             offline_after_fetch = $true
         }
-        $debuggerCreation = [DateTime]::UtcNow.ToFileTimeUtc()
-        $debuggerCreated = [DateTime]::FromFileTimeUtc($debuggerCreation).ToString('o')
-        $traceStarted = [DateTime]::UtcNow.ToString('o')
-        $fakeProcessTrace = [ordered]@{
-            record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
-            schema_version = 2
-            event_source = 'Win32-WaitForDebugEvent-dedicated-OS-thread'
-            state = 'COMPLETED'
-            block_reason = $null
-            debugger_process_id = [int]$syntheticRunnerProcessId
-            uncontinued_create_process_id = 0
-            uncontinued_create_continue_call_count = 0
-            debugger_thread_id = [int]$syntheticRunnerProcessId + 1
-            dedicated_debugger_thread = $true
-            debugger_kill_on_exit_enabled = $true
-            root_resumed_after_kill_on_exit = $true
-            debugger_thread_exited = $true
-            debugger_thread_joined = $true
-            retained_process_handle_count = 2
-            retained_process_handles_signaled = $true
-            debugger_association_query_verified = $true
-            debugger_association_absent = $true
-            debugger_creation_filetime = [Int64]$debuggerCreation
-            debugger_created_at_utc = $debuggerCreated
-            started_at_utc = $traceStarted
-            completed_at_utc = [DateTime]::UtcNow.ToString('o')
-            debug_event_count = 2
-            process_create_event_count = 1
-            process_exit_event_count = 1
-            process_event_count = 2
-            thread_create_event_count = 0
-            thread_exit_event_count = 0
-            image_load_event_count = 0
-            image_unload_event_count = 0
-            exception_event_count = 0
-            debug_string_event_count = 0
-            wait_timeout_count = 0
-            debug_api_error_count = 0
-            event_chain_complete = $true
-            job_accounting_verified = $true
-            job_total_processes = 1
-            job_active_processes = 0
-            accounting_consistent = $true
-            injected_interruption = $false
-            process_events = @(
-                [ordered]@{ sequence = 1; kind = 'CREATE'; process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 },
-                [ordered]@{ sequence = 2; kind = 'EXIT'; process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation; exit_code = 0 }
-            )
-            processes = @([ordered]@{
-                process_id = 1234; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $debuggerCreation + 1; parent_creation_filetime = $debuggerCreation
-                image_path = $provenanceCargoPath; bytes = 100; sha256 = ('a' * 64); volume_serial_hex = ('b' * 16); file_id_hex = ('c' * 32)
-                allowed_image_reason = 'exact-caller-pinned-fixed-root-image'; image_verified = $true; exited = $true; exit_code = 0
-                create_sequence = 1; exit_sequence = 2; created_at_utc = $debuggerCreated; exited_at_utc = $debuggerCreated
-            })
-        }
         $traceNames = @('fixture-01-fetch', 'fixture-02-fetch', 'fixture-03-fetch', 'd29h1-authority-fixture', 'd29h7-authority-fixture', 'd29h7-process-fixture', 'd29h7-git-helper-fixture', 'd32a-sandbox-fixture')
         $traceRecords = [System.Collections.Generic.List[object]]::new()
         foreach ($traceIndex in 0..($traceNames.Count - 1)) {
@@ -9791,6 +10220,75 @@ public static class D32DebugSelfTestLauncher
                 if ($spec.features.Count -gt 0) { $traceArguments += @('--features', ($spec.features -join ' ')) }
                 $traceArguments += @('--jobs', '4')
             }
+            $rootProcessId = [int]($syntheticRunnerProcessId + 10001 + ($traceIndex * 100))
+            $rootCreationFileTime = [Int64]($syntheticRunnerCreationFileTime + (($traceIndex + 1) * [TimeSpan]::TicksPerMillisecond))
+            $rootCreatedAt = [DateTime]::FromFileTimeUtc($rootCreationFileTime).ToString('o')
+            $traceStartedAt = [DateTimeOffset]::UtcNow
+            $traceCompletedAt = $traceStartedAt.AddMilliseconds(10)
+            $fakeProcessTrace = [ordered]@{
+                record_type = 'D32_DEBUG_JOB_PROCESS_TRACE_V2'
+                schema_version = 2
+                event_source = 'Win32-WaitForDebugEvent-dedicated-OS-thread'
+                state = 'COMPLETED'
+                block_reason = $null
+                debugger_process_id = [int]$syntheticRunnerProcessId
+                uncontinued_create_process_id = 0
+                uncontinued_create_continue_call_count = 0
+                debugger_thread_id = [int]($syntheticRunnerProcessId + 50000)
+                dedicated_debugger_thread = $true
+                debugger_kill_on_exit_enabled = $true
+                root_resumed_after_kill_on_exit = $true
+                debugger_thread_exited = $true
+                debugger_thread_joined = $true
+                retained_process_handle_count = 2
+                retained_process_handles_signaled = $true
+                debugger_association_query_verified = $true
+                debugger_association_absent = $true
+                debugger_creation_filetime = [Int64]$syntheticRunnerCreationFileTime
+                debugger_created_at_utc = [DateTime]::new($syntheticRunnerStartTicks, [DateTimeKind]::Utc).ToString('o')
+                started_at_utc = $traceStartedAt.ToString('o')
+                completed_at_utc = $traceCompletedAt.ToString('o')
+                debug_event_count = 2
+                process_create_event_count = 1
+                process_exit_event_count = 1
+                process_event_count = 2
+                thread_create_event_count = 0
+                thread_exit_event_count = 0
+                image_load_event_count = 0
+                image_unload_event_count = 0
+                exception_event_count = 0
+                debug_string_event_count = 0
+                wait_timeout_count = 0
+                debug_api_error_count = 0
+                event_chain_complete = $true
+                job_accounting_verified = $true
+                job_total_processes = 1
+                job_active_processes = 0
+                accounting_consistent = $true
+                injected_interruption = $false
+                process_events = @(
+                    [ordered]@{ sequence = 1; kind = 'CREATE'; process_id = $rootProcessId; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $rootCreationFileTime; parent_creation_filetime = [Int64]$syntheticRunnerCreationFileTime; exit_code = 0 },
+                    [ordered]@{ sequence = 2; kind = 'EXIT'; process_id = $rootProcessId; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $rootCreationFileTime; parent_creation_filetime = [Int64]$syntheticRunnerCreationFileTime; exit_code = 0 }
+                )
+                processes = @([ordered]@{
+                    process_id = $rootProcessId; parent_process_id = [int]$syntheticRunnerProcessId; creation_filetime = $rootCreationFileTime; parent_creation_filetime = [Int64]$syntheticRunnerCreationFileTime
+                    image_path = [IO.Path]::GetFullPath($provenanceCargoPath); bytes = [Int64]$syntheticCargoIdentity.bytes; sha256 = [string]$syntheticCargoIdentity.sha256
+                    volume_serial_hex = [string]$syntheticCargoIdentity.volume_serial_hex; file_id_hex = [string]$syntheticCargoIdentity.file_id_hex
+                    allowed_image_reason = 'exact-caller-pinned-fixed-root-image'; image_verified = $true; exited = $true; exit_code = 0
+                    create_sequence = 1; exit_sequence = 2; created_at_utc = $rootCreatedAt; exited_at_utc = $traceCompletedAt.ToString('o')
+                })
+            }
+            if ($traceIndex -lt 3) {
+                $fetchIdentity = $provenanceFetchManifests[$traceIndex].process_identity
+                $fetchIdentity.process_id = [int]$rootProcessId
+                $fetchIdentity.parent_process_id = [int]$syntheticRunnerProcessId
+                $fetchIdentity.name = 'cargo.exe'
+                $fetchIdentity.image_path = [IO.Path]::GetFullPath($provenanceCargoPath)
+                $fetchIdentity.creation_date = $rootCreatedAt
+                $fetchIdentity.command_line = ConvertTo-D32CommandLine (@($provenanceCargoPath) + $traceArguments)
+                $fetchIdentity.observed_at_utc = $traceStartedAt.ToString('o')
+                $fetchIdentity.identity_verified = $true
+            }
             $traceRecords.Add([ordered]@{
                 name = $traceName
                 executable = $provenanceCargoPath
@@ -9800,6 +10298,7 @@ public static class D32DebugSelfTestLauncher
                 process_trace = $fakeProcessTrace
             })
         }
+        $fakeProcessTrace = $traceRecords[0].process_trace
         $boundManifestArtifact = Get-D32BoundArtifactWithFileId -Path $sample
         $provenanceDocument = [ordered]@{
             schema_version = 7
@@ -9839,7 +10338,65 @@ public static class D32DebugSelfTestLauncher
             powershell_module_admission = $fixtureSyntheticAdmission
         }
         Set-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease -Admission $fixtureSyntheticAdmission
+        $script:ValidatedToolchainProfile = $syntheticValidatedProfile
         try {
+        $blockedCompanionPath = Join-Path $provenanceEvidenceRoot 'd31-recovery-seeder-companion.json'
+        $blockedCompanion = [ordered]@{
+            schema_version = 1
+            record_type = 'D32_D31_RECOVERY_SEEDER_COMPANION_V1'
+            status = 'blocked'
+            candidate_sha = [string]$fixtureSyntheticAdmission.candidate_sha
+            source_repo = [string]$fixtureSyntheticAdmission.source_repo
+            run_id = [string]$provenanceEnvironment.run_id
+            runner_process_id = [int]$syntheticRunnerProcessId
+            toolchain_profile = [ordered]@{
+                path = [string]$syntheticProfileArtifact.path
+                sha256 = [string]$syntheticProfileArtifact.sha256
+                bytes = [Int64]$syntheticProfileArtifact.bytes
+                volume_serial_hex = [string]$syntheticProfileArtifact.volume_serial_hex
+                file_id_hex = [string]$syntheticProfileArtifact.file_id_hex
+            }
+            powershell_module_admission = $fixtureSyntheticAdmission
+            source_protoc_authority = $null
+            owner_marker = $null
+            protoc_run_grant = $null
+            run_root = $null
+            cargo_home = $null
+            temp_root = $null
+            fetch_phases = @()
+            build_phase = $null
+            seeder_record = $null
+            artifact = $null
+            process_cleanup = [ordered]@{
+                status = 'not_run'; checked_at_utc = $null; relevant_pattern = $null
+                residual_identities = @(); error = $null
+            }
+            blocked_reason = 'D32 SelfTest synthetic case: blocked before owner claim; no process or output was created.'
+        }
+        Assert-D32D31RecoverySeederCompanionShape -Document $blockedCompanion -Path $blockedCompanionPath `
+            -OutputRoot $provenanceEvidenceRoot -Repository $fakeRepo -CandidateSha ([string]$fixtureSyntheticAdmission.candidate_sha) `
+            -ValidatedProfile $syntheticValidatedProfile -ExpectedModuleAdmission $fixtureSyntheticAdmission
+        $passed++
+        foreach ($companionMutation in @(
+                [PSCustomObject]@{ Name = 'runner PID'; Mutate = { param($value) $value.runner_process_id++ } },
+                [PSCustomObject]@{ Name = 'candidate SHA'; Mutate = { param($value) $value.candidate_sha = 'f' * 40 } },
+                [PSCustomObject]@{ Name = 'unknown outer field'; Mutate = { param($value) $value['unapproved'] = $true } },
+                [PSCustomObject]@{ Name = 'not-run cleanup invents a timestamp'; Mutate = { param($value) $value.process_cleanup.checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o') } },
+                [PSCustomObject]@{ Name = 'not-run cleanup contradicts an observed phase'; Mutate = { param($value) $value.fetch_phases = @([ordered]@{}) } },
+                [PSCustomObject]@{ Name = 'success status omits V2 phase/ref graph'; Mutate = { param($value) $value.status = 'succeeded'; $value.blocked_reason = $null } }
+            )) {
+            $mutatedCompanion = ConvertTo-D32FixtureAuthorityHashtable -Value $blockedCompanion
+            & $companionMutation.Mutate $mutatedCompanion
+            $companionRejected = $false
+            try {
+                Assert-D32D31RecoverySeederCompanionShape -Document $mutatedCompanion -Path $blockedCompanionPath `
+                    -OutputRoot $provenanceEvidenceRoot -Repository $fakeRepo -CandidateSha ([string]$fixtureSyntheticAdmission.candidate_sha) `
+                    -ValidatedProfile $syntheticValidatedProfile -ExpectedModuleAdmission $fixtureSyntheticAdmission
+            }
+            catch { $companionRejected = $_.Exception.Message -like 'D31_RECOVERY_SEEDER_COMPANION_INVALID:*' }
+            if (-not $companionRejected) { throw "SELFTEST_FAILED: companion accepted $($companionMutation.Name) tampering" }
+            $passed++
+        }
         Assert-D32FixtureBuildProvenanceShape -Document $provenanceDocument
         $oldTraceProvenance = [ordered]@{}
         foreach ($field in $provenanceDocument.Keys) { $oldTraceProvenance[$field] = $provenanceDocument[$field] }
@@ -9952,6 +10509,8 @@ public static class D32DebugSelfTestLauncher
         }
         finally {
             Restore-D32PowerShellModuleSelfTestAdmission -Lease $syntheticModuleAdmissionLease
+            if ($hadProvenanceProfile) { $script:ValidatedToolchainProfile = $priorProvenanceProfile }
+            else { Remove-Variable -Name ValidatedToolchainProfile -Scope Script -Force -ErrorAction SilentlyContinue }
         }
 
         $ambientHandle = [IntPtr]::Zero

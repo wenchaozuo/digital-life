@@ -1,6 +1,9 @@
 # Focused no-Cargo checks for module-free facts generation and reviewed fixes.
 [CmdletBinding()]
-param([switch]$PrepareCurrentCandidates)
+param(
+    [switch]$PrepareCurrentCandidates,
+    [string]$ProtocEvidenceRoot = 'E:\d32\inv1'
+)
 
 $repo = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..'))
 $pwsh = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$PSHOME, 'pwsh.exe'))
@@ -20,6 +23,12 @@ $failures = [System.Collections.Generic.List[string]]::new()
 $testId = [Guid]::NewGuid().ToString('N')
 $scratch = 'E:\d32'
 if (-not [IO.Directory]::Exists($scratch) -or -not (Test-D32PowerShellAuthorityPathNoReparse -Path $scratch)) { throw 'MODULEFREE_SELFTEST_BLOCKED: E:\d32 must already exist and be non-reparse' }
+$evidenceRoot = [IO.Path]::GetFullPath($ProtocEvidenceRoot)
+if ($ProtocEvidenceRoot -cne $evidenceRoot -or
+    -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName($evidenceRoot), $scratch) -or
+    [IO.File]::Exists($evidenceRoot) -or [IO.Directory]::Exists($evidenceRoot)) {
+    throw 'MODULEFREE_SELFTEST_BLOCKED: protoc EvidenceRoot must be a canonical, absent compact child path beneath E:\d32; it is only bound into candidate facts and is never created or claimed'
+}
 
 function Add-D32FactsSelfTestCase {
     param([string]$Name, [bool]$Passed, [AllowNull()][string]$Detail = $null)
@@ -451,7 +460,7 @@ try {
     $baselineSource = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-baseline.ps1'), [Text.UTF8Encoding]::new($false, $true))
     $discoverySource = [IO.File]::ReadAllText([IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-discovery.ps1'), [Text.UTF8Encoding]::new($false, $true))
     $inventoryHelpersReuseBound = $baselineSource.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha') -and
-        $discoverySource.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -ModuleAuthorityCandidateSha $ExpectedCandidateSha') -and
+        $discoverySource.Contains('. $preflightLibraryPath -LibraryOnly -Phase0DependencyLibraryOnly -RepoRoot $Repository -EvidenceRoot $EvidenceRoot -ModuleAuthorityCandidateSha $ExpectedCandidateSha') -and
         $baselineSource.Contains('-PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256') -and
         $discoverySource.Contains('-PowerShellModuleAuthorityPath $PowerShellModuleAuthorityPath -ExpectedPowerShellModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256') -and
         $baselineSource.Contains('-TrustedGitPath $PinnedGitPath -TrustedGitSha256 $PinnedGitSha256') -and
@@ -1119,8 +1128,6 @@ try {
             ($wrongElementChild.ExitCode -ne 0 -and -not [IO.File]::Exists($wrongElementOutput)) `
             ("exit=$($wrongElementChild.ExitCode); stdout=$($wrongElementChild.Stdout.Trim()); stderr=$($wrongElementChild.Stderr.Trim())")
 
-        $evidenceRoot = 'E:\d32\inv1'
-        if ([IO.File]::Exists($evidenceRoot) -or [IO.Directory]::Exists($evidenceRoot)) { throw 'MODULEFREE_SELFTEST_BLOCKED: D32 inventory root is not absent; facts test will not claim it' }
         if ([IO.File]::Exists($protocOutput) -or [IO.Directory]::Exists($protocOutput)) { throw 'MODULEFREE_SELFTEST_BLOCKED: unique protoc output path already exists' }
         $protocScript = [IO.Path]::Combine($PSScriptRoot, 'd32-test-inventory-protoc-authority-facts.ps1')
         $protocArgs = [System.Collections.Generic.List[string]]::new()
@@ -1129,8 +1136,8 @@ try {
         $protocChild = Invoke-D32FactsSelfTestChild -Arguments $protocArgs.ToArray() -TimeoutSeconds 480
         $protocGenerated = $protocChild.ExitCode -eq 0 -and [IO.File]::Exists($protocOutput) -and -not [IO.Directory]::Exists($evidenceRoot)
         if ($protocGenerated -and -not $PrepareCurrentCandidates) { $ownedFiles.Add($protocOutput) }
-        Add-D32FactsSelfTestCase 'direct discovery-only protoc facts generator validates ProfileV2 without claiming inv1' $protocGenerated `
-            ("exit=$($protocChild.ExitCode); stdout=$($protocChild.Stdout.Trim()); stderr=$($protocChild.Stderr.Trim()); inv1-exists=$([IO.Directory]::Exists($evidenceRoot))")
+        Add-D32FactsSelfTestCase 'direct discovery-only protoc facts generator validates ProfileV2 without claiming its compact candidate EvidenceRoot' $protocGenerated `
+            ("exit=$($protocChild.ExitCode); stdout=$($protocChild.Stdout.Trim()); stderr=$($protocChild.Stderr.Trim()); evidence-root=$evidenceRoot; evidence-root-exists=$([IO.Directory]::Exists($evidenceRoot))")
         if ($protocGenerated) {
             $protocDoc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($protocOutput, [Text.UTF8Encoding]::new($false, $true)))
             try {
@@ -1347,6 +1354,6 @@ finally {
     Assert-D32PowerShellAuthorityLoadedModuleSetUnchanged -Expected $moduleSetAtStart
 }
 
-$result = [ordered]@{ record_type = 'D32_POWERSHELL_MODULEFREE_FACTS_SELFTEST_V1'; case_count = $cases.Count; passed = $cases.Where({ $_.passed }).Count; failed = @($failures.ToArray()); cases = $cases.ToArray(); temp_files_removed = $ownedFiles.Count; candidate_outputs_preserved = [bool]$PrepareCurrentCandidates; candidate_sha = if ($PrepareCurrentCandidates) { $candidateSha } else { $null }; module_import_attempts = [int]$global:D32PowerShellModuleImportAttempts; cargo_invoked = $false; discovery_invoked = $false; evidence_root_claimed = $false }
+$result = [ordered]@{ record_type = 'D32_POWERSHELL_MODULEFREE_FACTS_SELFTEST_V1'; case_count = $cases.Count; passed = $cases.Where({ $_.passed }).Count; failed = @($failures.ToArray()); cases = $cases.ToArray(); temp_files_removed = $ownedFiles.Count; candidate_outputs_preserved = [bool]$PrepareCurrentCandidates; candidate_sha = if ($PrepareCurrentCandidates) { $candidateSha } else { $null }; protoc_candidate_evidence_root = $evidenceRoot; module_import_attempts = [int]$global:D32PowerShellModuleImportAttempts; cargo_invoked = $false; discovery_invoked = $false; evidence_root_claimed = $false }
 [Console]::WriteLine((ConvertTo-D32PowerShellAuthorityJsonText -Value $result))
 if ($failures.Count -gt 0) { exit 1 }

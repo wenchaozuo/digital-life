@@ -56,6 +56,7 @@ param(
     [string]$ExpectedVendoredProtocAuthoritySha256,
     [string]$TauriMacrosSourceAuthorityPath,
     [string]$ExpectedTauriMacrosSourceAuthoritySha256,
+    [string]$D32ModuleAuthorityEntryScriptPath,
     [AllowNull()][object]$Phase0FixtureBuildCapacity,
     [switch]$BuildD31RecoverySeeder,
     [ValidateRange(1, 14400)]
@@ -69,11 +70,18 @@ param(
 )
 
 . ([IO.Path]::Combine($PSScriptRoot, 'd32-powershell-module-authority.ps1'))
+$moduleAuthorityEntryPath = $PSCommandPath
+if (-not [String]::IsNullOrWhiteSpace($D32ModuleAuthorityEntryScriptPath)) {
+    if (-not $D32LauncherLibraryOnly -or -not [IO.Path]::IsPathRooted($D32ModuleAuthorityEntryScriptPath)) {
+        throw 'D32_LAUNCHER_LIBRARY_MODE_INVALID: an alternate module-authority entry is permitted only for a caller-admitted dot-source library load'
+    }
+    $moduleAuthorityEntryPath = [IO.Path]::GetFullPath($D32ModuleAuthorityEntryScriptPath)
+}
 $null = Initialize-D32PowerShellModuleAuthority -CallerProfilePath $ToolchainProfilePath `
     -CallerExpectedProfileSha256 $ExpectedToolchainProfileSha256 `
     -CallerModuleAuthorityPath $PowerShellModuleAuthorityPath -CallerExpectedModuleAuthoritySha256 $ExpectedPowerShellModuleAuthoritySha256 `
     -CallerCandidateSha $ExpectedCandidateSha -CallerRepository $RepoRoot -CallerGitPath $PinnedGitPath -CallerGitSha256 $PinnedGitSha256 `
-    -EntryScriptPath $PSCommandPath -LocalSelfTestOnly:$SelfTest
+    -EntryScriptPath $moduleAuthorityEntryPath -LocalSelfTestOnly:$SelfTest
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -2673,6 +2681,7 @@ function Get-D32GitOutput {
         [AllowNull()][object]$MetadataLocks,
         [switch]$PreserveOutput,
         [switch]$CaptureResult,
+        [switch]$BoundedCompilerDiagnosticQuery,
         [switch]$SelfTestFixtureSetup,
         [string]$SelfTestOwnedRoot,
         [string]$SelfTestMarkerPath,
@@ -2681,6 +2690,9 @@ function Get-D32GitOutput {
 
     $script:D32LastPinnedGitAttempt = $null
     $script:D32LastPinnedGitCaptureResult = $null
+    if ($BoundedCompilerDiagnosticQuery -and -not (Test-D32BoundedCompilerDiagnosticFixedGitQuery -Arguments $Arguments)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GIT_BLOCKED: bounded-diagnostic Git timeout is restricted to one of the three exact caller-pinned metadata queries'
+    }
     Assert-D32PinnedGitCurrent
     Assert-D32ApprovedPinnedGitRoot
     $rootFull = Assert-D32NoReparsePath -Path $Root
@@ -2813,9 +2825,14 @@ function Get-D32GitOutput {
         $stderrBuffer = [IO.MemoryStream]::new()
         $stdoutCopy = $nativeProcess.OpenStdoutStream().CopyToAsync($stdoutBuffer)
         $stderrCopy = $nativeProcess.OpenStderrStream().CopyToAsync($stderrBuffer)
-        $timeoutMilliseconds = [int][Math]::Min([int]::MaxValue, ([long]$script:TimeoutSeconds * 1000))
+        $timeoutMilliseconds = if ($BoundedCompilerDiagnosticQuery) {
+            [int]$script:D32BoundedCompilerDiagnosticGitQueryTimeoutMilliseconds
+        } else {
+            [int][Math]::Min([int]::MaxValue, ([long]$script:TimeoutSeconds * 1000))
+        }
         $nativeProcess.ConfigurePinnedGitDebugCapture($expectedRootPin, $approvedChildImagePin, $timeoutMilliseconds)
-        $traceTimeoutMilliseconds = [int][Math]::Min([int]::MaxValue, ([long]$timeoutMilliseconds + 20000))
+        $traceGraceMilliseconds = if ($BoundedCompilerDiagnosticQuery) { [int]$script:D32BoundedCompilerDiagnosticGitJoinGraceMilliseconds } else { 20000 }
+        $traceTimeoutMilliseconds = [int][Math]::Min([int]::MaxValue, ([long]$timeoutMilliseconds + $traceGraceMilliseconds))
         $trace = $nativeProcess.WaitForDebugTrace($traceTimeoutMilliseconds)
         $cleanup = $nativeProcess.CloseJobAndWait(10000)
         $script:D32LastPinnedGitAttempt = [ordered]@{
@@ -2837,8 +2854,9 @@ function Get-D32GitOutput {
                 debugger_association_absent = [bool]$cleanup.DebuggerAssociationAbsent
             }
         }
-        if (-not $stdoutCopy.Wait(10000) -or $stdoutCopy.IsFaulted -or
-            -not $stderrCopy.Wait(10000) -or $stderrCopy.IsFaulted) {
+        $pipeJoinMilliseconds = if ($BoundedCompilerDiagnosticQuery) { [int]$script:D32BoundedCompilerDiagnosticGitPipeJoinMilliseconds } else { 10000 }
+        if (-not $stdoutCopy.Wait($pipeJoinMilliseconds) -or $stdoutCopy.IsFaulted -or
+            -not $stderrCopy.Wait($pipeJoinMilliseconds) -or $stderrCopy.IsFaulted) {
             throw 'GIT_CAPTURE_FAILED: pinned Git stdout/stderr raw-pipe capture did not complete'
         }
         $null = $stdoutCopy.GetAwaiter().GetResult()
@@ -3300,6 +3318,7 @@ function Ensure-D32NativeLauncher {
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -3331,6 +3350,151 @@ public sealed class D32NativeCleanupEvidenceV2
     public bool DebuggerAssociationAbsent { get; internal set; }
     public string RetainedProcessHandleStates { get; internal set; }
     public string Detail { get; internal set; }
+}
+
+// Independent measurement sidecar only. These counters are never projected into Trace V2.
+public sealed class D32BoundedCompilerDiagnosticNativeCountersV1
+{
+    public long StopwatchFrequency { get; set; }
+    public long WaitCallCount { get; set; }
+    public long WaitElapsedTicks { get; set; }
+    public long ImageIdentityCheckCount { get; set; }
+    public long ImageIdentityElapsedTicks { get; set; }
+    public long ParentIdentityCheckCount { get; set; }
+    public long ParentIdentityElapsedTicks { get; set; }
+    public long RetainedHandleVerificationBatchCount { get; set; }
+    public long RetainedHandleCheckCount { get; set; }
+    public long RetainedHandleElapsedTicks { get; set; }
+    public long ContinueCallCount { get; set; }
+    public long ContinueElapsedTicks { get; set; }
+    public long CleanupCallCount { get; set; }
+    public long CleanupElapsedTicks { get; set; }
+}
+
+public sealed class D32BoundedCompilerDiagnosticProcessSampleV1
+{
+    public uint ProcessId { get; set; }
+    public long CreationFileTime { get; set; }
+    public string ImagePath { get; set; }
+    public bool ProcessSignaled { get; set; }
+    public bool CpuVerified { get; set; }
+    public long UserTime100Ns { get; set; }
+    public long KernelTime100Ns { get; set; }
+    public bool MemoryVerified { get; set; }
+    public long PrivateBytes { get; set; }
+    public long WorkingSetBytes { get; set; }
+}
+
+public sealed class D32BoundedCompilerDiagnosticCommandRecordV1
+{
+    public uint ProcessId { get; set; }
+    public long CreationFileTime { get; set; }
+    public uint ParentProcessId { get; set; }
+    public long ParentCreationFileTime { get; set; }
+    public string ImagePath { get; set; }
+    public string CommandLine { get; set; }
+    public string[] Argv { get; set; }
+}
+
+public sealed class D32BoundedCompilerDiagnosticSystemSampleV1
+{
+    public bool Reliable { get; set; }
+    public string Failure { get; set; }
+    public long StopwatchTicks { get; set; }
+    public long AvailablePhysicalBytes { get; set; }
+    public long TotalPhysicalBytes { get; set; }
+    public long CommitUsedBytes { get; set; }
+    public long CommitLimitBytes { get; set; }
+    public long SystemCommitPeakBytes { get; set; }
+    public long CommitHeadroomBytes { get; set; }
+    public uint JobTotalProcesses { get; set; }
+    public uint JobActiveProcesses { get; set; }
+    public bool JobAccountingVerified { get; set; }
+    public D32BoundedCompilerDiagnosticProcessSampleV1[] Processes { get; set; }
+}
+
+public sealed class D32BoundedCompilerDiagnosticOutputBudgetV1
+{
+    private readonly long _limit;
+    private long _reserved;
+    private int _exceeded;
+    public D32BoundedCompilerDiagnosticOutputBudgetV1(long limit)
+    {
+        if (limit <= 0) throw new ArgumentOutOfRangeException("limit");
+        _limit = limit;
+    }
+    public long BytesReserved { get { return Interlocked.Read(ref _reserved); } }
+    public bool Exceeded { get { return Interlocked.CompareExchange(ref _exceeded, 0, 0) != 0; } }
+    public int ReserveUpTo(int requested)
+    {
+        if (requested <= 0) return 0;
+        while (true)
+        {
+            long current = Interlocked.Read(ref _reserved);
+            long remaining = Math.Max(0, _limit - current);
+            int accepted = (int)Math.Min((long)requested, remaining);
+            if (Interlocked.CompareExchange(ref _reserved, current + accepted, current) == current)
+            {
+                if (accepted < requested || current + accepted >= _limit) Interlocked.Exchange(ref _exceeded, 1);
+                return accepted;
+            }
+        }
+    }
+}
+
+public sealed class D32BoundedCompilerDiagnosticPipeCaptureV1
+{
+    private readonly Stream _source;
+    private readonly FileStream _destination;
+    private readonly D32BoundedCompilerDiagnosticOutputBudgetV1 _budget;
+    private readonly Thread _reader;
+    private volatile string _failure;
+    private long _bytesWritten;
+    private volatile bool _completed;
+
+    public D32BoundedCompilerDiagnosticPipeCaptureV1(Stream source, FileStream destination, D32BoundedCompilerDiagnosticOutputBudgetV1 budget, string name)
+    {
+        if (source == null || destination == null || budget == null || String.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("bounded raw pipe capture requires a source, create-new destination, shared budget, and name");
+        _source = source;
+        _destination = destination;
+        _budget = budget;
+        _reader = new Thread(ReadLoop);
+        _reader.IsBackground = true;
+        _reader.Name = "D32-diagnostic-" + name;
+        _reader.Start();
+    }
+    public long BytesWritten { get { return Interlocked.Read(ref _bytesWritten); } }
+    public bool Completed { get { return _completed && !_reader.IsAlive; } }
+    public bool IsAlive { get { return _reader.IsAlive; } }
+    public string Failure { get { return _failure; } }
+    public bool Wait(int milliseconds) { return _reader.Join(Math.Max(0, milliseconds)); }
+    private void ReadLoop()
+    {
+        byte[] buffer = new byte[65536];
+        try
+        {
+            while (true)
+            {
+                int count = _source.Read(buffer, 0, buffer.Length);
+                if (count == 0) break;
+                int accepted = _budget.ReserveUpTo(count);
+                if (accepted > 0)
+                {
+                    _destination.Write(buffer, 0, accepted);
+                    Interlocked.Add(ref _bytesWritten, accepted);
+                }
+            }
+            _destination.Flush(true);
+        }
+        catch (Exception error) { _failure = error.GetType().FullName + ": " + error.Message; }
+        finally
+        {
+            try { _destination.Dispose(); }
+            catch (Exception error) { if (_failure == null) _failure = "raw output close: " + error.GetType().FullName + ": " + error.Message; }
+            _completed = true;
+        }
+    }
 }
 
 public sealed class D32DebugProcessEventV2
@@ -3438,7 +3602,11 @@ internal sealed class D32DebugLaunchCoordinator
     public D32FixtureNativeProcessV2 Process;
     public Thread WorkerThread;
     public Exception Failure;
-    public bool AbortRequested;
+    public volatile bool AbortRequested;
+    public string DiagnosticStopReason;
+    public string BoundedDiagnosticTestExecutableRoot;
+    public bool BoundedCompilerDiagnosticMode;
+    public bool RequireRustcCommandLineCapture;
     public string ExpectedRootPin;
     public string ExpectedRootCommandLine;
     public string[] ApprovedImagePins;
@@ -3620,6 +3788,41 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         public uint TotalProcesses;
         public uint ActiveProcesses;
         public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PerformanceInformation
+    {
+        public uint Size;
+        public UIntPtr CommitTotal;
+        public UIntPtr CommitLimit;
+        public UIntPtr CommitPeak;
+        public UIntPtr PhysicalTotal;
+        public UIntPtr PhysicalAvailable;
+        public UIntPtr SystemCache;
+        public UIntPtr KernelTotal;
+        public UIntPtr KernelPaged;
+        public UIntPtr KernelNonpaged;
+        public UIntPtr PageSize;
+        public uint HandleCount;
+        public uint ProcessCount;
+        public uint ThreadCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessMemoryCountersEx
+    {
+        public uint Size;
+        public uint PageFaultCount;
+        public UIntPtr PeakWorkingSetSize;
+        public UIntPtr WorkingSetSize;
+        public UIntPtr QuotaPeakPagedPoolUsage;
+        public UIntPtr QuotaPagedPoolUsage;
+        public UIntPtr QuotaPeakNonPagedPoolUsage;
+        public UIntPtr QuotaNonPagedPoolUsage;
+        public UIntPtr PagefileUsage;
+        public UIntPtr PeakPagefileUsage;
+        public UIntPtr PrivateUsage;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -3870,6 +4073,12 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessTimes(IntPtr process, out DebugFileTime creation, out DebugFileTime exit, out DebugFileTime kernel, out DebugFileTime user);
 
+    [DllImport("psapi.dll", SetLastError = true)]
+    private static extern bool GetPerformanceInfo(ref PerformanceInformation information, uint size);
+
+    [DllImport("psapi.dll", SetLastError = true, EntryPoint = "GetProcessMemoryInfo")]
+    private static extern bool GetProcessMemoryInfoEx(IntPtr process, ref ProcessMemoryCountersEx counters, uint size);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetFileInformationByHandle(IntPtr file, out DebugFileInformation information);
 
@@ -3982,10 +4191,25 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     private readonly object _observedProcessLock = new object();
     private readonly List<IntPtr> _observedProcessHandles = new List<IntPtr>();
     private readonly List<uint> _observedProcessIds = new List<uint>();
+    private readonly List<long> _observedProcessCreationFileTimes = new List<long>();
+    private readonly List<string> _observedProcessImagePaths = new List<string>();
     private readonly List<string> _observedHandleDuplicationAudit = new List<string>();
     private readonly object _h7cGitChildLock = new object();
     private readonly List<D32H7CGitChildObservationV1> _h7cGitChildren = new List<D32H7CGitChildObservationV1>();
     private D32DebugProcessTraceV2 _debugTrace;
+    private long _diagnosticWaitCallCount;
+    private long _diagnosticWaitElapsedTicks;
+    private long _diagnosticImageIdentityCheckCount;
+    private long _diagnosticImageIdentityElapsedTicks;
+    private long _diagnosticParentIdentityCheckCount;
+    private long _diagnosticParentIdentityElapsedTicks;
+    private long _diagnosticRetainedHandleVerificationBatchCount;
+    private long _diagnosticRetainedHandleCheckCount;
+    private long _diagnosticRetainedHandleElapsedTicks;
+    private long _diagnosticContinueCallCount;
+    private long _diagnosticContinueElapsedTicks;
+    private long _diagnosticCleanupCallCount;
+    private long _diagnosticCleanupElapsedTicks;
 
     public int ProcessId { get; private set; }
     public bool JobAssigned { get; private set; }
@@ -4436,6 +4660,39 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         return bytes == 335328 && String.Equals(sha256, PinnedVctipSha256, StringComparison.Ordinal);
     }
 
+    public void ConfigureBoundedCompilerDiagnosticCapture(
+        string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds,
+        bool allowPinnedVctip, string expectedCargoHome, string vendoredProtocPin)
+    {
+        string[] root = ParseDebugPin(expectedRootPin);
+        if (!String.Equals(Path.GetFileName(root[0]), "cargo.exe", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("D32_BOUNDED_COMPILER_DIAGNOSTIC_BLOCKED: root must be the caller-pinned direct Cargo executable");
+        if (allowPinnedVctip && !IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
+            throw new InvalidOperationException("D32_BOUNDED_COMPILER_DIAGNOSTIC_BLOCKED: optional VCTIP image does not match the exact approved Profile V2 identity");
+        bool allowPinnedProtoc = !String.IsNullOrWhiteSpace(vendoredProtocPin);
+        if (allowPinnedProtoc && !IsApprovedPinnedCargoVendoredProtocConfiguration(expectedRootPin, approvedImagePins, expectedCargoHome, vendoredProtocPin))
+            throw new InvalidOperationException("D32_BOUNDED_COMPILER_DIAGNOSTIC_BLOCKED: optional vendored protoc image is not bound to the exact diagnostic Cargo-home grant");
+        if (timeoutMilliseconds <= 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        if (allowPinnedProtoc && (String.IsNullOrWhiteSpace(expectedCargoHome) || !Path.IsPathRooted(expectedCargoHome)))
+            throw new InvalidOperationException("D32_BOUNDED_COMPILER_DIAGNOSTIC_BLOCKED: optional protoc Cargo-home path is not absolute");
+        if (candidateImageRoots == null || candidateImageRoots.Length != 1 ||
+            !String.Equals(Path.GetFileName(NormalizeDebugPath(candidateImageRoots[0])), "debug", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(Path.GetDirectoryName(NormalizeDebugPath(candidateImageRoots[0]))), "target", StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(NormalizeDebugPath(candidateImageRoots[0])))), "vita-agent", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("D32_BOUNDED_COMPILER_DIAGNOSTIC_BLOCKED: only the ordinary Vita target/debug image root is supported");
+        if (_debugCoordinator == null || !_debugEnabled) throw new InvalidOperationException("dedicated debugger session is not initialized");
+        lock (_debugCoordinator)
+        {
+            if (_debugCoordinator.CapturePlanReady.WaitOne(0)) throw new InvalidOperationException("debug capture plan was already supplied");
+            _debugCoordinator.BoundedCompilerDiagnosticMode = true;
+            _debugCoordinator.RequireRustcCommandLineCapture = true;
+            _debugCoordinator.BoundedDiagnosticTestExecutableRoot = NormalizeDebugPath(Path.Combine(candidateImageRoots[0], "deps"));
+            ConfigureDebugCapture(expectedRootPin, approvedImagePins, candidateImageRoots, timeoutMilliseconds,
+                false, false, null, false, allowPinnedVctip, allowPinnedProtoc,
+                allowPinnedProtoc ? expectedCargoHome : null, allowPinnedProtoc ? vendoredProtocPin : null, null);
+        }
+    }
+
     public void ConfigurePinnedCargoDebugCapture(string expectedRootPin, string[] approvedImagePins, string[] candidateImageRoots, int timeoutMilliseconds)
     {
         if (!IsApprovedPinnedCargoVctipConfiguration(expectedRootPin, approvedImagePins))
@@ -4568,7 +4825,12 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
     {
         if (_debugCoordinator != null)
         {
-            lock (_debugCoordinator) _debugCoordinator.AbortRequested = true;
+            lock (_debugCoordinator)
+            {
+                if (_debugCoordinator.BoundedCompilerDiagnosticMode && String.IsNullOrEmpty(_debugCoordinator.DiagnosticStopReason))
+                    _debugCoordinator.DiagnosticStopReason = reason;
+                _debugCoordinator.AbortRequested = true;
+            }
             _debugCoordinator.CapturePlanReady.Set();
         }
         IntPtr job = _parentJob != IntPtr.Zero ? _parentJob : _job;
@@ -4930,11 +5192,263 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
         lock (_observedProcessLock) return String.Join(";", _observedHandleDuplicationAudit.ToArray());
     }
 
-    private bool VerifyObservedProcessHandles(out string invalidHandles)
+    public static D32BoundedCompilerDiagnosticSystemSampleV1 GetInitialBoundedDiagnosticSystemCapacity()
     {
-        List<string> invalid = new List<string>();
+        D32BoundedCompilerDiagnosticSystemSampleV1 sample = new D32BoundedCompilerDiagnosticSystemSampleV1 {
+            Reliable = false, StopwatchTicks = Stopwatch.GetTimestamp(), Processes = new D32BoundedCompilerDiagnosticProcessSampleV1[0]
+        };
+        PerformanceInformation performance = new PerformanceInformation();
+        performance.Size = (uint)Marshal.SizeOf(typeof(PerformanceInformation));
+        if (!GetPerformanceInfo(ref performance, performance.Size))
+        {
+            sample.Failure = "GetPerformanceInfo failed (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+            return sample;
+        }
+        ulong pageSize = performance.PageSize.ToUInt64();
+        ulong physicalTotalPages = performance.PhysicalTotal.ToUInt64();
+        ulong physicalAvailablePages = performance.PhysicalAvailable.ToUInt64();
+        ulong commitTotalPages = performance.CommitTotal.ToUInt64();
+        ulong commitLimitPages = performance.CommitLimit.ToUInt64();
+        ulong commitPeakPages = performance.CommitPeak.ToUInt64();
+        if (pageSize == 0 || physicalAvailablePages > physicalTotalPages || commitTotalPages > commitLimitPages || commitPeakPages < commitTotalPages ||
+            physicalTotalPages > (ulong)Int64.MaxValue / pageSize || physicalAvailablePages > (ulong)Int64.MaxValue / pageSize ||
+            commitTotalPages > (ulong)Int64.MaxValue / pageSize || commitLimitPages > (ulong)Int64.MaxValue / pageSize ||
+            commitPeakPages > (ulong)Int64.MaxValue / pageSize || commitLimitPages - commitTotalPages > (ulong)Int64.MaxValue / pageSize)
+        {
+            sample.Failure = "GetPerformanceInfo page or commitment values are internally inconsistent";
+            return sample;
+        }
+        sample.TotalPhysicalBytes = (long)(physicalTotalPages * pageSize);
+        sample.AvailablePhysicalBytes = (long)(physicalAvailablePages * pageSize);
+        sample.CommitUsedBytes = (long)(commitTotalPages * pageSize);
+        sample.CommitLimitBytes = (long)(commitLimitPages * pageSize);
+        sample.SystemCommitPeakBytes = (long)(commitPeakPages * pageSize);
+        sample.CommitHeadroomBytes = (long)((commitLimitPages - commitTotalPages) * pageSize);
+        sample.Reliable = true;
+        return sample;
+    }
+
+    private void AddBoundedDiagnosticMeasurement(ref long count, ref long elapsedTicks, long started)
+    {
+        if (started == 0 || _debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode) return;
+        long ended = Stopwatch.GetTimestamp();
+        if (ended < started) return;
+        Interlocked.Increment(ref count);
+        Interlocked.Add(ref elapsedTicks, ended - started);
+    }
+
+    public void RequestBoundedCompilerDiagnosticStop(string reason)
+    {
+        if (!_debugEnabled || _debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode)
+            throw new InvalidOperationException("bounded compiler diagnostic stop is not configured");
+        if (String.IsNullOrWhiteSpace(reason) || reason.Length > 512 || reason.IndexOfAny(new char[] { '\r', '\n', '\0' }) >= 0)
+            throw new ArgumentException("bounded diagnostic stop reason must be a short single-line string", "reason");
+        RequestDebugAbort(reason);
+    }
+
+    public string GetBoundedCompilerDiagnosticStopReason()
+    {
+        if (_debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode) return null;
+        lock (_debugCoordinator) return _debugCoordinator.DiagnosticStopReason;
+    }
+
+    public bool IsBoundedCompilerDiagnosticTraceReady()
+    {
+        return _debugCoordinator != null && _debugCoordinator.BoundedCompilerDiagnosticMode &&
+            _debugCoordinator.CaptureCompleted.WaitOne(0);
+    }
+
+    public D32BoundedCompilerDiagnosticNativeCountersV1 GetBoundedCompilerDiagnosticNativeCounters()
+    {
+        if (_debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode)
+            throw new InvalidOperationException("bounded compiler diagnostic counters are not configured");
+        return new D32BoundedCompilerDiagnosticNativeCountersV1 {
+            StopwatchFrequency = Stopwatch.Frequency,
+            WaitCallCount = Interlocked.Read(ref _diagnosticWaitCallCount),
+            WaitElapsedTicks = Interlocked.Read(ref _diagnosticWaitElapsedTicks),
+            ImageIdentityCheckCount = Interlocked.Read(ref _diagnosticImageIdentityCheckCount),
+            ImageIdentityElapsedTicks = Interlocked.Read(ref _diagnosticImageIdentityElapsedTicks),
+            ParentIdentityCheckCount = Interlocked.Read(ref _diagnosticParentIdentityCheckCount),
+            ParentIdentityElapsedTicks = Interlocked.Read(ref _diagnosticParentIdentityElapsedTicks),
+            RetainedHandleVerificationBatchCount = Interlocked.Read(ref _diagnosticRetainedHandleVerificationBatchCount),
+            RetainedHandleCheckCount = Interlocked.Read(ref _diagnosticRetainedHandleCheckCount),
+            RetainedHandleElapsedTicks = Interlocked.Read(ref _diagnosticRetainedHandleElapsedTicks),
+            ContinueCallCount = Interlocked.Read(ref _diagnosticContinueCallCount),
+            ContinueElapsedTicks = Interlocked.Read(ref _diagnosticContinueElapsedTicks),
+            CleanupCallCount = Interlocked.Read(ref _diagnosticCleanupCallCount),
+            CleanupElapsedTicks = Interlocked.Read(ref _diagnosticCleanupElapsedTicks)
+        };
+    }
+
+    public D32BoundedCompilerDiagnosticSystemSampleV1 GetBoundedCompilerDiagnosticSystemSample()
+    {
+        if (_debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode)
+            throw new InvalidOperationException("bounded compiler diagnostic sampling is not configured");
+        D32BoundedCompilerDiagnosticSystemSampleV1 sample = new D32BoundedCompilerDiagnosticSystemSampleV1 {
+            Reliable = false, StopwatchTicks = Stopwatch.GetTimestamp(), Processes = new D32BoundedCompilerDiagnosticProcessSampleV1[0]
+        };
+        List<IntPtr> handles = new List<IntPtr>();
+        List<uint> processIds = new List<uint>();
+        List<long> expectedCreations = new List<long>();
+        List<string> imagePaths = new List<string>();
         lock (_observedProcessLock)
         {
+            if (_observedProcessHandles.Count != _observedProcessIds.Count ||
+                _observedProcessHandles.Count != _observedProcessCreationFileTimes.Count ||
+                _observedProcessHandles.Count != _observedProcessImagePaths.Count)
+            {
+                sample.Failure = "retained process identity arrays are not aligned";
+                return sample;
+            }
+            handles.AddRange(_observedProcessHandles);
+            processIds.AddRange(_observedProcessIds);
+            expectedCreations.AddRange(_observedProcessCreationFileTimes);
+            imagePaths.AddRange(_observedProcessImagePaths);
+        }
+
+        PerformanceInformation performance = new PerformanceInformation();
+        performance.Size = (uint)Marshal.SizeOf(typeof(PerformanceInformation));
+        if (!GetPerformanceInfo(ref performance, performance.Size))
+        {
+            sample.Failure = "GetPerformanceInfo failed (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+            return sample;
+        }
+        ulong pageSize = performance.PageSize.ToUInt64();
+        ulong physicalTotalPages = performance.PhysicalTotal.ToUInt64();
+        ulong physicalAvailablePages = performance.PhysicalAvailable.ToUInt64();
+        ulong commitTotalPages = performance.CommitTotal.ToUInt64();
+        ulong commitLimitPages = performance.CommitLimit.ToUInt64();
+        ulong commitPeakPages = performance.CommitPeak.ToUInt64();
+        if (pageSize == 0 || physicalAvailablePages > physicalTotalPages || commitTotalPages > commitLimitPages || commitPeakPages < commitTotalPages ||
+            physicalTotalPages > (ulong)Int64.MaxValue / pageSize || physicalAvailablePages > (ulong)Int64.MaxValue / pageSize ||
+            commitTotalPages > (ulong)Int64.MaxValue / pageSize || commitLimitPages > (ulong)Int64.MaxValue / pageSize ||
+            commitPeakPages > (ulong)Int64.MaxValue / pageSize || commitLimitPages - commitTotalPages > (ulong)Int64.MaxValue / pageSize)
+        {
+            sample.Failure = "GetPerformanceInfo page or commitment values are internally inconsistent";
+            return sample;
+        }
+        sample.TotalPhysicalBytes = (long)(physicalTotalPages * pageSize);
+        sample.AvailablePhysicalBytes = (long)(physicalAvailablePages * pageSize);
+        sample.CommitUsedBytes = (long)(commitTotalPages * pageSize);
+        sample.CommitLimitBytes = (long)(commitLimitPages * pageSize);
+        sample.SystemCommitPeakBytes = (long)(commitPeakPages * pageSize);
+        sample.CommitHeadroomBytes = (long)((commitLimitPages - commitTotalPages) * pageSize);
+
+        IntPtr accountingJob = _parentJob != IntPtr.Zero ? _parentJob : _job;
+        JobObjectBasicAccountingInformation accounting = new JobObjectBasicAccountingInformation();
+        uint returned;
+        uint accountingSize = (uint)Marshal.SizeOf(typeof(JobObjectBasicAccountingInformation));
+        if (accountingJob == IntPtr.Zero || !QueryInformationJobObject(accountingJob, JobObjectBasicAccountingInformationClass,
+            ref accounting, accountingSize, out returned) || returned < accountingSize)
+        {
+            sample.Failure = "owned Job accounting query failed (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+            return sample;
+        }
+        sample.JobTotalProcesses = accounting.TotalProcesses;
+        sample.JobActiveProcesses = accounting.ActiveProcesses;
+        sample.JobAccountingVerified = true;
+
+        List<D32BoundedCompilerDiagnosticProcessSampleV1> processSamples = new List<D32BoundedCompilerDiagnosticProcessSampleV1>();
+        for (int i = 0; i < handles.Count; i++)
+        {
+            D32BoundedCompilerDiagnosticProcessSampleV1 row = new D32BoundedCompilerDiagnosticProcessSampleV1 {
+                ProcessId = processIds[i], CreationFileTime = expectedCreations[i], ImagePath = imagePaths[i]
+            };
+            uint waitResult = WaitForSingleObject(handles[i], 0);
+            if (waitResult == WaitObject0) row.ProcessSignaled = true;
+            else if (waitResult != 0x00000102)
+            {
+                sample.Failure = "retained process handle wait failed for pid=" + processIds[i].ToString(CultureInfo.InvariantCulture) +
+                    " (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+                return sample;
+            }
+            DebugFileTime creation;
+            DebugFileTime exit;
+            DebugFileTime kernel;
+            DebugFileTime user;
+            if (!GetProcessTimes(handles[i], out creation, out exit, out kernel, out user) ||
+                DebugFileTimeValue(creation) != expectedCreations[i])
+            {
+                sample.Failure = "retained process CPU/creation identity query failed for pid=" + processIds[i].ToString(CultureInfo.InvariantCulture) +
+                    " (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+                return sample;
+            }
+            row.CpuVerified = true;
+            row.UserTime100Ns = DebugFileTimeValue(user);
+            row.KernelTime100Ns = DebugFileTimeValue(kernel);
+            if (String.IsNullOrWhiteSpace(row.ImagePath) && !row.ProcessSignaled)
+            {
+                sample.Failure = "live retained process lacks its CREATE-event opened-image path for pid=" + processIds[i].ToString(CultureInfo.InvariantCulture);
+                return sample;
+            }
+            ProcessMemoryCountersEx memory = new ProcessMemoryCountersEx();
+            memory.Size = (uint)Marshal.SizeOf(typeof(ProcessMemoryCountersEx));
+            if (GetProcessMemoryInfoEx(handles[i], ref memory, memory.Size))
+            {
+                row.MemoryVerified = true;
+                row.PrivateBytes = checked((long)memory.PrivateUsage.ToUInt64());
+                row.WorkingSetBytes = checked((long)memory.WorkingSetSize.ToUInt64());
+            }
+            else if (!row.ProcessSignaled)
+            {
+                sample.Failure = "live retained process memory query failed for pid=" + processIds[i].ToString(CultureInfo.InvariantCulture) +
+                    " (win32=" + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture) + ")";
+                return sample;
+            }
+            processSamples.Add(row);
+        }
+        sample.Processes = processSamples.ToArray();
+        sample.Reliable = true;
+        return sample;
+    }
+
+    public D32BoundedCompilerDiagnosticCommandRecordV1[] GetBoundedCompilerDiagnosticRustcCommandRecords()
+    {
+        if (_debugCoordinator == null || !_debugCoordinator.BoundedCompilerDiagnosticMode || _debugTrace == null)
+            throw new InvalidOperationException("bounded compiler diagnostic process trace is not complete and available");
+        List<D32BoundedCompilerDiagnosticCommandRecordV1> records = new List<D32BoundedCompilerDiagnosticCommandRecordV1>();
+        foreach (D32DebugProcessRecordV2 process in _debugTrace.Processes)
+        {
+            if (!String.Equals(Path.GetFileName(process.ImagePath), "rustc.exe", StringComparison.OrdinalIgnoreCase)) continue;
+            D32DebugCommandLineCaptureV1 capture = process.CommandLineCapture;
+            if (!process.ImageVerified || !process.CommandLineCaptureRequired || capture == null ||
+                capture.Source != "CREATE_PROCESS_DEBUG_EVENT.hProcess/PEB.ProcessParameters.CommandLine" ||
+                capture.ProcessId != process.ProcessId || capture.CreationFileTime != process.CreationFileTime ||
+                capture.ParentProcessId != process.ParentProcessId || capture.ParentCreationFileTime != process.ParentCreationFileTime ||
+                !String.Equals(capture.ImagePath, process.ImagePath, StringComparison.Ordinal) || String.IsNullOrWhiteSpace(capture.CommandLine))
+                throw new InvalidOperationException("rustc CREATE command line lacks verified PID/creation/parent/opened-image binding");
+            int argumentCount;
+            IntPtr argumentVector = CommandLineToArgvW(capture.CommandLine, out argumentCount);
+            if (argumentVector == IntPtr.Zero || argumentCount <= 0 || argumentCount > 4096)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "captured rustc command-line argv parse failed");
+            try
+            {
+                string[] argv = new string[argumentCount];
+                for (int i = 0; i < argumentCount; i++)
+                {
+                    IntPtr item = Marshal.ReadIntPtr(argumentVector, i * IntPtr.Size);
+                    argv[i] = Marshal.PtrToStringUni(item);
+                    if (String.IsNullOrEmpty(argv[i])) throw new InvalidOperationException("captured rustc argv contains a null or empty field");
+                }
+                records.Add(new D32BoundedCompilerDiagnosticCommandRecordV1 {
+                    ProcessId = process.ProcessId, CreationFileTime = process.CreationFileTime,
+                    ParentProcessId = process.ParentProcessId, ParentCreationFileTime = process.ParentCreationFileTime,
+                    ImagePath = process.ImagePath, CommandLine = capture.CommandLine, Argv = argv
+                });
+            }
+            finally { LocalFree(argumentVector); }
+        }
+        return records.ToArray();
+    }
+
+    private bool VerifyObservedProcessHandles(out string invalidHandles)
+    {
+        long diagnosticStarted = _debugCoordinator != null && _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+        List<string> invalid = new List<string>();
+        int checkedCount = 0;
+        lock (_observedProcessLock)
+        {
+            checkedCount = _observedProcessHandles.Count;
             for (int i = 0; i < _observedProcessHandles.Count; i++)
             {
                 uint flags;
@@ -4944,6 +5458,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             }
         }
         invalidHandles = String.Join(";", invalid.ToArray());
+        if (diagnosticStarted != 0) AddBoundedDiagnosticMeasurement(ref _diagnosticRetainedHandleVerificationBatchCount, ref _diagnosticRetainedHandleElapsedTicks, diagnosticStarted);
+        if (diagnosticStarted != 0) Interlocked.Add(ref _diagnosticRetainedHandleCheckCount, checkedCount);
         return invalid.Count == 0;
     }
 
@@ -5239,7 +5755,13 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
             throw new InvalidOperationException("CREATE command-line evidence is not linked to the exact retained child PID/creation handle");
         VerifyRetainedDebugParentIdentity(retainedCurrent.Handle, record.ProcessId, record.CreationFileTime,
             record.ParentProcessId, record.ParentCreationFileTime, "CREATE child");
-        VerifyCreateParentIdentityBeforeContinue(record, active, debuggerCreation);
+        long parentCheckStarted = _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+        try { VerifyCreateParentIdentityBeforeContinue(record, active, debuggerCreation); }
+        finally
+        {
+            if (parentCheckStarted != 0)
+                AddBoundedDiagnosticMeasurement(ref _diagnosticParentIdentityCheckCount, ref _diagnosticParentIdentityElapsedTicks, parentCheckStarted);
+        }
         DebugImageSnapshot openedImage = new DebugImageSnapshot {
             Path = record.ImagePath, Bytes = record.Bytes, Sha256 = record.Sha256,
             VolumeSerialHex = record.VolumeSerialHex, FileIdHex = record.FileIdHex
@@ -5870,13 +6392,16 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 trace.EventChainComplete = false;
                 break;
             }
-            if (!WaitForDebugEvent(out ev, 250))
+            long waitStarted = _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+            bool waitSucceeded = WaitForDebugEvent(out ev, 250);
+            int waitError = waitSucceeded ? 0 : Marshal.GetLastWin32Error();
+            if (waitStarted != 0) AddBoundedDiagnosticMeasurement(ref _diagnosticWaitCallCount, ref _diagnosticWaitElapsedTicks, waitStarted);
+            if (!waitSucceeded)
             {
-                int error = Marshal.GetLastWin32Error();
-                if (error == ErrorSemTimeout) { trace.WaitTimeoutCount++; continue; }
+                if (waitError == ErrorSemTimeout) { trace.WaitTimeoutCount++; continue; }
                 trace.DebugApiErrorCount++;
                 trace.EventChainComplete = false;
-                TraceBlock(trace, "WaitForDebugEvent failed without a loss-recovery path: " + error.ToString(CultureInfo.InvariantCulture));
+                TraceBlock(trace, "WaitForDebugEvent failed without a loss-recovery path: " + waitError.ToString(CultureInfo.InvariantCulture));
                 if (!TerminateJobObject(_job, 0xD3201003)) trace.DebugApiErrorCount++;
                 break;
             }
@@ -5950,10 +6475,36 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                             _observedHandleDuplicationAudit.Add(ev.ProcessId.ToString(CultureInfo.InvariantCulture) + ":source=0x" + created.Process.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":thread=0x" + created.Thread.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":file=0x" + eventImageHandle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":retained=0x" + retainedHandle.ToInt64().ToString("x", CultureInfo.InvariantCulture) + ":same=" + (retainedHandle == created.Process).ToString() + ":priorCollision=" + priorCollision.ToString());
                                 _observedProcessHandles.Add(retainedHandle);
                                 _observedProcessIds.Add(ev.ProcessId);
+                                _observedProcessCreationFileTimes.Add(creation);
+                                _observedProcessImagePaths.Add(null);
                             }
                             if (failureInjection == "root-parent-mismatch" && isRootProcessEvent)
                                 parentPid = parentPid == UInt32.MaxValue ? parentPid - 1 : parentPid + 1;
-                            image = ReadDebugImage(created.File);
+                            long imageCheckStarted = _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+                            try { image = ReadDebugImage(created.File); }
+                            finally
+                            {
+                                if (imageCheckStarted != 0)
+                                    AddBoundedDiagnosticMeasurement(ref _diagnosticImageIdentityCheckCount, ref _diagnosticImageIdentityElapsedTicks, imageCheckStarted);
+                            }
+                            if (_debugCoordinator.BoundedCompilerDiagnosticMode)
+                            {
+                                lock (_observedProcessLock)
+                                {
+                                    for (int observedIndex = _observedProcessIds.Count - 1; observedIndex >= 0; observedIndex--)
+                                    {
+                                        if (_observedProcessIds[observedIndex] == ev.ProcessId &&
+                                            _observedProcessCreationFileTimes[observedIndex] == creation)
+                                        {
+                                            _observedProcessImagePaths[observedIndex] = image.Path;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (String.Equals(Path.GetExtension(image.Path), ".exe", StringComparison.OrdinalIgnoreCase) &&
+                                    IsImageUnderRoot(image.Path, _debugCoordinator.BoundedDiagnosticTestExecutableRoot))
+                                    throw new InvalidOperationException("D32_BOUNDED_DIAGNOSTIC_TEST_EXECUTION_BLOCKED: an executable under the ordinary target/debug/deps test-artifact directory was refused before ContinueDebugEvent");
+                            }
                             string identity = ev.ProcessId.ToString(CultureInfo.InvariantCulture) + "@" + creation.ToString(CultureInfo.InvariantCulture);
                             if (creation <= 0 || !identities.Add(identity)) throw new InvalidOperationException("process PID/creation identity is absent or duplicated");
                             if (active.ContainsKey(ev.ProcessId)) throw new InvalidOperationException("PID reused before the prior process identity exited");
@@ -6045,7 +6596,8 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                                 verified = true;
                             }
                         requireActualCommandLine = trace.ProcessCreateEventCount == 1 ||
-                            reason == "narrow-caller-pinned-H7C-Git-child-v1";
+                            reason == "narrow-caller-pinned-H7C-Git-child-v1" ||
+                            (_debugCoordinator.RequireRustcCommandLineCapture && String.Equals(Path.GetFileName(image.Path), "rustc.exe", StringComparison.OrdinalIgnoreCase));
                         commandLineCapture = CaptureDebugCommandLine(created.Process, ev.ProcessId, creation,
                             parentPid, parentCreation, image, requireActualCommandLine);
                         if (trace.ProcessCreateEventCount == 1 &&
@@ -6231,11 +6783,15 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
                 }
             }
             DebugContinueCallCount++;
-            if (!ContinueDebugEvent(ev.ProcessId, ev.ThreadId, continueStatus))
+            long continueStarted = _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+            bool continueSucceeded = ContinueDebugEvent(ev.ProcessId, ev.ThreadId, continueStatus);
+            int continueError = continueSucceeded ? 0 : Marshal.GetLastWin32Error();
+            if (continueStarted != 0) AddBoundedDiagnosticMeasurement(ref _diagnosticContinueCallCount, ref _diagnosticContinueElapsedTicks, continueStarted);
+            if (!continueSucceeded)
             {
                 trace.DebugApiErrorCount++;
                 trace.EventChainComplete = false;
-                TraceBlock(trace, "ContinueDebugEvent failed; no polling fallback is permitted: " + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture));
+                TraceBlock(trace, "ContinueDebugEvent failed; no polling fallback is permitted: " + continueError.ToString(CultureInfo.InvariantCulture));
                 if (!TerminateJobObject(_job, 0xD3201009)) trace.DebugApiErrorCount++;
                 break;
             }
@@ -6256,7 +6812,16 @@ public sealed class D32FixtureNativeProcessV2 : IDisposable
 
     public D32NativeCleanupEvidenceV2 CloseJobAndWait(int timeoutMilliseconds)
     {
-        if (_debugEnabled) return CloseDebugJobAndWait(timeoutMilliseconds);
+        if (_debugEnabled)
+        {
+            long cleanupStarted = _debugCoordinator != null && _debugCoordinator.BoundedCompilerDiagnosticMode ? Stopwatch.GetTimestamp() : 0;
+            try { return CloseDebugJobAndWait(timeoutMilliseconds); }
+            finally
+            {
+                if (cleanupStarted != 0)
+                    AddBoundedDiagnosticMeasurement(ref _diagnosticCleanupCallCount, ref _diagnosticCleanupElapsedTicks, cleanupStarted);
+            }
+        }
         D32NativeCleanupEvidenceV2 evidence = new D32NativeCleanupEvidenceV2();
         if (_job == IntPtr.Zero)
         {

@@ -27,6 +27,7 @@
 | ADR-D32-POWERSHELL-MODULE-CONTENT-AUTHORITY-V1 | SUPERSEDED (partial) | Caller-pinned closed content authority for installed PowerShell modules | GPT-6.1 Sol Max | Retained except where V2 explicitly supersedes |
 | ADR-D32-POWERSHELL-MODULE-CONTENT-AUTHORITY-V2 | APPROVED WITH CONDITIONS | Protected PowerShell distribution and resolver admission | GPT-6.1 Sol Max | D32 PowerShell admission and dependent evidence only |
 | ADR-D32-CARGO-PINNED-VCTIP-DESCENDANT-V1 | APPROVED WITH CONDITIONS | Exact Profile V2 VCTIP child under fixed Cargo roots | GPT-6 Sol Max | D32 Phase 0/Phase 1 Cargo process traces only |
+| ADR-D32-BOUNDED-COMPILER-DIAGNOSTIC-V1 | APPROVED WITH CONDITIONS | One-shot, bounded, non-gating compiler diagnostic for the exact blocked D32 candidate | GPT-6.1 Sol Max | Prospective diagnostic tooling and separately caller-pinned diagnostic use only; no formal gate authority |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -885,6 +886,63 @@ This narrow clarification is prospective under ADR V2. It does not broaden the t
 5. Required focused synthetic negatives cover wrong/missing/null/unprotected root descriptors, wrong owner/opened identity/path/type, 0x4 on files or non-root/resolver directories, other-drive/UNC/nested roots, all forbidden rights, unsafe child/ancestor replacement or inheritance, root siblings entering a resolver or masquerading as components, and ProgramData owner/descriptor/child-chain failures. Use record mutations and in-memory fixtures only; do not write to installed runtime paths or lock a whole volume.
 
 The volume-root identity, full descriptor and child-chain/resolver proof are inputs to the same schema-2 authority and shared admission already defined by V2. There is no V3 record, per-run companion, outer migration, new gate or D32/D33 authorization.
+
+## ADR-D32-BOUNDED-COMPILER-DIAGNOSTIC-V1 — One-shot bounded non-gating compiler diagnostic
+
+- **Status:** APPROVED WITH CONDITIONS
+- **Decision authority:** GPT-6.1 Sol Max
+- **Decision date:** 2026-10-04
+- **Related milestone:** D32 final-gate readiness (D32-A-R2)
+- **Related implementation base:** `2de30edf5de48aa4ed3216c3d3df13c3e2f0ac51`
+- **Supersedes:** None
+
+#### Context
+
+An earlier D32 inventory attempt retained a `D32_PHASE0_BLOCKED_DIAGNOSTIC_V1` record whose V2 process trace is `BLOCKED`. Its prior fetch completion was not retained, and its authority was `NONE`. This evidence cannot be upgraded into successful discovery or reused as authority for a later process. A separate, exact-candidate compiler diagnostic may help explain the failure, but it must remain outside the formal D32 evidence and gate path.
+
+#### Decision
+
+1. A future use requires a new create-new `D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1` record with `gate_authority = NONE`, exact candidate SHA/repository identity, six independently pinned source files (diagnostic runner, policy, selftest, fixture launcher, Profile V2 implementation, and module-authority implementation), exact Profile V2/module-authority/pinned-Git path and content pins, fixed command/environment/query list, current target and optional dependency-origin identities, external output/TempRoot owner identities, finite budgets, and optional image grants. Its path and SHA must be supplied independently; an authority candidate cannot authorize itself.
+2. The only Cargo invocation is a direct, caller-pinned image with exact argv `test --manifest-path vita-agent/Cargo.toml --all-targets --locked --offline --features d32-a-test-helper --jobs 4 --no-run --message-format=json -vv`, from the exact clean Integration repository. At most one invocation is permitted. `--no-run` is mandatory: no test body, extra Cargo command, shell, profiler, root `rustc` probe, retry, fresh CargoHome, cache copy, or target override is authorized. The ordinary candidate-local `vita-agent/target` remains the exclusive target; it is neither a gate artifact nor a freshness/inventory claim.
+3. The only optional dependency source is the existing `E:\d32\inv7\r\c` CargoHome. Current source provenance must be re-established from the exact current `vita-agent/Cargo.lock`, its six current manifest/lock pins and Profile V2 lock bindings, the independently pinned inv7 owner/blocked-attempt/raw-capture references, and current archive/pack/index/extracted-checkout contents. Registry archives are checked against lock checksums and strict USTAR members; Git objects are independently recomputed through commit/tree/blob closure and compared with the complete current checkout. `.git`, `.cargo-ok`, and Cargo checksum metadata are limited to the explicitly supported metadata cases. Unsupported formats, catalog drift, aliases, reparse entries, extras, missing members, symlinks/gitlinks, helpers, hooks, filters, alternates, promisor objects, submodules, user configuration, fetches, or repairs fail closed.
+4. Source verification is bounded: each registry archive is at most 256 MiB; each Git pack is at most 256 MiB and index at most 64 MiB; each object is at most 64 MiB; object resolution is limited to 500,000 records and delta depth 32; expanded data is limited to 32 GiB; managed verifier buffers are limited to 512 MiB; the combined current registry/Git source proof is limited to 300 seconds. A bound or format failure is a diagnostic refusal/stop, not grounds to add a helper, install a parser, use network access, copy a cache, or expand Git authority.
+5. Exactly five direct, pinned-Git metadata queries are permitted in this order: pre-Cargo `rev-parse --verify --end-of-options HEAD^{commit}`, `status --porcelain=v1 --untracked-files=all`, `ls-files -v -z`; then post-cleanup `rev-parse --verify --end-of-options HEAD^{commit}` and `status --porcelain=v1 --untracked-files=all`. No source-origin Git query, arbitrary query, or H7-C child extension is added. The bounded diagnostic route uses a finite query/join/pipe ceiling and refuses any other argv.
+6. Existing Profile V2 VCTIP may be admitted only by its exact caller pin. Vendored protoc may be admitted only by a new, current-run grant bound to the exact lock-derived and content-verified dependency source/image. A prior inv7 protoc grant remains historical provenance only and cannot authorize the new diagnostic. No process may use old discovery permissions as a substitute for the new grant.
+7. Before the one Cargo launch, require at least 8 logical CPUs, 12 GiB available physical memory, 8 GiB commit headroom, 200 GiB free on both output and ordinary-target volumes, and zero competing target writers. Any missing/unreliable measurement refuses launch. From the first owned launch, the total ceiling is 1,800 seconds, Cargo is limited to 1,200 seconds, and at least 120 seconds for cleanup plus 60 seconds for persistence must remain before launch. If that budget cannot be met, do not start Cargo. Resource sampling is no more frequent than once per 10 seconds; stop the owned Job on metrics unreliability, available physical memory below 4 GiB, commit headroom below 2 GiB, raw stdout/stderr reaching the shared 256 MiB cap, capacity/admission failure, or deadline. The sample sidecar has its own 64 MiB ceiling.
+8. The direct Cargo root remains in the existing non-breakaway, kill-on-close Job and the existing V2 debugger. Every descendant CREATE still receives the unchanged parent/image/argv/identity/Job checks before `ContinueDebugEvent`; any executable under `vita-agent/target/debug/deps` is denied before continuation. At stop, Trace V2 remains `BLOCKED`, never a passing trace. The dedicated debug thread must be joined, retained handles signaled, debugger association absent, and Job active count verified at zero before close. Unverified cleanup permits no later launch.
+9. New native measurement counters, 10-second process/system samples, raw stdout/stderr, Cargo JSON, and rustc/Cargo cross-binding are separate diagnostic result/sidecar data only. They do not add fields to Trace V2, change its accounting or event order, or authorize a formal cache result. Process attribution uses both PID and creation time; unmatched identities remain `UNVERIFIED`/unsampled, never guessed. Observed PrivateUsage is labeled a sampled maximum, not a lifetime peak.
+10. The only result type is `D32_BOUNDED_COMPILER_DIAGNOSTIC_V1`, with `gate_authority = NONE`, `phase1_allowed = false`, and `aggregate_allowed = false`. Its only statuses are `COMPLETED_DIAGNOSTIC`, `BUDGET_STOPPED`, `REFUSED`, and `UNRESOLVED`; `PASS` is impossible. No formal Phase 0, Phase 1, aggregate, release, Host, D31 seeder, or readiness consumer may consume or promote this result. Existing `D32_PHASE0_BLOCKED_DIAGNOSTIC_V1`, SC-D32-V1, all formal outer schemas, fixed formal commands, and all Stage Contract gates remain unchanged.
+
+#### Frozen constraints and forbidden implementation
+
+- The historical inv7 attempt stays `BLOCKED`; missing historical fetch records stay `NOT_RETAINED`. Do not fabricate successful fetch records or re-label a blocked trace, grant, or gate authority.
+- Output root and TempRoot are external to the repository and source CargoHome, independently pinned, create-new, owner-bound, and never reused. Do not reclaim or write inv7 evidence roots or owners.
+- Do not change formal SC-D32-V1 commands, schemas, test inventories, cache policy, V2 Trace semantics, Job policy, Host authority, migration/recovery/security meaning, or frozen invariants.
+- No Cargo/network/native diagnostic/source-closure invocation is authorized by this ADR alone. A future run requires the coordinator's separate exact-SHA pin and current complete caller inputs; generated facts remain untrusted until independently reviewed.
+- This prospective diagnostic does not close a D32 gate, establish PASS/FROZEN, or authorize D33.
+
+#### Required module-free implementation evidence
+
+- Positive and negative tests for the exact authority/pin shapes, fixed Cargo argv/environment and five-query Git list, current-source-plan parsing, strict USTAR and in-process Git pack/index/tree/delta handling, stop/capacity/deadline policy, cleanup and test-executable denial, raw PID+creation sampling replay, all four non-PASS result statuses, historical `NOT_RETAINED`/`BLOCKED`/`NONE` replay, and exact formal-consumer schema rejection.
+- Wrong/stale/cross-run pins, missing/extra source records, malformed archive/pack/index/tree, path/case collisions, unsupported source forms, wrong environment/target, arbitrary Git query, insufficient capacity/budget, unreliable sampling, capture ceiling, test-executable CREATE, cleanup failure, and any attempt to use diagnostic records as formal evidence must fail closed.
+- Existing inv6/inv7 source records remain immutable and bound to their original attempts. Diagnostic-source relation is not a source-authority or gate claim.
+
+#### Required real canary
+
+None. This is not a formal gate or production canary.
+
+#### Compatibility constraints
+
+- Preserve Profile V2, module admission V2, process/Job Trace V2, fixture manifest v3, all formal outer schemas, fixed formal argv/jobs/deadlines, and the exact SC-D32-V1 order.
+- Formal consumers remain strict on their existing Phase0 V8 / aggregate V8 and related exact schemas and reject the new diagnostic record as an unknown type.
+
+#### Supersedes / Superseded by
+
+Supersedes none. This decision only approves the prospective bounded diagnostic domain above and grants no formal authority.
+
+#### 2026-10-04 historical-origin clarification
+
+The earlier inv7 evidence remains a `BLOCKED` attempt with gate authority `NONE`; historical fetch completion is `NOT_RETAINED`, and absent fetch-record references are allowed to remain absent rather than being fabricated. The retained owner, blocked diagnostic, raw captures, and any old grant can support only a candidate/run/root origin relationship. Current source verification must independently reopen and compare the exact current lock, archives, Git object closure, checkout, and image grants. Before any such source-content read scan, the coordinator must independently pin the exact candidate, scripts, roots, records, file identities, and finite limits. This clarification changes no schema, gate, Stage Contract, or architecture status.
 
 ## ADR 模板
 

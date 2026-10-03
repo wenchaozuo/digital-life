@@ -705,6 +705,68 @@ function Test-D32BoundedCompilerDiagnosticInteger {
     return ([Int64]$Value -ge 0)
 }
 
+function Get-D32BoundedCompilerDiagnosticGlobalWriterCensus {
+    param([Parameter(Mandatory = $true)][scriptblock]$ProcessProbe)
+    try { $probeResult = & $ProcessProbe }
+    catch { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: Win32_Process target-writer census failed' }
+    if ($null -eq $probeResult) { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: target-writer census returned no verifiable result' }
+    $processes = @($probeResult)
+    if ($processes.Count -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: target-writer census returned an empty, unverifiable result' }
+
+    $writerNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'build-script-build.exe')) { [void]$writerNames.Add($name) }
+    $targetWriters = [System.Collections.Generic.List[string]]::new()
+    foreach ($process in $processes) {
+        $nameProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['Name'] }
+        $processIdProperty = if ($null -eq $process) { $null } else { $process.PSObject.Properties['ProcessId'] }
+        if ($null -eq $nameProperty -or $null -eq $processIdProperty -or $nameProperty.Value -isnot [string] -or
+            [String]::IsNullOrWhiteSpace([string]$nameProperty.Value) -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger -Value $processIdProperty.Value)) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: target-writer census contains an incomplete process identity'
+        }
+        $processName = [string]$nameProperty.Value
+        $processId = [Int64]$processIdProperty.Value
+
+        # Match the frozen Phase 0 census exceptions exactly; all other malformed
+        # reserved identities fail closed instead of being treated as ordinary rows.
+        if ($processId -eq 0 -or $processName -ceq 'System Idle Process') {
+            $parentProperty = $process.PSObject.Properties['ParentProcessId']
+            if ($processId -ne 0 -or $processName -cne 'System Idle Process' -or $null -eq $parentProperty -or
+                -not (Test-D32BoundedCompilerDiagnosticInteger -Value $parentProperty.Value) -or [Int64]$parentProperty.Value -ne 0) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: PID-zero row is not the exact Windows System Idle Process identity'
+            }
+            continue
+        }
+        if ($processId -eq 4 -or $processName -ceq 'System') {
+            $parentProperty = $process.PSObject.Properties['ParentProcessId']
+            if ($processId -ne 4 -or $processName -cne 'System' -or $null -eq $parentProperty -or
+                -not (Test-D32BoundedCompilerDiagnosticInteger -Value $parentProperty.Value) -or [Int64]$parentProperty.Value -ne 0) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: PID-four row is not the exact Windows System process identity'
+            }
+            continue
+        }
+        if ($processId -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: target-writer census contains an incomplete process identity' }
+        if ($writerNames.Contains($processName)) {
+            $targetWriters.Add("${processName} PID=${processId}: active build-class process cannot be excluded from candidate target trees")
+        }
+    }
+    return [PSCustomObject]@{
+        process_count = [Int64]$processes.Count
+        competing_target_writer_count = [Int64]$targetWriters.Count
+        target_writer_check = 'Win32-CIM-active-build-process-census'
+        competing_target_writers = @($targetWriters.ToArray())
+    }
+}
+
+function Assert-D32BoundedCompilerDiagnosticNoGlobalWriter {
+    param([Parameter(Mandatory = $true)][scriptblock]$ProcessProbe)
+    $census = Get-D32BoundedCompilerDiagnosticGlobalWriterCensus -ProcessProbe $ProcessProbe
+    if ([Int64]$census.competing_target_writer_count -gt 0) {
+        throw ('D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: competing target writer exists: ' + (@($census.competing_target_writers) -join '; '))
+    }
+    return $census
+}
+
 function Test-D32BoundedCompilerDiagnosticFixedArgv {
     param([AllowNull()][object]$Arguments)
     if ($Arguments -isnot [Array] -or $Arguments.Count -ne (Get-D32BoundedCompilerDiagnosticFixedArgv).Count) { return $false }

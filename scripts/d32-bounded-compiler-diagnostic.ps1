@@ -1359,19 +1359,9 @@ function Get-D32BoundedDiagnosticCapacity {
     if (-not $targetDrive.IsReady -or [Int64]$targetDrive.AvailableFreeSpace -lt (200L * 1024L * 1024L * 1024L)) {
         throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: normal-target volume free space is below 200 GiB or unavailable'
     }
-    try { $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
-    catch { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: process census for competing target writers failed' }
-    $targetFull = [IO.Path]::GetFullPath($TargetDirectory).TrimEnd('\')
-    $writerNames = @('cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe', 'lld-link.exe', 'cc.exe', 'cc1.exe')
-    $writers = [System.Collections.Generic.List[object]]::new()
-    foreach ($process in $processes) {
-        $name = if ($null -eq $process.Name) { '' } else { [string]$process.Name }
-        $commandLine = if ($null -eq $process.CommandLine) { '' } else { [string]$process.CommandLine }
-        if ($writerNames -icontains $name -and $commandLine.IndexOf($targetFull, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            $writers.Add([PSCustomObject]@{ process_id = [int]$process.ProcessId; name = $name; command_line_sha256 = Get-D32BoundedDiagnosticSha256 ([Text.UTF8Encoding]::new($false).GetBytes($commandLine)) })
-        }
+    $writerCensus = Assert-D32BoundedCompilerDiagnosticNoGlobalWriter -ProcessProbe {
+        Get-CimInstance -ClassName Win32_Process -ErrorAction Stop
     }
-    if ($writers.Count -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: one or more processes currently name the exclusive normal target as a build output' }
     return [PSCustomObject]@{
         checked_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
         logical_processors = [int][Environment]::ProcessorCount
@@ -1380,9 +1370,10 @@ function Get-D32BoundedDiagnosticCapacity {
         commit_headroom_bytes = [Int64]$system.CommitHeadroomBytes
         output_volume_free_bytes = [Int64]$drive.AvailableFreeSpace
         target_volume_free_bytes = [Int64]$targetDrive.AvailableFreeSpace
-        competing_target_writer_count = [Int64]$writers.Count
-        competing_target_writers = @($writers.ToArray())
-        target_writer_probe = 'Win32-CIM-process-command-line-target-output-census'
+        process_census_count = [Int64]$writerCensus.process_count
+        competing_target_writer_count = [Int64]$writerCensus.competing_target_writer_count
+        competing_target_writers = @($writerCensus.competing_target_writers)
+        target_writer_check = [string]$writerCensus.target_writer_check
     }
 }
 

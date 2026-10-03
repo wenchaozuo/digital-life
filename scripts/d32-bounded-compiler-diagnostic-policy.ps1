@@ -3,6 +3,9 @@
 
 $script:D32BoundedCompilerDiagnosticAuthorityType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1'
 $script:D32BoundedCompilerDiagnosticResultType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'
+$script:D32BoundedDiagnosticSourceProofAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V1'
+$script:D32BoundedDiagnosticSourceProofCandidateType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V1'
+$script:D32BoundedDiagnosticHistoricalInv7CandidateSha = '2de30edf5de48aa4ed3216c3d3df13c3e2f0ac51'
 $script:D32BoundedCompilerDiagnosticGateAuthority = 'NONE'
 $script:D32BoundedCompilerDiagnosticStatuses = @('COMPLETED_DIAGNOSTIC', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED')
 $script:D32BoundedCompilerDiagnosticMaxCargoMilliseconds = 1200000
@@ -810,6 +813,183 @@ function Test-D32BoundedCompilerDiagnosticFormalReject {
         $Record.status -isnot [string] -or [string]$Record.status -cne 'PASS')
 }
 
+function Test-D32BoundedDiagnosticSourceProofCandidate {
+    param([AllowNull()][object]$Record)
+    $fields = @('schema_version', 'record_type', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
+        'source_repo', 'status', 'formal_phase1_allowed', 'formal_aggregate_allowed', 'diagnostic_invocation_authority',
+        'historical_origin', 'proof_authority', 'proof_entry', 'proof_started_at_utc', 'proof_completed_at_utc',
+        'proof_elapsed_milliseconds', 'proof_budget', 'source_pins', 'current_profile_lock_bindings', 'current_source_closure', 'primary_error')
+    $historicalFields = @('fetch_completion', 'attempt_state', 'gate_authority')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields) -or
+        [int64]$Record.schema_version -ne 1 -or [string]$Record.record_type -cne $script:D32BoundedDiagnosticSourceProofCandidateType -or
+        [string]$Record.gate_authority -cne 'NONE' -or
+        [string]$Record.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Record.historical_origin_candidate_sha -cne $script:D32BoundedDiagnosticHistoricalInv7CandidateSha -or
+        [string]$Record.historical_origin_candidate_sha -ceq [string]$Record.candidate_sha -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Record.source_repo) -or
+        [string]$Record.status -cnotin @('CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY', 'BLOCKED') -or
+        $Record.formal_phase1_allowed -isnot [bool] -or [bool]$Record.formal_phase1_allowed -or
+        $Record.formal_aggregate_allowed -isnot [bool] -or [bool]$Record.formal_aggregate_allowed -or
+        [string]$Record.diagnostic_invocation_authority -cne 'NONE_UNTRUSTED_CANDIDATE_ONLY' -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.historical_origin $historicalFields) -or
+        [string]$Record.historical_origin.fetch_completion -cne 'NOT_RETAINED' -or
+        [string]$Record.historical_origin.attempt_state -cne 'BLOCKED' -or
+        [string]$Record.historical_origin.gate_authority -cne 'NONE' -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.proof_authority @('path', 'sha256')) -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Record.proof_authority.path) -or
+        [string]$Record.proof_authority.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.proof_entry @('path', 'sha256')) -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Record.proof_entry.path) -or
+        [string]$Record.proof_entry.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.proof_elapsed_milliseconds) -or
+        (($Record.primary_error -isnot [string]) -and ($null -ne $Record.primary_error)) -or
+        (($Record.current_profile_lock_bindings -isnot [Array]) -and ($null -ne $Record.current_profile_lock_bindings)) -or
+        (($null -ne $Record.current_source_closure) -and ([string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED'))) { return $false }
+    if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -and
+        ($null -eq $Record.current_source_closure -or [Int64]$Record.proof_elapsed_milliseconds -gt 300000 -or $null -ne $Record.primary_error -or
+            $Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne 5 -or
+            $Record.current_profile_lock_bindings -isnot [Array] -or $Record.current_profile_lock_bindings.Count -ne 3 -or
+            [string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED' -or
+            [string]$Record.current_source_closure.HistoricalFetchCompletion -cne 'NOT_RETAINED' -or
+            [string]$Record.current_source_closure.HistoricalGateAuthority -cne 'NONE' -or
+            [string]$Record.current_source_closure.RegistryContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V1' -or
+            [string]$Record.current_source_closure.GitContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V1' -or
+            [string]$Record.current_source_closure.RegistryContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
+            [string]$Record.current_source_closure.GitContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
+            [bool]$Record.current_source_closure.RegistryContentProof.formal_gate_usable -or
+            [bool]$Record.current_source_closure.GitContentProof.formal_gate_usable)) { return $false }
+    if ([string]$Record.status -ceq 'BLOCKED' -and [String]::IsNullOrWhiteSpace([string]$Record.primary_error)) { return $false }
+    return $true
+}
+
+function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
+    param(
+        [AllowNull()][object]$Document,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [Parameter(Mandatory = $true)][string]$ExpectedHistoricalOriginCandidateSha,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath,
+        [Parameter(Mandatory = $true)][string]$RunnerPath,
+        [Parameter(Mandatory = $true)][string]$ToolchainProfilePath,
+        [Parameter(Mandatory = $true)][string]$ToolchainProfileSha256
+    )
+    $top = @('schema_version', 'record_type', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
+        'source_repo', 'repository_identity', 'toolchain_profile', 'source_pins', 'dependency_origin', 'proof_budget',
+        'output_candidate', 'run_id', 'issued_at_utc')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $Document -Expected $top) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [int]$Document.schema_version -ne 1 -or
+        $Document.record_type -isnot [string] -or [string]$Document.record_type -cne $script:D32BoundedDiagnosticSourceProofAuthorityType -or
+        $Document.gate_authority -isnot [string] -or [string]$Document.gate_authority -cne 'NONE' -or
+        $Document.candidate_sha -isnot [string] -or [string]$Document.candidate_sha -cne $ExpectedCandidateSha -or
+        $ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+        $Document.historical_origin_candidate_sha -isnot [string] -or
+        [string]$Document.historical_origin_candidate_sha -cne $ExpectedHistoricalOriginCandidateSha -or
+        [string]$Document.historical_origin_candidate_sha -cne $script:D32BoundedDiagnosticHistoricalInv7CandidateSha -or
+        [string]$Document.historical_origin_candidate_sha -ceq [string]$Document.candidate_sha -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Document.source_repo) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$Document.source_repo), [IO.Path]::GetFullPath($Repository)) -or
+        -not (Test-D32BoundedCompilerDiagnosticIdentityPair $Document.repository_identity) -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Document.repository_identity @('volume_serial_hex', 'file_id_hex')) -or
+        [string]$Document.run_id -cnotmatch '^[0-9a-f]{32}$') { return $false }
+
+    $profile = $Document.toolchain_profile
+    if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $profile) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$profile.path, [IO.Path]::GetFullPath($ToolchainProfilePath)) -or
+        [string]$profile.sha256 -cne $ToolchainProfileSha256 -or
+        [string]$profile.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        (Test-D32BoundedCompilerDiagnosticWithin $profile.path $Repository) -or
+        (Test-D32BoundedCompilerDiagnosticWithin $profile.path 'E:\d32\inv7\r\c')) { return $false }
+
+    $origin = $Document.dependency_origin
+    $originFields = @('path', 'volume_serial_hex', 'file_id_hex', 'owner_record', 'blocked_diagnostic', 'fetch_records',
+        'manifest_refs', 'registry_archives', 'registry_archive_root', 'registry_source_root', 'git_database_root', 'git_checkout_root', 'git_content_refs')
+    $requiredOrigin = 'E:\d32\inv7\r\c'
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $origin $originFields) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.path, $requiredOrigin) -or
+        -not (Test-D32BoundedCompilerDiagnosticIdentityPair $origin) -or
+        $origin.fetch_records -isnot [Array] -or $origin.fetch_records.Count -gt 3 -or
+        $origin.manifest_refs -isnot [Array] -or $origin.manifest_refs.Count -ne 6 -or
+        $origin.registry_archives -isnot [Array] -or $origin.registry_archives.Count -eq 0 -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.owner_record) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.owner_record.path, 'E:\d32\inv7\D32-PHASE0-OWNER.json') -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.blocked_diagnostic) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.blocked_diagnostic.path, 'E:\d32\inv7\D32-PHASE0-BLOCKED-DIAGNOSTIC.json')) { return $false }
+    foreach ($reference in @($origin.fetch_records) + @($origin.manifest_refs)) {
+        if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $reference)) { return $false }
+    }
+    $rootPaths = @(
+        [PSCustomObject]@{ Name = 'registry_archive_root'; Path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f' },
+        [PSCustomObject]@{ Name = 'registry_source_root'; Path = 'E:\d32\inv7\r\c\registry\src\index.crates.io-1949cf8c6b5b557f' },
+        [PSCustomObject]@{ Name = 'git_database_root'; Path = 'E:\d32\inv7\r\c\git\db' },
+        [PSCustomObject]@{ Name = 'git_checkout_root'; Path = 'E:\d32\inv7\r\c\git\checkouts' })
+    foreach ($rootPin in $rootPaths) {
+        $reference = $origin.PSObject.Properties[[string]$rootPin.Name].Value
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $reference @('path', 'volume_serial_hex', 'file_id_hex')) -or
+            -not (Test-D32BoundedCompilerDiagnosticIdentityPair $reference) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$reference.path, [string]$rootPin.Path)) { return $false }
+    }
+    foreach ($archive in $origin.registry_archives) {
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $archive @('source', 'name', 'version', 'checksum', 'path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+            [string]$archive.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
+            [string]$archive.name -notmatch '^[A-Za-z0-9_-]+$' -or [string]$archive.version -notmatch '^[0-9A-Za-z.+_-]+$' -or
+            [string]$archive.checksum -cnotmatch '^[0-9a-f]{64}$' -or [string]$archive.sha256 -cne [string]$archive.checksum -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $archive.bytes -Positive) -or [Int64]$archive.bytes -gt 268435456 -or
+            [string]$archive.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$archive.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$archive.path, (Join-Path ([string]$origin.registry_archive_root.path) ([string]$archive.name + '-' + [string]$archive.version + '.crate')))) { return $false }
+    }
+    if ($origin.git_content_refs -isnot [Array] -or $origin.git_content_refs.Count -eq 0 -or $origin.git_content_refs.Count -gt 16) { return $false }
+    $gitSourcesSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($reference in $origin.git_content_refs) {
+        if (-not (Test-D32BoundedCompilerDiagnosticGitContentReferenceShape $reference) -or -not $gitSourcesSeen.Add([string]$reference.source)) { return $false }
+    }
+
+    $pins = $Document.source_pins
+    $expectedPins = @(
+        'scripts/d32-bounded-diagnostic-sourceproof.ps1',
+        'scripts/d32-bounded-compiler-diagnostic.ps1',
+        'scripts/d32-bounded-compiler-diagnostic-policy.ps1',
+        'scripts/d32-build-toolchain-profile.ps1',
+        'scripts/d32-powershell-module-authority.ps1')
+    if ($pins -isnot [Array] -or $pins.Count -ne $expectedPins.Count) { return $false }
+    $pinPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pin in $pins) {
+        if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $pin) -or
+            -not (Test-D32BoundedCompilerDiagnosticWithin $pin.path $Repository) -or -not $pinPaths.Add([string]$pin.path)) { return $false }
+    }
+    foreach ($relative in $expectedPins) {
+        $expectedPath = [IO.Path]::GetFullPath((Join-Path $Repository ($relative.Replace('/', '\'))))
+        $matches = @($pins | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path, $expectedPath) })
+        if ($matches.Count -ne 1) { return $false }
+    }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($EntryScriptPath), [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-diagnostic-sourceproof.ps1'))) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($RunnerPath), [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-compiler-diagnostic.ps1')))) { return $false }
+
+    $budget = $Document.proof_budget
+    $budgetFields = @('combined_milliseconds', 'managed_buffer_bytes', 'max_registry_archive_bytes', 'max_git_pack_bytes',
+        'max_git_index_bytes', 'max_git_object_bytes', 'max_git_object_count', 'max_git_delta_depth', 'max_git_expanded_bytes', 'max_manifest_or_lock_file_bytes')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $budget $budgetFields)) { return $false }
+    foreach ($name in $budgetFields) { if (-not (Test-D32BoundedCompilerDiagnosticInteger $budget.($name) -Positive)) { return $false } }
+    if (
+        [Int64]$budget.combined_milliseconds -ne 300000 -or [Int64]$budget.managed_buffer_bytes -ne 536870912 -or
+        [Int64]$budget.max_registry_archive_bytes -ne 268435456 -or [Int64]$budget.max_git_pack_bytes -ne 268435456 -or
+        [Int64]$budget.max_git_index_bytes -ne 67108864 -or [Int64]$budget.max_git_object_bytes -ne 67108864 -or
+        [Int64]$budget.max_git_object_count -ne 500000 -or [Int64]$budget.max_git_delta_depth -ne 32 -or
+        [Int64]$budget.max_git_expanded_bytes -ne 34359738368 -or [Int64]$budget.max_manifest_or_lock_file_bytes -ne 16777216) { return $false }
+
+    $output = $Document.output_candidate
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $output @('path', 'parent_path', 'parent_volume_serial_hex', 'parent_file_id_hex')) -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $output.path) -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $output.parent_path) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$output.path), [string]$output.parent_path) -or
+        [string]$output.parent_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$output.parent_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+        (Test-D32BoundedCompilerDiagnosticWithin $output.path $Repository) -or
+        (Test-D32BoundedCompilerDiagnosticWithin $output.path $requiredOrigin) -or
+        (Test-D32BoundedCompilerDiagnosticWithin $output.path $profile.path)) { return $false }
+    try { $null = [DateTimeOffset]::Parse([string]$Document.issued_at_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+    catch { return $false }
+    return $true
+}
+
 function Test-D32BoundedCompilerDiagnosticCanonicalPath {
     param([AllowNull()][object]$Value)
     if ($Value -isnot [string] -or [String]::IsNullOrWhiteSpace([string]$Value) -or -not [IO.Path]::IsPathRooted([string]$Value)) { return $false }
@@ -840,6 +1020,46 @@ function Test-D32BoundedCompilerDiagnosticFileReferenceShape {
         (Test-D32BoundedCompilerDiagnosticCanonicalPath $Reference.path) -and
         (Test-D32BoundedCompilerDiagnosticInteger $Reference.bytes -Positive) -and
         [string]$Reference.sha256 -cmatch '^[0-9a-f]{64}$' -and (Test-D32BoundedCompilerDiagnosticIdentityPair $Reference))
+}
+
+function Test-D32BoundedCompilerDiagnosticGitContentReferenceShape {
+    param([AllowNull()][object]$Reference)
+    $fields = @('source', 'commit', 'database_path', 'database_volume_serial_hex', 'database_file_id_hex',
+        'checkout_cache_path', 'checkout_cache_volume_serial_hex', 'checkout_cache_file_id_hex',
+        'checkout_path', 'checkout_volume_serial_hex', 'checkout_file_id_hex',
+        'pack_path', 'pack_bytes', 'pack_volume_serial_hex', 'pack_file_id_hex',
+        'index_path', 'index_bytes', 'index_volume_serial_hex', 'index_file_id_hex')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Reference $fields) -or
+        $Reference.source -isnot [string] -or $Reference.commit -isnot [string] -or
+        [string]$Reference.commit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Reference.source -notmatch '^git\+https://[^?#@\s]+(?:\?[^#\r\n]+)?#([0-9a-f]{40})$' -or
+        [string]$Matches[1] -cne [string]$Reference.commit) { return $false }
+    $databaseRoot = 'E:\d32\inv7\r\c\git\db'
+    $checkoutRoot = 'E:\d32\inv7\r\c\git\checkouts'
+    foreach ($path in @($Reference.database_path, $Reference.checkout_cache_path, $Reference.checkout_path, $Reference.pack_path, $Reference.index_path)) {
+        if (-not (Test-D32BoundedCompilerDiagnosticCanonicalPath $path)) { return $false }
+    }
+    if (-not (Test-D32BoundedCompilerDiagnosticWithin $Reference.database_path $databaseRoot) -or
+        -not (Test-D32BoundedCompilerDiagnosticWithin $Reference.checkout_cache_path $checkoutRoot) -or
+        -not (Test-D32BoundedCompilerDiagnosticWithin $Reference.checkout_path $Reference.checkout_cache_path) -or
+        -not (Test-D32BoundedCompilerDiagnosticWithin $Reference.pack_path $Reference.database_path) -or
+        -not (Test-D32BoundedCompilerDiagnosticWithin $Reference.index_path $Reference.database_path) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$Reference.pack_path), [IO.Path]::GetDirectoryName([string]$Reference.index_path)) -or
+        [IO.Path]::GetFileName([string]$Reference.checkout_path) -cne ([string]$Reference.commit).Substring(0, 7) -or
+        [IO.Path]::GetFileName([string]$Reference.pack_path) -cnotmatch '^pack-([0-9a-f]{40})\.pack$' -or
+        [IO.Path]::GetFileName([string]$Reference.index_path) -cnotmatch '^pack-([0-9a-f]{40})\.idx$') { return $false }
+    $packId = [regex]::Match([IO.Path]::GetFileName([string]$Reference.pack_path), '^pack-([0-9a-f]{40})\.pack$').Groups[1].Value
+    $indexId = [regex]::Match([IO.Path]::GetFileName([string]$Reference.index_path), '^pack-([0-9a-f]{40})\.idx$').Groups[1].Value
+    if ($packId -cne $indexId -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Reference.pack_bytes -Positive) -or [Int64]$Reference.pack_bytes -gt 268435456 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Reference.index_bytes -Positive) -or [Int64]$Reference.index_bytes -gt 67108864) { return $false }
+    foreach ($name in @('database', 'checkout_cache', 'checkout', 'pack', 'index')) {
+        $volumeName = $name + '_volume_serial_hex'
+        $fileName = $name + '_file_id_hex'
+        if ([string]$Reference.PSObject.Properties[$volumeName].Value -cnotmatch '^[0-9a-f]{16}$' -or
+            [string]$Reference.PSObject.Properties[$fileName].Value -cnotmatch '^[0-9a-f]{32}$') { return $false }
+    }
+    return $true
 }
 
 function Test-D32BoundedCompilerDiagnosticGitQueryList {
@@ -960,7 +1180,7 @@ function Test-D32BoundedCompilerDiagnosticAuthorityShape {
     $cargoHome = $Document.cargo_home
     $origin = $Document.dependency_origin
     $cargoFields = @('path', 'volume_serial_hex', 'file_id_hex')
-    $originFields = @('path', 'volume_serial_hex', 'file_id_hex', 'owner_record', 'blocked_diagnostic', 'protoc_run_grant', 'fetch_records', 'manifest_refs', 'registry_archive_root', 'registry_source_root', 'git_database_root', 'git_checkout_root', 'registry_archives', 'git_source_authority')
+    $originFields = @('path', 'volume_serial_hex', 'file_id_hex', 'historical_origin_candidate_sha', 'owner_record', 'blocked_diagnostic', 'protoc_run_grant', 'fetch_records', 'manifest_refs', 'registry_archive_root', 'registry_source_root', 'git_database_root', 'git_checkout_root', 'registry_archives', 'git_source_authority', 'git_content_refs')
     $requiredOrigin = 'E:\d32\inv7\r\c'
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $cargoHome $cargoFields) -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $origin $originFields) -or
@@ -968,6 +1188,8 @@ function Test-D32BoundedCompilerDiagnosticAuthorityShape {
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.path, $requiredOrigin) -or
         -not (Test-D32BoundedCompilerDiagnosticIdentityPair $cargoHome) -or
         -not (Test-D32BoundedCompilerDiagnosticIdentityPair $origin) -or
+        [string]$origin.historical_origin_candidate_sha -cne $script:D32BoundedDiagnosticHistoricalInv7CandidateSha -or
+        [string]$origin.historical_origin_candidate_sha -ceq [string]$Document.candidate_sha -or
         [string]$cargoHome.volume_serial_hex -cne [string]$origin.volume_serial_hex -or [string]$cargoHome.file_id_hex -cne [string]$origin.file_id_hex -or
         $origin.fetch_records -isnot [Array] -or $origin.fetch_records.Count -gt 3 -or
         $origin.manifest_refs -isnot [Array] -or $origin.manifest_refs.Count -ne 6 -or
@@ -975,6 +1197,7 @@ function Test-D32BoundedCompilerDiagnosticAuthorityShape {
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.owner_record) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.blocked_diagnostic) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.protoc_run_grant) -or
+        $origin.git_content_refs -isnot [Array] -or $origin.git_content_refs.Count -eq 0 -or $origin.git_content_refs.Count -gt 16 -or
         ($null -ne $origin.git_source_authority -and -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.git_source_authority)) -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $origin.registry_archive_root @('path', 'volume_serial_hex', 'file_id_hex')) -or
         -not (Test-D32BoundedCompilerDiagnosticIdentityPair $origin.registry_archive_root) -or
@@ -990,6 +1213,10 @@ function Test-D32BoundedCompilerDiagnosticAuthorityShape {
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.git_checkout_root.path, (Join-Path $requiredOrigin 'git/checkouts'))) { return $false }
     foreach ($reference in $origin.fetch_records) { if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $reference)) { return $false } }
     foreach ($reference in $origin.manifest_refs) { if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $reference)) { return $false } }
+    $seenGitContentSources = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($reference in $origin.git_content_refs) {
+        if (-not (Test-D32BoundedCompilerDiagnosticGitContentReferenceShape $reference) -or -not $seenGitContentSources.Add([string]$reference.source)) { return $false }
+    }
 
     $target = $Document.target
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $target @('path', 'volume_serial_hex', 'file_id_hex', 'source_sha256', 'build_owner_mode')) -or
@@ -1423,8 +1650,12 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         [long]$MaximumCompressedBytes = 268435456L,
         [long]$MaximumExpandedBytes = 1073741824L,
         [long]$MaximumMemberBytes = 134217728L,
-        [int]$MaximumMembers = 10000
+        [int]$MaximumMembers = 10000,
+        [Diagnostics.Stopwatch]$ProofTimer
     )
+    if ($null -ne $ProofTimer -and (-not $ProofTimer.IsRunning -or $ProofTimer.ElapsedMilliseconds -ge 300000)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer is absent, stopped, or expired before archive parsing'
+    }
     if ($CompressedBytes.Length -le 0 -or [Int64]$CompressedBytes.Length -gt $MaximumCompressedBytes -or
         $ExpectedArchiveSha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $ExpectedPackageRoot -cnotmatch '^[A-Za-z0-9_-]+-[0-9A-Za-z.+_-]+$' -or
@@ -1432,6 +1663,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive bytes, expected package identity, or finite parser bound is invalid'
     }
     $archiveSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($CompressedBytes)).ToLowerInvariant()
+    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while hashing the compressed archive'
+    }
     if ($archiveSha -cne $ExpectedArchiveSha256) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: compressed registry archive SHA-256 differs from Cargo.lock checksum' }
     $compressed = [IO.MemoryStream]::new($CompressedBytes, $false)
     $gzip = $null
@@ -1445,6 +1679,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $rootSeen = $false
         $ended = $false
         while (-not $ended) {
+            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired during USTAR inventory'
+            }
             $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
             $expandedBytes += 512
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
@@ -1455,6 +1692,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 $expandedBytes += 512
                 for ($index = 0; $index -lt 512; $index++) { if ($second[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar terminator is not two complete zero blocks' } }
                 while (($read = $gzip.Read($header, 0, 512)) -gt 0) {
+                    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while consuming trailing archive data'
+                    }
                     $expandedBytes += $read
                     if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: trailing archive data exceeds its fixed byte ceiling' }
                     for ($index = 0; $index -lt $read; $index++) { if ($header[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: nonzero data follows the tar terminator' } }
@@ -1521,6 +1761,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                         $remaining = [Int64]$size
                         $buffer = [byte[]]::new(65536)
                         while ($remaining -gt 0) {
+                            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+                                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while hashing a USTAR member'
+                            }
                             $take = [int][Math]::Min([Int64]$buffer.Length, $remaining)
                             $read = $gzip.Read($buffer, 0, $take)
                             if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated file member data' }
@@ -1547,6 +1790,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 $discard = [byte[]]::new(65536)
                 $remaining = [Int64]$size
                 while ($remaining -gt 0) {
+                    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while consuming unsupported USTAR member data'
+                    }
                     $read = $gzip.Read($discard, 0, [int][Math]::Min([Int64]$discard.Length, $remaining))
                     if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated unsupported member data' }
                     $remaining -= $read
@@ -1566,6 +1812,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $rows = [System.Collections.Generic.List[object]]::new()
         $canonical = [System.Collections.Generic.List[string]]::new()
         foreach ($path in $paths) {
+            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while finalizing the USTAR inventory'
+            }
             $entry = $expected[$path]
             $rows.Add($entry)
             $canonical.Add(([string]$entry.kind + "`t" + [string]$entry.path + "`t" + [Int64]$entry.bytes + "`t" + [string]$entry.sha256))

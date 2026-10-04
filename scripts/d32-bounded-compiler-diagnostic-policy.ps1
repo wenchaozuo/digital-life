@@ -4,7 +4,7 @@
 $script:D32BoundedCompilerDiagnosticAuthorityType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1'
 $script:D32BoundedCompilerDiagnosticResultType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'
 $script:D32BoundedDiagnosticSourceProofAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V1'
-$script:D32BoundedDiagnosticSourceProofCandidateType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V1'
+$script:D32BoundedDiagnosticSourceProofCandidateType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V2'
 $script:D32BoundedDiagnosticHistoricalInv7CandidateSha = '2de30edf5de48aa4ed3216c3d3df13c3e2f0ac51'
 $script:D32BoundedCompilerDiagnosticGateAuthority = 'NONE'
 $script:D32BoundedCompilerDiagnosticStatuses = @('COMPLETED_DIAGNOSTIC', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED')
@@ -813,15 +813,168 @@ function Test-D32BoundedCompilerDiagnosticFormalReject {
         $Record.status -isnot [string] -or [string]$Record.status -cne 'PASS')
 }
 
+function Test-D32BoundedDiagnosticSourceGraphProof {
+    param([AllowNull()][object]$Graph)
+    $fields = @('schema_version', 'record_type', 'gate_authority', 'formal_gate_usable', 'status', 'semantic_scope', 'lock_sha256',
+        'lock_dependency_edges_sha256', 'graph_sha256', 'root_manifest_path', 'selected_root_ids', 'root_selection_rule', 'host_triple',
+        'target_triple', 'target_resolution_scope', 'locked_package_count', 'included_package_ids', 'included_package_count',
+        'excluded_package_count', 'classification_count', 'classifications', 'included_edges', 'dependency_decisions',
+        'inactive_target_edge_count', 'unknown_cfg_conservative_include_count', 'included_manifest_set_sha256', 'feature_rule',
+        'root_dev_dependency_rule', 'nonroot_dev_dependency_rule', 'build_proc_macro_rule', 'closed_reachability_set_sha256',
+        'source_plan_version', 'selected_target_mode', 'selected_crate_kinds')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Graph $fields) -or
+        [int64]$Graph.schema_version -ne 2 -or [string]$Graph.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2' -or
+        [string]$Graph.gate_authority -cne 'NONE' -or $Graph.formal_gate_usable -isnot [bool] -or [bool]$Graph.formal_gate_usable -or
+        [string]$Graph.status -cne 'CURRENT_LOCKED_SOURCE_GRAPH_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
+        [string]$Graph.semantic_scope -cne 'FULL_LOCK_AUDIT_CATALOG_PLUS_SELECTED_REACHABLE_CONSERVATIVE_SUPERSET' -or
+        [string]$Graph.lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$Graph.lock_dependency_edges_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Graph.graph_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$Graph.included_manifest_set_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Graph.closed_reachability_set_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$Graph.root_manifest_path -cne 'vita-agent/Cargo.toml' -or
+        [string]$Graph.root_selection_rule -cne 'EXACT_PACKAGE_NAMED_BY_MANIFEST_PATH_DEFAULT_FEATURES_PLUS_D32_A_TEST_HELPER_NO_WORKSPACE_EXPANSION' -or
+        [string]$Graph.host_triple -cne 'x86_64-pc-windows-msvc' -or [string]$Graph.target_triple -cne 'x86_64-pc-windows-msvc' -or
+        [string]$Graph.target_resolution_scope -cne 'ONE_FIXED_X86_64_PC_WINDOWS_MSVC_HOST_AND_TARGET' -or [int]$Graph.source_plan_version -ne 2 -or
+        [string]$Graph.selected_target_mode -cne 'ALL_TARGETS_FOR_SELECTED_PACKAGE_ONLY' -or
+        $Graph.selected_crate_kinds -isnot [Array] -or
+        [string]::Join(',', [string[]]$Graph.selected_crate_kinds) -cne 'lib,bin,example,test,bench,custom-build,proc-macro' -or
+        [string]$Graph.feature_rule -cne 'ALL_OPTIONAL_AND_FEATURE_ACTIVATION_EDGES_INCLUDED_UNLESS_TARGET_PREDICATE_PROVEN_FALSE' -or
+        [string]$Graph.root_dev_dependency_rule -cne 'INCLUDED_FOR_SELECTED_PACKAGE_ALL_TARGETS' -or
+        [string]$Graph.nonroot_dev_dependency_rule -cne 'EXCLUDED_NOT_BUILT_FOR_DEPENDENCY_PACKAGE' -or
+        [string]$Graph.build_proc_macro_rule -cne 'INCLUDED_HOST_EQUALS_TARGET' -or
+        $Graph.selected_root_ids -isnot [Array] -or $Graph.selected_root_ids.Count -ne 1 -or
+        $Graph.included_package_ids -isnot [Array] -or $Graph.classifications -isnot [Array] -or
+        $Graph.included_edges -isnot [Array] -or $Graph.dependency_decisions -isnot [Array] -or
+        [Int64]$Graph.locked_package_count -le 0 -or [Int64]$Graph.locked_package_count -gt 2048 -or
+        [Int64]$Graph.included_package_count -lt 1 -or [Int64]$Graph.excluded_package_count -lt 0 -or
+        [Int64]$Graph.classification_count -ne [Int64]$Graph.locked_package_count -or
+        [Int64]$Graph.included_package_count + [Int64]$Graph.excluded_package_count -ne [Int64]$Graph.locked_package_count -or
+        $Graph.classifications.Count -ne [Int64]$Graph.locked_package_count -or
+        $Graph.included_package_ids.Count -ne [Int64]$Graph.included_package_count -or
+        $Graph.dependency_decisions.Count -gt 65536 -or $Graph.included_edges.Count -gt 65536) { return $false }
+    $rootId = [string]$Graph.selected_root_ids[0]
+    if ($rootId -notmatch '^digital-life-vita-agent@[^|]+\|workspace\|workspace$') { return $false }
+    $included = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($id in $Graph.included_package_ids) { if ($id -isnot [string] -or -not $included.Add([string]$id)) { return $false } }
+    if (-not $included.Contains($rootId)) { return $false }
+    $classified = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $includedClassifications = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $excludedClassifications = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($class in $Graph.classifications) {
+        if ([string]$class.classification -ceq 'INCLUDED') {
+            $classFields = @('package_id', 'classification', 'source_kind', 'source_identity', 'manifest_path', 'manifest_sha256', 'witness_kind', 'witness_root_path', 'closed_reachability_sha256')
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $class $classFields) -or
+                [string]$class.source_kind -cnotin @('workspace', 'registry', 'git') -or
+                [string]$class.manifest_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$|^Cargo\.toml$' -or
+                [string]$class.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                [string]$class.closed_reachability_sha256 -cne [string]$Graph.closed_reachability_set_sha256 -or
+                [string]$class.witness_kind -cne 'ROOT_PATH_IN_VERIFIED_DECLARATION_GRAPH' -or
+                $class.witness_root_path -isnot [Array] -or $class.witness_root_path.Count -lt 1 -or
+                [string]$class.witness_root_path[0] -cne $rootId -or
+                [string]$class.witness_root_path[$class.witness_root_path.Count - 1] -cne [string]$class.package_id -or
+                -not $classified.Add([string]$class.package_id) -or -not $included.Contains([string]$class.package_id)) { return $false }
+            $identityMatch = [regex]::Match([string]$class.package_id, '^(?<name>[A-Za-z0-9_-]+)@(?<version>[0-9A-Za-z.+_-]+)\|(?<kind>workspace|registry|git)\|(?<source>.*)$')
+            if (-not $identityMatch.Success -or [string]$identityMatch.Groups['kind'].Value -cne [string]$class.source_kind -or
+                [string]$identityMatch.Groups['source'].Value -cne [string]$class.source_identity) { return $false }
+            $includedClassifications.Add([string]$class.package_id, $class)
+        }
+        elseif ([string]$class.classification -ceq 'EXCLUDED_WITH_WITNESS') {
+            $classFields = @('package_id', 'classification', 'source_kind', 'source_identity', 'witness_kind', 'unreachable_from_roots', 'complete_reachable_parent_count',
+                'complete_reachable_dependency_decision_count', 'no_active_incoming_edge_from_included', 'closed_reachability_sha256')
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $class $classFields) -or
+                [string]$class.source_kind -cnotin @('workspace', 'registry', 'git') -or
+                [string]$class.witness_kind -cne 'CLOSED_REACHABILITY_CUT' -or $class.unreachable_from_roots -isnot [Array] -or
+                $class.unreachable_from_roots.Count -ne 1 -or [string]$class.unreachable_from_roots[0] -cne $rootId -or
+                $class.no_active_incoming_edge_from_included -isnot [bool] -or -not [bool]$class.no_active_incoming_edge_from_included -or
+                [Int64]$class.complete_reachable_parent_count -ne [Int64]$Graph.included_package_count -or
+                [Int64]$class.complete_reachable_dependency_decision_count -ne [Int64]$Graph.dependency_decisions.Count -or
+                [string]$class.closed_reachability_sha256 -cne [string]$Graph.closed_reachability_set_sha256 -or
+                -not $classified.Add([string]$class.package_id) -or $included.Contains([string]$class.package_id)) { return $false }
+            $identityMatch = [regex]::Match([string]$class.package_id, '^(?<name>[A-Za-z0-9_-]+)@(?<version>[0-9A-Za-z.+_-]+)\|(?<kind>workspace|registry|git)\|(?<source>.*)$')
+            if (-not $identityMatch.Success -or [string]$identityMatch.Groups['kind'].Value -cne [string]$class.source_kind -or
+                [string]$identityMatch.Groups['source'].Value -cne [string]$class.source_identity) { return $false }
+            $excludedClassifications.Add([string]$class.package_id, $class)
+        }
+        else { return $false }
+    }
+    if ($classified.Count -ne [Int64]$Graph.locked_package_count -or $includedClassifications.Count -ne [Int64]$Graph.included_package_count -or
+        $excludedClassifications.Count -ne [Int64]$Graph.excluded_package_count) { return $false }
+    foreach ($edge in $Graph.included_edges) {
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $edge @('parent_package_id', 'target_package_id', 'lock_spec', 'dependency_alias', 'kind', 'target_predicate', 'predicate_proven', 'predicate_witness', 'optional_included')) -or
+            -not $included.Contains([string]$edge.parent_package_id) -or -not $included.Contains([string]$edge.target_package_id)) { return $false }
+        if (@($Graph.dependency_decisions | Where-Object {
+            [string]$_.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG') -and
+            [string]$_.parent_package_id -ceq [string]$edge.parent_package_id -and
+            [string]$_.target_package_id -ceq [string]$edge.target_package_id -and
+            [string]$_.lock_specs[0] -ceq [string]$edge.lock_spec -and
+            [string]$_.alias -ceq [string]$edge.dependency_alias -and
+            [string]$_.kind -ceq [string]$edge.kind -and
+            [string]$_.target -ceq [string]$edge.target_predicate -and
+            [bool]$_.predicate_proven -eq [bool]$edge.predicate_proven -and
+            [string]$_.predicate_witness -ceq [string]$edge.predicate_witness -and
+            [bool]$_.optional_included -eq [bool]$edge.optional_included
+        }).Count -ne 1) { return $false }
+    }
+    foreach ($decision in $Graph.dependency_decisions) {
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $decision @('parent_package_id', 'alias', 'kind', 'target', 'disposition', 'predicate_proven', 'predicate_witness', 'target_package_id', 'lock_specs', 'optional_included')) -or
+            -not $included.Contains([string]$decision.parent_package_id) -or $decision.lock_specs -isnot [Array]) { return $false }
+        if ([string]$decision.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG')) {
+            if (-not $included.Contains([string]$decision.target_package_id) -or $decision.lock_specs.Count -ne 1 -or
+                @($Graph.included_edges | Where-Object {
+                    [string]$_.parent_package_id -ceq [string]$decision.parent_package_id -and
+                    [string]$_.target_package_id -ceq [string]$decision.target_package_id -and
+                    [string]$_.lock_spec -ceq [string]$decision.lock_specs[0] -and
+                    [string]$_.dependency_alias -ceq [string]$decision.alias -and
+                    [string]$_.kind -ceq [string]$decision.kind -and
+                    [string]$_.target_predicate -ceq [string]$decision.target -and
+                    [bool]$_.predicate_proven -eq [bool]$decision.predicate_proven -and
+                    [string]$_.predicate_witness -ceq [string]$decision.predicate_witness -and
+                    [bool]$_.optional_included -eq [bool]$decision.optional_included
+                }).Count -ne 1) { return $false }
+        }
+    }
+    foreach ($id in $Graph.included_package_ids) {
+        $class = $includedClassifications[[string]$id]
+        $path = [string[]]$class.witness_root_path
+        for ($i = 1; $i -lt $path.Length; $i++) {
+            if (-not @($Graph.included_edges | Where-Object { [string]$_.parent_package_id -ceq $path[$i - 1] -and [string]$_.target_package_id -ceq $path[$i] }).Count) { return $false }
+        }
+    }
+    foreach ($id in $excludedClassifications.Keys) {
+        if (@($Graph.included_edges | Where-Object { [string]$_.target_package_id -ceq $id }).Count -gt 0 -or
+            @($Graph.dependency_decisions | Where-Object { [string]$_.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG') -and [string]$_.target_package_id -ceq $id }).Count -gt 0) { return $false }
+    }
+    $includedIds = [string[]]@($Graph.included_package_ids); [Array]::Sort($includedIds, [StringComparer]::Ordinal)
+    $expectedClosedSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($includedIds -join "`n") + "`n"))).ToLowerInvariant()
+    if ($expectedClosedSha -cne [string]$Graph.closed_reachability_set_sha256) { return $false }
+    $manifestCanon = [System.Collections.Generic.List[string]]::new()
+    foreach ($id in $includedIds) {
+        $class = $includedClassifications[$id]
+        $manifestCanon.Add($id + "`t" + [string]$class.source_kind + "`t" + [string]$class.source_identity + "`t" + [string]$class.manifest_path + "`t" + [string]$class.manifest_sha256)
+    }
+    $manifestCanon.Sort([StringComparer]::Ordinal)
+    $expectedManifestSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($manifestCanon -join "`n") + "`n"))).ToLowerInvariant()
+    if ($expectedManifestSha -cne [string]$Graph.included_manifest_set_sha256) { return $false }
+    $edgeCanon = [System.Collections.Generic.List[string]]::new()
+    foreach ($edge in $Graph.included_edges) { $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)) }
+    $edgeCanon.Sort([StringComparer]::Ordinal)
+    $decisionCanon = [System.Collections.Generic.List[string]]::new()
+    foreach ($decision in $Graph.dependency_decisions) { $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)) }
+    $decisionCanon.Sort([StringComparer]::Ordinal)
+    $rootCanonical = [string]::Join("`n", [string[]]$Graph.selected_root_ids)
+    $expectedGraphSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(([string]$Graph.lock_sha256 + "`n" + [string]$Graph.lock_dependency_edges_sha256 + "`n" + $rootCanonical + "`n" + ($edgeCanon -join "`n") + "`n" + ($decisionCanon -join "`n") + "`n" + $expectedClosedSha + "`n" + $expectedManifestSha + "`n")))).ToLowerInvariant()
+    if ($expectedGraphSha -cne [string]$Graph.graph_sha256) { return $false }
+    return $true
+}
+
 function Test-D32BoundedDiagnosticSourceProofCandidate {
     param([AllowNull()][object]$Record)
-    $fields = @('schema_version', 'record_type', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
+    $fields = @('schema_version', 'record_type', 'source_plan_semantics_version', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
         'source_repo', 'status', 'formal_phase1_allowed', 'formal_aggregate_allowed', 'diagnostic_invocation_authority',
         'historical_origin', 'proof_authority', 'proof_entry', 'proof_started_at_utc', 'proof_completed_at_utc',
         'proof_elapsed_milliseconds', 'proof_budget', 'source_pins', 'current_profile_lock_bindings', 'current_source_closure', 'primary_error')
     $historicalFields = @('fetch_completion', 'attempt_state', 'gate_authority')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields) -or
-        [int64]$Record.schema_version -ne 1 -or [string]$Record.record_type -cne $script:D32BoundedDiagnosticSourceProofCandidateType -or
+        [int64]$Record.schema_version -ne 2 -or [string]$Record.record_type -cne $script:D32BoundedDiagnosticSourceProofCandidateType -or
+        [int]$Record.source_plan_semantics_version -ne 2 -or
         [string]$Record.gate_authority -cne 'NONE' -or
         [string]$Record.candidate_sha -cnotmatch '^[0-9a-f]{40}$' -or
         [string]$Record.historical_origin_candidate_sha -cne $script:D32BoundedDiagnosticHistoricalInv7CandidateSha -or
@@ -845,6 +998,9 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
         (($Record.primary_error -isnot [string]) -and ($null -ne $Record.primary_error)) -or
         (($Record.current_profile_lock_bindings -isnot [Array]) -and ($null -ne $Record.current_profile_lock_bindings)) -or
         (($null -ne $Record.current_source_closure) -and ([string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED'))) { return $false }
+    if ($null -ne $Record.current_source_closure -and
+        ([string]$Record.current_source_closure.CurrentCandidateSha -cne [string]$Record.candidate_sha -or
+         [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha)) { return $false }
     if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -and
         ($null -eq $Record.current_source_closure -or [Int64]$Record.proof_elapsed_milliseconds -gt 300000 -or $null -ne $Record.primary_error -or
             $Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne 5 -or
@@ -852,12 +1008,54 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
             [string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED' -or
             [string]$Record.current_source_closure.HistoricalFetchCompletion -cne 'NOT_RETAINED' -or
             [string]$Record.current_source_closure.HistoricalGateAuthority -cne 'NONE' -or
-            [string]$Record.current_source_closure.RegistryContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V1' -or
-            [string]$Record.current_source_closure.GitContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V1' -or
+            [string]$Record.current_source_closure.RegistryContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2' -or
+            [string]$Record.current_source_closure.GitContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V2' -or
+            [string]$Record.current_source_closure.SourceGraphProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2' -or
+            [string]$Record.current_source_closure.CurrentCandidateSha -cne [string]$Record.candidate_sha -or
+            [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha -or
+            -not (Test-D32BoundedDiagnosticSourceGraphProof $Record.current_source_closure.SourceGraphProof) -or
+            ([Int64]$Record.current_source_closure.SourceGraphProof.included_package_count + [Int64]$Record.current_source_closure.SourceGraphProof.excluded_package_count) -ne [Int64]$Record.current_source_closure.SourceGraphProof.locked_package_count -or
             [string]$Record.current_source_closure.RegistryContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
             [string]$Record.current_source_closure.GitContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
             [bool]$Record.current_source_closure.RegistryContentProof.formal_gate_usable -or
-            [bool]$Record.current_source_closure.GitContentProof.formal_gate_usable)) { return $false }
+            [bool]$Record.current_source_closure.GitContentProof.formal_gate_usable -or
+            [string]$Record.current_source_closure.RegistryContentProof.lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256 -or
+            [string]$Record.current_source_closure.GitContentProof.lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256 -or
+            $Record.current_source_closure.RegistryContentProof.verified_package_ids -isnot [Array] -or
+            $Record.current_source_closure.GitContentProof.verified_package_ids -isnot [Array] -or
+            $Record.current_source_closure.CurrentManifestProof -isnot [Array])) { return $false }
+    if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY') {
+        $registryIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($id in $Record.current_source_closure.RegistryContentProof.verified_package_ids) { if ($id -isnot [string] -or -not $registryIds.Add([string]$id)) { return $false } }
+        $gitIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($id in $Record.current_source_closure.GitContentProof.verified_package_ids) { if ($id -isnot [string] -or -not $gitIds.Add([string]$id)) { return $false } }
+        $workspaceManifests = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($manifest in $Record.current_source_closure.CurrentManifestProof) {
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $manifest @('manifest_path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
+                [string]$manifest.manifest_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$' -or
+                -not (Test-D32BoundedCompilerDiagnosticInteger $manifest.bytes -Positive) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                [string]$manifest.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$manifest.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+                -not $workspaceManifests.TryAdd([string]$manifest.manifest_path, [string]$manifest.sha256)) { return $false }
+        }
+        if ($workspaceManifests.Count -ne $Record.current_profile_lock_bindings.Count) { return $false }
+        foreach ($binding in $Record.current_profile_lock_bindings) {
+            if (-not $workspaceManifests.ContainsKey([string]$binding.manifest_path)) { return $false }
+        }
+        foreach ($class in $Record.current_source_closure.SourceGraphProof.classifications) {
+            if ([string]$class.classification -cne 'INCLUDED') { continue }
+            switch ([string]$class.source_kind) {
+                'workspace' { if (-not $workspaceManifests.ContainsKey([string]$class.manifest_path) -or $workspaceManifests[[string]$class.manifest_path] -cne [string]$class.manifest_sha256) { return $false } }
+                'registry' { if (-not $registryIds.Contains([string]$class.package_id) -or [string]$class.source_identity -cne 'registry+https://github.com/rust-lang/crates.io-index') { return $false } }
+                'git' {
+                    if (-not $gitIds.Contains([string]$class.package_id) -or
+                        @($Record.current_source_closure.GitContentProof.sources | Where-Object { [string]$_.source -ceq [string]$class.source_identity }).Count -ne 1) { return $false }
+                }
+                default { return $false }
+            }
+        }
+        $lockBinding = @($Record.current_profile_lock_bindings | Where-Object { [string]$_.lock_path -ceq 'vita-agent/Cargo.lock' })
+        if ($lockBinding.Count -ne 1 -or [string]$lockBinding[0].lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256) { return $false }
+    }
     if ([string]$Record.status -ceq 'BLOCKED' -and [String]::IsNullOrWhiteSpace([string]$Record.primary_error)) { return $false }
     return $true
 }
@@ -1437,44 +1635,140 @@ function Test-D32BoundedCompilerDiagnosticTestBinaryNotStarted {
     return $true
 }
 
+function ConvertFrom-D32BoundedDiagnosticLockStringArray {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Body)
+    $items = [System.Collections.Generic.List[string]]::new()
+    $index = 0
+    while ($index -lt $Body.Length) {
+        while ($index -lt $Body.Length -and ($Body[$index] -eq ',' -or [char]::IsWhiteSpace($Body[$index]))) { $index++ }
+        if ($index -ge $Body.Length) { break }
+        if ($Body[$index] -cne '"') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array has an unsupported TOML token' }
+        $index++
+        $value = [Text.StringBuilder]::new()
+        $closed = $false
+        while ($index -lt $Body.Length) {
+            $character = $Body[$index++]
+            if ($character -ceq '"') { $closed = $true; break }
+            if ($character -ceq '\') {
+                if ($index -ge $Body.Length) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: truncated TOML string escape' }
+                $escape = $Body[$index++]
+                if ($escape -cnotin @('"', '\', 'n', 'r', 't')) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unsupported dependency-string escape' }
+                $character = switch ($escape) { 'n' { [char]10 } 'r' { [char]13 } 't' { [char]9 } default { $escape } }
+            }
+            [void]$value.Append($character)
+        }
+        if (-not $closed) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unterminated dependency string' }
+        $items.Add($value.ToString())
+        while ($index -lt $Body.Length -and [char]::IsWhiteSpace($Body[$index])) { $index++ }
+        if ($index -lt $Body.Length -and $Body[$index] -cne ',') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array separator is unsupported' }
+    }
+    return $items.ToArray()
+}
+
+function ConvertFrom-D32BoundedDiagnosticLockDependencySpec {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    $match = [regex]::Match($Value, '^(?<name>[A-Za-z0-9_-]+)(?: (?<version>[0-9][0-9A-Za-z.+_-]*))?(?: \((?<source>[^()\r\n]+)\))?$')
+    if (-not $match.Success) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency edge identity is outside the supported finite Cargo.lock format' }
+    return [PSCustomObject][ordered]@{
+        raw = $Value
+        name = [string]$match.Groups['name'].Value
+        version = if ($match.Groups['version'].Success) { [string]$match.Groups['version'].Value } else { $null }
+        source = if ($match.Groups['source'].Success) { [string]$match.Groups['source'].Value } else { $null }
+    }
+}
+
 function Get-D32BoundedCompilerDiagnosticLockSources {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$LockText)
+    if ($LockText.Length -le 0 -or $LockText.Length -gt 8388608) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: finite Cargo.lock input is empty or exceeds 8 MiB' }
     $packages = [System.Collections.Generic.List[object]]::new()
     $current = $null
+    $collectingEdges = $false
+    $lockVersion = $null
+    $totalEdgeTextCount = 0
     foreach ($line in ($LockText -split '\r?\n')) {
         if ($line -cmatch '^\[\[package\]\]$') {
-            if ($null -ne $current) { $packages.Add([PSCustomObject]$current) }
-            $current = [ordered]@{ name = $null; version = $null; source = $null; checksum = $null }
+            if ($collectingEdges) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: truncated Cargo.lock dependency array before the next package' }
+            if ($null -ne $current) { $packages.Add($current) }
+            if ($packages.Count -gt 2048) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock package count exceeds its fixed 2048-entry limit' }
+            $current = [ordered]@{ name = $null; version = $null; source = $null; checksum = $null; dependency_text = $null; dependencies = @() }
             continue
         }
-        if ($null -eq $current) { continue }
-        if ($line -cmatch '^name\s*=\s*"([^"]+)"\s*$') { if ($null -ne $current.name) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: duplicate Cargo.lock package name field' }; $current.name = [string]$Matches[1]; continue }
-        if ($line -cmatch '^version\s*=\s*"([^"]+)"\s*$') { if ($null -ne $current.version) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: duplicate Cargo.lock package version field' }; $current.version = [string]$Matches[1]; continue }
-        if ($line -cmatch '^source\s*=\s*"([^"]+)"\s*$') { if ($null -ne $current.source) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: duplicate Cargo.lock package source field' }; $current.source = [string]$Matches[1]; continue }
-        if ($line -cmatch '^checksum\s*=\s*"([^"]+)"\s*$') { if ($null -ne $current.checksum) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: duplicate Cargo.lock package checksum field' }; $current.checksum = [string]$Matches[1]; continue }
+        if ($null -eq $current) {
+            $rootLine = $line.Trim()
+            if ([String]::IsNullOrWhiteSpace($rootLine) -or $rootLine.StartsWith('#')) { continue }
+            if ($rootLine -cmatch '^version\s*=\s*([0-9]+)\s*$') {
+                if ($null -ne $lockVersion -or [int]$Matches[1] -notin @(3, 4)) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock version is duplicated or outside the finite supported v3/v4 formats' }
+                $lockVersion = [int]$Matches[1]
+                continue
+            }
+            throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unsupported Cargo.lock root statement or table before package catalog'
+        }
+        if ($collectingEdges) {
+            $current.dependency_text += "`n" + $line
+            if ($line -match '\]') {
+                $close = $current.dependency_text.LastIndexOf(']')
+                if ($close -lt 0 -or -not [String]::IsNullOrWhiteSpace($current.dependency_text.Substring($close + 1))) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array tail is unsupported' }
+                $body = $current.dependency_text.Substring(0, $close)
+                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $body)
+                $totalEdgeTextCount += $current.dependencies.Count
+                if ($totalEdgeTextCount -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock dependency edge count exceeds its fixed 65536-entry limit' }
+                $collectingEdges = $false
+            }
+            continue
+        }
+        if ([String]::IsNullOrWhiteSpace($line) -or $line.Trim().StartsWith('#')) { continue }
+        if ($line -cmatch '^name\s*=\s*"([^"\\]+)"\s*$') { if ($null -ne $current.name) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: duplicate package name field' }; $current.name = [string]$Matches[1]; continue }
+        if ($line -cmatch '^version\s*=\s*"([^"\\]+)"\s*$') { if ($null -ne $current.version) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: duplicate package version field' }; $current.version = [string]$Matches[1]; continue }
+        if ($line -cmatch '^source\s*=\s*"([^"\\]+)"\s*$') { if ($null -ne $current.source) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: duplicate package source field' }; $current.source = [string]$Matches[1]; continue }
+        if ($line -cmatch '^checksum\s*=\s*"([^"\\]+)"\s*$') { if ($null -ne $current.checksum) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: duplicate package checksum field' }; $current.checksum = [string]$Matches[1]; continue }
+        if ($line -cmatch '^dependencies\s*=\s*\[(.*)$') {
+            if ($null -ne $current.dependency_text) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: duplicate package dependency array' }
+            $current.dependency_text = [string]$Matches[1]
+            if ($current.dependency_text -match '\]') {
+                $close = $current.dependency_text.LastIndexOf(']')
+                if (-not [String]::IsNullOrWhiteSpace($current.dependency_text.Substring($close + 1))) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array tail is unsupported' }
+                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $current.dependency_text.Substring(0, $close))
+                $totalEdgeTextCount += $current.dependencies.Count
+                if ($totalEdgeTextCount -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock dependency edge count exceeds its fixed 65536-entry limit' }
+            }
+            else { $collectingEdges = $true }
+            continue
+        }
+        throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: package record contains an unsupported or malformed Cargo.lock field/table'
     }
-    if ($null -ne $current) { $packages.Add([PSCustomObject]$current) }
+    if ($collectingEdges) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unterminated Cargo.lock dependency array' }
+    if ($null -ne $current) { $packages.Add($current) }
+    if ($null -eq $lockVersion -or $packages.Count -eq 0 -or $packages.Count -gt 2048) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: finite Cargo.lock requires one supported version and a bounded nonempty package catalog' }
+    $output = [System.Collections.Generic.List[object]]::new()
     foreach ($package in $packages) {
         if ([String]::IsNullOrWhiteSpace([string]$package.name) -or [string]$package.name -notmatch '^[A-Za-z0-9_-]+$' -or
             [String]::IsNullOrWhiteSpace([string]$package.version) -or [string]$package.version -notmatch '^[0-9A-Za-z.+_-]+$') {
-            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: Cargo.lock package identity is malformed'
+            throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock package identity is malformed'
         }
+        $sourceKind = $null
+        $commit = $null
         if ($null -ne $package.source -and [string]$package.source -like 'registry+*') {
-            if ([string]$package.checksum -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: locked registry package lacks its exact SHA-256 checksum' }
-            $package | Add-Member -NotePropertyName source_kind -NotePropertyValue 'registry'
+            if ([string]$package.checksum -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: locked registry package lacks its exact SHA-256 checksum' }
+            $sourceKind = 'registry'
         }
         elseif ($null -ne $package.source -and [string]$package.source -like 'git+*') {
-            if ([string]$package.source -notmatch '#([0-9a-f]{40})$') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: locked Git package does not end in an immutable full commit' }
-            if ([string]$package.checksum -ne '') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: locked Git package must not carry a registry checksum' }
-            $package | Add-Member -NotePropertyName source_kind -NotePropertyValue 'git'
-            $package | Add-Member -NotePropertyName commit -NotePropertyValue ([string]$Matches[1])
+            $gitMatch = [regex]::Match([string]$package.source, '#([0-9a-f]{40})$')
+            if (-not $gitMatch.Success -or [string]$package.checksum -ne '') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: locked Git package source/commit is incomplete' }
+            $sourceKind = 'git'
+            $commit = [string]$gitMatch.Groups[1].Value
         }
-        elseif ($null -eq $package.source -and $null -eq $package.checksum) {
-            $package | Add-Member -NotePropertyName source_kind -NotePropertyValue 'workspace'
-        }
-        else { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: Cargo.lock source kind is unsupported or incomplete' }
+        elseif ($null -eq $package.source -and $null -eq $package.checksum) { $sourceKind = 'workspace' }
+        else { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock source kind is unsupported or incomplete' }
+        $sourceIdentity = if ($null -eq $package.source) { 'workspace' } else { [string]$package.source }
+        $id = [string]$package.name + '@' + [string]$package.version + '|' + $sourceKind + '|' + $sourceIdentity
+        $edgeSpecs = [System.Collections.Generic.List[object]]::new()
+        foreach ($dependencyText in $package.dependencies) { $edgeSpecs.Add((ConvertFrom-D32BoundedDiagnosticLockDependencySpec -Value ([string]$dependencyText))) }
+        $output.Add([PSCustomObject][ordered]@{
+            package_id = $id; name = [string]$package.name; version = [string]$package.version; source = $package.source
+            source_kind = $sourceKind; checksum = $package.checksum; commit = $commit; dependency_specs = @($edgeSpecs.ToArray()); dependency_ids = @()
+        })
     }
-    return @($packages.ToArray())
+    return $output.ToArray()
 }
 
 function Get-D32BoundedCompilerDiagnosticSourcePlan {
@@ -1483,12 +1777,28 @@ function Get-D32BoundedCompilerDiagnosticSourcePlan {
     $maxLockedPackages = 2048
     $maxRegistryPackages = 1536
     $maxGitSources = 16
-    if ($LockText.Length -le 0 -or $LockText.Length -gt $maxLockCharacters) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock input is empty or exceeds its fixed 8 MiB text bound'
-    }
+    if ($LockText.Length -le 0 -or $LockText.Length -gt $maxLockCharacters) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock input is empty or exceeds its fixed 8 MiB text bound' }
     $packages = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $LockText)
-    if ($packages.Count -eq 0 -or $packages.Count -gt $maxLockedPackages) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: locked package inventory is empty or exceeds its fixed 2048-entry bound'
+    if ($packages.Count -eq 0 -or $packages.Count -gt $maxLockedPackages) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: locked package inventory is empty or exceeds its fixed 2048-entry bound' }
+    $catalog = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($package in $packages) { if (-not $catalog.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate full Cargo.lock package identity' } }
+    $edges = [System.Collections.Generic.List[object]]::new()
+    foreach ($package in $packages) {
+        $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($spec in $package.dependency_specs) {
+            $matches = @($packages | Where-Object {
+                [string]$_.name -ceq [string]$spec.name -and
+                ($null -eq $spec.version -or [string]$_.version -ceq [string]$spec.version) -and
+                ($null -eq $spec.source -or [string]$_.source -ceq [string]$spec.source)
+            })
+            if ($matches.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Cargo.lock dependency edge does not resolve to exactly one audited package ID' }
+            $target = $matches[0]
+            if (-not $targets.Add([string]$target.package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate dependency edge target is unsupported' }
+            $edges.Add([PSCustomObject][ordered]@{ parent_package_id = [string]$package.package_id; target_package_id = [string]$target.package_id; lock_spec = [string]$spec.raw })
+        }
+        $targetIds = [string[]]@($targets)
+        [Array]::Sort($targetIds, [StringComparer]::Ordinal)
+        $package.dependency_ids = @($targetIds)
     }
     $cargoHome = 'E:\d32\inv7\r\c'
     $registryIndex = 'index.crates.io-1949cf8c6b5b557f'
@@ -1500,94 +1810,712 @@ function Get-D32BoundedCompilerDiagnosticSourcePlan {
     $pathKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($package in $packages) {
         if ($package.source_kind -ceq 'registry') {
-            if ([string]$package.source -cne 'registry+https://github.com/rust-lang/crates.io-index') {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: non-crates.io registry source is outside the approved finite origin'
-            }
-            $key = [string]$package.name + "`0" + [string]$package.version
-            if (-not $packageKeys.Add($key)) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate locked registry name/version tuple'
-            }
-            $archiveName = [string]$package.name + '-' + [string]$package.version + '.crate'
-            $sourceName = [string]$package.name + '-' + [string]$package.version
-            $archivePath = [IO.Path]::GetFullPath((Join-Path $registryCache $archiveName))
-            $sourcePath = [IO.Path]::GetFullPath((Join-Path $registrySource $sourceName))
-            if (-not $pathKeys.Add($archivePath) -or -not $pathKeys.Add($sourcePath)) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: case-insensitive registry path collision'
-            }
-            $registryRows.Add([PSCustomObject][ordered]@{
-                name = [string]$package.name
-                version = [string]$package.version
-                checksum = [string]$package.checksum
-                source = [string]$package.source
-                archive_path = $archivePath
-                extracted_source_path = $sourcePath
-            })
-            continue
+            if ([string]$package.source -cne 'registry+https://github.com/rust-lang/crates.io-index') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: non-crates.io registry source is outside the approved finite origin' }
+            $key = [string]$package.name + [char]0 + [string]$package.version
+            if (-not $packageKeys.Add($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate locked registry name/version tuple' }
+            $archivePath = [IO.Path]::GetFullPath((Join-Path $registryCache ([string]$package.name + '-' + [string]$package.version + '.crate')))
+            $sourcePath = [IO.Path]::GetFullPath((Join-Path $registrySource ([string]$package.name + '-' + [string]$package.version)))
+            if (-not $pathKeys.Add($archivePath) -or -not $pathKeys.Add($sourcePath)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: case-insensitive registry path collision' }
+            $registryRows.Add([PSCustomObject][ordered]@{ package_id = $package.package_id; name = $package.name; version = $package.version; checksum = $package.checksum; source = $package.source; archive_path = $archivePath; extracted_source_path = $sourcePath })
         }
-        if ($package.source_kind -ceq 'git') {
+        elseif ($package.source_kind -ceq 'git') {
             $source = [string]$package.source
             $match = [regex]::Match($source, '^git\+(https://[^?#@\s]+(?:\?[^#\r\n]+)?)#([0-9a-f]{40})$')
-            if (-not $match.Success -or [string]$match.Groups[2].Value -cne [string]$package.commit) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source must be an immutable HTTPS URL plus the same full lowercase 40-hex lock commit'
-            }
+            if (-not $match.Success -or [string]$match.Groups[2].Value -cne [string]$package.commit) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source must be an immutable HTTPS URL plus the same full lowercase 40-hex lock commit' }
             $url = [string]$match.Groups[1].Value
             $parsedUrl = $null
-            if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUrl) -or
-                $parsedUrl.Scheme -cne 'https' -or [String]::IsNullOrEmpty($parsedUrl.Host) -or -not [String]::IsNullOrEmpty($parsedUrl.UserInfo)) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source URL is not an absolute credential-free HTTPS URL'
-            }
+            if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$parsedUrl) -or $parsedUrl.Scheme -cne 'https' -or [String]::IsNullOrEmpty($parsedUrl.Host) -or -not [String]::IsNullOrEmpty($parsedUrl.UserInfo)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source URL is not an absolute credential-free HTTPS URL' }
             $query = if ($url.Contains('?')) { $url.Substring($url.IndexOf('?') + 1) } else { '' }
-            if ($query -notmatch '(?:^|&)rev=' + [regex]::Escape([string]$package.commit) + '(?:&|$)') {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source query does not pin the exact lock commit with rev='
-            }
+            if ($query -cnotmatch ('(?:^|&)rev=' + [regex]::Escape([string]$package.commit) + '(?:&|$)')) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Git source query does not pin the exact full commit with rev=' }
             if (-not $gitBySource.ContainsKey($source)) {
-                $gitBySource.Add($source, [PSCustomObject][ordered]@{
-                    source = $source
-                    url = $url
-                    commit = [string]$package.commit
-                    database_root = [IO.Path]::GetFullPath((Join-Path $cargoHome 'git/db'))
-                    checkout_root = [IO.Path]::GetFullPath((Join-Path $cargoHome 'git/checkouts'))
-                })
+                $gitBySource.Add($source, [PSCustomObject][ordered]@{ source = $source; url = $url; commit = [string]$package.commit; database_root = [IO.Path]::GetFullPath((Join-Path $cargoHome 'git/db')); checkout_root = [IO.Path]::GetFullPath((Join-Path $cargoHome 'git/checkouts')) })
             }
-            continue
         }
-        if ($package.source_kind -cne 'workspace') {
-            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock contains an unapproved source kind'
-        }
+        elseif ($package.source_kind -cne 'workspace') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock contains an unapproved source kind' }
     }
-    if ($registryRows.Count -gt $maxRegistryPackages -or $gitBySource.Count -gt $maxGitSources) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: registry or Git source tuple count exceeds its fixed finite bound'
-    }
-    $registryRows.Sort([System.Comparison[object]]{ param($left, $right) [StringComparer]::Ordinal.Compare(([string]$left.name + "`0" + [string]$left.version), ([string]$right.name + "`0" + [string]$right.version)) })
+    if ($registryRows.Count -gt $maxRegistryPackages -or $gitBySource.Count -gt $maxGitSources) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: registry or Git tuple count exceeds its fixed finite bound' }
+    $registryRows.Sort([System.Comparison[object]]{ param($a, $b) [StringComparer]::Ordinal.Compare(([string]$a.name + [char]0 + [string]$a.version), ([string]$b.name + [char]0 + [string]$b.version)) })
     $gitRows = [System.Collections.Generic.List[object]]::new()
     foreach ($source in @($gitBySource.Keys | Sort-Object -CaseSensitive)) { $gitRows.Add($gitBySource[$source]) }
     $registryCanonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($row in $registryRows) { $registryCanonical.Add(('registry' + "`t" + $row.name + "`t" + $row.version + "`t" + $row.checksum)) }
+    foreach ($row in $registryRows) { $registryCanonical.Add(('registry' + [char]9 + $row.name + [char]9 + $row.version + [char]9 + $row.checksum)) }
     $gitCanonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($row in $gitRows) { $gitCanonical.Add(('git' + "`t" + $row.url + "`t" + $row.commit)) }
+    foreach ($row in $gitRows) { $gitCanonical.Add(('git' + [char]9 + $row.url + [char]9 + $row.commit)) }
+    $edgeCanonical = [System.Collections.Generic.List[string]]::new()
+    foreach ($edge in $edges) { $edgeCanonical.Add(([string]$edge.parent_package_id + [char]9 + [string]$edge.target_package_id + [char]9 + [string]$edge.lock_spec)) }
+    $edgeCanonical.Sort([StringComparer]::Ordinal)
     $utf8 = [Text.UTF8Encoding]::new($false)
-    $registryDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($registryCanonical -join "`n") + "`n"))).ToLowerInvariant()
-    $gitDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($gitCanonical -join "`n") + "`n"))).ToLowerInvariant()
+    $registryDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $registryCanonical.ToArray())) + [char]10))).ToLowerInvariant()
+    $gitDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $gitCanonical.ToArray())) + [char]10))).ToLowerInvariant()
+    $edgeDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $edgeCanonical.ToArray())) + [char]10))).ToLowerInvariant()
     $lockDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($LockText))).ToLowerInvariant()
     return [PSCustomObject][ordered]@{
-        schema_version = 1
-        record_type = 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1'
-        gate_authority = 'NONE'
-        verification_status = 'NOT_RUN'
-        cargo_home = $cargoHome
-        lock_bytes = [Int64]$utf8.GetByteCount($LockText)
-        lock_sha256 = $lockDigest
-        locked_package_count = [Int64]$packages.Count
-        registry_package_count = [Int64]$registryRows.Count
-        registry_tuple_sha256 = $registryDigest
-        registry_archive_root = [IO.Path]::GetFullPath($registryCache)
-        registry_source_root = [IO.Path]::GetFullPath($registrySource)
-        registry_packages = @($registryRows.ToArray())
-        git_source_count = [Int64]$gitRows.Count
-        git_tuple_sha256 = $gitDigest
-        git_sources = @($gitRows.ToArray())
-        verifier_managed_buffer_cap_bytes = [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes
-        source_proof_status = 'NOT_VERIFIED'
+        schema_version = 2; record_type = 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2'; gate_authority = 'NONE'; verification_status = 'NOT_RUN'
+        semantic_scope = 'FULL_LOCK_AUDIT_CATALOG_PLUS_SELECTED_REACHABLE_CONSERVATIVE_SUPERSET'
+        cargo_home = $cargoHome; target_triple = 'x86_64-pc-windows-msvc'; host_triple = 'x86_64-pc-windows-msvc'
+        lock_bytes = [Int64]$utf8.GetByteCount($LockText); lock_sha256 = $lockDigest
+        locked_package_count = [Int64]$packages.Count; locked_packages = @($packages)
+        lock_dependency_edge_count = [Int64]$edges.Count; lock_dependency_edges = @($edges.ToArray()); lock_dependency_edges_sha256 = $edgeDigest
+        registry_package_count = [Int64]$registryRows.Count; registry_tuple_sha256 = $registryDigest
+        registry_archive_root = [IO.Path]::GetFullPath($registryCache); registry_source_root = [IO.Path]::GetFullPath($registrySource); registry_packages = @($registryRows.ToArray())
+        git_source_count = [Int64]$gitRows.Count; git_tuple_sha256 = $gitDigest; git_sources = @($gitRows.ToArray())
+        selected_roots = @(); selected_root_rule = 'NOT_RESOLVED_WITHOUT_PINNED_MANIFEST'; requested_features = @('default', 'd32-a-test-helper')
+        verifier_managed_buffer_cap_bytes = [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes; source_proof_status = 'NOT_VERIFIED'
+    }
+}
+
+function Split-D32BoundedDiagnosticTopLevel {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [char]$Separator = ',')
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $start = 0; $depthSquare = 0; $depthCurly = 0; $depthParen = 0; $quote = [char]0; $escaped = $false
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $ch = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
+            if ($quote -ceq '"' -and $ch -ceq '\\') { $escaped = $true; continue }
+            if ($ch -ceq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; continue }
+        if ($ch -ceq '[') { $depthSquare++; continue }
+        if ($ch -ceq ']') { $depthSquare--; if ($depthSquare -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unbalanced TOML array' }; continue }
+        if ($ch -ceq '{') { $depthCurly++; continue }
+        if ($ch -ceq '}') { $depthCurly--; if ($depthCurly -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unbalanced TOML inline table' }; continue }
+        if ($ch -ceq '(') { $depthParen++; continue }
+        if ($ch -ceq ')') { $depthParen--; if ($depthParen -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unbalanced cfg parenthesis' }; continue }
+        if ($ch -ceq $Separator -and $depthSquare -eq 0 -and $depthCurly -eq 0 -and $depthParen -eq 0) {
+            $parts.Add($Text.Substring($start, $i - $start).Trim()); $start = $i + 1
+        }
+    }
+    if ($quote -ne [char]0 -or $depthSquare -ne 0 -or $depthCurly -ne 0 -or $depthParen -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML value has unbalanced string/container delimiters' }
+    if ($start -lt $Text.Length -or $Text.Length -eq 0) { $parts.Add($Text.Substring($start).Trim()) }
+    return $parts.ToArray()
+}
+
+function Remove-D32BoundedDiagnosticTomlComment {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line)
+    $quote = [char]0; $escaped = $false
+    for ($i = 0; $i -lt $Line.Length; $i++) {
+        $ch = $Line[$i]
+        if ($quote -ne [char]0) {
+            if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
+            if ($quote -ceq '"' -and $ch -ceq '\\') { $escaped = $true; continue }
+            if ($ch -ceq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; continue }
+        if ($ch -ceq '#') { return $Line.Substring(0, $i) }
+    }
+    return $Line
+}
+
+function ConvertFrom-D32BoundedDiagnosticTomlString {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $value = $Text.Trim()
+    if ($value.Length -lt 2 -or ($value[0] -cne '"' -and $value[0] -cne "'") -or $value[$value.Length - 1] -cne $value[0]) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: expected a bounded TOML string'
+    }
+    $quote = $value[0]; $result = [Text.StringBuilder]::new()
+    for ($i = 1; $i -lt ($value.Length - 1); $i++) {
+        $ch = $value[$i]
+        if ($quote -ceq '"' -and $ch -ceq '\\') {
+            $i++; if ($i -ge ($value.Length - 1)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: truncated TOML string escape' }
+            $escape = $value[$i]
+            $decoded = switch ($escape) {
+                '"' { '"' } '\\' { '\\' } 'n' { [char]10 } 'r' { [char]13 } 't' { [char]9 } 'b' { [char]8 } 'f' { [char]12 }
+                default { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported TOML string escape' }
+            }
+            [void]$result.Append($decoded); continue
+        }
+        [void]$result.Append($ch)
+    }
+    return $result.ToString()
+}
+
+function ConvertFrom-D32BoundedDiagnosticCargoValue {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $value = $Text.Trim()
+    if ($value.Length -ge 2 -and (($value[0] -ceq '"' -and $value[$value.Length - 1] -ceq '"') -or ($value[0] -ceq "'" -and $value[$value.Length - 1] -ceq "'"))) {
+        return [PSCustomObject]@{ kind = 'string'; value = (ConvertFrom-D32BoundedDiagnosticTomlString -Text $value) }
+    }
+    if ($value -ceq 'true' -or $value -ceq 'false') { return [PSCustomObject]@{ kind = 'bool'; value = ($value -ceq 'true') } }
+    if ($value.StartsWith('[') -and $value.EndsWith(']')) {
+        $items = [System.Collections.Generic.List[string]]::new()
+        $inner = $value.Substring(1, $value.Length - 2)
+        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner)) {
+            if ([String]::IsNullOrWhiteSpace($part)) { continue }
+            $parsed = ConvertFrom-D32BoundedDiagnosticCargoValue -Text $part
+            if ([string]$parsed.kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: only bounded string arrays are supported in dependency metadata' }
+            $items.Add([string]$parsed.value)
+        }
+        return [PSCustomObject]@{ kind = 'array'; value = @($items.ToArray()) }
+    }
+    if ($value.StartsWith('{') -and $value.EndsWith('}')) {
+        $map = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $inner = $value.Substring(1, $value.Length - 2)
+        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner)) {
+            if ([String]::IsNullOrWhiteSpace($part)) { continue }
+            $assignment = [regex]::Match($part, '^\s*(?<key>[A-Za-z0-9_-]+)\s*=\s*(?<value>.+?)\s*$')
+            if (-not $assignment.Success) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported inline-table field syntax' }
+            $key = [string]$assignment.Groups['key'].Value
+            if ($map.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate inline-table field' }
+            $map.Add($key, (ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value)))
+        }
+        return [PSCustomObject]@{ kind = 'table'; value = $map }
+    }
+    throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported TOML value in the finite dependency parser'
+}
+
+function Test-D32BoundedDiagnosticTomlStatementComplete {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $square = 0; $curly = 0; $quote = [char]0; $escaped = $false
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $ch = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
+            if ($quote -ceq '"' -and $ch -ceq '\\') { $escaped = $true; continue }
+            if ($ch -ceq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; continue }
+        if ($ch -ceq '[') { $square++ } elseif ($ch -ceq ']') { $square-- } elseif ($ch -ceq '{') { $curly++ } elseif ($ch -ceq '}') { $curly-- }
+        if ($square -lt 0 -or $curly -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML statement has unbalanced delimiters' }
+    }
+    return ($quote -eq [char]0 -and $square -eq 0 -and $curly -eq 0)
+}
+
+function ConvertFrom-D32BoundedDiagnosticCargoManifest {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [string]$SourcePath = '')
+    if ($Text.Length -le 0 -or [Text.Encoding]::UTF8.GetByteCount($Text) -gt 1048576 -or $Text.Contains("`0")) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: manifest is empty or exceeds the 1 MiB finite input bound'
+    }
+    $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKind = 'dependencies'; $nestedKey = ''; $pending = ''
+    $package = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $workspace = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $workspacePackage = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $dependencies = [System.Collections.Generic.List[object]]::new(); $workspaceDependencies = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $features = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $patches = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $nestedDeps = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $workspaceRootSeen = $false
+    $lineNumber = 0
+    foreach ($rawLine in ($Text -split '\r?\n')) {
+        $lineNumber++; $line = (Remove-D32BoundedDiagnosticTomlComment -Line $rawLine).Trim()
+        if ([String]::IsNullOrWhiteSpace($line)) { continue }
+        if ([String]::IsNullOrEmpty($pending) -and $line.StartsWith('[')) {
+            if ($line -match '^\[\[.*\]\]$') { $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKey = ''; continue }
+            if ($line -notmatch '^\[(?<body>[^\[\]]+)\]$') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported TOML table header' }
+            $body = [string]$Matches['body']; $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKey = ''; $nestedKind = 'dependencies'
+            switch -Regex ($body) {
+                '^package$' { $section = 'package'; break }
+                '^workspace$' { $section = 'workspace'; $workspaceRootSeen = $true; break }
+                '^workspace\.package$' { $section = 'workspace_package'; break }
+                '^workspace\.dependencies$' { $section = 'workspace_dependencies'; break }
+                '^features$' { $section = 'features'; break }
+                '^patch\.crates-io$' { $section = 'patches'; break }
+                '^(?<dependency_kind>dependencies|dev-dependencies|build-dependencies)$' { $section = [string]$Matches['dependency_kind']; break }
+                '^(?<parent>dependencies|dev-dependencies|build-dependencies)\.(?<alias>[A-Za-z0-9_-]+)$' { $section = 'nested_dependency'; $nestedKind = [string]$Matches['parent']; $nestedAlias = [string]$Matches['alias']; $targetCondition = ''; $nestedKey = $nestedKind + [char]0 + $nestedAlias; break }
+                '^workspace\.dependencies\.(?<alias>[A-Za-z0-9_-]+)$' { $section = 'nested_workspace_dependency'; $nestedAlias = [string]$Matches['alias']; break }
+                '^target\.(?<target>"[^"]+"|''[^'']+''|[A-Za-z0-9_-]+)\.(?<kind>dependencies|dev-dependencies|build-dependencies)$' {
+                    $targetCondition = [string]$Matches['target']; if ($targetCondition.Length -ge 2) { $targetCondition = $targetCondition.Substring(1, $targetCondition.Length - 2) }; $section = 'target_' + [string]$Matches['kind']; break
+                }
+                '^target\.(?<target>"[^"]+"|''[^'']+''|[A-Za-z0-9_-]+)\.(?<kind>dependencies|dev-dependencies|build-dependencies)\.(?<alias>[A-Za-z0-9_-]+)$' {
+                    $targetCondition = [string]$Matches['target']; if ($targetCondition.Length -ge 2) { $targetCondition = $targetCondition.Substring(1, $targetCondition.Length - 2) }; $section = 'nested_dependency'; $nestedKind = [string]$Matches['kind']; $nestedAlias = [string]$Matches['alias']; $nestedKey = $nestedKind + [char]0 + $targetCondition + [char]0 + $nestedAlias; break
+                }
+                default {
+                    if ($body -match '^(?:replace(?:\.|$)|patch\.)' -and $body -cne 'patch.crates-io') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported source-affecting replace or patch table' }
+                    $section = 'other'
+                }
+            }
+            continue
+        }
+        if (-not [String]::IsNullOrEmpty($pending)) { $pending += ' ' + $line } else { $pending = $line }
+        if (-not (Test-D32BoundedDiagnosticTomlStatementComplete -Text $pending)) { continue }
+        $assignment = [regex]::Match($pending, '^\s*(?<key>[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)\s*=\s*(?<value>.+?)\s*$')
+        if (-not $assignment.Success) { if ($section -ne 'other') { throw ('D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported assignment at ' + $SourcePath + ':' + $lineNumber) }; $pending = ''; continue }
+        $key = [string]$assignment.Groups['key'].Value; $value = ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value)
+        switch -Regex ($section) {
+            '^package$' { if ($package.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate package field' }; $package.Add($key, $value); break }
+            '^workspace$' { if ($workspace.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate workspace field' }; $workspace.Add($key, $value); break }
+            '^workspace_package$' { if ($workspacePackage.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate workspace package field' }; $workspacePackage.Add($key, $value); break }
+            '^features$' { if ($features.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate feature declaration' }; $features.Add($key, $value); break }
+            '^dependencies$|^dev-dependencies$|^build-dependencies$|^target_' {
+                $kind = $section; $condition = $targetCondition
+                if ($section.StartsWith('target_')) { $kind = $section.Substring(7) }
+                if ($value.kind -ceq 'string') { $fields = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $fields.Add('version', $value) }
+                elseif ($value.kind -ceq 'table') { $fields = $value.value }
+                else { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: dependency declaration must be a string or inline table' }
+                $dependencies.Add([PSCustomObject]@{ alias = $key; kind = $kind; target = $condition; fields = $fields }); break
+            }
+            '^nested_dependency$' {
+                $fields = $null
+                if (-not $nestedDeps.TryGetValue($nestedKey, [ref]$fields)) { $fields = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $nestedDeps.Add($nestedKey, [PSCustomObject]@{ alias = $nestedAlias; kind = $nestedKind; target = $targetCondition; fields = $fields }) }
+                else { $fields = $nestedDeps[$nestedKey].fields }
+                if ($fields.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate nested dependency field' }; $fields.Add($key, $value); break
+            }
+            '^workspace_dependencies$' {
+                if ($value.kind -ceq 'string') { $fields = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $fields.Add('version', $value) }
+                elseif ($value.kind -ceq 'table') { $fields = $value.value } else { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: workspace dependency must be a string or inline table' }
+                if ($workspaceDependencies.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate workspace dependency' }; $workspaceDependencies.Add($key, $fields); break
+            }
+            '^nested_workspace_dependency$' {
+                $fields = $null
+                if (-not $workspaceDependencies.TryGetValue($nestedAlias, [ref]$fields)) { $fields = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $workspaceDependencies.Add($nestedAlias, $fields) }
+                if ($fields.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate nested workspace dependency field' }; $fields.Add($key, $value); break
+            }
+            '^patches$' {
+                if ($value.kind -ceq 'string') { $fields = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $fields.Add('version', $value) }
+                elseif ($value.kind -ceq 'table') { $fields = $value.value } else { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: patch declaration must be a string or inline table' }
+                if ($patches.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate patch declaration' }; $patches.Add($key, $fields); break
+            }
+            default { }
+        }
+        $pending = ''
+    }
+    if (-not [String]::IsNullOrEmpty($pending)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: manifest ends with an incomplete TOML statement' }
+    foreach ($nestedKeyValue in $nestedDeps.Keys) {
+        $nested = $nestedDeps[$nestedKeyValue]
+        $dependencies.Add([PSCustomObject]@{ alias = [string]$nested.alias; kind = [string]$nested.kind; target = [string]$nested.target; fields = $nested.fields })
+    }
+    foreach ($key in @('name', 'version')) {
+        if ($package.ContainsKey($key) -and $package[$key].kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: package name/version must be literal strings unless workspace inheritance is explicit' }
+    }
+    if ($package.ContainsKey('workspace') -and $package['workspace'].kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: package.workspace must be a literal relative path' }
+    if ($package.ContainsKey('version.workspace') -and ($package['version.workspace'].kind -cne 'bool' -or -not [bool]$package['version.workspace'].value)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: package version workspace inheritance must be explicitly true' }
+    if ($workspace.ContainsKey('members') -and $workspace['members'].kind -cne 'array') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: workspace members must be a supported string array' }
+    if ($workspace.ContainsKey('default-members') -and $workspace['default-members'].kind -cne 'array') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: workspace default-members must be a supported string array' }
+    foreach ($feature in $features.Values) { if ($feature.kind -cne 'array') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: feature activation declarations must be bounded string arrays' } }
+    return [PSCustomObject][ordered]@{
+        source_path = $SourcePath
+        package_name = if ($package.ContainsKey('name')) { [string]$package['name'].value } else { $null }
+        package_version = if ($package.ContainsKey('version')) { [string]$package['version'].value } else { $null }
+        package_version_workspace = ($package.ContainsKey('version.workspace') -and $package['version.workspace'].kind -ceq 'bool' -and [bool]$package['version.workspace'].value)
+        is_workspace_root = $workspaceRootSeen
+        workspace_root_path = if ($package.ContainsKey('workspace')) { [string]$package['workspace'].value } else { $null }
+        workspace_members = if ($workspace.ContainsKey('members') -and $workspace['members'].kind -ceq 'array') { @($workspace['members'].value) } else { @() }
+        workspace_default_members = if ($workspace.ContainsKey('default-members') -and $workspace['default-members'].kind -ceq 'array') { @($workspace['default-members'].value) } else { @() }
+        workspace_package = $workspacePackage; workspace_dependencies = $workspaceDependencies; dependencies = @($dependencies.ToArray()); features = $features; patches = $patches
+    }
+}
+
+function Get-D32BoundedDiagnosticTargetPredicate {
+    param([Parameter(Mandatory = $true)][string]$Expression, [Parameter(Mandatory = $true)][string]$TargetTriple)
+    if ($Expression -ceq $TargetTriple) { return [PSCustomObject]@{ value = $true; proven = $true; witness = 'exact target triple' } }
+    if ($Expression -match '^cfg\((?<inner>.*)\)$') { $inner = [string]$Matches['inner'] } else { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown target selector conservatively included' } }
+    $inner = $inner.Trim()
+    foreach ($operator in @('all', 'any', 'not')) {
+        if ($inner.StartsWith($operator + '(') -and $inner.EndsWith(')')) {
+            $parts = @(Split-D32BoundedDiagnosticTopLevel -Text $inner.Substring($operator.Length + 1, $inner.Length - $operator.Length - 2))
+            if ($operator -ceq 'not') { if ($parts.Count -ne 1) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'malformed unknown cfg conservatively included' } }; $child = Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $parts[0] + ')') -TargetTriple $TargetTriple; if (-not $child.proven) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'not of unknown cfg conservatively included' } }; return [PSCustomObject]@{ value = -not [bool]$child.value; proven = $true; witness = 'not(' + [string]$child.witness + ')' } }
+            $children = @($parts | ForEach-Object { Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $_ + ')') -TargetTriple $TargetTriple })
+            if ($operator -ceq 'all') { if (@($children | Where-Object { $_.proven -and -not $_.value }).Count -gt 0) { return [PSCustomObject]@{ value = $false; proven = $true; witness = 'all contains proven-false target predicate' } }; if (@($children | Where-Object { -not $_.proven }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown member of all conservatively included' } }; return [PSCustomObject]@{ value = $true; proven = $true; witness = 'all target predicates proven true' } }
+            if (@($children | Where-Object { $_.proven -and $_.value }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $true; witness = 'any contains proven-true target predicate' } }; if (@($children | Where-Object { -not $_.proven }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown member of any conservatively included' } }; return [PSCustomObject]@{ value = $false; proven = $true; witness = 'all any-target predicates proven false' }
+        }
+    }
+    $atom = [regex]::Match($inner, '^(?<name>[A-Za-z0-9_]+)\s*=\s*(?<value>"[^"]+")$')
+    if ($atom.Success) {
+        $name = [string]$atom.Groups['name'].Value; $value = [string]$atom.Groups['value'].Value.Trim('"')
+        $facts = @{ target_arch = 'x86_64'; target_os = 'windows'; target_family = 'windows'; target_env = 'msvc'; target_vendor = 'pc'; target_endian = 'little'; target_pointer_width = '64' }
+        if ($facts.ContainsKey($name)) { return [PSCustomObject]@{ value = ($facts[$name] -ceq $value); proven = $true; witness = ($name + '=' + $facts[$name]) } }
+        return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown cfg atom conservatively included' }
+    }
+    if ($inner -ceq 'windows') { return [PSCustomObject]@{ value = $true; proven = $true; witness = 'windows host/target fact' } }
+    if ($inner -ceq 'unix') { return [PSCustomObject]@{ value = $false; proven = $true; witness = 'not a Unix target' } }
+    return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown cfg expression conservatively included' }
+}
+
+function Test-D32BoundedDiagnosticVersionRequirement {
+    param([Parameter(Mandatory = $true)][string]$Requirement, [Parameter(Mandatory = $true)][string]$LockedVersion)
+    if ($Requirement -ceq '*') { return $true }
+    if ($Requirement -match '^=(?<exact>[0-9A-Za-z.+_-]+)$') { return [string]$Matches['exact'] -ceq $LockedVersion }
+    if ($Requirement.Contains('-') -and $Requirement -ceq $LockedVersion) { return $true }
+    if ($LockedVersion -match '-' -or $LockedVersion -notmatch '^(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)(?:\+(?<build>[0-9A-Za-z.-]+))?$') { return $false }
+    $locked = [version]::new([int]$Matches.major, [int]$Matches.minor, [int]$Matches.patch)
+    foreach ($part in [regex]::Split($Requirement, '\s*,\s*')) {
+        if ($part -match '^(?<op>>=|<=|>|<|\^|~|=)?\s*(?<major>0|[1-9][0-9]*)(?:\.(?<minor>0|[1-9][0-9]*|\*))?(?:\.(?<patch>0|[1-9][0-9]*|\*))?$') {
+            $op = if ($Matches.op) { [string]$Matches.op } else { '^' }; $major = [int]$Matches.major
+            $minor = if ($Matches.minor -and $Matches.minor -ne '*') { [int]$Matches.minor } else { 0 }; $patch = if ($Matches.patch -and $Matches.patch -ne '*') { [int]$Matches.patch } else { 0 }
+            $minorWildcard = ($Matches.minor -ceq '*')
+            $patchWildcard = ($Matches.patch -ceq '*')
+            $specified = if ($Matches.patch -and -not $patchWildcard) { 3 } elseif ($Matches.minor -and -not $minorWildcard) { 2 } else { 1 }
+            if (($minorWildcard -or $patchWildcard) -and $op -cnotin @('^', '')) { return $false }
+            if ($minorWildcard -and $Matches.patch -and $Matches.patch -cne '*') { return $false }
+            $base = [version]::new($major, $minor, $patch)
+            if ($minorWildcard) { if ([int]$locked.Major -ne $major) { return $false }; continue }
+            if ($patchWildcard) { if ([int]$locked.Major -ne $major -or [int]$locked.Minor -ne $minor) { return $false }; continue }
+            $ok = switch ($op) {
+                '=' { $locked -eq $base -and $specified -eq 3 }
+                '>' { $locked -gt $base }
+                '>=' { $locked -ge $base }
+                '<' { $locked -lt $base }
+                '<=' { $locked -le $base }
+                '~' { if ($specified -ge 2) { $locked -ge $base -and $locked -lt [version]::new($major, $minor + 1, 0) } else { $locked -ge $base -and $locked -lt [version]::new($major + 1, 0, 0) } }
+                default { if ($major -gt 0 -or $specified -eq 1) { $locked -ge $base -and $locked -lt [version]::new($major + 1, 0, 0) } elseif ($minor -gt 0 -or $specified -eq 2) { $locked -ge $base -and $locked -lt [version]::new(0, $minor + 1, 0) } else { $locked -ge $base -and $locked -lt [version]::new(0, 0, $patch + 1) } }
+            }
+            if (-not $ok) { return $false }; continue
+        }
+        return $false
+    }
+    return $true
+}
+
+function Resolve-D32BoundedDiagnosticWorkspaceDependency {
+    param([Parameter(Mandatory = $true)][object]$Dependency, [AllowNull()][object]$WorkspaceManifest)
+    $fields = $Dependency.fields
+    if (-not ($fields -is [System.Collections.IDictionary])) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency fields are not a supported map' }
+    $workspaceFlag = $fields.ContainsKey('workspace') -and $fields['workspace'].kind -ceq 'bool' -and [bool]$fields['workspace'].value
+    if (-not $workspaceFlag) { return $Dependency }
+    if ($null -eq $WorkspaceManifest -or -not $WorkspaceManifest.workspace_dependencies.ContainsKey([string]$Dependency.alias)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: inherited dependency has no verified workspace declaration'
+    }
+    $merged = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($key in $WorkspaceManifest.workspace_dependencies[[string]$Dependency.alias].Keys) { $merged.Add([string]$key, $WorkspaceManifest.workspace_dependencies[[string]$Dependency.alias][$key]) }
+    foreach ($key in $fields.Keys) {
+        if ($key -ceq 'workspace') { continue }
+        if ($key -cin @('features', 'optional', 'default-features')) { continue }
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: workspace-inherited dependency overrides a source/version field'
+    }
+    return [PSCustomObject]@{ alias = $Dependency.alias; kind = $Dependency.kind; target = $Dependency.target; fields = $merged }
+}
+
+function Assert-D32BoundedDiagnosticDependencyFields {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Fields)
+    $allowed = @('version', 'package', 'path', 'git', 'rev', 'branch', 'tag', 'registry', 'optional', 'default-features', 'features', 'workspace')
+    foreach ($key in $Fields.Keys) {
+        if ($allowed -cnotcontains [string]$key) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency manifest uses an unsupported field that may alter package selection or source identity' }
+        $value = $Fields[$key]
+        switch ([string]$key) {
+            { $_ -in @('version', 'package', 'path', 'git', 'rev', 'branch', 'tag', 'registry') } {
+                if ($null -eq $value -or [string]$value.kind -cne 'string' -or [String]::IsNullOrWhiteSpace([string]$value.value)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source/version dependency field is not a nonempty literal string' }
+                break
+            }
+            { $_ -in @('optional', 'default-features', 'workspace') } {
+                if ($null -eq $value -or [string]$value.kind -cne 'bool') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency activation field is not a literal boolean' }
+                if ([string]$key -ceq 'workspace' -and -not [bool]$value.value) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: workspace inheritance must be explicitly true when present' }
+                break
+            }
+            'features' {
+                if ($null -eq $value -or [string]$value.kind -cne 'array' -or $value.value -isnot [Array]) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency features are not a bounded string array' }
+                break
+            }
+        }
+    }
+    $sourceSelectors = 0
+    foreach ($key in @('path', 'git', 'registry')) { if ($Fields.ContainsKey($key)) { $sourceSelectors++ } }
+    if ($sourceSelectors -gt 1 -or ($Fields.ContainsKey('rev') -and -not $Fields.ContainsKey('git')) -or
+        (($Fields.ContainsKey('branch') -or $Fields.ContainsKey('tag')) -and -not $Fields.ContainsKey('git')) -or
+        ($Fields.ContainsKey('branch') -and $Fields.ContainsKey('tag'))) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency has ambiguous or unsupported source selectors'
+    }
+}
+
+function Get-D32BoundedDiagnosticDependencyExpectedSource {
+    param([Parameter(Mandatory = $true)][object]$Dependency, [Parameter(Mandatory = $true)][object]$RootManifest,
+        [Parameter(Mandatory = $true)][object]$ParentPackage)
+    $fields = $Dependency.fields; Assert-D32BoundedDiagnosticDependencyFields -Fields $fields
+    $packageName = if ($fields.ContainsKey('package')) { [string]$fields['package'].value } else { [string]$Dependency.alias }
+    if ($fields.ContainsKey('path')) {
+        if ([string]$ParentPackage.source_kind -ceq 'workspace') { return [PSCustomObject]@{ name = $packageName; source_kind = 'workspace'; source = $null; path = [string]$fields['path'].value; path_base = 'DEPENDENCY_PARENT_MANIFEST' } }
+        if ([string]$ParentPackage.source_kind -ceq 'git') { return [PSCustomObject]@{ name = $packageName; source_kind = 'git'; source = [string]$ParentPackage.source; path = [string]$fields['path'].value; path_base = 'DEPENDENCY_PARENT_MANIFEST' } }
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: path dependency from a registry package is outside the approved current source mapping'
+    }
+    if ($fields.ContainsKey('git')) {
+        if (-not $fields.ContainsKey('rev') -or [string]$fields['rev'].value -cnotmatch '^[0-9a-f]{40}$' -or $fields.ContainsKey('branch') -or $fields.ContainsKey('tag')) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: Git dependency must use one exact full-commit rev and no floating selector' }
+        $url = [string]$fields['git'].value
+        if ($url.Contains('?') -or $url.Contains('#') -or $url -match '[@\s]') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: Git dependency URL has query, fragment, credentials, or whitespace outside the finite form' }
+        $source = 'git+' + $url + '?rev=' + [string]$fields['rev'].value + '#' + [string]$fields['rev'].value
+        return [PSCustomObject]@{ name = $packageName; source_kind = 'git'; source = $source }
+    }
+    if ($fields.ContainsKey('registry') -and [string]$fields['registry'].value -cne 'crates-io') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: non-crates.io registry dependency is outside the fixed source domain' }
+    $patch = $null
+    foreach ($patchAlias in $RootManifest.patches.Keys) {
+        $patchFields = $RootManifest.patches[$patchAlias]
+        $patchedName = if ($patchFields.ContainsKey('package')) { [string]$patchFields['package'].value } else { [string]$patchAlias }
+        if ($patchedName -ceq $packageName) { if ($null -ne $patch) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: ambiguous root crates.io patch target' }; $patch = $patchFields }
+    }
+    if ($null -ne $patch) {
+        Assert-D32BoundedDiagnosticDependencyFields -Fields $patch
+        if ($patch.ContainsKey('path')) { return [PSCustomObject]@{ name = $packageName; source_kind = 'workspace'; source = $null; path = [string]$patch['path'].value; path_base = 'SELECTED_WORKSPACE_PATCH_MANIFEST' } }
+        if ($patch.ContainsKey('git') -and $patch.ContainsKey('rev')) {
+            if ([string]$patch['rev'].value -cnotmatch '^[0-9a-f]{40}$' -or $patch.ContainsKey('branch') -or $patch.ContainsKey('tag') -or
+                [string]$patch['git'].value -match '[@\s?#]') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: root patch Git source is not one exact full-commit immutable URL' }
+            $source = 'git+' + [string]$patch['git'].value + '?rev=' + [string]$patch['rev'].value + '#' + [string]$patch['rev'].value
+            return [PSCustomObject]@{ name = $packageName; source_kind = 'git'; source = $source }
+        }
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: unsupported root patch declaration'
+    }
+    return [PSCustomObject]@{ name = $packageName; source_kind = 'registry'; source = 'registry+https://github.com/rust-lang/crates.io-index' }
+}
+
+function Test-D32BoundedDiagnosticPathDependencyBinding {
+    param([Parameter(Mandatory = $true)][object]$ParentPackage, [Parameter(Mandatory = $true)][object]$ParentManifest,
+        [Parameter(Mandatory = $true)][object]$TargetPackage, [Parameter(Mandatory = $true)][object]$TargetManifest, [Parameter(Mandatory = $true)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [IO.Path]::IsPathRooted($Path) -or $Path.Contains(':') -or $Path.Contains('\') -or $Path.Contains("`0")) { return $false }
+    if ([string]$ParentPackage.source_kind -ceq 'workspace') {
+        if ([string]$TargetPackage.source_kind -cne 'workspace') { return $false }
+    }
+    elseif ([string]$ParentPackage.source_kind -ceq 'git') {
+        if ([string]$TargetPackage.source_kind -cne 'git' -or [string]$TargetPackage.source -cne [string]$ParentPackage.source) { return $false }
+    }
+    else { return $false }
+    $parentDirectory = [IO.Path]::GetDirectoryName(([string]$ParentManifest.source_path).Replace('/', '\'))
+    if ($null -eq $parentDirectory) { $parentDirectory = '' }
+    $sourceRoot = 'C:\d32\graph-source-root'
+    $targetDirectory = [IO.Path]::GetFullPath((Join-Path $sourceRoot (Join-Path $parentDirectory $Path.Replace('/', '\'))))
+    $relativeDirectory = [IO.Path]::GetRelativePath($sourceRoot, $targetDirectory).Replace('\', '/')
+    if ($relativeDirectory -match '(^/|^[A-Za-z]:|(^|/)\.\.(?:/|$)|\x00)') { return $false }
+    $expectedManifestPath = if ([String]::IsNullOrEmpty($relativeDirectory)) { 'Cargo.toml' } else { $relativeDirectory + '/Cargo.toml' }
+    return [StringComparer]::Ordinal.Equals([string]$TargetManifest.source_path, $expectedManifestPath)
+}
+
+function Complete-D32BoundedDiagnosticManifestCatalog {
+    param([Parameter(Mandatory = $true)][object]$Plan, [Parameter(Mandatory = $true)][object[]]$Candidates)
+    if ($Candidates.Count -gt 4096) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: candidate manifest count exceeds its fixed 4096-entry bound' }
+    $lockedPackageById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($lockedPackage in $Plan.locked_packages) {
+        if (-not $lockedPackageById.TryAdd([string]$lockedPackage.package_id, $lockedPackage)) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-plan package identity is duplicated before manifest mapping'
+        }
+    }
+    $parsed = [System.Collections.Generic.List[object]]::new()
+    $bySourcePath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $candidateBytes = [Int64]0
+    foreach ($candidate in $Candidates) {
+        if ([string]$candidate.source_kind -cnotin @('workspace', 'registry', 'git') -or
+            [string]$candidate.source_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$|^Cargo\.toml$' -or
+            [string]$candidate.content_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$candidate.content -isnot [string]) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: current source manifest candidate is not exact, bounded, or checksum-bound'
+        }
+        foreach ($segment in ([string]$candidate.source_path).Split('/')) {
+            if ([String]::IsNullOrEmpty($segment) -or $segment -ceq '.' -or $segment -ceq '..') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source manifest candidate path has an empty, dot, or traversal segment' }
+        }
+        $candidateSize = [Int64][Text.Encoding]::UTF8.GetByteCount([string]$candidate.content)
+        if ($candidateSize -gt 1048576) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source manifest exceeds the 1 MiB content ceiling' }
+        $candidateBytes += $candidateSize
+        if ($candidateBytes -gt 67108864L) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: combined source-manifest candidate bytes exceed the 64 MiB managed buffer bound' }
+        $actualSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$candidate.content))).ToLowerInvariant()
+        if ($actualSha -cne [string]$candidate.content_sha256) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: manifest bytes differ from their archive/tree/file content digest' }
+        if (-not [String]::IsNullOrEmpty([string]$candidate.package_id)) {
+            if (-not $lockedPackageById.ContainsKey([string]$candidate.package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: manifest candidate package ID is absent from the exact lock catalog' }
+            $boundPackage = $lockedPackageById[[string]$candidate.package_id]
+            $expectedCandidateSource = if ($null -eq $boundPackage.source) { 'workspace' } else { [string]$boundPackage.source }
+            $actualCandidateSource = if ($candidate.source_kind -ceq 'workspace') { 'workspace' } else { [string]$candidate.source }
+            if ([string]$candidate.source_kind -cne [string]$boundPackage.source_kind -or
+                [string]$actualCandidateSource -cne [string]$expectedCandidateSource) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: explicit manifest package ID is cross-bound to another locked source kind or identity'
+            }
+        }
+        elseif ($candidate.source_kind -ceq 'workspace' -and $null -ne $candidate.source) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: workspace manifest candidate unexpectedly names an external source identity'
+        }
+        $groupSource = if ($candidate.source_kind -ceq 'workspace') { 'workspace' } else { [string]$candidate.source }
+        if ($candidate.source_kind -ceq 'registry' -and ($groupSource -cne 'registry+https://github.com/rust-lang/crates.io-index' -or [String]::IsNullOrEmpty([string]$candidate.package_id))) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: registry manifest candidate has a non-approved source or lacks its exact lock package binding' }
+        if ($candidate.source_kind -ceq 'git' -and -not ($Plan.git_sources | Where-Object { [string]$_.source -ceq $groupSource })) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: Git manifest candidate is not from an exact lock-derived Git source' }
+        $groupIdentity = if ($candidate.source_kind -ceq 'registry') { $groupSource + [char]0 + [string]$candidate.package_id } else { $groupSource }
+        $key = $candidate.source_kind + [char]0 + $groupIdentity + [char]0 + [string]$candidate.source_path
+        if ($bySourcePath.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: duplicate manifest path within one verified source identity' }
+        $model = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text ([string]$candidate.content) -SourcePath ([string]$candidate.source_path)
+        $entry = [PSCustomObject]@{ source_kind = [string]$candidate.source_kind; source = $groupSource; group_identity = $groupIdentity; source_path = [string]$candidate.source_path; content_sha256 = [string]$candidate.content_sha256; explicit_package_id = [string]$candidate.package_id; model = $model }
+        $parsed.Add($entry); $bySourcePath.Add($key, $entry)
+    }
+    foreach ($entry in $parsed) {
+        $model = $entry.model
+        if ([String]::IsNullOrEmpty([string]$model.package_name)) { continue }
+        $manifestDirectory = [IO.Path]::GetDirectoryName([string]$entry.source_path.Replace('/', '\'))
+        if ($null -eq $manifestDirectory) { $manifestDirectory = '' }
+        $workspaceManifest = $null
+        if (-not [String]::IsNullOrWhiteSpace([string]$model.workspace_root_path)) {
+            $targetDir = [IO.Path]::GetFullPath((Join-Path ('C:\d32\manifest-root') (Join-Path $manifestDirectory ([string]$model.workspace_root_path))))
+            $relativeDir = [IO.Path]::GetRelativePath('C:\d32\manifest-root', $targetDir).Replace('\', '/')
+            if ($relativeDir -match '(^|/)\.\.(?:/|$)' -or [IO.Path]::IsPathRooted($relativeDir)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: explicit Cargo workspace path escapes its verified source root' }
+            $workspacePath = if ([String]::IsNullOrEmpty($relativeDir)) { 'Cargo.toml' } else { $relativeDir + '/Cargo.toml' }
+            $workspaceKey = $entry.source_kind + [char]0 + [string]$entry.group_identity + [char]0 + $workspacePath
+            if (-not $bySourcePath.ContainsKey($workspaceKey) -or -not [bool]$bySourcePath[$workspaceKey].model.is_workspace_root) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: explicit package workspace manifest is absent from verified current source content' }
+            $workspaceManifest = $bySourcePath[$workspaceKey].model
+        }
+        else {
+            if ([bool]$model.is_workspace_root) { $workspaceManifest = $model }
+            $ancestor = $manifestDirectory
+            while ($null -eq $workspaceManifest -and -not [String]::IsNullOrEmpty($ancestor)) {
+                $workspacePath = $ancestor.Replace('\', '/') + '/Cargo.toml'
+                $workspaceKey = $entry.source_kind + [char]0 + [string]$entry.group_identity + [char]0 + $workspacePath
+                if ($bySourcePath.ContainsKey($workspaceKey) -and [bool]$bySourcePath[$workspaceKey].model.is_workspace_root) { $workspaceManifest = $bySourcePath[$workspaceKey].model; break }
+                $separator = $ancestor.LastIndexOf('\'); if ($separator -lt 0) { $ancestor = '' } elseif ($separator -eq 0) { $ancestor = '' } else { $ancestor = $ancestor.Substring(0, $separator) }
+            }
+        }
+        if ($model.package_version_workspace) {
+            if ($null -eq $workspaceManifest -or -not $workspaceManifest.workspace_package.ContainsKey('version') -or [string]$workspaceManifest.workspace_package['version'].kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: inherited package version lacks a verified workspace.package.version' }
+            $model.package_version = [string]$workspaceManifest.workspace_package['version'].value
+        }
+        if ($null -ne $workspaceManifest) { $model | Add-Member -NotePropertyName workspace_manifest -NotePropertyValue $workspaceManifest -Force }
+    }
+    $catalog = [System.Collections.Generic.List[object]]::new()
+    foreach ($package in $Plan.locked_packages) {
+        $matches = @($parsed | Where-Object {
+            $entry = $_
+            if ([string]$entry.model.package_name -cne [string]$package.name -or [string]$entry.model.package_version -cne [string]$package.version) { return $false }
+            if (-not [String]::IsNullOrEmpty([string]$entry.explicit_package_id)) { return [string]$entry.explicit_package_id -ceq [string]$package.package_id }
+            if ([string]$package.source_kind -cne [string]$entry.source_kind) { return $false }
+            if ([string]$package.source_kind -ceq 'workspace') { return $true }
+            return [string]$package.source -ceq [string]$entry.source
+        })
+        if ($matches.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: multiple verified current manifests match one locked package identity' }
+        if ($matches.Count -eq 1) {
+            $entry = $matches[0]
+            $catalog.Add([PSCustomObject]@{ package_id = [string]$package.package_id; source_kind = [string]$entry.source_kind; source_identity = [string]$entry.source; source_path = [string]$entry.source_path; content_sha256 = [string]$entry.content_sha256; model = $entry.model })
+        }
+    }
+    return [PSCustomObject]@{ entries = @($catalog.ToArray()); verified_candidate_manifest_count = [Int64]$parsed.Count }
+}
+
+function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
+    param([Parameter(Mandatory = $true)][object]$Plan, [Parameter(Mandatory = $true)][object[]]$ManifestCatalog,
+        [string]$RootManifestPath = 'vita-agent/Cargo.toml')
+    if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -or [int]$Plan.schema_version -ne 2 -or
+        [string]$Plan.semantic_scope -cne 'FULL_LOCK_AUDIT_CATALOG_PLUS_SELECTED_REACHABLE_CONSERVATIVE_SUPERSET' -or
+        [string]$Plan.host_triple -cne 'x86_64-pc-windows-msvc' -or [string]$Plan.target_triple -cne 'x86_64-pc-windows-msvc' -or
+        $Plan.locked_packages -isnot [Array] -or $Plan.lock_dependency_edges -isnot [Array] -or $ManifestCatalog -isnot [Array] -or
+        [string]$RootManifestPath -cne 'vita-agent/Cargo.toml' -or $Plan.locked_packages.Count -le 0 -or $Plan.locked_packages.Count -gt 2048 -or
+        $Plan.lock_dependency_edges.Count -gt 65536 -or [string]$Plan.lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Plan.lock_dependency_edges_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-plan version, fixed target, root selection, or manifest catalog is invalid' }
+    $packageById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($package in $Plan.locked_packages) { if (-not $packageById.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: lock catalog package identity is duplicated' } }
+    $edgeByParent = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $edgeIdentitySet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($edge in $Plan.lock_dependency_edges) {
+        if (-not $packageById.ContainsKey([string]$edge.parent_package_id) -or -not $packageById.ContainsKey([string]$edge.target_package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: lock edge references an unknown catalog package' }
+        if ([String]::IsNullOrWhiteSpace([string]$edge.lock_spec) -or -not $edgeIdentitySet.Add(([string]$edge.parent_package_id + [char]0 + [string]$edge.lock_spec))) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: duplicate or empty lock edge identity cannot support exhaustive reconciliation' }
+        if (-not $edgeByParent.ContainsKey([string]$edge.parent_package_id)) { $edgeByParent.Add([string]$edge.parent_package_id, [System.Collections.Generic.List[object]]::new()) }
+        $edgeByParent[[string]$edge.parent_package_id].Add($edge)
+    }
+    $manifestById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $manifestRecordById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($manifest in $ManifestCatalog) {
+        $manifestPackage = $null
+        if ($null -ne $manifest -and $packageById.ContainsKey([string]$manifest.package_id)) { $manifestPackage = $packageById[[string]$manifest.package_id] }
+        $expectedSourceIdentity = if ($null -eq $manifestPackage -or $null -eq $manifestPackage.source) { 'workspace' } else { [string]$manifestPackage.source }
+        if ([string]$manifest.package_id -cnotmatch '^.+\|(?:workspace|registry|git)\|.+$' -or [string]$manifest.content_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $null -eq $manifest.model -or
+            $null -eq $manifestPackage -or [string]$manifest.source_kind -cne [string]$manifestPackage.source_kind -or
+            [string]$manifest.source_identity -cne $expectedSourceIdentity -or
+            -not $manifestById.TryAdd([string]$manifest.package_id, $manifest.model)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-verified manifest record is malformed or duplicated' }
+        $manifestRecordById.Add([string]$manifest.package_id, $manifest)
+    }
+    $rootModels = @($ManifestCatalog | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.source_path, $RootManifestPath) })
+    if ($rootModels.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: selected manifest path does not identify exactly one caller-pinned current root' }
+    $rootModel = $rootModels[0].model
+    if ([string]$rootModel.package_name -cne 'digital-life-vita-agent' -or $null -eq $rootModel.package_version -or
+        -not $rootModel.features.ContainsKey('d32-a-test-helper')) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: selected current manifest package/feature identity differs from the fixed command' }
+    $rootIds = @($Plan.locked_packages | Where-Object { $_.source_kind -ceq 'workspace' -and $_.name -ceq [string]$rootModel.package_name -and $_.version -ceq [string]$rootModel.package_version } | ForEach-Object { [string]$_.package_id })
+    if ($rootIds.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: current selected package does not resolve to exactly one local lock package' }
+    if (-not $manifestById.ContainsKey($rootIds[0])) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: selected root package lacks its exact current source-manifest pin' }
+    $selectedRootWorkspace = if ($null -ne $rootModel.PSObject.Properties['workspace_manifest']) { $rootModel.workspace_manifest } else { $rootModel }
+
+    $queue = [System.Collections.Generic.Queue[string]]::new(); $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $parentPath = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($rootId in $rootIds) { $queue.Enqueue($rootId); $parentPath[$rootId] = $rootId }
+    $graphEdges = [System.Collections.Generic.List[object]]::new(); $dependencyDecisions = [System.Collections.Generic.List[object]]::new(); $unknownCfgCount = 0L; $inactiveCfgCount = 0L
+    while ($queue.Count -gt 0) {
+        $parentId = $queue.Dequeue(); if (-not $visited.Add($parentId)) { continue }
+        if (-not $manifestById.ContainsKey($parentId)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: reachable locked package lacks a verified current source manifest; absence cannot prove exclusion' }
+        $parentPackage = $packageById[$parentId]; $manifestModel = $manifestById[$parentId]
+        if ([string]$manifestModel.package_name -cne [string]$parentPackage.name -or [string]$manifestModel.package_version -cne [string]$parentPackage.version) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: verified package manifest identity differs from its exact Cargo.lock package record' }
+        $workspaceModel = if ($null -ne $manifestModel.PSObject.Properties['workspace_manifest']) { $manifestModel.workspace_manifest } elseif ([bool]$manifestModel.is_workspace_root) { $manifestModel } else { $null }
+        $lockEdges = if ($edgeByParent.ContainsKey($parentId)) { @($edgeByParent[$parentId].ToArray()) } else { @() }
+        $matchedLockEdges = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $dependencyRows = [System.Collections.Generic.List[object]]::new()
+        foreach ($rawDependency in $manifestModel.dependencies) {
+            $dependency = Resolve-D32BoundedDiagnosticWorkspaceDependency -Dependency $rawDependency -WorkspaceManifest $workspaceModel
+            Assert-D32BoundedDiagnosticDependencyFields -Fields $dependency.fields
+            $nonRootDev = ([string]$dependency.kind -ceq 'dev-dependencies' -and $parentId -cne $rootIds[0])
+            $condition = if ([String]::IsNullOrEmpty([string]$dependency.target)) { [PSCustomObject]@{ value = $true; proven = $true; witness = 'unconditional dependency' } } else { Get-D32BoundedDiagnosticTargetPredicate -Expression ([string]$dependency.target) -TargetTriple ([string]$Plan.target_triple) }
+            $resolvedTargets = [System.Collections.Generic.List[object]]::new()
+            foreach ($edge in $lockEdges) {
+                $targetPackage = $packageById[[string]$edge.target_package_id]
+                $declarationFields = $dependency.fields
+                $targetName = if ($declarationFields.ContainsKey('package')) { [string]$declarationFields['package'].value } else { [string]$dependency.alias }
+                if ([string]$targetPackage.name -cne $targetName) { continue }
+                $versionField = if ($declarationFields.ContainsKey('version')) { $declarationFields['version'] } else { $null }
+                if ($null -ne $versionField -and [string]$versionField.kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency version is not a supported string' }
+                $requirement = if ($null -eq $versionField) { '*' } else { [string]$versionField.value }
+                if (-not (Test-D32BoundedDiagnosticVersionRequirement -Requirement $requirement -LockedVersion ([string]$targetPackage.version))) { continue }
+                $expectedSource = Get-D32BoundedDiagnosticDependencyExpectedSource -Dependency $dependency -RootManifest $selectedRootWorkspace -ParentPackage $parentPackage
+                if ([string]$targetPackage.source_kind -cne [string]$expectedSource.source_kind -or
+                    (($null -eq $expectedSource.source) -ne ($null -eq $targetPackage.source)) -or
+                    ($null -ne $expectedSource.source -and [string]$targetPackage.source -cne [string]$expectedSource.source)) { continue }
+                if ($expectedSource.PSObject.Properties['path'] -and -not [String]::IsNullOrEmpty([string]$expectedSource.path)) {
+                    if (-not $manifestById.ContainsKey([string]$targetPackage.package_id)) { continue }
+                    $pathParentPackage = $parentPackage; $pathParentManifest = $manifestModel
+                    if ([string]$expectedSource.path_base -ceq 'SELECTED_WORKSPACE_PATCH_MANIFEST') { $pathParentPackage = $packageById[$rootIds[0]]; $pathParentManifest = $selectedRootWorkspace }
+                    if (-not (Test-D32BoundedDiagnosticPathDependencyBinding -ParentPackage $pathParentPackage -ParentManifest $pathParentManifest -TargetPackage $targetPackage -TargetManifest $manifestById[[string]$targetPackage.package_id] -Path ([string]$expectedSource.path))) { continue }
+                }
+                $resolvedTargets.Add($edge)
+            }
+            if ($nonRootDev) {
+                if ($resolvedTargets.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: non-root development dependency maps ambiguously to lock edges' }
+                if ($resolvedTargets.Count -eq 1) { [void]$matchedLockEdges.Add(([string]$parentId + [char]0 + [string]$resolvedTargets[0].lock_spec)) }
+                $dependencyRows.Add([PSCustomObject]@{ parent_package_id = $parentId; alias = [string]$dependency.alias; kind = [string]$dependency.kind; target = [string]$dependency.target; disposition = 'EXCLUDED_NONROOT_DEV_DEPENDENCY'; predicate_proven = [bool]$condition.proven; predicate_witness = 'Cargo does not build dependency-package dev-dependencies for selected root all-targets command'; target_package_id = if ($resolvedTargets.Count -eq 1) { [string]$resolvedTargets[0].target_package_id } else { $null }; lock_specs = @($resolvedTargets | ForEach-Object { [string]$_.lock_spec }); optional_included = ($dependency.fields.ContainsKey('optional') -and [bool]$dependency.fields['optional'].value) })
+                continue
+            }
+            if (-not [bool]$condition.value) {
+                $inactiveCfgCount++
+                if ($resolvedTargets.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: inactive target dependency maps ambiguously to lock edges' }
+                if ($resolvedTargets.Count -eq 1) { [void]$matchedLockEdges.Add(([string]$parentId + [char]0 + [string]$resolvedTargets[0].lock_spec)) }
+                $dependencyRows.Add([PSCustomObject]@{ parent_package_id = $parentId; alias = [string]$dependency.alias; kind = [string]$dependency.kind; target = [string]$dependency.target; disposition = 'EXCLUDED_TARGET_PREDICATE_PROVEN_FALSE'; predicate_proven = [bool]$condition.proven; predicate_witness = [string]$condition.witness; target_package_id = if ($resolvedTargets.Count -eq 1) { [string]$resolvedTargets[0].target_package_id } else { $null }; lock_specs = @($resolvedTargets | ForEach-Object { [string]$_.lock_spec }); optional_included = ($dependency.fields.ContainsKey('optional') -and [bool]$dependency.fields['optional'].value) })
+                continue
+            }
+            if (-not $condition.proven) { $unknownCfgCount++ }
+            if ($resolvedTargets.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: active/conservatively included manifest dependency does not resolve to exactly one exact lock edge' }
+            $edge = $resolvedTargets[0]; [void]$matchedLockEdges.Add(([string]$parentId + [char]0 + [string]$edge.lock_spec))
+            $isOptional = ($dependency.fields.ContainsKey('optional') -and [bool]$dependency.fields['optional'].value)
+            $graphEdges.Add([PSCustomObject]@{ parent_package_id = $parentId; target_package_id = [string]$edge.target_package_id; lock_spec = [string]$edge.lock_spec; dependency_alias = [string]$dependency.alias; kind = [string]$dependency.kind; target_predicate = [string]$dependency.target; predicate_proven = [bool]$condition.proven; predicate_witness = [string]$condition.witness; optional_included = $isOptional })
+            $dependencyRows.Add([PSCustomObject]@{ parent_package_id = $parentId; alias = [string]$dependency.alias; kind = [string]$dependency.kind; target = [string]$dependency.target; disposition = if ($condition.proven) { 'INCLUDED' } else { 'INCLUDED_UNKNOWN_CFG' }; predicate_proven = [bool]$condition.proven; predicate_witness = [string]$condition.witness; target_package_id = [string]$edge.target_package_id; lock_specs = @([string]$edge.lock_spec); optional_included = $isOptional })
+            if (-not $visited.Contains([string]$edge.target_package_id)) { $queue.Enqueue([string]$edge.target_package_id); if (-not $parentPath.ContainsKey([string]$edge.target_package_id)) { $parentPath[[string]$edge.target_package_id] = $parentId } }
+        }
+        foreach ($edge in $lockEdges) {
+            if (-not $matchedLockEdges.Contains(([string]$parentId + [char]0 + [string]$edge.lock_spec))) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: reachable parent has an unexplained lock dependency edge not reconciled with its complete manifest declarations'
+            }
+        }
+        foreach ($decision in $dependencyRows) { $dependencyDecisions.Add($decision) }
+    }
+    $rootSetCanonical = [string]::Join("`n", [string[]]$rootIds)
+    $includedIds = [string[]]@($visited); [Array]::Sort($includedIds, [StringComparer]::Ordinal)
+    $excludedIds = [string[]]@(@($Plan.locked_packages | Where-Object { -not $visited.Contains([string]$_.package_id) } | ForEach-Object { [string]$_.package_id })); [Array]::Sort($excludedIds, [StringComparer]::Ordinal)
+    $edgeCanon = [System.Collections.Generic.List[string]]::new(); $manifestCanon = [System.Collections.Generic.List[string]]::new()
+    foreach ($id in $includedIds) { $row = $manifestRecordById[$id]; $manifestCanon.Add($id + "`t" + [string]$row.source_kind + "`t" + [string]$row.source_identity + "`t" + [string]$row.source_path + "`t" + [string]$row.content_sha256) }
+    $manifestCanon.Sort([StringComparer]::Ordinal)
+    foreach ($edge in $graphEdges) { $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)) }
+    $edgeCanon.Sort([StringComparer]::Ordinal); $utf8 = [Text.UTF8Encoding]::new($false)
+    $decisionCanon = [System.Collections.Generic.List[string]]::new()
+    foreach ($decision in $dependencyDecisions) { $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)) }
+    $decisionCanon.Sort([StringComparer]::Ordinal)
+    $closedSetSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($includedIds -join "`n") + "`n"))).ToLowerInvariant()
+    $manifestSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($manifestCanon -join "`n") + "`n"))).ToLowerInvariant()
+    $graphSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]$Plan.lock_sha256 + "`n" + [string]$Plan.lock_dependency_edges_sha256 + "`n" + $rootSetCanonical + "`n" + ($edgeCanon -join "`n") + "`n" + ($decisionCanon -join "`n") + "`n" + $closedSetSha + "`n" + $manifestSha + "`n")))).ToLowerInvariant()
+    $classifications = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $includedIds) {
+        $row = $manifestRecordById[$id]
+        $path = [System.Collections.Generic.List[string]]::new(); $cursor = $id; $guard = 0
+        while ($cursor -cne $rootIds[0]) {
+            if (-not $parentPath.ContainsKey($cursor) -or $guard -ge $includedIds.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: included package lacks a bounded root reachability witness path' }
+            $cursor = [string]$parentPath[$cursor]; $path.Add($cursor); $guard++
+        }
+        $path.Reverse(); $path.Add($id)
+        $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'INCLUDED'; source_kind = [string]$packageById[$id].source_kind; source_identity = [string]$row.source_identity; manifest_path = [string]$row.source_path; manifest_sha256 = [string]$row.content_sha256; witness_kind = 'ROOT_PATH_IN_VERIFIED_DECLARATION_GRAPH'; witness_root_path = @($path.ToArray()); closed_reachability_sha256 = $closedSetSha })
+    }
+    foreach ($id in $excludedIds) { $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'EXCLUDED_WITH_WITNESS'; source_kind = [string]$packageById[$id].source_kind; source_identity = if ($null -eq $packageById[$id].source) { 'workspace' } else { [string]$packageById[$id].source }; witness_kind = 'CLOSED_REACHABILITY_CUT'; unreachable_from_roots = @($rootIds); complete_reachable_parent_count = [Int64]$visited.Count; complete_reachable_dependency_decision_count = [Int64]$dependencyDecisions.Count; no_active_incoming_edge_from_included = $true; closed_reachability_sha256 = $closedSetSha }) }
+    return [PSCustomObject][ordered]@{
+        schema_version = 2; record_type = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2'; gate_authority = 'NONE'; formal_gate_usable = $false
+        status = 'CURRENT_LOCKED_SOURCE_GRAPH_VERIFIED_FOR_DIAGNOSTIC_ONLY'; semantic_scope = [string]$Plan.semantic_scope
+        lock_sha256 = [string]$Plan.lock_sha256; lock_dependency_edges_sha256 = [string]$Plan.lock_dependency_edges_sha256; graph_sha256 = $graphSha
+        root_manifest_path = $RootManifestPath; selected_root_ids = @($rootIds); root_selection_rule = 'EXACT_PACKAGE_NAMED_BY_MANIFEST_PATH_DEFAULT_FEATURES_PLUS_D32_A_TEST_HELPER_NO_WORKSPACE_EXPANSION'
+        host_triple = [string]$Plan.host_triple; target_triple = [string]$Plan.target_triple; target_resolution_scope = 'ONE_FIXED_X86_64_PC_WINDOWS_MSVC_HOST_AND_TARGET'
+        locked_package_count = [Int64]$packageById.Count; included_package_ids = @($includedIds); included_package_count = [Int64]$includedIds.Count
+        excluded_package_count = [Int64]$excludedIds.Count; classification_count = [Int64]$classifications.Count; classifications = @($classifications.ToArray())
+        included_edges = @($graphEdges.ToArray()); dependency_decisions = @($dependencyDecisions.ToArray()); inactive_target_edge_count = $inactiveCfgCount; unknown_cfg_conservative_include_count = $unknownCfgCount; included_manifest_set_sha256 = $manifestSha
+        feature_rule = 'ALL_OPTIONAL_AND_FEATURE_ACTIVATION_EDGES_INCLUDED_UNLESS_TARGET_PREDICATE_PROVEN_FALSE'
+        root_dev_dependency_rule = 'INCLUDED_FOR_SELECTED_PACKAGE_ALL_TARGETS'; nonroot_dev_dependency_rule = 'EXCLUDED_NOT_BUILT_FOR_DEPENDENCY_PACKAGE'
+        build_proc_macro_rule = 'INCLUDED_HOST_EQUALS_TARGET'; closed_reachability_set_sha256 = $closedSetSha; source_plan_version = 2
+        selected_target_mode = 'ALL_TARGETS_FOR_SELECTED_PACKAGE_ONLY'; selected_crate_kinds = @('lib', 'bin', 'example', 'test', 'bench', 'custom-build', 'proc-macro')
     }
 }
 
@@ -1677,6 +2605,7 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $expandedBytes = [Int64]0
         $rootPrefix = $ExpectedPackageRoot + '/'
         $rootSeen = $false
+        $manifestText = $null; $manifestContentSha256 = $null
         $ended = $false
         while (-not $ended) {
             if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
@@ -1757,6 +2686,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 elseif ($isDirectory) { $expected.Add($relative, [PSCustomObject]@{ path = $relative; kind = 'directory'; bytes = 0L; sha256 = $null }) }
                 else {
                     $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+                    $captureManifest = ($relative -ceq 'Cargo.toml')
+                    if ($captureManifest -and $size -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: crate Cargo.toml exceeds its 1 MiB dependency-graph parser bound' }
+                    $manifestBuffer = if ($captureManifest) { [IO.MemoryStream]::new([int]$size) } else { $null }
                     try {
                         $remaining = [Int64]$size
                         $buffer = [byte[]]::new(65536)
@@ -1768,11 +2700,18 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                             $read = $gzip.Read($buffer, 0, $take)
                             if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated file member data' }
                             $hash.AppendData($buffer, 0, $read)
+                            if ($captureManifest) { $manifestBuffer.Write($buffer, 0, $read) }
                             $remaining -= $read
                         }
                         $fileSha = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+                        if ($captureManifest) {
+                            $manifestBytes = $manifestBuffer.ToArray()
+                            try { $manifestText = [Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes) }
+                            catch { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: Cargo.toml is not strict UTF-8' }
+                            $manifestContentSha256 = $fileSha
+                        }
                     }
-                    finally { $hash.Dispose() }
+                    finally { $hash.Dispose(); if ($null -ne $manifestBuffer) { $manifestBuffer.Dispose() } }
                     $expandedBytes += [Int64]$size
                     if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
                     $padding = [int]((512 - ($size % 512)) % 512)
@@ -1807,6 +2746,7 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
         }
         if ($expected.Count -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member inventory is empty' }
+        if ($null -eq $manifestText -or [string]$manifestContentSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: checksum-matched crate archive lacks one regular root Cargo.toml' }
         $paths = [string[]]@($expected.Keys)
         [Array]::Sort($paths, [StringComparer]::Ordinal)
         $rows = [System.Collections.Generic.List[object]]::new()
@@ -1820,7 +2760,7 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
             $canonical.Add(([string]$entry.kind + "`t" + [string]$entry.path + "`t" + [Int64]$entry.bytes + "`t" + [string]$entry.sha256))
         }
         $inventorySha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + "`n"))).ToLowerInvariant()
-        return [PSCustomObject][ordered]@{ archive_sha256 = $archiveSha; expanded_bytes = $expandedBytes; member_count = [Int64]$rawMemberCount; entries = @($rows.ToArray()); inventory_sha256 = $inventorySha }
+        return [PSCustomObject][ordered]@{ archive_sha256 = $archiveSha; expanded_bytes = $expandedBytes; member_count = [Int64]$rawMemberCount; entries = @($rows.ToArray()); inventory_sha256 = $inventorySha; manifest_text = $manifestText; manifest_sha256 = $manifestContentSha256 }
     }
     finally {
         if ($null -ne $gzip) { $gzip.Dispose() }

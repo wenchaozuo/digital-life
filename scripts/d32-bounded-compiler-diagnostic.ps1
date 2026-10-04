@@ -674,12 +674,12 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         [Parameter(Mandatory = $true)][string]$Repo,
         [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer
     )
-    if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1' -or
+    if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -or [int]$Plan.schema_version -ne 2 -or
         [string]$Plan.gate_authority -cne 'NONE' -or [string]$Plan.verification_status -cne 'NOT_RUN' -or
         [string]$Plan.source_proof_status -cne 'NOT_VERIFIED' -or $Plan.registry_packages -isnot [Array] -or
         $Plan.registry_packages.Count -le 0 -or $Plan.registry_packages.Count -gt 1536 -or
-        $Origin.registry_archives -isnot [Array] -or $Origin.registry_archives.Count -ne $Plan.registry_packages.Count) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: source plan or pinned archive closure is malformed or outside its finite package bound'
+        $Origin.registry_archives -isnot [Array] -or $Origin.registry_archives.Count -le 0 -or $Origin.registry_archives.Count -gt $Plan.registry_packages.Count) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: source plan or caller-pinned reachable-source archive subset is malformed or outside its finite package bound'
     }
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Origin.registry_archive_root.path, [string]$Plan.registry_archive_root) -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Origin.registry_source_root.path, [string]$Plan.registry_source_root)) {
@@ -695,14 +695,18 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         if (-not $archiveByKey.TryAdd($key, $reference)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: duplicate registry archive pin' }
     }
     $proofRows = [System.Collections.Generic.List[object]]::new()
+    $manifestCandidates = [System.Collections.Generic.List[object]]::new()
     $totalCompressed = [Int64]0
     $totalExpanded = [Int64]0
     $totalEntries = [Int64]0
-    foreach ($package in $Plan.registry_packages) {
+    $manifestBytesTotal = [Int64]0
+    foreach ($archive in $Origin.registry_archives) {
         if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate source proof reached its 300-second ceiling' }
-        $key = [string]$package.name + "`0" + [string]$package.version
-        $archive = $null
-        if (-not $archiveByKey.TryGetValue($key, [ref]$archive) -or $null -eq $archive -or
+        $key = [string]$archive.name + "`0" + [string]$archive.version
+        $packageMatches = @($Plan.registry_packages | Where-Object { [string]$_.name -ceq [string]$archive.name -and [string]$_.version -ceq [string]$archive.version })
+        if ($packageMatches.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: caller-pinned archive is not one exact lock-catalog package' }
+        $package = $packageMatches[0]
+        if (-not $archiveByKey.ContainsKey($key) -or $null -eq $archive -or
             [string]$archive.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
             [string]$archive.checksum -cne [string]$package.checksum -or [string]$archive.sha256 -cne [string]$package.checksum -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$archive.path, [string]$package.archive_path)) {
@@ -721,6 +725,8 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         $inventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $compressedBytes `
             -ExpectedPackageRoot ([string]$package.name + '-' + [string]$package.version) `
             -ExpectedArchiveSha256 ([string]$package.checksum) -ProofTimer $ProofTimer
+        $manifestBytesTotal += [Int64][Text.Encoding]::UTF8.GetByteCount([string]$inventory.manifest_text)
+        if ($manifestBytesTotal -gt 33554432L) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: verified registry Cargo.toml contents exceed their combined 32 MiB working-set bound' }
         $sourceProof = Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource -SourceRoot ([string]$package.extracted_source_path) `
             -ArchiveInventory $inventory -ProofTimer $ProofTimer -MaximumEntries 10000
         $totalExpanded += [Int64]$inventory.expanded_bytes
@@ -729,6 +735,7 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate registry expanded-byte or member-count bound exceeded'
         }
         $proofRows.Add([PSCustomObject][ordered]@{
+            package_id = [string]$package.package_id
             name = [string]$package.name
             version = [string]$package.version
             checksum = [string]$package.checksum
@@ -747,6 +754,7 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
             source_bytes = [Int64]$sourceProof.observed_source_bytes
             source_inventory_sha256 = [string]$sourceProof.source_inventory_sha256
         })
+        $manifestCandidates.Add([PSCustomObject]@{ source_kind = 'registry'; source = [string]$package.source; source_path = 'Cargo.toml'; content = [string]$inventory.manifest_text; content_sha256 = [string]$inventory.manifest_sha256; package_id = [string]$package.package_id })
     }
     $archiveRootAfter = Assert-D32BoundedDiagnosticDirectoryReference -Path ([string]$Origin.registry_archive_root.path) -VolumeSerialHex $Origin.registry_archive_root.volume_serial_hex -FileIdHex $Origin.registry_archive_root.file_id_hex
     $sourceRootAfter = Assert-D32BoundedDiagnosticDirectoryReference -Path ([string]$Origin.registry_source_root.path) -VolumeSerialHex $Origin.registry_source_root.volume_serial_hex -FileIdHex $Origin.registry_source_root.file_id_hex
@@ -762,12 +770,13 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
             [Int64]$row.source_bytes + "`t" + [string]$row.source_inventory_sha256))
     }
     $proofSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + "`n"))).ToLowerInvariant()
-    return [PSCustomObject][ordered]@{
-        schema_version = 1
-        record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V1'
+    $proof = [PSCustomObject][ordered]@{
+        schema_version = 2
+        record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2'
         gate_authority = 'NONE'
         status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
         formal_gate_usable = $false
+        semantic_scope = 'EXACT_CALLER_PINNED_ARCHIVE_SUBSET_FOR_LOCKED_GRAPH_CANDIDATES'
         source_proof_sha256 = $proofSha
         verifier_managed_buffer_cap_bytes = [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes
         maximum_buffered_registry_archive_bytes = [Int64]$script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes
@@ -775,12 +784,15 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         lock_sha256 = [string]$Plan.lock_sha256
         registry_tuple_sha256 = [string]$Plan.registry_tuple_sha256
         package_count = [Int64]$proofRows.Count
+        locked_registry_catalog_count = [Int64]$Plan.registry_package_count
+        verified_package_ids = @($proofRows | ForEach-Object { [string]$_.package_id })
         compressed_bytes = $totalCompressed
         expanded_bytes = $totalExpanded
         member_count = $totalEntries
         elapsed_milliseconds = [Int64]$ProofTimer.ElapsedMilliseconds
         packages = @($proofRows.ToArray())
     }
+    return [PSCustomObject]@{ proof = $proof; manifest_candidates = @($manifestCandidates.ToArray()) }
 }
 
 function Get-D32BoundedDiagnosticGitCatalog {
@@ -971,6 +983,8 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
     $directoryCount = [Int64]0
     $sourceBytes = [Int64]0
     $metadataCount = [Int64]0
+    $manifestTextRows = [System.Collections.Generic.List[object]]::new()
+    $manifestBytesTotal = [Int64]0
     while ($walk.Count -gt 0) {
         if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: aggregate source proof reached its 300-second ceiling' }
         $directory = $walk.Pop()
@@ -1042,6 +1056,19 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
                 if ([Int64]$item.Length -gt 67108864L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout file exceeds 64 MiB' }
                 $blobProof = Get-D32BoundedDiagnosticGitBlobOidFromFile -Path $full -ExpectedBytes ([Int64]$item.Length)
                 if ([string]$blobProof.oid -cne [string]$expectedEntry.oid) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout file Git blob SHA-1 differs from its locked tree object ID' }
+                if ([IO.Path]::GetFileName($relative) -ceq 'Cargo.toml') {
+                    if ([Int64]$blobProof.bytes -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git Cargo.toml exceeds the 1 MiB dependency-graph parser bound' }
+                    $manifestBytesTotal += [Int64]$blobProof.bytes
+                    if ($manifestBytesTotal -gt 33554432L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: verified Git manifest buffer total exceeds its 32 MiB bound' }
+                    $manifestBytes = [IO.File]::ReadAllBytes($full)
+                    $manifestAfterRead = Get-D32ProfileFileSnapshot -Path $full
+                    if ($manifestBytes.Length -ne [Int64]$blobProof.bytes -or $manifestAfterRead.Bytes -ne [Int64]$blobProof.bytes -or
+                        $manifestAfterRead.Sha256 -cne [string]$blobProof.sha256 -or $manifestAfterRead.VolumeSerialHex -cne [string]$blobProof.volume_serial_hex -or
+                        $manifestAfterRead.FileIdHex -cne [string]$blobProof.file_id_hex) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git Cargo.toml changed while its bounded manifest bytes were captured' }
+                    try { $manifestText = [Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes) }
+                    catch { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git Cargo.toml is not strict UTF-8' }
+                    $manifestTextRows.Add([PSCustomObject]@{ relative_path = $relative; text = $manifestText; content_sha256 = [string]$blobProof.sha256; bytes = [Int64]$blobProof.bytes })
+                }
                 $fileCount++
                 $sourceBytes += [Int64]$blobProof.bytes
                 if ($fileCount -gt 100000 -or $sourceBytes -gt 34359738368L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout file count or source-byte total exceeds its fixed bound' }
@@ -1087,6 +1114,8 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
         source_bytes = $sourceBytes
         inventory_managed_estimate_bytes = $managedInventoryEstimate
         inventory_sha256 = $inventorySha
+        manifest_texts = @($manifestTextRows.ToArray())
+        manifest_bytes = $manifestBytesTotal
     }
 }
 
@@ -1097,18 +1126,22 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
         [Parameter(Mandatory = $true)][string]$Repo,
         [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer
     )
-    if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1' -or
+    if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -or [int]$Plan.schema_version -ne 2 -or
         [string]$Plan.gate_authority -cne 'NONE' -or [string]$Plan.verification_status -cne 'NOT_RUN' -or
         $Plan.git_sources -isnot [Array] -or $Plan.git_sources.Count -le 0 -or $Plan.git_sources.Count -gt 16 -or
-        $Origin.git_content_refs -isnot [Array] -or $Origin.git_content_refs.Count -ne $Plan.git_sources.Count) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: lock-derived Git source plan is malformed or exceeds its fixed tuple bound'
+        $Origin.git_content_refs -isnot [Array] -or $Origin.git_content_refs.Count -le 0 -or $Origin.git_content_refs.Count -gt $Plan.git_sources.Count) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: lock-derived Git source plan or caller-pinned reachable-source subset is malformed or exceeds its fixed tuple bound'
     }
     $gitReferenceBySource = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $verifiedSourcePlans = [System.Collections.Generic.List[object]]::new()
     foreach ($reference in $Origin.git_content_refs) {
         if (-not (Test-D32BoundedCompilerDiagnosticGitContentReferenceShape $reference) -or
             -not $gitReferenceBySource.TryAdd([string]$reference.source, $reference)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: finite caller-pinned Git pack/index/checkout metadata references are malformed or duplicated'
         }
+        $sourceMatches = @($Plan.git_sources | Where-Object { [string]$_.source -ceq [string]$reference.source -and [string]$_.commit -ceq [string]$reference.commit })
+        if ($sourceMatches.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: pinned Git source is absent from or ambiguous in the full current lock catalog' }
+        $verifiedSourcePlans.Add($sourceMatches[0])
     }
     $databaseRoot = Join-Path ([string]$Origin.path) 'git/db'
     $checkoutRoot = Join-Path ([string]$Origin.path) 'git/checkouts'
@@ -1121,10 +1154,11 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
     $dbRootCatalog = Get-D32BoundedDiagnosticGitCatalog -Path $databaseRoot -MaximumEntries 64
     $checkoutRootCatalog = Get-D32BoundedDiagnosticGitCatalog -Path $checkoutRoot -MaximumEntries 64
     $tupleRows = [System.Collections.Generic.List[object]]::new()
+    $manifestCandidates = [System.Collections.Generic.List[object]]::new()
     $usedCacheNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $totalExpanded = [Int64]0
     $totalSourceBytes = [Int64]0
-    foreach ($source in $Plan.git_sources) {
+    foreach ($source in $verifiedSourcePlans) {
         if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: aggregate source proof reached its 300-second ceiling' }
         $sourceFields = @('source', 'url', 'commit', 'database_root', 'checkout_root')
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $source -Expected $sourceFields) -or
@@ -1238,6 +1272,9 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
             $checkoutProof = Get-D32BoundedDiagnosticGitCheckoutContentProof -Reader $reader -TreeOid $treeOid -CheckoutPath $checkoutPath `
                 -ExpectedCheckoutVolumeSerialHex ([string]$checkoutMatches[0].volume_serial_hex) -ExpectedCheckoutFileIdHex ([string]$checkoutMatches[0].file_id_hex) `
                 -DatabasePath $databasePath -ProofTimer $ProofTimer
+            foreach ($manifestText in $checkoutProof.manifest_texts) {
+                $manifestCandidates.Add([PSCustomObject]@{ source_kind = 'git'; source = [string]$source.source; source_path = [string]$manifestText.relative_path; content = [string]$manifestText.text; content_sha256 = [string]$manifestText.content_sha256; package_id = '' })
+            }
             $totalExpanded += [Int64]$reader.ExpandedBytes
             $totalSourceBytes += [Int64]$checkoutProof.source_bytes
             if ($totalExpanded -gt 34359738368L -or $totalSourceBytes -gt 34359738368L -or
@@ -1303,7 +1340,7 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
             $indexBytes = $null
         }
     }
-    if ($tupleRows.Count -ne $Plan.git_sources.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: current Git source proof does not cover every locked tuple exactly once' }
+    if ($tupleRows.Count -ne $Origin.git_content_refs.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: current Git source proof does not cover every caller-pinned tuple exactly once' }
     $dbRootAfter = Get-D32ProfileDirectoryIdentity -Path $databaseRoot
     $checkoutRootAfter = Get-D32ProfileDirectoryIdentity -Path $checkoutRoot
     $dbRootCatalogAfter = Get-D32BoundedDiagnosticGitCatalog -Path $databaseRoot -MaximumEntries 64
@@ -1322,36 +1359,48 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
     $canonicalRows.Sort([StringComparer]::Ordinal)
     $canonical = ($canonicalRows -join "`n") + "`n"
     $proofSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical))).ToLowerInvariant()
-    return [PSCustomObject][ordered]@{
-        schema_version = 1
-        record_type = 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V1'
+    $verifiedGitSources = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($verifiedSource in $verifiedSourcePlans) { [void]$verifiedGitSources.Add([string]$verifiedSource.source) }
+    $verifiedGitPackageIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($lockedPackage in $Plan.locked_packages) {
+        if ([string]$lockedPackage.source_kind -ceq 'git' -and $verifiedGitSources.Contains([string]$lockedPackage.source)) { $verifiedGitPackageIds.Add([string]$lockedPackage.package_id) }
+    }
+    $proof = [PSCustomObject][ordered]@{
+        schema_version = 2
+        record_type = 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V2'
         gate_authority = 'NONE'
         status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
         formal_gate_usable = $false
+        semantic_scope = 'EXACT_CALLER_PINNED_GIT_SOURCE_SUBSET_FOR_LOCKED_GRAPH_CANDIDATES'
         source_proof_sha256 = $proofSha
+        lock_sha256 = [string]$Plan.lock_sha256
         git_tuple_sha256 = [string]$Plan.git_tuple_sha256
         database_root = [PSCustomObject]@{ path = $databaseRoot; volume_serial_hex = [string]$dbRootAfter.VolumeSerialHex; file_id_hex = [string]$dbRootAfter.FileIdHex; catalog_sha256 = [string]$dbRootCatalog.inventory_sha256 }
         checkout_root = [PSCustomObject]@{ path = $checkoutRoot; volume_serial_hex = [string]$checkoutRootAfter.VolumeSerialHex; file_id_hex = [string]$checkoutRootAfter.FileIdHex; catalog_sha256 = [string]$checkoutRootCatalog.inventory_sha256 }
         source_count = [Int64]$tupleRows.Count
+        locked_git_source_catalog_count = [Int64]$Plan.git_source_count
         elapsed_milliseconds = [Int64]$ProofTimer.ElapsedMilliseconds
         expanded_object_bytes = $totalExpanded
         verified_checkout_source_bytes = $totalSourceBytes
         verifier_managed_buffer_cap_bytes = [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes
         pack_reader_buffer_cap_bytes = 268435456L
+        verified_package_ids = @($verifiedGitPackageIds.ToArray())
         sources = @($tupleRows.ToArray())
     }
+    return [PSCustomObject]@{ proof = $proof; manifest_candidates = @($manifestCandidates.ToArray()) }
 }
 
 function Assert-D32BoundedDiagnosticInv7Origin {
     param([Parameter(Mandatory = $true)][object]$Origin, [Parameter(Mandatory = $true)][object]$Profile,
         [Parameter(Mandatory = $true)][string]$Repo,
+        [Parameter(Mandatory = $true)][string]$CurrentCandidateSha,
         [string]$HistoricalOriginCandidateSha = $script:D32BoundedDiagnosticHistoricalOriginCandidateSha,
         [Diagnostics.Stopwatch]$ProofTimer,
         [switch]$SourceProofOnly)
     if ($null -eq $ProofTimer) { $ProofTimer = [Diagnostics.Stopwatch]::StartNew() }
     elseif (-not $ProofTimer.IsRunning) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: supplied aggregate source-proof stopwatch must already be running' }
-    if ($HistoricalOriginCandidateSha -cne $script:D32BoundedDiagnosticHistoricalOriginCandidateSha -or
-        $HistoricalOriginCandidateSha -ceq $CandidateSha) {
+    if ($CurrentCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $HistoricalOriginCandidateSha -cne $script:D32BoundedDiagnosticHistoricalOriginCandidateSha -or
+        $HistoricalOriginCandidateSha -ceq $CurrentCandidateSha) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: historical inv7 origin SHA is not distinct from the current diagnostic/source-proof candidate'
     }
     $originRoot = 'E:\d32\inv7'
@@ -1436,11 +1485,12 @@ function Assert-D32BoundedDiagnosticInv7Origin {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: archive path or package/version key is wrong or duplicated'
         }
     }
-    if ($archiveByKey.Count -ne $lockedRegistry.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: registry archive coverage is not exact for vita-agent/Cargo.lock' }
-    foreach ($package in $lockedRegistry) {
-        $key = [string]$package.name + "`0" + [string]$package.version
-        if (-not $archiveByKey.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: a locked registry archive is not referenced' }
-        $archive = $archiveByKey[$key]
+    if ($archiveByKey.Count -gt $lockedRegistry.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: caller-pinned registry subset exceeds the current lock catalog' }
+    foreach ($archive in $Origin.registry_archives) {
+        $key = [string]$archive.name + "`0" + [string]$archive.version
+        $packageMatches = @($lockedRegistry | Where-Object { [string]$_.name -ceq [string]$archive.name -and [string]$_.version -ceq [string]$archive.version })
+        if (-not $archiveByKey.ContainsKey($key) -or $packageMatches.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: caller-pinned archive is duplicated or absent from the exact current lock catalog' }
+        $package = $packageMatches[0]
         if ([string]$archive.checksum -cne [string]$package.checksum -or [string]$archive.sha256 -cne [string]$package.checksum) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: registry archive checksum differs from Cargo.lock'
         }
@@ -1451,20 +1501,45 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         $null = Assert-D32BoundedDiagnosticFileReference -Reference $archiveReference -MustBeWithin $registryRootExpected -MustNotBeWithin $Repo -ProofTimer $ProofTimer
     }
     if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate registry/Git source proof reached its 300-second ceiling before content verification' }
-    $registryContentProof = New-D32BoundedDiagnosticRegistrySourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
+    $registryContentResult = New-D32BoundedDiagnosticRegistrySourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
 
     if (-not $SourceProofOnly -and $null -ne $Origin.git_source_authority) {
         # This optional reference is historical context only. Current source
         # content is proved from the lock, pack/index, and checkout below.
         $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.git_source_authority -MustBeWithin $originRoot -MustNotBeWithin $Repo -ProofTimer $ProofTimer
     }
-    $gitContentProof = New-D32BoundedDiagnosticGitSourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
+    $gitContentResult = New-D32BoundedDiagnosticGitSourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
+    $manifestCandidates = [System.Collections.Generic.List[object]]::new()
+    $currentManifestProofs = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $registryContentResult.manifest_candidates) { $manifestCandidates.Add($candidate) }
+    foreach ($candidate in $gitContentResult.manifest_candidates) { $manifestCandidates.Add($candidate) }
+    foreach ($reference in $Origin.manifest_refs) {
+        $relative = [IO.Path]::GetRelativePath($Repo, [string]$reference.path).Replace('\', '/')
+        if (-not $relative.EndsWith('/Cargo.toml', [StringComparison]::Ordinal)) { continue }
+        if ([Int64]$reference.bytes -le 0 -or [Int64]$reference.bytes -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: pinned current workspace Cargo.toml exceeds the fixed 1 MiB manifest bound' }
+        $content = [IO.File]::ReadAllText([string]$reference.path, [Text.UTF8Encoding]::new($false, $true))
+        $afterRead = Get-D32ProfileFileSnapshot -Path ([string]$reference.path)
+        if ([Int64]$afterRead.Bytes -ne [Int64]$reference.bytes -or [string]$afterRead.Sha256 -cne [string]$reference.sha256 -or
+            [string]$afterRead.VolumeSerialHex -cne [string]$reference.volume_serial_hex -or [string]$afterRead.FileIdHex -cne [string]$reference.file_id_hex) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: caller-pinned current workspace manifest changed during the bounded graph input read'
+        }
+        $manifestCandidates.Add([PSCustomObject]@{ source_kind = 'workspace'; source = $null; source_path = $relative; content = $content; content_sha256 = [string]$reference.sha256; package_id = '' })
+        $currentManifestProofs.Add([PSCustomObject][ordered]@{
+            manifest_path = $relative; bytes = [Int64]$reference.bytes; sha256 = [string]$reference.sha256
+            volume_serial_hex = [string]$reference.volume_serial_hex; file_id_hex = [string]$reference.file_id_hex
+        })
+    }
+    $resolvedManifestCatalog = Complete-D32BoundedDiagnosticManifestCatalog -Plan $sourcePlan -Candidates @($manifestCandidates.ToArray())
+    $graphContentProof = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $sourcePlan -ManifestCatalog $resolvedManifestCatalog.entries -RootManifestPath 'vita-agent/Cargo.toml'
+    $registryContentProof = $registryContentResult.proof
+    $gitContentProof = $gitContentResult.proof
     $historicalSourceClosureReference = $null
     $gitAuthorityProperty = $Origin.PSObject.Properties['git_source_authority']
     if ($null -ne $gitAuthorityProperty -and $null -ne $gitAuthorityProperty.Value) { $historicalSourceClosureReference = [string]$gitAuthorityProperty.Value.path }
     return [PSCustomObject]@{
         CargoHome = $cargoHome
         OwnerRunId = [string]$owner.RunId
+        CurrentCandidateSha = $CurrentCandidateSha
          HistoricalOriginCandidateSha = $HistoricalOriginCandidateSha
          HistoricalFetchCompletion = $historicalFetchCompletion
         HistoricalAttemptState = 'BLOCKED'
@@ -1473,6 +1548,11 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         RegistryArchiveCount = [Int64]$archiveByKey.Count
         RegistryContentProof = $registryContentProof
         GitContentProof = $gitContentProof
+        SourceGraphProof = $graphContentProof
+        CurrentManifestProof = @($currentManifestProofs.ToArray())
+        LockedPackageCount = [Int64]$sourcePlan.locked_package_count
+        ReachablePackageCount = [Int64]$graphContentProof.included_package_count
+        ExcludedPackageCount = [Int64]$graphContentProof.excluded_package_count
         LockedGitSourceCount = [Int64]$sourcePlan.git_source_count
         HistoricalSourceClosureReference = $historicalSourceClosureReference
     }
@@ -1854,6 +1934,12 @@ function New-D32BoundedDiagnosticResult {
         [object]$Trace, [object]$Cleanup, [object]$Sampling, [object]$CargoArtifacts, [object]$RustcCrossBinding,
         [object]$SourceClosure, [object]$Capture, [object]$NativeCounters, [object]$GitState)
     Assert-D32BoundedCompilerDiagnosticStatus -Status $Status | Out-Null
+    if ($null -ne $SourceClosure -and
+        ([string]$SourceClosure.CurrentCandidateSha -cne $CandidateSha -or
+         [string]$SourceClosure.HistoricalOriginCandidateSha -cne $script:D32BoundedDiagnosticHistoricalOriginCandidateSha -or
+         [string]$SourceClosure.CurrentCandidateSha -ceq [string]$SourceClosure.HistoricalOriginCandidateSha)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: diagnostic result source-origin closure is not cross-bound to this current candidate and the immutable historical origin'
+    }
     return [ordered]@{
         schema_version = 1
         record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'
@@ -2009,7 +2095,7 @@ function New-D32BoundedDiagnosticImageGrant {
     }
     $sourceRoots = [Collections.Generic.List[string]]::new()
     foreach ($package in @($SourceClosure.RegistryContentProof.packages)) { $sourceRoots.Add([string]$package.source_root) }
-    foreach ($tuple in @($SourceClosure.GitContentProof.tuples)) { $sourceRoots.Add([string]$tuple.checkout_path) }
+    foreach ($tuple in @($SourceClosure.GitContentProof.sources)) { $sourceRoots.Add([string]$tuple.checkout_path) }
     $matches = @($sourceRoots | Where-Object { Test-D32BoundedCompilerDiagnosticWithin -Child $image.Path -Parent $_ })
     if ($matches.Count -ne 1) {
         throw 'D32_BOUNDED_DIAGNOSTIC_IMAGE_BLOCKED: new per-run protoc pin is not inside exactly one lock-derived and content-verified dependency source tree'
@@ -2223,7 +2309,7 @@ function Invoke-D32BoundedDiagnosticSourceProofRun {
         }
         $profile = Get-D32BoundedDiagnosticSourceProofProfile -Authority $authority -Repo $Repository -ProofTimer $proofTimer
         $sourceClosure = Assert-D32BoundedDiagnosticInv7Origin -Origin $authority.dependency_origin -Profile $profile `
-            -Repo $Repository -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha -ProofTimer $proofTimer -SourceProofOnly
+            -Repo $Repository -CurrentCandidateSha $CandidateSha -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha -ProofTimer $proofTimer -SourceProofOnly
         $proofElapsedMilliseconds = [Int64]$proofTimer.ElapsedMilliseconds
         if ($proofElapsedMilliseconds -gt [Int64]$authority.proof_budget.combined_milliseconds) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: combined registry/Git proof exceeded its caller-pinned monotonic deadline'
@@ -2238,8 +2324,9 @@ function Invoke-D32BoundedDiagnosticSourceProofRun {
         $completedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
         if ($persistAllowed) {
             $record = [ordered]@{
-                schema_version = 1
-                record_type = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V1'
+                schema_version = 2
+                record_type = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V2'
+                source_plan_semantics_version = 2
                 gate_authority = 'NONE'
                 candidate_sha = $CandidateSha
                 historical_origin_candidate_sha = $HistoricalOriginCandidateSha
@@ -2404,7 +2491,7 @@ function Invoke-D32BoundedCompilerDiagnosticRun {
         if ($gitState.Commands.Count -ne 3) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_BLOCKED: initial three-query HEAD/status/index sequence is incomplete' }
 
         $sourceClosure = Assert-D32BoundedDiagnosticInv7Origin -Origin $authority.dependency_origin -Profile $profile -Repo $Repository `
-            -HistoricalOriginCandidateSha ([string]$authority.dependency_origin.historical_origin_candidate_sha)
+            -CurrentCandidateSha $CandidateSha -HistoricalOriginCandidateSha ([string]$authority.dependency_origin.historical_origin_candidate_sha)
         if (-not (Test-D32BoundedCompilerDiagnosticHistoricalReplay -SourceClosure $sourceClosure)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: old fetch or discovery evidence acquired unauthorized success semantics'
         }

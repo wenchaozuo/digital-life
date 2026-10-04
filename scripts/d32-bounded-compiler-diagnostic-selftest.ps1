@@ -391,7 +391,7 @@ name = "sample-crate"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-dependencies = ["another-crate"]
+dependencies = []
 
 [[package]]
 name = "git-crate"
@@ -405,10 +405,136 @@ version = "0.1.0"
 $lockRows = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockText)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'registry archive and immutable Git source parsed' ($lockRows.Count -eq 3 -and $lockRows[0].source_kind -ceq 'registry' -and $lockRows[1].source_kind -ceq 'git' -and $lockRows[1].commit -ceq ('b' * 40) -and $lockRows[2].source_kind -ceq 'workspace')
 $sourcePlan = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $lockText
-Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan is explicitly non-authorizing and not verified' ($sourcePlan.record_type -ceq 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1' -and $sourcePlan.gate_authority -ceq 'NONE' -and $sourcePlan.verification_status -ceq 'NOT_RUN' -and $sourcePlan.source_proof_status -ceq 'NOT_VERIFIED')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan V2 is explicitly non-authorizing and not verified' ($sourcePlan.record_type -ceq 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -and $sourcePlan.schema_version -eq 2 -and $sourcePlan.gate_authority -ceq 'NONE' -and $sourcePlan.verification_status -ceq 'NOT_RUN' -and $sourcePlan.source_proof_status -ceq 'NOT_VERIFIED' -and $sourcePlan.lock_dependency_edge_count -eq 0)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan declares the verifier-wide 512 MiB cap and single buffered-archive ceiling' ($sourcePlan.verifier_managed_buffer_cap_bytes -eq 536870912L -and $script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes -eq 268435456L)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan emits exact registry archive and source paths' ($sourcePlan.registry_package_count -eq 1 -and $sourcePlan.registry_packages[0].archive_path -ceq 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f\sample-crate-1.2.3.crate' -and $sourcePlan.registry_packages[0].extracted_source_path -ceq 'E:\d32\inv7\r\c\registry\src\index.crates.io-1949cf8c6b5b557f\sample-crate-1.2.3')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan emits immutable Git URL/commit tuple and fixed roots' ($sourcePlan.git_source_count -eq 1 -and $sourcePlan.git_sources[0].url -ceq ('https://example.invalid/repo?rev=' + ('b' * 40)) -and $sourcePlan.git_sources[0].commit -ceq ('b' * 40) -and $sourcePlan.git_sources[0].database_root -ceq 'E:\d32\inv7\r\c\git\db' -and $sourcePlan.git_sources[0].checkout_root -ceq 'E:\d32\inv7\r\c\git\checkouts')
+try { $null = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $lockText.Replace('version = 4', 'version = 2'); $oldLockVersionRejected = $false } catch { $oldLockVersionRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unsupported Cargo.lock format version rejected by finite lock parser' $oldLockVersionRejected
+try { $null = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $lockText.Replace('version = 4', 'version = 4' + "`n[metadata]`n") ; $unknownLockTableRejected = $false } catch { $unknownLockTableRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unknown Cargo.lock root table rejected instead of silently omitted from the audit catalog' $unknownLockTableRejected
+function Add-D32BoundedCompilerDiagnosticGraphFixturePackage {
+    param([System.Collections.Generic.List[string]]$Lines, [string]$Name, [string[]]$DependencySpecs = @(), [switch]$Workspace)
+    $Lines.Add(''); $Lines.Add('[[package]]'); $Lines.Add(('name = "' + $Name + '"')); $Lines.Add('version = "1.0.0"')
+    if (-not $Workspace) { $Lines.Add('source = "registry+https://github.com/rust-lang/crates.io-index"'); $Lines.Add(('checksum = "' + ('a' * 64) + '"')) }
+    if ($DependencySpecs.Count -gt 0) { $Lines.Add('dependencies = ['); foreach ($spec in $DependencySpecs) { $Lines.Add(('    "' + $spec + '",')) }; $Lines.Add(']') }
+}
+function New-D32BoundedCompilerDiagnosticGraphFixtureEntry {
+    param([object]$Plan, [string]$Name, [string]$Text, [string]$SourcePath = 'Cargo.toml')
+    $package = @($Plan.locked_packages | Where-Object { [string]$_.name -ceq $Name })
+    if ($package.Count -ne 1) { throw ('graph fixture lock identity missing/ambiguous: ' + $Name) }
+    $model = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $Text -SourcePath $SourcePath
+    $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($Text))).ToLowerInvariant()
+    $sourceKind = [string]$package[0].source_kind
+    $sourceIdentity = if ($null -eq $package[0].source) { 'workspace' } else { [string]$package[0].source }
+    return [PSCustomObject]@{ package_id = [string]$package[0].package_id; source_kind = $sourceKind; source_identity = $sourceIdentity; source_path = $SourcePath; content_sha256 = $sha; content = $Text; model = $model }
+}
+$graphRegistrySource = 'registry+https://github.com/rust-lang/crates.io-index'
+$graphLines = [System.Collections.Generic.List[string]]::new(); $graphLines.Add('version = 4')
+$rootEdgeSpecs = [System.Collections.Generic.List[string]]::new(); $rootEdgeSpecs.Add('local-protocol 1.0.0')
+foreach ($name in @('left', 'right', 'shared', 'windows-only', 'unix-only', 'unknown-cfg', 'build-helper', 'root-dev', 'proc-macro-helper')) { $rootEdgeSpecs.Add(($name + ' 1.0.0 (' + $graphRegistrySource + ')')) }
+Add-D32BoundedCompilerDiagnosticGraphFixturePackage -Lines $graphLines -Name 'digital-life-vita-agent' -DependencySpecs $rootEdgeSpecs -Workspace
+Add-D32BoundedCompilerDiagnosticGraphFixturePackage -Lines $graphLines -Name 'local-protocol' -Workspace
+Add-D32BoundedCompilerDiagnosticGraphFixturePackage -Lines $graphLines -Name 'left' -DependencySpecs @('shared 1.0.0 (' + $graphRegistrySource + ')')
+Add-D32BoundedCompilerDiagnosticGraphFixturePackage -Lines $graphLines -Name 'right' -DependencySpecs @('shared 1.0.0 (' + $graphRegistrySource + ')')
+foreach ($leaf in @('shared', 'windows-only', 'unix-only', 'unknown-cfg', 'build-helper', 'root-dev', 'proc-macro-helper', 'unreferenced')) { Add-D32BoundedCompilerDiagnosticGraphFixturePackage -Lines $graphLines -Name $leaf }
+$graphPlan = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText ($graphLines -join "`n")
+$graphRootManifest = "[package]`nname = `"digital-life-vita-agent`"`nversion = `"1.0.0`"`n[features]`ndefault = []`nd32-a-test-helper = []`n[dependencies]`nlocal-protocol = { path = `"../vita-agent-protocol`", version = `"1`" }`nrenamed-left = { package = `"left`", version = `"1`" }`noptional-right = { package = `"right`", version = `"1`", optional = true }`nproc-macro-helper = `"1`"`n[target.'cfg(windows)'.dependencies]`nwindows-only = `"1`"`n[target.'cfg(unix)'.dependencies]`nunix-only = `"1`"`nshared = `"1`"`n[target.'cfg(target_feature = `"future_extension`")'.dependencies]`nunknown-cfg = `"1`"`n[build-dependencies]`nbuild-helper = `"1`"`n[dev-dependencies]`nroot-dev = `"1`"`n"
+$graphCatalog = [System.Collections.Generic.List[object]]::new()
+$graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest -SourcePath 'vita-agent/Cargo.toml'))
+$graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'local-protocol' -Text "[package]`nname = `"local-protocol`"`nversion = `"1.0.0`"`n" -SourcePath 'vita-agent-protocol/Cargo.toml'))
+$graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'left' -Text "[package]`nname = `"left`"`nversion = `"1.0.0`"`n[dependencies]`nshared = `"1`"`n"))
+$graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'right' -Text "[package]`nname = `"right`"`nversion = `"1.0.0`"`n[dependencies]`nshared = `"1`"`n"))
+foreach ($leaf in @('shared', 'windows-only', 'unknown-cfg', 'build-helper', 'root-dev')) { $graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name $leaf -Text ('[package]' + "`n" + 'name = "' + $leaf + '"' + "`nversion = `"1.0.0`"`n"))) }
+$graphCatalog.Add((New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'proc-macro-helper' -Text "[package]`nname = `"proc-macro-helper`"`nversion = `"1.0.0`"`n[lib]`nproc-macro = true`n"))
+$graphProof = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray())
+$graphCrateKinds = @($graphProof.selected_crate_kinds)
+$graphProof.selected_crate_kinds = [string]::Join(',', [string[]]$graphCrateKinds)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'graph proof selected crate-kind list must remain an exact typed array' (-not (Test-D32BoundedDiagnosticSourceGraphProof $graphProof))
+$graphProof.selected_crate_kinds = $graphCrateKinds
+Assert-D32BoundedCompilerDiagnosticSelfTest 'graph proof exact selected crate kinds and all-targets package scope validate' (Test-D32BoundedDiagnosticSourceGraphProof $graphProof)
+$graphManifestCandidates = [System.Collections.Generic.List[object]]::new()
+foreach ($entry in $graphCatalog) {
+    $kind = if ([string]$entry.package_id -like '*|workspace|*') { 'workspace' } else { 'registry' }
+    $source = if ($kind -ceq 'registry') { $graphRegistrySource } else { $null }
+    $graphManifestCandidates.Add([PSCustomObject]@{ source_kind = $kind; source = $source; source_path = [string]$entry.source_path; content = [string]$entry.content; content_sha256 = [string]$entry.content_sha256; package_id = [string]$entry.package_id })
+}
+$completedGraphCatalog = Complete-D32BoundedDiagnosticManifestCatalog -Plan $graphPlan -Candidates @($graphManifestCandidates.ToArray())
+$completedGraphProof = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $completedGraphCatalog.entries
+Assert-D32BoundedCompilerDiagnosticSelfTest 'verified archive/tree/current-manifest catalog closes into the same graph proof without retaining raw source authority' ($completedGraphProof.graph_sha256 -ceq $graphProof.graph_sha256 -and $completedGraphCatalog.verified_candidate_manifest_count -eq $graphCatalog.Count)
+$crossBoundCandidate = [PSCustomObject]@{ source_kind = 'registry'; source = $graphRegistrySource; source_path = [string]$graphManifestCandidates[0].source_path; content = [string]$graphManifestCandidates[0].content; content_sha256 = [string]$graphManifestCandidates[0].content_sha256; package_id = [string]$graphManifestCandidates[0].package_id }
+$crossBoundCandidates = @($crossBoundCandidate) + @($graphManifestCandidates | Select-Object -Skip 1)
+try { $null = Complete-D32BoundedDiagnosticManifestCatalog -Plan $graphPlan -Candidates $crossBoundCandidates; $candidateSourceCrossBindRejected = $false } catch { $candidateSourceCrossBindRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED:*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'explicit manifest package ID cannot be rebound to another locked source kind' $candidateSourceCrossBindRejected
+$badManifestBinding = [PSCustomObject]@{ package_id = [string]$graphCatalog[0].package_id; source_kind = 'registry'; source_identity = $graphRegistrySource; source_path = [string]$graphCatalog[0].source_path; content_sha256 = [string]$graphCatalog[0].content_sha256; model = $graphCatalog[0].model }
+$badManifestBindingCatalog = @($badManifestBinding) + @($graphCatalog | Select-Object -Skip 1)
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $badManifestBindingCatalog; $graphSourceIdentityMismatchRejected = $false } catch { $graphSourceIdentityMismatchRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED:*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'graph catalog manifest source kind and identity must equal the exact lock package source' $graphSourceIdentityMismatchRejected
+$changedManifestCandidate = @($graphManifestCandidates.ToArray()); $changedManifestCandidate[1] = [PSCustomObject]@{ source_kind = $changedManifestCandidate[1].source_kind; source = $changedManifestCandidate[1].source; source_path = $changedManifestCandidate[1].source_path; content = $changedManifestCandidate[1].content + "`n# drift"; content_sha256 = $changedManifestCandidate[1].content_sha256; package_id = $changedManifestCandidate[1].package_id }
+try { $null = Complete-D32BoundedDiagnosticManifestCatalog -Plan $graphPlan -Candidates $changedManifestCandidate; $sourceManifestDriftRejected = $false } catch { $sourceManifestDriftRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'manifest bytes must match their independently proved archive/tree/current-file digest' $sourceManifestDriftRejected
+Assert-D32BoundedCompilerDiagnosticSelfTest 'locked graph emits exhaustive included/excluded V2 partition and closure witness' ($graphProof.record_type -ceq 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2' -and $graphProof.gate_authority -ceq 'NONE' -and $graphProof.locked_package_count -eq 12 -and $graphProof.included_package_count -eq 10 -and $graphProof.excluded_package_count -eq 2 -and $graphProof.classification_count -eq 12 -and @($graphProof.classifications | Where-Object { $_.package_id -like 'unreferenced@*' -and $_.classification -ceq 'EXCLUDED_WITH_WITNESS' -and $_.witness_kind -ceq 'CLOSED_REACHABILITY_CUT' }).Count -eq 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'renamed optional, root dev, host build, and proc-macro dependencies remain included' (@($graphProof.included_package_ids | Where-Object { $_ -like 'left@*' }).Count -eq 1 -and @($graphProof.included_package_ids | Where-Object { $_ -like 'right@*' }).Count -eq 1 -and @($graphProof.included_package_ids | Where-Object { $_ -like 'root-dev@*' }).Count -eq 1 -and @($graphProof.included_package_ids | Where-Object { $_ -like 'build-helper@*' }).Count -eq 1 -and @($graphProof.included_package_ids | Where-Object { $_ -like 'proc-macro-helper@*' }).Count -eq 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'two incoming routes to shared dependency are both retained' (@($graphProof.included_edges | Where-Object { $_.target_package_id -like 'shared@*' }).Count -eq 2)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'proven-false incoming cfg edge does not exclude a package reachable through other active routes' (@($graphProof.classifications | Where-Object { $_.package_id -like 'shared@*' -and $_.classification -ceq 'INCLUDED' }).Count -eq 1 -and @($graphProof.dependency_decisions | Where-Object { $_.target_package_id -like 'shared@*' -and $_.disposition -ceq 'EXCLUDED_TARGET_PREDICATE_PROVEN_FALSE' }).Count -eq 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'known Windows cfg includes while known Unix cfg is excluded' (@($graphProof.included_package_ids | Where-Object { $_ -like 'windows-only@*' }).Count -eq 1 -and @($graphProof.classifications | Where-Object { $_.package_id -like 'unix-only@*' -and $_.classification -ceq 'EXCLUDED_WITH_WITNESS' }).Count -eq 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unknown target cfg is conservatively included, never treated as false' ($graphProof.unknown_cfg_conservative_include_count -eq 1 -and @($graphProof.included_package_ids | Where-Object { $_ -like 'unknown-cfg@*' }).Count -eq 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'absent unreferenced lock source is excluded only with a closed-cut witness, not because its manifest is absent' (@($graphProof.classifications | Where-Object { $_.package_id -like 'unreferenced@*' -and $_.classification -ceq 'EXCLUDED_WITH_WITNESS' -and $_.complete_reachable_parent_count -eq $graphProof.included_package_count -and $_.no_active_incoming_edge_from_included }).Count -eq 1)
+$workspaceRootManifest = $graphRootManifest.Replace('[dev-dependencies]', "[workspace]`nmembers = [`"vita-agent-protocol`"]`ndefault-members = [`"vita-agent-protocol`"]`n[workspace.dependencies]`nbuild-helper = { version = `"1`" }`n[dev-dependencies]").Replace('build-helper = "1"', 'build-helper = { workspace = true }')
+$workspaceRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $workspaceRootManifest -SourcePath 'vita-agent/Cargo.toml'
+$workspaceCatalog = @($workspaceRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+$workspaceProof = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $workspaceCatalog
+Assert-D32BoundedCompilerDiagnosticSelfTest 'explicit selected package manifest wins over different workspace default-members; inherited host build dependency remains included' (@($workspaceProof.selected_root_ids).Count -eq 1 -and [string]$workspaceProof.selected_root_ids[0] -like 'digital-life-vita-agent@*' -and @($workspaceProof.included_package_ids | Where-Object { $_ -like 'build-helper@*' }).Count -eq 1 -and @($workspaceProof.dependency_decisions | Where-Object { $_.alias -ceq 'build-helper' -and $_.disposition -ceq 'INCLUDED' }).Count -eq 1)
+$unsupportedDependencyRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest.Replace('optional = true', 'optional = true, artifact = "bin"') -SourcePath 'vita-agent/Cargo.toml'
+$unsupportedDependencyCatalog = @($unsupportedDependencyRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $unsupportedDependencyCatalog; $unknownDepFieldRejected = $false } catch { $unknownDepFieldRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unsupported source-affecting dependency field fails closed' $unknownDepFieldRejected
+$ambiguousSourceRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest.Replace('path = "../vita-agent-protocol"', ('path = "../vita-agent-protocol", git = "https://example.invalid/repo", rev = "' + ('b' * 40) + '"')) -SourcePath 'vita-agent/Cargo.toml'
+$ambiguousSourceCatalog = @($ambiguousSourceRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $ambiguousSourceCatalog; $ambiguousSourceRejected = $false } catch { $ambiguousSourceRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'conflicting path and Git source selectors rejected' $ambiguousSourceRejected
+Assert-D32BoundedCompilerDiagnosticSelfTest 'bounded semver wildcard uses exact major/minor range rather than broad caret range' (-not (Test-D32BoundedDiagnosticVersionRequirement -Requirement '1.2.*' -LockedVersion '1.3.0') -and (Test-D32BoundedDiagnosticVersionRequirement -Requirement '1.2.*' -LockedVersion '1.2.9'))
+$oldPlanType = $graphPlan.record_type; $graphPlan.record_type = 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1'
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray()); $oldPlanRejected = $false } catch { $oldPlanRejected = $true }
+$graphPlan.record_type = $oldPlanType
+Assert-D32BoundedCompilerDiagnosticSelfTest 'old source-plan proof semantics cannot be reused for graph classification' $oldPlanRejected
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray()) -RootManifestPath 'src-tauri/Cargo.toml'; $wrongRootRejected = $false } catch { $wrongRootRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'wrong root manifest path rejected' $wrongRootRejected
+$wrongPathRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest.Replace('../vita-agent-protocol', '../elsewhere') -SourcePath 'vita-agent/Cargo.toml'
+$wrongPathCatalog = @($wrongPathRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $wrongPathCatalog; $wrongPathRejected = $false } catch { $wrongPathRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'path dependency source location must bind to the exact verified target manifest' $wrongPathRejected
+$priorGraphTarget = $graphPlan.target_triple; $graphPlan.target_triple = 'x86_64-unknown-linux-gnu'
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray()); $wrongGraphTargetRejected = $false } catch { $wrongGraphTargetRejected = $true }
+$graphPlan.target_triple = $priorGraphTarget
+Assert-D32BoundedCompilerDiagnosticSelfTest 'wrong host/target platform rejected' $wrongGraphTargetRejected
+$missingBuildManifest = @($graphCatalog | Where-Object { $_.package_id -notlike 'build-helper@*' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $missingBuildManifest; $missingBuildRejected = $false } catch { $missingBuildRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED:*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reachable missing build macro manifest is unresolved, not excluded' $missingBuildRejected
+$missingProcMacroManifest = @($graphCatalog | Where-Object { $_.package_id -notlike 'proc-macro-helper@*' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $missingProcMacroManifest; $missingProcMacroRejected = $false } catch { $missingProcMacroRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED:*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reachable missing proc-macro manifest is unresolved, not excluded' $missingProcMacroRejected
+$missingDevManifest = @($graphCatalog | Where-Object { $_.package_id -notlike 'root-dev@*' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $missingDevManifest; $missingDevRejected = $false } catch { $missingDevRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED:*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'selected root dev dependency without source is unresolved, not excluded' $missingDevRejected
+$wrongVersionRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest.Replace('package = "left", version = "1"', 'package = "left", version = "9"') -SourcePath 'vita-agent/Cargo.toml'
+$wrongVersionCatalog = @($wrongVersionRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $wrongVersionCatalog; $wrongVersionRejected = $false } catch { $wrongVersionRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'manifest version range mismatch against exact lock edge blocked' $wrongVersionRejected
+$missingDeclarationText = $graphRootManifest.Replace('renamed-left = { package = "left", version = "1" }' + "`n", '')
+$missingDeclarationRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $missingDeclarationText -SourcePath 'vita-agent/Cargo.toml'
+$missingDeclarationCatalog = @($missingDeclarationRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $missingDeclarationCatalog; $missingDeclarationRejected = $false } catch { $missingDeclarationRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unexplained Cargo.lock edge absent from a reachable parent manifest is blocked' $missingDeclarationRejected
+$wrongSourceText = $graphRootManifest.Replace('package = "left", version = "1"', ('package = "left", version = "1", git = "https://example.invalid/repo", rev = "' + ('b' * 40) + '"'))
+$wrongSourceRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $wrongSourceText -SourcePath 'vita-agent/Cargo.toml'
+$wrongSourceCatalog = @($wrongSourceRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $wrongSourceCatalog; $wrongSourceRejected = $false } catch { $wrongSourceRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'manifest source mismatch against full lock source identity blocked' $wrongSourceRejected
+$helperlessRoot = New-D32BoundedCompilerDiagnosticGraphFixtureEntry -Plan $graphPlan -Name 'digital-life-vita-agent' -Text $graphRootManifest.Replace('d32-a-test-helper = []', 'other-feature = []') -SourcePath 'vita-agent/Cargo.toml'
+$helperlessCatalog = @($helperlessRoot) + @($graphCatalog | Where-Object { $_.source_path -cne 'vita-agent/Cargo.toml' })
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $helperlessCatalog; $helperFeatureRejected = $false } catch { $helperFeatureRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'selected root must declare d32-a-test-helper' $helperFeatureRejected
 $altRegistryLock = $lockText.Replace('registry+https://github.com/rust-lang/crates.io-index', 'registry+https://example.invalid/index')
 try { $null = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $altRegistryLock; $altRegistryRejected = $false } catch { $altRegistryRejected = $true }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'non-crates.io registry source rejected' $altRegistryRejected
@@ -419,11 +545,12 @@ $archiveRoot = 'sample-crate-1.2.3'
 $archiveMembers = @(
     [PSCustomObject]@{ path = "$archiveRoot/"; kind = 'directory'; content = [byte[]]::new(0) },
     [PSCustomObject]@{ path = "$archiveRoot/src/"; kind = 'directory'; content = [byte[]]::new(0) },
+    [PSCustomObject]@{ path = "$archiveRoot/Cargo.toml"; kind = 'file'; content = [Text.Encoding]::UTF8.GetBytes('[package]' + "`n" + 'name = "sample-crate"' + "`n" + 'version = "1.2.3"' + "`n") },
     [PSCustomObject]@{ path = "$archiveRoot/src/lib.rs"; kind = 'file'; content = [Text.Encoding]::UTF8.GetBytes('pub fn sample() {}' + "`n") })
 $archiveBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $archiveMembers
 $archiveSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($archiveBytes)).ToLowerInvariant()
 $archiveInventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $archiveBytes -ExpectedPackageRoot $archiveRoot -ExpectedArchiveSha256 $archiveSha
-Assert-D32BoundedCompilerDiagnosticSelfTest 'strict USTAR archive parsed into complete file and directory hashes' ($archiveInventory.member_count -eq 3 -and $archiveInventory.entries.Count -eq 2 -and $archiveInventory.archive_sha256 -ceq $archiveSha -and $archiveInventory.entries[1].path -ceq 'src/lib.rs')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict USTAR archive parsed with bounded verified root Cargo.toml content' ($archiveInventory.member_count -eq 4 -and $archiveInventory.entries.Count -eq 3 -and $archiveInventory.archive_sha256 -ceq $archiveSha -and @($archiveInventory.entries | Where-Object { $_.path -ceq 'src/lib.rs' }).Count -eq 1 -and $archiveInventory.manifest_text.Contains('sample-crate') -and $archiveInventory.manifest_sha256 -ceq $archiveInventory.entries[0].sha256)
 $stoppedProofTimer = [Diagnostics.Stopwatch]::new(); $stoppedProofTimer.Stop()
 try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $archiveBytes -ExpectedPackageRoot $archiveRoot -ExpectedArchiveSha256 $archiveSha -ProofTimer $stoppedProofTimer; $stoppedArchiveTimerRejected = $false }
 catch { $stoppedArchiveTimerRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer*' }
@@ -768,6 +895,18 @@ $sourceProofEntrySafetyExact = $sourceProofEntryParametersExact -and $sourceProo
 $sourceProofRunnerAst = $runnerAst
 $sourceProofInvokerAst = $sourceProofRunnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32BoundedDiagnosticSourceProofRun' }, $true)
 $sourceProofInvokerText = if ($null -eq $sourceProofInvokerAst) { '' } else { [string]$sourceProofInvokerAst.Extent.Text }
+$sourceOriginAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true)
+$sourceOriginText = if ($null -eq $sourceOriginAst) { '' } else { [string]$sourceOriginAst.Extent.Text }
+$diagnosticResultAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32BoundedDiagnosticResult' }, $true)
+$diagnosticResultText = if ($null -eq $diagnosticResultAst) { '' } else { [string]$diagnosticResultAst.Extent.Text }
+$diagnosticOriginInvocations = @($runnerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true))
+$currentHistoricalCrossBindingExact = $sourceOriginText.Contains('[string]$CurrentCandidateSha') -and
+    $sourceOriginText.Contains('$HistoricalOriginCandidateSha -ceq $CurrentCandidateSha') -and
+    $sourceProofInvokerText.Contains('-CurrentCandidateSha $CandidateSha') -and
+    $diagnosticOriginInvocations.Count -eq 2 -and
+    $diagnosticResultText.Contains('$SourceClosure.CurrentCandidateSha -cne $CandidateSha') -and
+    $diagnosticResultText.Contains('$SourceClosure.HistoricalOriginCandidateSha -cne $script:D32BoundedDiagnosticHistoricalOriginCandidateSha')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'both diagnostic and proof-only origin readers require explicit current SHA; diagnostic result writer rechecks current/historical cross-binding' $currentHistoricalCrossBindingExact
 $sourceProofDispatchExact = $runnerParseErrors.Count -eq 0 -and $sourceProofEntryParseErrors.Count -eq 0 -and
     $sourceProofEntryText.Contains('-SourceProofOnly') -and $sourceProofEntryText.Contains('& $runnerPath') -and
     -not $sourceProofEntryText.Contains('. $runnerPath') -and $null -ne $sourceProofInvokerAst -and
@@ -783,8 +922,9 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry invocation contrac
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry passes current and historical SHA pins to distinct runner parameters' ($sourceProofInvocationExact -and
     $sourceProofInvocationElements[5] -ceq '$CandidateSha' -and $sourceProofInvocationElements[7] -ceq '$HistoricalOriginCandidateSha')
 $sourceProofCandidate = [PSCustomObject][ordered]@{
-    schema_version = 1
+    schema_version = 2
     record_type = $script:D32BoundedDiagnosticSourceProofCandidateType
+    source_plan_semantics_version = 2
     gate_authority = 'NONE'
     candidate_sha = $sourceProofCurrentSha
     historical_origin_candidate_sha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
@@ -803,16 +943,53 @@ $sourceProofCandidate = [PSCustomObject][ordered]@{
     source_pins = $sourceProofPins
     current_profile_lock_bindings = @(
         [PSCustomObject]@{ manifest_path = 'vita-agent-protocol/Cargo.toml'; lock_path = 'vita-agent-protocol/Cargo.lock'; lock_bytes = 10L; lock_sha256 = 'a' * 64 },
-        [PSCustomObject]@{ manifest_path = 'vita-agent/Cargo.toml'; lock_path = 'vita-agent/Cargo.lock'; lock_bytes = 10L; lock_sha256 = 'b' * 64 },
+        [PSCustomObject]@{ manifest_path = 'vita-agent/Cargo.toml'; lock_path = 'vita-agent/Cargo.lock'; lock_bytes = 10L; lock_sha256 = [string]$graphPlan.lock_sha256 },
         [PSCustomObject]@{ manifest_path = 'src-tauri/Cargo.toml'; lock_path = 'src-tauri/Cargo.lock'; lock_bytes = 10L; lock_sha256 = 'c' * 64 })
     current_source_closure = [PSCustomObject]@{
+        CurrentCandidateSha = $sourceProofCurrentSha
+        HistoricalOriginCandidateSha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
         HistoricalAttemptState = 'BLOCKED'; HistoricalFetchCompletion = 'NOT_RETAINED'; HistoricalGateAuthority = 'NONE'
-        RegistryContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V1'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false }
-        GitContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V1'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false }
+        RegistryContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false; lock_sha256 = [string]$graphPlan.lock_sha256; verified_package_ids = @($graphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'registry' } | ForEach-Object { [string]$_.package_id }) }
+        GitContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V2'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false; lock_sha256 = [string]$graphPlan.lock_sha256; verified_package_ids = @(); sources = @() }
+        SourceGraphProof = $graphProof
+        CurrentManifestProof = @($graphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'workspace' } | ForEach-Object { [PSCustomObject]@{ manifest_path = [string]$_.manifest_path; bytes = 1L; sha256 = [string]$_.manifest_sha256; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' } }) + @([PSCustomObject]@{ manifest_path = 'src-tauri/Cargo.toml'; bytes = 1L; sha256 = 'd' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' })
     }
     primary_error = $null
 }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'current source-proof-only candidate is valid while remaining untrusted and non-gating' (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate)
+$candidateClosureSha = [string]$sourceProofCandidate.current_source_closure.CurrentCandidateSha
+$sourceProofCandidate.current_source_closure.CurrentCandidateSha = [string]$sourceProofCandidate.historical_origin_candidate_sha
+Assert-D32BoundedCompilerDiagnosticSelfTest 'current source closure cannot be rebound to historical inv7 SHA' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.current_source_closure.CurrentCandidateSha = $candidateClosureSha
+$candidateTopSha = [string]$sourceProofCandidate.candidate_sha
+$sourceProofCandidate.candidate_sha = [string]$sourceProofCandidate.historical_origin_candidate_sha
+Assert-D32BoundedCompilerDiagnosticSelfTest 'current source proof candidate SHA cannot be swapped to the historical inv7 SHA' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.candidate_sha = $candidateTopSha
+$registryIdsBeforeTamper = @($sourceProofCandidate.current_source_closure.RegistryContentProof.verified_package_ids)
+$sourceProofCandidate.current_source_closure.RegistryContentProof.verified_package_ids = @($registryIdsBeforeTamper | Select-Object -Skip 1)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'every included registry source package must cross-bind to its exact content proof ID' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.current_source_closure.RegistryContentProof.verified_package_ids = $registryIdsBeforeTamper
+$workspaceProofIndex = -1
+for ($proofIndex = 0; $proofIndex -lt $sourceProofCandidate.current_source_closure.CurrentManifestProof.Count; $proofIndex++) {
+    if ([string]$sourceProofCandidate.current_source_closure.CurrentManifestProof[$proofIndex].manifest_path -ceq 'vita-agent/Cargo.toml') { $workspaceProofIndex = $proofIndex; break }
+}
+if ($workspaceProofIndex -lt 0) { throw 'D32_BOUNDED_COMPILER_DIAGNOSTIC_SELFTEST_FAILED: workspace manifest fixture is missing' }
+$workspaceProofSha = [string]$sourceProofCandidate.current_source_closure.CurrentManifestProof[$workspaceProofIndex].sha256
+$sourceProofCandidate.current_source_closure.CurrentManifestProof[$workspaceProofIndex].sha256 = 'e' * 64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'current workspace manifest digest cannot be swapped independently of its included graph classification' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.current_source_closure.CurrentManifestProof[$workspaceProofIndex].sha256 = $workspaceProofSha
+$rootWitness = @($sourceProofCandidate.current_source_closure.SourceGraphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'workspace' -and $_.manifest_path -ceq 'vita-agent/Cargo.toml' })[0]
+$rootWitness.witness_root_path[0] = 'stale-cross-run-root'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'stale/cross-run root path witness cannot pass source graph proof validation' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$rootWitness.witness_root_path[0] = [string]$sourceProofCandidate.current_source_closure.SourceGraphProof.selected_root_ids[0]
+$bindingLockSha = [string]$sourceProofCandidate.current_profile_lock_bindings[1].lock_sha256
+$sourceProofCandidate.current_profile_lock_bindings[1].lock_sha256 = 'f' * 64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source graph lock digest must cross-bind to the current Profile V2 lock tuple' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.current_profile_lock_bindings[1].lock_sha256 = $bindingLockSha
+$sourceProofPlanVersion = [int]$sourceProofCandidate.source_plan_semantics_version
+$sourceProofCandidate.source_plan_semantics_version = 1
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source proof candidate with prior graph semantics version cannot be reused' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$sourceProofCandidate.source_plan_semantics_version = $sourceProofPlanVersion
 $sourceProofCandidate.status = 'PASS'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof-only candidate cannot acquire a PASS status' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
 $sourceProofCandidate.status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
@@ -836,4 +1013,4 @@ foreach ($consumer in $formalConsumerSchemas) {
     Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema: $([IO.Path]::GetFileName($consumer.path))" ($consumerText.Contains([string]$consumer.schema) -and -not $consumerText.Contains('D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, lock-derived source plan, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, current-vs-historical SHA binding, source-proof authority and exact entry invocation contract negatives, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, current-vs-historical SHA binding, source-proof authority and exact entry invocation contract negatives, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'

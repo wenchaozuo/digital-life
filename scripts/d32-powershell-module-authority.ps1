@@ -3041,15 +3041,18 @@ function Copy-D32PowerShellAuthorityJsonShape {
     # readers. PSSerializer round-trips a one-item array as ArrayList, which is
     # not the JSON array type required by the module-admission validator. Keep
     # this clone module-free: ConvertFrom-Json would autoload Utility here.
+    # Its decoder intentionally returns ordered dictionaries; keep it separate
+    # from the canonical authority decoder below, whose PSCustomObject shape is
+    # consumed by strict runtime/bootstrap validators.
     $json = ConvertTo-D32PowerShellAuthorityJsonText -Value $Value
     $jsonDocument = [System.Text.Json.JsonDocument]::Parse($json)
-    try { $copy = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $jsonDocument.RootElement }
+    try { $copy = ConvertFrom-D32PowerShellAuthorityJsonShapeElement -Element $jsonDocument.RootElement }
     finally { $jsonDocument.Dispose() }
     if ($null -eq $copy) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: JSON-shape copy unexpectedly decoded as null' }
     return ,$copy
 }
 
-function ConvertFrom-D32PowerShellAuthorityJsonElement {
+function ConvertFrom-D32PowerShellAuthorityJsonShapeElement {
     param([Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Element)
 
     switch ($Element.ValueKind) {
@@ -3057,13 +3060,13 @@ function ConvertFrom-D32PowerShellAuthorityJsonElement {
             $record = [ordered]@{}
             foreach ($property in $Element.EnumerateObject()) {
                 if ($record.Contains($property.Name)) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: duplicate JSON property in SelfTest shape copy' }
-                $record[$property.Name] = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $property.Value
+                $record[$property.Name] = ConvertFrom-D32PowerShellAuthorityJsonShapeElement -Element $property.Value
             }
             return ,$record
         }
         ([System.Text.Json.JsonValueKind]::Array) {
             $items = [System.Collections.Generic.List[object]]::new()
-            foreach ($item in $Element.EnumerateArray()) { $items.Add((ConvertFrom-D32PowerShellAuthorityJsonElement -Element $item)) }
+            foreach ($item in $Element.EnumerateArray()) { $items.Add((ConvertFrom-D32PowerShellAuthorityJsonShapeElement -Element $item)) }
             return ,$items.ToArray()
         }
         ([System.Text.Json.JsonValueKind]::String) { return $Element.GetString() }

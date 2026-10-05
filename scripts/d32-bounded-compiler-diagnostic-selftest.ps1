@@ -811,6 +811,104 @@ $sourceProofAuthorityValid = Test-D32BoundedDiagnosticSourceProofAuthorityShape 
     -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
     -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'separate exact current source-proof authority shape accepted with historical inv7 SHA kept distinct' $sourceProofAuthorityValid
+
+$moduleAuthorityPath = Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'
+$moduleAuthorityTokens = $null; $moduleAuthorityParseErrors = $null
+$moduleAuthorityAst = [System.Management.Automation.Language.Parser]::ParseFile($moduleAuthorityPath, [ref]$moduleAuthorityTokens, [ref]$moduleAuthorityParseErrors)
+$authorityDecoderAsts = @($moduleAuthorityAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'ConvertFrom-D32PowerShellAuthorityJsonElement'
+}, $true))
+$authorityShapeDecoderAsts = @($moduleAuthorityAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'ConvertFrom-D32PowerShellAuthorityJsonShapeElement'
+}, $true))
+$authorityShapeCopyAst = $moduleAuthorityAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Copy-D32PowerShellAuthorityJsonShape'
+}, $true)
+$authoritySerializerAst = $moduleAuthorityAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'ConvertTo-D32PowerShellAuthorityJsonText'
+}, $true)
+$authorityDecoderAstContract = $moduleAuthorityParseErrors.Count -eq 0 -and $authorityDecoderAsts.Count -eq 1 -and
+    $authorityShapeDecoderAsts.Count -eq 1 -and $null -ne $authorityShapeCopyAst -and $null -ne $authoritySerializerAst -and
+    $authorityShapeCopyAst.Extent.Text.Contains('ConvertFrom-D32PowerShellAuthorityJsonShapeElement') -and
+    -not $authorityShapeCopyAst.Extent.Text.Contains('ConvertFrom-D32PowerShellAuthorityJsonElement')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'canonical authority decoder is not overwritten by the separate ordered-dictionary SelfTest shape decoder' $authorityDecoderAstContract
+
+# Evaluate only the four pure JSON conversion functions extracted from their
+# ASTs. This exercises the implementation without dot-sourcing the authority
+# module or invoking any file/native/process helpers.
+Invoke-Expression $authoritySerializerAst.Extent.Text
+Invoke-Expression $authorityDecoderAsts[0].Extent.Text
+Invoke-Expression $authorityShapeDecoderAsts[0].Extent.Text
+Invoke-Expression $authorityShapeCopyAst.Extent.Text
+$sourceProofRoundTripJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProofAuthority
+$sourceProofRoundTripDocument = [System.Text.Json.JsonDocument]::Parse($sourceProofRoundTripJson)
+try { $sourceProofRoundTrip = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $sourceProofRoundTripDocument.RootElement }
+finally { $sourceProofRoundTripDocument.Dispose() }
+$sourceProofRoundTripValid = Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofRoundTrip `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'serialized source-proof authority JSON roundtrip remains valid with distinct current and historical SHA pins' $sourceProofRoundTripValid
+$sourceProofRoundTripCollectionsExact = $sourceProofRoundTrip -is [PSCustomObject] -and
+    $sourceProofRoundTrip.source_pins -is [Array] -and $sourceProofRoundTrip.source_pins.Count -eq 5 -and
+    $sourceProofRoundTrip.source_pins[0] -is [PSCustomObject] -and
+    $sourceProofRoundTrip.dependency_origin.manifest_refs -is [Array] -and $sourceProofRoundTrip.dependency_origin.manifest_refs.Count -eq 6 -and
+    $sourceProofRoundTrip.dependency_origin.fetch_records -is [Array] -and $sourceProofRoundTrip.dependency_origin.fetch_records.Count -eq 0 -and
+    [string]$sourceProofRoundTrip.candidate_sha -ceq $sourceProofCurrentSha -and
+    [string]$sourceProofRoundTrip.historical_origin_candidate_sha -ceq $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
+Assert-D32BoundedCompilerDiagnosticSelfTest 'JSON conversion preserves nested PSCustomObjects and empty/singleton-capable collection wire types' $sourceProofRoundTripCollectionsExact
+$sourceProofShapeCopy = Copy-D32PowerShellAuthorityJsonShape -Value $sourceProofAuthority
+$sourceProofShapeCopyCollectionsExact = $sourceProofShapeCopy -is [System.Collections.IDictionary] -and
+    $sourceProofShapeCopy.source_pins -is [Array] -and $sourceProofShapeCopy.source_pins.Count -eq 5 -and
+    $sourceProofShapeCopy.source_pins[0] -is [System.Collections.IDictionary] -and
+    $sourceProofShapeCopy.dependency_origin.manifest_refs -is [Array] -and $sourceProofShapeCopy.dependency_origin.fetch_records -is [Array] -and
+    $sourceProofShapeCopy.dependency_origin.fetch_records.Count -eq 0
+Assert-D32BoundedCompilerDiagnosticSelfTest 'SelfTest JSON shape copy keeps ordered-dictionary records distinct while preserving nested arrays' $sourceProofShapeCopyCollectionsExact
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict source-proof authority consumer fails closed for dictionary representations rather than mistaking adapter properties for JSON fields' (-not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofShapeCopy `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64)))
+
+$sourceProofMissingTopValue = $sourceProofAuthority.run_id
+$sourceProofAuthority.PSObject.Properties.Remove('run_id')
+$sourceProofMissingTopRejected = -not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64))
+$sourceProofAuthority | Add-Member -NotePropertyName run_id -NotePropertyValue $sourceProofMissingTopValue
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof authority rejects a missing exact top-level field' $sourceProofMissingTopRejected
+$sourceProofAuthority | Add-Member -NotePropertyName unexpected_field -NotePropertyValue 'extra'
+$sourceProofExtraTopRejected = -not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64))
+$sourceProofAuthority.PSObject.Properties.Remove('unexpected_field')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof authority rejects an extra exact top-level field' $sourceProofExtraTopRejected
+$sourceProofPin = $sourceProofAuthority.source_pins[0]
+$sourceProofPinFileId = [string]$sourceProofPin.file_id_hex
+$sourceProofPin.PSObject.Properties.Remove('file_id_hex')
+$sourceProofMissingPinFieldRejected = -not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64))
+$sourceProofPin | Add-Member -NotePropertyName file_id_hex -NotePropertyValue $sourceProofPinFileId
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof authority rejects a missing nested source-pin field' $sourceProofMissingPinFieldRejected
+$sourceProofPin | Add-Member -NotePropertyName unexpected_field -NotePropertyValue 'extra'
+$sourceProofExtraPinFieldRejected = -not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64))
+$sourceProofPin.PSObject.Properties.Remove('unexpected_field')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof authority rejects an extra nested source-pin field' $sourceProofExtraPinFieldRejected
+$sourceProofPinsOriginal = $sourceProofAuthority.source_pins
+$sourceProofAuthority.source_pins = $sourceProofAuthority.source_pins[0]
+$sourceProofNestedCollectionRejected = -not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
+    -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -EntryScriptPath $sourceProofEntryPath -RunnerPath $sourceProofRunnerPath `
+    -ToolchainProfilePath $sourceProofProfilePath -ToolchainProfileSha256 ('a' * 64))
+$sourceProofAuthority.source_pins = $sourceProofPinsOriginal
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof authority rejects a record where the finite source-pin collection is not an array' $sourceProofNestedCollectionRejected
+
 $sourceProofAuthority.historical_origin_candidate_sha = $sourceProofCurrentSha
 Assert-D32BoundedCompilerDiagnosticSelfTest 'cross-run current/historical SHA rebinding rejected by source-proof authority' (-not (Test-D32BoundedDiagnosticSourceProofAuthorityShape -Document $sourceProofAuthority `
     -ExpectedCandidateSha $sourceProofCurrentSha -ExpectedHistoricalOriginCandidateSha $sourceProofCurrentSha -Repository $testRepo `
@@ -897,6 +995,15 @@ $sourceProofInvokerAst = $sourceProofRunnerAst.Find({ param($node) $node -is [Sy
 $sourceProofInvokerText = if ($null -eq $sourceProofInvokerAst) { '' } else { [string]$sourceProofInvokerAst.Extent.Text }
 $sourceOriginAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true)
 $sourceOriginText = if ($null -eq $sourceOriginAst) { '' } else { [string]$sourceOriginAst.Extent.Text }
+$sourceProofBootstrapAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticSourceProofBootstrap' }, $true)
+$sourceProofBootstrapText = if ($null -eq $sourceProofBootstrapAst) { '' } else { [string]$sourceProofBootstrapAst.Extent.Text }
+$sourceProofBootstrapConsumerExact = $null -ne $sourceProofBootstrapAst -and
+    $sourceProofBootstrapText.Contains('ConvertFrom-D32PowerShellAuthorityJsonElement') -and
+    $sourceProofBootstrapText.Contains("@('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')") -and
+    $sourceProofBootstrapText.Contains('$reference.PSObject.Properties') -and
+    $sourceProofBootstrapText.Contains('$bootstrap.candidate_sha -cne $CandidateSha') -and
+    $sourceProofBootstrapText.Contains('$bootstrap.historical_origin_candidate_sha -cne $HistoricalOriginCandidateSha')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only bootstrap consumer retains exact pin fields and dual current/historical SHA binding' $sourceProofBootstrapConsumerExact
 $diagnosticResultAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32BoundedDiagnosticResult' }, $true)
 $diagnosticResultText = if ($null -eq $diagnosticResultAst) { '' } else { [string]$diagnosticResultAst.Extent.Text }
 $diagnosticOriginInvocations = @($runnerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and [string]$node.GetCommandName() -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true))

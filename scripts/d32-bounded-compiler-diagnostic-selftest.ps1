@@ -339,6 +339,14 @@ $profileLibraryAst = [System.Management.Automation.Language.Parser]::ParseFile($
 $moduleAuthorityPath = Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'
 $moduleAuthorityTokens = $null; $moduleAuthorityParseErrors = $null
 $moduleAuthorityAst = [System.Management.Automation.Language.Parser]::ParseFile($moduleAuthorityPath, [ref]$moduleAuthorityTokens, [ref]$moduleAuthorityParseErrors)
+$diagnosticJsonDuplicatesAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedDiagnosticJsonDuplicates' }, $true)
+$cargoChecksumValidatorAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticCargoChecksumMetadata' }, $true)
+$registryAuxiliaryPredicateAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile' }, $true)
+$registryMarkerBytesAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedDiagnosticRegistryCargoOkMarkerBytes' }, $true)
+$registryMarkerSnapshotAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot' }, $true)
+$gitMarkerEmptyAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty' }, $true)
+$gitPointerTargetAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32BoundedDiagnosticGitPointerTarget' }, $true)
+$gitPointerCompareAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedDiagnosticExactGitPointerTarget' }, $true)
 $profileWithinAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32ProfilePathWithin' }, $true)
 $authorityWithinAst = $moduleAuthorityAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32PowerShellAuthorityPathWithin' }, $true)
 $profileFullPathAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32ProfileFullPath' }, $true)
@@ -360,6 +368,128 @@ $pathHelperParseExact = $policyParseErrors.Count -eq 0 -and $runnerParseErrors.C
     $null -ne $inv7OriginAst -and $null -ne $capturedStreamShapeAst -and $null -ne $fileReferenceFailureAst -and
     $null -ne $profileTestAst -and $null -ne $profileCurrentAst
 Assert-D32BoundedCompilerDiagnosticSelfTest 'all source-origin/root-containment functions parse for the synthetic containment census' $pathHelperParseExact
+
+$registryMetadataAstReady = $null -ne $diagnosticJsonDuplicatesAst -and $null -ne $cargoChecksumValidatorAst -and
+    $null -ne $registryAuxiliaryPredicateAst -and $null -ne $registryMarkerBytesAst -and
+    $null -ne $registryMarkerSnapshotAst -and $null -ne $gitMarkerEmptyAst -and
+    $null -ne $gitPointerTargetAst -and $null -ne $gitPointerCompareAst -and
+    $runnerParseErrors.Count -eq 0 -and $policyParseErrors.Count -eq 0
+Assert-D32BoundedCompilerDiagnosticSelfTest 'all Cargo auxiliary metadata validators parse for module-free fixtures' $registryMetadataAstReady
+Invoke-Expression $diagnosticJsonDuplicatesAst.Extent.Text
+Invoke-Expression $cargoChecksumValidatorAst.Extent.Text
+Invoke-Expression $gitPointerTargetAst.Extent.Text
+Invoke-Expression $gitPointerCompareAst.Extent.Text
+
+$canonicalCargoMarker = [Text.Encoding]::UTF8.GetBytes('{"v":1}')
+$canonicalCargoMarkerSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($canonicalCargoMarker)).ToLowerInvariant()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry marker accepts only exact seven-byte canonical Cargo v1 JSON and its matching bounded snapshot' `
+    ((Test-D32BoundedDiagnosticRegistryCargoOkMarkerBytes -Bytes $canonicalCargoMarker) -and
+     (Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot -Bytes $canonicalCargoMarker.Length -Sha256 $canonicalCargoMarkerSha256))
+$registryMarkerNegativeCases = @(
+    [PSCustomObject]@{ name = 'empty'; bytes = [byte[]]::new(0) },
+    [PSCustomObject]@{ name = 'unknown version'; bytes = [Text.Encoding]::UTF8.GetBytes('{"v":2}') },
+    [PSCustomObject]@{ name = 'extra field'; bytes = [Text.Encoding]::UTF8.GetBytes('{"v":1,"x":0}') },
+    [PSCustomObject]@{ name = 'trailing byte'; bytes = [Text.Encoding]::UTF8.GetBytes('{"v":1} ') },
+    [PSCustomObject]@{ name = 'UTF-8 BOM'; bytes = [byte[]]@([byte]0xef, [byte]0xbb, [byte]0xbf) + $canonicalCargoMarker },
+    [PSCustomObject]@{ name = 'noncanonical whitespace'; bytes = [Text.Encoding]::UTF8.GetBytes('{ "v":1}') },
+    [PSCustomObject]@{ name = 'noncanonical numeric value'; bytes = [Text.Encoding]::UTF8.GetBytes('{"v":1.0}') }
+)
+foreach ($markerCase in $registryMarkerNegativeCases) {
+    $caseSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$markerCase.bytes)).ToLowerInvariant()
+    Assert-D32BoundedCompilerDiagnosticSelfTest "registry .cargo-ok rejects $($markerCase.name) bytes and snapshot" `
+        (-not (Test-D32BoundedDiagnosticRegistryCargoOkMarkerBytes -Bytes ([byte[]]$markerCase.bytes)) -and
+         -not (Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot -Bytes ([long]$markerCase.bytes.Length) -Sha256 $caseSha256))
+}
+
+Assert-D32BoundedCompilerDiagnosticSelfTest 'generated registry metadata classification preserves archive-member validation for both auxiliary names' `
+    ((Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath '.cargo-ok' -AtRoot $true -ArchiveMember $false) -and
+     -not (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath '.cargo-ok' -AtRoot $true -ArchiveMember $true) -and
+     (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath '.cargo-checksum.json' -AtRoot $true -ArchiveMember $false) -and
+     -not (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath '.cargo-checksum.json' -AtRoot $true -ArchiveMember $true) -and
+     -not (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath 'nested/.cargo-ok' -AtRoot $false -ArchiveMember $false) -and
+     -not (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath '.CARGO-OK' -AtRoot $true -ArchiveMember $false))
+$emptyGitMarkerAccepted = $true
+try { Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes 0L } catch { $emptyGitMarkerAccepted = $false }
+$nonemptyGitMarkerRejected = $false
+try { Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes 1L }
+catch { $nonemptyGitMarkerRejected = $_.Exception.Message -ceq 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: generated .cargo-ok marker is not empty' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'Git checkout .cargo-ok retains its distinct empty-file rule and rejects nonempty bytes' `
+    ($emptyGitMarkerAccepted -and $nonemptyGitMarkerRejected)
+
+$gitPointerCheckout = 'C:\d32-pointer-fixture\checkout'
+$gitPointerDatabase = 'C:\d32-pointer-fixture\git\db'
+$relativeGitPointer = [Text.Encoding]::ASCII.GetBytes("gitdir: ..\git\db`n")
+$absoluteGitPointer = [Text.Encoding]::ASCII.GetBytes("gitdir: $gitPointerDatabase`r`n")
+$relativeGitPointerTarget = Get-D32BoundedDiagnosticGitPointerTarget -PointerBytes $relativeGitPointer -CheckoutPath $gitPointerCheckout
+$absoluteGitPointerTarget = Get-D32BoundedDiagnosticGitPointerTarget -PointerBytes $absoluteGitPointer -CheckoutPath $gitPointerCheckout
+$trailingTextGitPointerTarget = Get-D32BoundedDiagnosticGitPointerTarget `
+    -PointerBytes ([Text.Encoding]::ASCII.GetBytes('gitdir: ../git/db extra')) -CheckoutPath $gitPointerCheckout
+Assert-D32BoundedCompilerDiagnosticSelfTest 'bounded .git pointer parser resolves permitted relative and absolute exact database roots' `
+    ((Test-D32BoundedDiagnosticExactGitPointerTarget -Target $relativeGitPointerTarget -ExpectedTarget $gitPointerDatabase) -and
+     (Test-D32BoundedDiagnosticExactGitPointerTarget -Target $absoluteGitPointerTarget -ExpectedTarget $gitPointerDatabase) -and
+     (Test-D32BoundedDiagnosticExactGitPointerTarget -Target $gitPointerDatabase.ToUpperInvariant() -ExpectedTarget $gitPointerDatabase) -and
+     -not (Test-D32BoundedDiagnosticExactGitPointerTarget -Target 'C:\d32-pointer-fixture\other\db' -ExpectedTarget $gitPointerDatabase) -and
+     -not (Test-D32BoundedDiagnosticExactGitPointerTarget -Target $trailingTextGitPointerTarget -ExpectedTarget $gitPointerDatabase))
+$malformedGitPointerCases = @(
+    [PSCustomObject]@{ name = 'empty'; bytes = [byte[]]::new(0) },
+    [PSCustomObject]@{ name = 'oversized'; bytes = [byte[]]::new(4097) },
+    [PSCustomObject]@{ name = 'missing keyword'; bytes = [Text.Encoding]::ASCII.GetBytes('git-dir: ../git/db') },
+    [PSCustomObject]@{ name = 'missing target'; bytes = [Text.Encoding]::ASCII.GetBytes('gitdir: ') },
+    [PSCustomObject]@{ name = 'leading whitespace'; bytes = [Text.Encoding]::ASCII.GetBytes(' gitdir: ../git/db') },
+    [PSCustomObject]@{ name = 'multiple lines'; bytes = [Text.Encoding]::ASCII.GetBytes("gitdir: ../git/db`ngitdir: ../other`n") }
+)
+foreach ($pointerCase in $malformedGitPointerCases) {
+    $pointerRejected = $false
+    try { $null = Get-D32BoundedDiagnosticGitPointerTarget -PointerBytes ([byte[]]$pointerCase.bytes) -CheckoutPath $gitPointerCheckout }
+    catch { $pointerRejected = $true }
+    Assert-D32BoundedCompilerDiagnosticSelfTest "bounded .git pointer parser rejects $($pointerCase.name)" $pointerRejected
+}
+
+$checksumFileSha = 'a' * 64
+$checksumPackageSha = 'b' * 64
+$validCargoChecksumText = '{"files":{"src/lib.rs":"' + $checksumFileSha + '"},"package":"' + $checksumPackageSha + '"}'
+$validCargoChecksum = Assert-D32BoundedDiagnosticCargoChecksumMetadata -Text $validCargoChecksumText
+Assert-D32BoundedCompilerDiagnosticSelfTest 'generated Cargo checksum metadata accepts exact files/package shape and canonical digests' `
+    ((Test-D32BoundedCompilerDiagnosticExactProperties $validCargoChecksum @('files', 'package')) -and
+     [string]$validCargoChecksum.files.'src/lib.rs' -ceq $checksumFileSha -and [string]$validCargoChecksum.package -ceq $checksumPackageSha)
+$validNullPackageChecksum = Assert-D32BoundedDiagnosticCargoChecksumMetadata -Text ('{"files":{"Cargo.toml":"' + $checksumFileSha + '"},"package":null}')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'Cargo checksum metadata retains the supported null package value' ($null -eq $validNullPackageChecksum.package)
+$invalidCargoChecksumCases = @(
+    [PSCustomObject]@{ name = 'extra field'; text = '{"files":{},"package":null,"extra":0}' },
+    [PSCustomObject]@{ name = 'missing package'; text = '{"files":{}}' },
+    [PSCustomObject]@{ name = 'array files'; text = '{"files":[],"package":null}' },
+    [PSCustomObject]@{ name = 'invalid package digest'; text = '{"files":{},"package":"xyz"}' },
+    [PSCustomObject]@{ name = 'duplicate top-level field'; text = '{"files":{},"package":null,"package":null}' },
+    [PSCustomObject]@{ name = 'duplicate file path'; text = '{"files":{"src/lib.rs":"' + $checksumFileSha + '","src/lib.rs":"' + $checksumFileSha + '"},"package":null}' },
+    [PSCustomObject]@{ name = 'unsafe relative path'; text = '{"files":{"../outside":"' + $checksumFileSha + '"},"package":null}' },
+    [PSCustomObject]@{ name = 'invalid file digest'; text = '{"files":{"src/lib.rs":"bad"},"package":null}' },
+    [PSCustomObject]@{ name = 'UTF-8 BOM'; text = [string]([char]0xfeff) + '{"files":{},"package":null}' },
+    [PSCustomObject]@{ name = 'trailing content'; text = '{"files":{},"package":null} trailing' }
+)
+foreach ($checksumCase in $invalidCargoChecksumCases) {
+    $checksumRejected = $false
+    try { $null = Assert-D32BoundedDiagnosticCargoChecksumMetadata -Text ([string]$checksumCase.text) }
+    catch { $checksumRejected = $true }
+    Assert-D32BoundedCompilerDiagnosticSelfTest "generated Cargo checksum metadata rejects $($checksumCase.name)" $checksumRejected
+}
+
+$registrySourceInventoryAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource' }, $true)
+$registryContentFunctionText = if ($null -eq $registrySourceInventoryAst) { '' } else { [string]$registrySourceInventoryAst.Extent.Text }
+$gitContentProofAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32BoundedDiagnosticGitCheckoutContentProof' }, $true)
+$gitContentFunctionText = if ($null -eq $gitContentProofAst) { '' } else { [string]$gitContentProofAst.Extent.Text }
+$registryAuxiliaryBranchesWired = $registryContentFunctionText.Contains('Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile') -and
+    $registryContentFunctionText.Contains('Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot') -and
+    $registryContentFunctionText.Contains('Assert-D32BoundedDiagnosticCargoChecksumMetadata') -and
+    $registryContentFunctionText.Contains('extracted registry file content differs from the lock-checksummed archive')
+$gitAuxiliaryBranchesWired = $gitContentFunctionText.Contains('Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile') -and
+    $gitContentFunctionText.Contains('Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty') -and
+    $gitContentFunctionText.Contains('Get-D32BoundedDiagnosticGitPointerTarget') -and
+    $gitContentFunctionText.Contains('Test-D32BoundedDiagnosticExactGitPointerTarget') -and
+    $gitContentFunctionText.Contains('Test-D32ProfileNoReparsePath') -and
+    $gitContentFunctionText.Contains('checkout path case differs from its locked Git tree')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry generated-vs-archive auxiliary routing and checksum parser remain wired to archive proof' $registryAuxiliaryBranchesWired
+Assert-D32BoundedCompilerDiagnosticSelfTest 'Git empty marker rule remains wired without replacing locked tree comparison' $gitAuxiliaryBranchesWired
+
 Invoke-Expression $profileWithinAst.Extent.Text
 Invoke-Expression $authorityWithinAst.Extent.Text
 $containmentFunctions = @(
@@ -1452,5 +1582,5 @@ foreach ($consumer in $formalConsumerSchemas) {
     Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema: $([IO.Path]::GetFileName($consumer.path))" ($consumerText.Contains([string]$consumer.schema) -and -not $consumerText.Contains('D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, source-proof result constructor success/failure/timeout/budget branches, PSCustomObject versus ordered-dictionary nested-record census, success/blocked JSON roundtrips, exact-field and candidate-pin negatives, primary-error-preserving BLOCKED fallback, proof-only entry/result AST wiring, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, canonical Cargo registry .cargo-ok bytes/snapshot and distinct empty Git marker rules, generated-versus-archive-member auxiliary metadata routing, bounded Cargo checksum metadata shape/path/digest/duplicate/BOM/trailing negative fixtures, bounded .git pointer syntax/relative-and-exact-root fixtures, source-proof result constructor success/failure/timeout/budget branches, PSCustomObject versus ordered-dictionary nested-record census, success/blocked JSON roundtrips, exact-field and candidate-pin negatives, primary-error-preserving BLOCKED fallback, proof-only entry/result AST wiring, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

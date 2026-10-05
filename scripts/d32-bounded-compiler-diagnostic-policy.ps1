@@ -708,6 +708,66 @@ function Test-D32BoundedCompilerDiagnosticInteger {
     return ([Int64]$Value -ge 0)
 }
 
+function Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][bool]$AtRoot,
+        [Parameter(Mandatory = $true)][bool]$ArchiveMember
+    )
+    return $AtRoot -and -not $ArchiveMember -and
+        ($RelativePath -ceq '.cargo-ok' -or $RelativePath -ceq '.cargo-checksum.json')
+}
+
+function Test-D32BoundedDiagnosticRegistryCargoOkMarkerBytes {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
+    $canonical = [Text.Encoding]::UTF8.GetBytes('{"v":1}')
+    if ($Bytes.Length -ne $canonical.Length) { return $false }
+    for ($index = 0; $index -lt $canonical.Length; $index++) {
+        if ($Bytes[$index] -ne $canonical[$index]) { return $false }
+    }
+    return $true
+}
+
+function Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][long]$Bytes,
+        [Parameter(Mandatory = $true)][string]$Sha256
+    )
+    $canonical = [Text.Encoding]::UTF8.GetBytes('{"v":1}')
+    $canonicalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($canonical)).ToLowerInvariant()
+    return $Bytes -eq $canonical.Length -and $Sha256 -ceq $canonicalSha256
+}
+
+function Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty {
+    param([Parameter(Mandatory = $true)][long]$Bytes)
+    if ($Bytes -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: generated .cargo-ok marker is not empty' }
+}
+
+function Get-D32BoundedDiagnosticGitPointerTarget {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$PointerBytes,
+        [Parameter(Mandatory = $true)][string]$CheckoutPath
+    )
+    if ($PointerBytes.Length -le 0 -or $PointerBytes.Length -gt 4096) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer is empty or exceeds 4096 bytes'
+    }
+    $pointerText = [Text.Encoding]::ASCII.GetString($PointerBytes)
+    if ($pointerText -cnotmatch '^gitdir: ([^\r\n]+)\r?\n?$') {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer format is unsupported'
+    }
+    $pointerValue = [string]$Matches[1]
+    if ([IO.Path]::IsPathRooted($pointerValue)) { return [IO.Path]::GetFullPath($pointerValue) }
+    return [IO.Path]::GetFullPath((Join-Path $CheckoutPath $pointerValue))
+}
+
+function Test-D32BoundedDiagnosticExactGitPointerTarget {
+    param(
+        [Parameter(Mandatory = $true)][string]$Target,
+        [Parameter(Mandatory = $true)][string]$ExpectedTarget
+    )
+    return [StringComparer]::OrdinalIgnoreCase.Equals($Target, $ExpectedTarget)
+}
+
 function Get-D32BoundedCompilerDiagnosticGlobalWriterCensus {
     param([Parameter(Mandatory = $true)][scriptblock]$ProcessProbe)
     try { $probeResult = & $ProcessProbe }

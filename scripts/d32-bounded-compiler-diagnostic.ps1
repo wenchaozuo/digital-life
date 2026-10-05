@@ -254,6 +254,30 @@ function Test-D32BoundedDiagnosticJsonDuplicates {
     return $false
 }
 
+function Assert-D32BoundedDiagnosticCargoChecksumMetadata {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $metadataJson = [System.Text.Json.JsonDocument]::Parse($Text)
+    try {
+        if ($metadataJson.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
+            (Test-D32BoundedDiagnosticJsonDuplicates -Element $metadataJson.RootElement)) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata is malformed'
+        }
+        $checksumMetadata = ConvertFrom-Json -InputObject $Text -Depth 20 -ErrorAction Stop
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $checksumMetadata @('files', 'package')) -or
+            $checksumMetadata.files -is [string] -or $checksumMetadata.files -is [Array] -or
+            ($null -ne $checksumMetadata.package -and [string]$checksumMetadata.package -cnotmatch '^[0-9a-f]{64}$')) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata schema is unsupported'
+        }
+        foreach ($property in $checksumMetadata.files.PSObject.Properties) {
+            if (-not (Test-D32BoundedCompilerDiagnosticTarPath ([string]$property.Name)) -or [string]$property.Value -cnotmatch '^[0-9a-f]{64}$') {
+                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata contains a malformed path or digest'
+            }
+        }
+        return $checksumMetadata
+    }
+    finally { $metadataJson.Dispose() }
+}
+
 function Read-D32BoundedDiagnosticJson {
     param([Parameter(Mandatory = $true)][string]$Path, [long]$MaximumBytes = 16777216, [AllowNull()][object]$ExpectedReference)
     $full = [IO.Path]::GetFullPath($Path)
@@ -651,33 +675,26 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
             $snapshot = Get-D32ProfileFileSnapshot -Path $item
             if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate source proof reached its 300-second ceiling while hashing extracted source files' }
             $sourceBytes += [Int64]$snapshot.Bytes
-            if ($relative -ceq '.cargo-ok' -and -not $expected.ContainsKey($relative)) {
-                if ([Int64]$snapshot.Bytes -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated .cargo-ok marker is not empty' }
+            $expectedArchiveMember = $expected.ContainsKey($relative)
+            $atSourceRoot = -not $relative.Contains('/')
+            $generatedAuxiliary = Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile `
+                -RelativePath $relative -AtRoot $atSourceRoot -ArchiveMember $expectedArchiveMember
+            if ($generatedAuxiliary -and $relative -ceq '.cargo-ok') {
+                if (-not (Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot -Bytes ([Int64]$snapshot.Bytes) -Sha256 ([string]$snapshot.Sha256))) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated registry .cargo-ok marker is not the exact canonical 7-byte v1 record'
+                }
+                $markerAfter = Get-D32ProfileFileSnapshot -Path $item
+                if ($markerAfter.Bytes -ne $snapshot.Bytes -or $markerAfter.Sha256 -cne $snapshot.Sha256 -or
+                    $markerAfter.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $markerAfter.FileIdHex -cne $snapshot.FileIdHex) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: generated metadata changed while it was inspected'
+                }
                 $metadata.Add([PSCustomObject]@{ path = $relative; bytes = [Int64]$snapshot.Bytes; sha256 = [string]$snapshot.Sha256; volume_serial_hex = [string]$snapshot.VolumeSerialHex; file_id_hex = [string]$snapshot.FileIdHex })
                 continue
             }
-            if ($relative -ceq '.cargo-checksum.json' -and -not $expected.ContainsKey($relative)) {
+            if ($generatedAuxiliary -and $relative -ceq '.cargo-checksum.json') {
                 if ([Int64]$snapshot.Bytes -gt 16777216) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata exceeds its fixed byte bound' }
                 $metadataText = [IO.File]::ReadAllText($item, [Text.UTF8Encoding]::new($false, $true))
-                $metadataJson = [System.Text.Json.JsonDocument]::Parse($metadataText)
-                try {
-                    if ($metadataJson.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
-                        (Test-D32BoundedDiagnosticJsonDuplicates -Element $metadataJson.RootElement)) {
-                        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata is malformed'
-                    }
-                    $checksumMetadata = ConvertFrom-Json -InputObject $metadataText -Depth 20 -ErrorAction Stop
-                    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $checksumMetadata @('files', 'package')) -or
-                        $checksumMetadata.files -is [string] -or $checksumMetadata.files -is [Array] -or
-                        ($null -ne $checksumMetadata.package -and [string]$checksumMetadata.package -cnotmatch '^[0-9a-f]{64}$')) {
-                        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata schema is unsupported'
-                    }
-                    foreach ($property in $checksumMetadata.files.PSObject.Properties) {
-                        if (-not (Test-D32BoundedCompilerDiagnosticTarPath ([string]$property.Name)) -or [string]$property.Value -cnotmatch '^[0-9a-f]{64}$') {
-                            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata contains a malformed path or digest'
-                        }
-                    }
-                }
-                finally { $metadataJson.Dispose() }
+                $null = Assert-D32BoundedDiagnosticCargoChecksumMetadata -Text $metadataText
                 $metadataAfter = Get-D32ProfileFileSnapshot -Path $item
                 if ($metadataAfter.Bytes -ne $snapshot.Bytes -or $metadataAfter.Sha256 -cne $snapshot.Sha256 -or
                     $metadataAfter.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $metadataAfter.FileIdHex -cne $snapshot.FileIdHex) {
@@ -1096,11 +1113,9 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
                     $pointerAfter.VolumeSerialHex -cne $pointerBefore.VolumeSerialHex -or $pointerAfter.FileIdHex -cne $pointerBefore.FileIdHex) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer changed or exceeds its bounded read'
                 }
-                $pointerText = [Text.Encoding]::ASCII.GetString($pointerBytes)
-                if ($pointerText -cnotmatch '^gitdir: ([^\r\n]+)\r?\n?$') { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer format is unsupported' }
-                $pointerValue = [string]$Matches[1]
-                $pointerTarget = if ([IO.Path]::IsPathRooted($pointerValue)) { [IO.Path]::GetFullPath($pointerValue) } else { [IO.Path]::GetFullPath((Join-Path $CheckoutPath $pointerValue)) }
-                if (-not [StringComparer]::OrdinalIgnoreCase.Equals($pointerTarget, $DatabasePath) -or -not (Test-D32ProfileNoReparsePath -Path $pointerTarget)) {
+                $pointerTarget = Get-D32BoundedDiagnosticGitPointerTarget -PointerBytes $pointerBytes -CheckoutPath $CheckoutPath
+                if (-not (Test-D32BoundedDiagnosticExactGitPointerTarget -Target $pointerTarget -ExpectedTarget $DatabasePath) -or
+                    -not (Test-D32ProfileNoReparsePath -Path $pointerTarget)) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer resolves outside its exact locked database root'
                 }
                 $null = Get-D32ProfileDirectoryIdentity -Path $pointerTarget
@@ -1108,10 +1123,12 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
                 $metadataCount++
                 continue
             }
-            if ($relative -ceq '.cargo-ok' -and $isAtRoot -and -not $expected.ContainsKey($relative)) {
+            $expectedGitArchiveMember = $expected.ContainsKey($relative)
+            if ($relative -ceq '.cargo-ok' -and $isAtRoot -and
+                (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath $relative -AtRoot $true -ArchiveMember $expectedGitArchiveMember)) {
                 if ($isDirectory) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Cargo .cargo-ok metadata is not a regular file' }
                 $marker = Get-D32ProfileFileSnapshot -Path $full
-                if ([Int64]$marker.Bytes -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: generated .cargo-ok marker is not empty' }
+                Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes ([Int64]$marker.Bytes)
                 $sourceMetadata.Add(('cargo-ok' + "`t" + $relative + "`t" + [string]$marker.Sha256 + "`t" + [string]$marker.VolumeSerialHex + "`t" + [string]$marker.FileIdHex))
                 $metadataCount++
                 continue

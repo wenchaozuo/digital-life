@@ -3610,8 +3610,183 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest {
         [Text.UTF8Encoding]::new($false).GetBytes(($rows -join "`n") + "`n"))).ToLowerInvariant()
 }
 
+function New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow {
+    param(
+        [Parameter(Mandatory = $true)][object]$Archive,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [AllowNull()][object]$OpenedReference,
+        [AllowNull()][object]$Inventory,
+        [AllowNull()][object]$FailureReason
+    )
+    $zeroCounts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $counts = if ($null -eq $Inventory) { $zeroCounts } else { $Inventory.format_counts }
+    $openedBytes = $null
+    $openedSha256 = $null
+    $openedVolumeSerialHex = $null
+    $openedFileIdHex = $null
+    $expandedBytes = 0L
+    $headerCount = 0L
+    $headerInventorySha256 = $null
+    $framingVerified = $false
+    $firstFailureOffset = $null
+    $firstFailureHeaderSha256 = $null
+    $firstFailureReason = $null
+    if ($null -ne $OpenedReference) {
+        $openedBytes = [Int64]$OpenedReference.bytes
+        $openedSha256 = [string]$OpenedReference.sha256
+        $openedVolumeSerialHex = [string]$OpenedReference.volume_serial_hex
+        $openedFileIdHex = [string]$OpenedReference.file_id_hex
+    }
+    if ($null -ne $Inventory) {
+        $expandedBytes = [Int64]$Inventory.expanded_bytes
+        $headerCount = [Int64]$Inventory.header_count
+        if ($null -ne $Inventory.header_inventory_sha256) { $headerInventorySha256 = [string]$Inventory.header_inventory_sha256 }
+        $framingVerified = [bool]$Inventory.framing_verified
+        if ($null -ne $Inventory.first_failure_offset) { $firstFailureOffset = $Inventory.first_failure_offset }
+        if ($null -ne $Inventory.first_failure_header_sha256) { $firstFailureHeaderSha256 = [string]$Inventory.first_failure_header_sha256 }
+        if ($null -ne $Inventory.first_failure_reason) { $firstFailureReason = [string]$Inventory.first_failure_reason }
+    }
+    if ($null -ne $FailureReason) { $firstFailureReason = $FailureReason }
+    return [PSCustomObject][ordered]@{
+        archive_id = [string]$Archive.name + '@' + [string]$Archive.version
+        source = [string]$Archive.source; name = [string]$Archive.name; version = [string]$Archive.version
+        checksum = [string]$Archive.checksum; archive_path = [string]$Archive.path; archive_bytes = [Int64]$Archive.bytes
+        archive_sha256 = [string]$Archive.sha256; archive_volume_serial_hex = [string]$Archive.volume_serial_hex
+        archive_file_id_hex = [string]$Archive.file_id_hex
+        opened_archive_bytes = $openedBytes
+        opened_archive_sha256 = $openedSha256
+        opened_archive_volume_serial_hex = $openedVolumeSerialHex
+        opened_archive_file_id_hex = $openedFileIdHex
+        status = $Status
+        expanded_bytes = $expandedBytes
+        header_count = $headerCount
+        format_counts = $counts
+        header_inventory_sha256 = $headerInventorySha256
+        framing_verified = $framingVerified
+        remainder_unknown = ($Status -cne 'COMPLETE_SUPPORTED')
+        first_failure_offset = $firstFailureOffset
+        first_failure_header_sha256 = $firstFailureHeaderSha256
+        first_failure_reason = $firstFailureReason
+    }
+}
+
+function New-D32BoundedDiagnosticArchiveFormatCensusUnexaminedRow {
+    param([Parameter(Mandatory = $true)][object]$Archive, [Parameter(Mandatory = $true)][string]$Reason)
+    return New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $Archive -Status 'UNEXAMINED' `
+        -OpenedReference $null -Inventory $null -FailureReason $Reason
+}
+
+function New-D32BoundedDiagnosticArchiveFormatCensusResult {
+    param(
+        [Parameter(Mandatory = $true)][object]$Authority,
+        [Parameter(Mandatory = $true)][object]$AuthorityReference,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][string]$StartedAtUtc,
+        [Parameter(Mandatory = $true)][string]$CompletedAtUtc,
+        [Parameter(Mandatory = $true)][Int64]$ElapsedMilliseconds,
+        [Parameter(Mandatory = $true)][object[]]$Archives,
+        [AllowNull()][object]$PrimaryError,
+        [string[]]$SecondaryErrors = @()
+    )
+    $rows = [object[]]@($Archives)
+    $unexamined = [string[]]@($rows | Where-Object { [string]$_.status -ceq 'UNEXAMINED' } | ForEach-Object { [string]$_.archive_id })
+    $blockedCount = [Int64]@($rows | Where-Object { [string]$_.status -cin @('UNSUPPORTED', 'PREFLIGHT_BLOCKED') }).Count
+    $coveredCount = [Int64]@($rows | Where-Object { [string]$_.status -cne 'UNEXAMINED' }).Count
+    $aggregateCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    foreach ($row in $rows) {
+        foreach ($formatName in @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')) {
+            $aggregateCounts[$formatName] = [Int64]$aggregateCounts[$formatName] + [Int64]$row.format_counts.($formatName)
+        }
+    }
+    $effectivePrimaryError = if ($null -eq $PrimaryError) { $null } else { [string]$PrimaryError }
+    if ($Status -cne 'COMPLETE_DIAGNOSTIC' -and [String]::IsNullOrWhiteSpace($effectivePrimaryError)) {
+        $effectivePrimaryError = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: strict census coverage did not complete'
+    }
+    $reference = [PSCustomObject][ordered]@{
+        path = [string]$AuthorityReference.path; bytes = [Int64]$AuthorityReference.bytes
+        sha256 = [string]$AuthorityReference.sha256; volume_serial_hex = [string]$AuthorityReference.volume_serial_hex
+        file_id_hex = [string]$AuthorityReference.file_id_hex
+    }
+    return [PSCustomObject][ordered]@{
+        schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType
+        registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'
+        formal_phase1_allowed = $false; formal_aggregate_allowed = $false; source_proof_checkpoint = $false
+        diagnostic_invocation_authority = 'NONE'; status = $Status
+        candidate_sha = [string]$Authority.candidate_sha; source_repo = [string]$Authority.source_repo
+        source_plan_semantics_version = [Int64]$Authority.source_plan_semantics_version
+        semantic_scope = [string]$Authority.semantic_scope; registry_tuple_sha256 = [string]$Authority.registry_tuple_sha256
+        repository_identity = $Authority.repository_identity
+        census_authority_reference = $reference
+        lock_reference = $Authority.lock_reference; dependency_origin = $Authority.dependency_origin
+        historical_origin = $Authority.historical_origin; source_pins = @($Authority.source_pins)
+        output_candidate = $Authority.output_candidate; resource_budget = $Authority.resource_budget
+        run_id = [string]$Authority.run_id; started_at_utc = $StartedAtUtc
+        completed_at_utc = $CompletedAtUtc; elapsed_milliseconds = [Int64]$ElapsedMilliseconds
+        requested_archive_count = [Int64]@($Authority.archive_refs).Count; covered_archive_count = $coveredCount
+        blocked_archive_count = $blockedCount; unexamined_archive_count = [Int64]$unexamined.Count
+        archives = $rows; unexamined_archive_ids = $unexamined
+        aggregate_format_counts = [PSCustomObject][ordered]@{
+            ustar_regular = [Int64]$aggregateCounts.ustar_regular; ustar_directory = [Int64]$aggregateCounts.ustar_directory
+            gnu_regular = [Int64]$aggregateCounts.gnu_regular; gnu_directory = [Int64]$aggregateCounts.gnu_directory
+        }
+        archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives $rows
+        payload_read_and_discarded = $true; payload_hashed = $false; payload_retained = $false; source_extraction_performed = $false
+        formal_gate_usable = $false; primary_error = $effectivePrimaryError; secondary_errors = [string[]]@($SecondaryErrors)
+    }
+}
+
+function Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure {
+    param([AllowNull()][System.Collections.Generic.List[string]]$FailureReasons, [Parameter(Mandatory = $true)][string]$Reason)
+    if ($null -ne $FailureReasons) { $FailureReasons.Add($Reason) }
+}
+
+function Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage {
+    param(
+        [AllowNull()][object]$Result,
+        [AllowNull()][object]$Authority,
+        [AllowNull()][object]$ExpectedAuthorityReference,
+        [AllowNull()][System.Collections.Generic.List[string]]$FailureReasons
+    )
+    if ($null -ne $FailureReasons) { $FailureReasons.Clear() }
+    if ($null -eq $Result -or $null -eq $Authority -or $Authority.archive_refs -isnot [Array] -or $Result.archives -isnot [Array]) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'authority_coverage.result_or_authority_shape'
+        return $false
+    }
+    if ($Result.archives.Count -ne $Authority.archive_refs.Count -or
+        [Int64]$Result.requested_archive_count -ne [Int64]$Authority.archive_refs.Count) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'authority_coverage.archive_count'
+        return $false
+    }
+    if ($null -ne $ExpectedAuthorityReference -and
+        ([string]$Result.census_authority_reference.path -cne [string]$ExpectedAuthorityReference.path -or
+         [Int64]$Result.census_authority_reference.bytes -ne [Int64]$ExpectedAuthorityReference.bytes -or
+         [string]$Result.census_authority_reference.sha256 -cne [string]$ExpectedAuthorityReference.sha256 -or
+         [string]$Result.census_authority_reference.volume_serial_hex -cne [string]$ExpectedAuthorityReference.volume_serial_hex -or
+         [string]$Result.census_authority_reference.file_id_hex -cne [string]$ExpectedAuthorityReference.file_id_hex)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'census_authority_reference.caller_pinned_identity'
+        return $false
+    }
+    for ($index = 0; $index -lt $Authority.archive_refs.Count; $index++) {
+        $expected = $Authority.archive_refs[$index]
+        $actual = $Result.archives[$index]
+        if ([string]$actual.source -cne [string]$expected.source -or
+            [string]$actual.name -cne [string]$expected.name -or [string]$actual.version -cne [string]$expected.version -or
+            [string]$actual.checksum -cne [string]$expected.checksum -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$actual.archive_path, [string]$expected.path) -or
+            [Int64]$actual.archive_bytes -ne [Int64]$expected.bytes -or
+            [string]$actual.archive_sha256 -cne [string]$expected.sha256 -or
+            [string]$actual.archive_volume_serial_hex -cne [string]$expected.volume_serial_hex -or
+            [string]$actual.archive_file_id_hex -cne [string]$expected.file_id_hex) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$index].authority_archive_reference_binding"
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
-    param([AllowNull()][object]$Record)
+    param([AllowNull()][object]$Record, [AllowNull()][System.Collections.Generic.List[string]]$FailureReasons)
+    if ($null -ne $FailureReasons) { $FailureReasons.Clear() }
     $fields = @('schema_version', 'record_type', 'registry_archive_policy', 'gate_authority', 'formal_phase1_allowed', 'formal_aggregate_allowed',
         'source_proof_checkpoint', 'diagnostic_invocation_authority', 'status', 'candidate_sha', 'source_repo', 'source_plan_semantics_version',
         'semantic_scope', 'registry_tuple_sha256', 'repository_identity', 'census_authority_reference', 'lock_reference',
@@ -3621,8 +3796,34 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         'archive_header_inventory_sha256', 'payload_read_and_discarded', 'payload_hashed', 'payload_retained', 'source_extraction_performed',
         'formal_gate_usable', 'primary_error', 'secondary_errors')
     $countFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')
-    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.schema_version -Positive) -or [Int64]$Record.schema_version -ne 1 -or
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields)) {
+        if ($null -eq $Record -or $Record -is [string] -or $Record -is [Array] -or $Record -is [ValueType]) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'result.object_shape'
+        }
+        else {
+            $actualFieldNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($property in $Record.PSObject.Properties) { [void]$actualFieldNames.Add([string]$property.Name) }
+            $missingFieldNames = @($fields | Where-Object { -not $actualFieldNames.Contains($_) })
+            $extraFieldNames = @($actualFieldNames | Where-Object { $_ -notin $fields })
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason (
+                'result.property_set.missing=' + ($missingFieldNames -join ',') + ';extra=' + ($extraFieldNames -join ','))
+        }
+        return $false
+    }
+    if ($Record.started_at_utc -isnot [string] -or $Record.completed_at_utc -isnot [string]) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'started_at_utc_or_completed_at_utc.string'
+        return $false
+    }
+    $startedAt = [DateTimeOffset]::MinValue
+    $completedAt = [DateTimeOffset]::MinValue
+    $roundtripStyle = [Globalization.DateTimeStyles]::RoundtripKind
+    $startedValid = [DateTimeOffset]::TryParseExact([string]$Record.started_at_utc, 'o', [Globalization.CultureInfo]::InvariantCulture, $roundtripStyle, [ref]$startedAt)
+    $completedValid = [DateTimeOffset]::TryParseExact([string]$Record.completed_at_utc, 'o', [Globalization.CultureInfo]::InvariantCulture, $roundtripStyle, [ref]$completedAt)
+    if (-not $startedValid -or -not $completedValid -or $completedAt -lt $startedAt) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'started_at_utc_or_completed_at_utc.roundtrip_order'
+        return $false
+    }
+    if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.schema_version -Positive) -or [Int64]$Record.schema_version -ne 1 -or
         [string]$Record.record_type -cne $script:D32BoundedDiagnosticArchiveFormatCensusType -or
         [string]$Record.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         [string]$Record.gate_authority -cne 'NONE' -or $Record.formal_phase1_allowed -isnot [bool] -or [bool]$Record.formal_phase1_allowed -or
@@ -3654,18 +3855,36 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         $Record.source_extraction_performed -isnot [bool] -or [bool]$Record.source_extraction_performed -or
         $Record.formal_gate_usable -isnot [bool] -or [bool]$Record.formal_gate_usable -or
         (($Record.primary_error -isnot [string]) -and ($null -ne $Record.primary_error)) -or
-        $Record.secondary_errors -isnot [Array]) { return $false }
+        $Record.secondary_errors -isnot [Array]) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'result.schema_policy_candidate_status_counts_or_payload_fields'
+        return $false
+    }
+    if (@($Record.secondary_errors | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $Record.secondary_errors.Count -gt 64) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'secondary_errors.items_or_count'
+        return $false
+    }
 
     $cargoHome = 'E:\d32\inv7\r\c'
     $archiveRoot = Join-Path $cargoHome 'registry/cache/index.crates.io-1949cf8c6b5b557f'
-    if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Record.census_authority_reference) -or
-        [Int64]$Record.census_authority_reference.bytes -gt 16777216 -or
+    $authorityReferenceFailure = Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Record.census_authority_reference
+    if ($null -ne $authorityReferenceFailure) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "census_authority_reference.$authorityReferenceFailure"
+        return $false
+    }
+    if ([Int64]$Record.census_authority_reference.bytes -gt 16777216 -or
         (Test-D32BoundedCompilerDiagnosticWithin ([string]$Record.census_authority_reference.path) ([string]$Record.source_repo)) -or
-        (Test-D32BoundedCompilerDiagnosticWithin ([string]$Record.census_authority_reference.path) $cargoHome) -or
-        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Record.lock_reference) -or
-        [Int64]$Record.lock_reference.bytes -gt 16777216 -or
+        (Test-D32BoundedCompilerDiagnosticWithin ([string]$Record.census_authority_reference.path) $cargoHome)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'census_authority_reference.bytes_or_external_path'
+        return $false
+    }
+    $lockReferenceFailure = Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Record.lock_reference
+    if ($null -ne $lockReferenceFailure -or [Int64]$Record.lock_reference.bytes -gt 16777216 -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Record.lock_reference.path, [IO.Path]::GetFullPath((Join-Path ([string]$Record.source_repo) 'vita-agent/Cargo.lock'))) -or
-        -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$Record.lock_reference.path) ([string]$Record.source_repo))) { return $false }
+        -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$Record.lock_reference.path) ([string]$Record.source_repo))) {
+        $failure = if ($null -ne $lockReferenceFailure) { $lockReferenceFailure } else { 'bytes_or_canonical_lock_path' }
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "lock_reference.$failure"
+        return $false
+    }
 
     $originFields = @('path', 'volume_serial_hex', 'file_id_hex', 'registry_archive_root')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.dependency_origin $originFields) -or
@@ -3673,7 +3892,10 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         -not (Test-D32BoundedCompilerDiagnosticIdentityPair $Record.dependency_origin) -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.dependency_origin.registry_archive_root @('path', 'volume_serial_hex', 'file_id_hex')) -or
         [string]$Record.dependency_origin.registry_archive_root.path -cne $archiveRoot -or
-        -not (Test-D32BoundedCompilerDiagnosticIdentityPair $Record.dependency_origin.registry_archive_root)) { return $false }
+        -not (Test-D32BoundedCompilerDiagnosticIdentityPair $Record.dependency_origin.registry_archive_root)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'dependency_origin.registry_archive_root_or_identity'
+        return $false
+    }
 
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.historical_origin @('candidate_sha', 'attempt_state', 'fetch_completion', 'gate_authority', 'owner_record', 'blocked_diagnostic')) -or
         [string]$Record.historical_origin.candidate_sha -cne $script:D32BoundedDiagnosticHistoricalInv7CandidateSha -or
@@ -3682,23 +3904,37 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Record.historical_origin.owner_record) -or
         [string]$Record.historical_origin.owner_record.path -cne 'E:\d32\inv7\D32-PHASE0-OWNER.json' -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Record.historical_origin.blocked_diagnostic) -or
-        [string]$Record.historical_origin.blocked_diagnostic.path -cne 'E:\d32\inv7\D32-PHASE0-BLOCKED-DIAGNOSTIC.json') { return $false }
+        [string]$Record.historical_origin.blocked_diagnostic.path -cne 'E:\d32\inv7\D32-PHASE0-BLOCKED-DIAGNOSTIC.json') {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'historical_origin.identity_or_references'
+        return $false
+    }
 
     $expectedPinPaths = @(
         [IO.Path]::GetFullPath((Join-Path ([string]$Record.source_repo) 'scripts/d32-bounded-diagnostic-archive-format-census.ps1')),
         [IO.Path]::GetFullPath((Join-Path ([string]$Record.source_repo) 'scripts/d32-bounded-compiler-diagnostic-policy.ps1')),
         [IO.Path]::GetFullPath((Join-Path ([string]$Record.source_repo) 'scripts/d32-build-toolchain-profile.ps1')),
         [IO.Path]::GetFullPath((Join-Path ([string]$Record.source_repo) 'scripts/d32-powershell-module-authority.ps1')))
-    if ($Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne $expectedPinPaths.Count) { return $false }
+    if ($Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne $expectedPinPaths.Count) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'source_pins.array_or_count'
+        return $false
+    }
     $seenPinPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pinIndex = 0
     foreach ($pin in $Record.source_pins) {
         if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $pin) -or
             [Int64]$pin.bytes -gt 16777216 -or
             -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$pin.path) ([string]$Record.source_repo)) -or
-            -not $seenPinPaths.Add([string]$pin.path)) { return $false }
+            -not $seenPinPaths.Add([string]$pin.path)) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "source_pins[$pinIndex].reference_or_unique_path"
+            return $false
+        }
+        $pinIndex++
     }
     foreach ($expectedPinPath in $expectedPinPaths) {
-        if (@($Record.source_pins | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path, $expectedPinPath) }).Count -ne 1) { return $false }
+        if (@($Record.source_pins | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path, $expectedPinPath) }).Count -ne 1) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "source_pins.expected_path:$expectedPinPath"
+            return $false
+        }
     }
 
     $output = $Record.output_candidate
@@ -3708,21 +3944,40 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$output.path), [string]$output.parent_path) -or
         [string]$output.parent_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$output.parent_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
         (Test-D32BoundedCompilerDiagnosticWithin ([string]$output.path) ([string]$Record.source_repo)) -or
-        (Test-D32BoundedCompilerDiagnosticWithin ([string]$output.path) $cargoHome)) { return $false }
+        (Test-D32BoundedCompilerDiagnosticWithin ([string]$output.path) $cargoHome)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'output_candidate.path_parent_identity_or_externality'
+        return $false
+    }
 
     $budgetFields = @('combined_milliseconds', 'managed_buffer_bytes', 'max_archive_bytes', 'max_archive_expanded_bytes',
         'max_archive_member_bytes', 'max_archive_members', 'max_aggregate_expanded_bytes', 'max_aggregate_members', 'maximum_output_bytes')
-    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.resource_budget $budgetFields)) { return $false }
-    foreach ($budgetField in $budgetFields) { if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.resource_budget.($budgetField) -Positive)) { return $false } }
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.resource_budget $budgetFields)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'resource_budget.property_set'
+        return $false
+    }
+    foreach ($budgetField in $budgetFields) { if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.resource_budget.($budgetField) -Positive)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "resource_budget.$budgetField.integer"
+        return $false
+    } }
     if (
         [Int64]$Record.resource_budget.combined_milliseconds -ne 300000 -or [Int64]$Record.resource_budget.managed_buffer_bytes -ne 536870912 -or
         [Int64]$Record.resource_budget.max_archive_bytes -ne 268435456 -or [Int64]$Record.resource_budget.max_archive_expanded_bytes -ne 1073741824 -or
         [Int64]$Record.resource_budget.max_archive_member_bytes -ne 134217728 -or [Int64]$Record.resource_budget.max_archive_members -ne 10000 -or
         [Int64]$Record.resource_budget.max_aggregate_expanded_bytes -ne 34359738368 -or [Int64]$Record.resource_budget.max_aggregate_members -ne 1000000 -or
-        [Int64]$Record.resource_budget.maximum_output_bytes -ne 67108864) { return $false }
-    foreach ($field in $countFields) { if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.aggregate_format_counts.($field))) { return $false } }
+        [Int64]$Record.resource_budget.maximum_output_bytes -ne 67108864) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'resource_budget.fixed_bound_values'
+        return $false
+    }
+    foreach ($field in $countFields) { if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.aggregate_format_counts.($field))) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "aggregate_format_counts.$field.integer"
+        return $false
+    } }
     $unexamined = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($id in $Record.unexamined_archive_ids) { if ($id -isnot [string] -or -not $unexamined.Add([string]$id)) { return $false } }
+    $unexaminedIndex = 0
+    foreach ($id in $Record.unexamined_archive_ids) { if ($id -isnot [string] -or -not $unexamined.Add([string]$id)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "unexamined_archive_ids[$unexaminedIndex].string_or_unique"
+        return $false
+    }; $unexaminedIndex++ }
     $coverageFields = @('archive_id', 'source', 'name', 'version', 'checksum', 'archive_path', 'archive_bytes', 'archive_sha256',
         'archive_volume_serial_hex', 'archive_file_id_hex', 'opened_archive_bytes', 'opened_archive_sha256',
         'opened_archive_volume_serial_hex', 'opened_archive_file_id_hex', 'status', 'expanded_bytes', 'header_count', 'format_counts',
@@ -3730,9 +3985,13 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
     $coverageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $computedUnexamined = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $actualCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $archiveIndex = 0
     foreach ($archive in $Record.archives) {
-        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $archive $coverageFields) -or
-            $archive.archive_id -isnot [string] -or -not $coverageIds.Add([string]$archive.archive_id) -or
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $archive $coverageFields)) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].property_set"
+            return $false
+        }
+        if ($archive.archive_id -isnot [string] -or -not $coverageIds.Add([string]$archive.archive_id) -or
             [string]$archive.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
             [string]$archive.name -notmatch '^[A-Za-z0-9_-]+$' -or [string]$archive.version -notmatch '^[0-9A-Za-z.+_-]+$' -or
             [string]$archive.archive_id -cne ([string]$archive.name + '@' + [string]$archive.version) -or
@@ -3755,25 +4014,46 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
             $archive.framing_verified -isnot [bool] -or $archive.remainder_unknown -isnot [bool] -or
             (($archive.first_failure_offset -isnot [long] -and $archive.first_failure_offset -isnot [int]) -and ($null -ne $archive.first_failure_offset)) -or
             (($archive.first_failure_header_sha256 -isnot [string]) -and ($null -ne $archive.first_failure_header_sha256)) -or
-            (($archive.first_failure_reason -isnot [string]) -and ($null -ne $archive.first_failure_reason))) { return $false }
-        if ($null -ne $archive.first_failure_offset -and [Int64]$archive.first_failure_offset -lt 0) { return $false }
-        if ($null -ne $archive.first_failure_header_sha256 -and [string]$archive.first_failure_header_sha256 -cnotmatch '^[0-9a-f]{64}$') { return $false }
+            (($archive.first_failure_reason -isnot [string]) -and ($null -ne $archive.first_failure_reason))) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].shape_identity_status_or_scalar_type"
+            return $false
+        }
+        if ($null -ne $archive.first_failure_offset -and [Int64]$archive.first_failure_offset -lt 0) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].first_failure_offset.nonnegative"
+            return $false
+        }
+        if ($null -ne $archive.first_failure_header_sha256 -and [string]$archive.first_failure_header_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].first_failure_header_sha256.lowercase_hex"
+            return $false
+        }
         if ($null -eq $archive.opened_archive_bytes) {
-            if ($null -ne $archive.opened_archive_sha256 -or $null -ne $archive.opened_archive_volume_serial_hex -or $null -ne $archive.opened_archive_file_id_hex) { return $false }
+            if ($null -ne $archive.opened_archive_sha256 -or $null -ne $archive.opened_archive_volume_serial_hex -or $null -ne $archive.opened_archive_file_id_hex) {
+                Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].opened_archive_reference.null_tuple"
+                return $false
+            }
         }
         else {
             if ([Int64]$archive.opened_archive_bytes -le 0 -or [Int64]$archive.opened_archive_bytes -gt 268435456 -or
                 [string]$archive.opened_archive_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
                 [string]$archive.opened_archive_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
-                [string]$archive.opened_archive_file_id_hex -cnotmatch '^[0-9a-f]{32}$') { return $false }
+                [string]$archive.opened_archive_file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+                Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].opened_archive_reference.identity_tuple"
+                return $false
+            }
         }
         foreach ($field in $countFields) {
-            if (-not (Test-D32BoundedCompilerDiagnosticInteger $archive.format_counts.($field))) { return $false }
+            if (-not (Test-D32BoundedCompilerDiagnosticInteger $archive.format_counts.($field))) {
+                Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].format_counts.$field.integer"
+                return $false
+            }
             $actualCounts[$field] = [Int64]$actualCounts[$field] + [Int64]$archive.format_counts.($field)
         }
         $formatTotal = [Int64]$archive.format_counts.ustar_regular + [Int64]$archive.format_counts.ustar_directory +
             [Int64]$archive.format_counts.gnu_regular + [Int64]$archive.format_counts.gnu_directory
-        if ($formatTotal -gt [Int64]$archive.header_count) { return $false }
+        if ($formatTotal -gt [Int64]$archive.header_count) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].format_counts.header_count_bound"
+            return $false
+        }
         if ([string]$archive.status -ceq 'COMPLETE_SUPPORTED') {
             if ($formatTotal -ne [Int64]$archive.header_count -or [bool]$archive.remainder_unknown -or -not [bool]$archive.framing_verified -or
                 [string]$archive.header_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
@@ -3782,28 +4062,53 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
                 [string]$archive.opened_archive_volume_serial_hex -cne [string]$archive.archive_volume_serial_hex -or
                 [string]$archive.opened_archive_file_id_hex -cne [string]$archive.archive_file_id_hex -or
                 $null -ne $archive.first_failure_reason -or $null -ne $archive.first_failure_offset -or
-                $null -ne $archive.first_failure_header_sha256) { return $false }
+                $null -ne $archive.first_failure_header_sha256) {
+                Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].complete_status_invariants"
+                return $false
+            }
         }
         else {
-            if (-not [bool]$archive.remainder_unknown -or [string]$archive.first_failure_reason -notlike 'D32_BOUNDED_DIAGNOSTIC_CENSUS_*:*') { return $false }
+            if (-not [bool]$archive.remainder_unknown -or [string]$archive.first_failure_reason -notlike 'D32_BOUNDED_DIAGNOSTIC_CENSUS_*:*') {
+                Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].blocked_status_remainder_or_first_failure_reason"
+                return $false
+            }
             if ([string]$archive.status -ceq 'UNEXAMINED') { [void]$computedUnexamined.Add([string]$archive.archive_id) }
         }
+        $archiveIndex++
     }
     if ($unexamined.Count -ne $computedUnexamined.Count -or
         @($unexamined | Where-Object { -not $computedUnexamined.Contains($_) }).Count -ne 0 -or
         [Int64]$Record.covered_archive_count -ne @($Record.archives | Where-Object { [string]$_.status -cne 'UNEXAMINED' }).Count -or
-        [Int64]$Record.blocked_archive_count -ne @($Record.archives | Where-Object { [string]$_.status -cin @('UNSUPPORTED', 'PREFLIGHT_BLOCKED') }).Count) { return $false }
-    foreach ($field in $countFields) { if ([Int64]$Record.aggregate_format_counts.($field) -ne [Int64]$actualCounts[$field]) { return $false } }
+        [Int64]$Record.blocked_archive_count -ne @($Record.archives | Where-Object { [string]$_.status -cin @('UNSUPPORTED', 'PREFLIGHT_BLOCKED') }).Count) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'coverage_counts_or_unexamined_archive_ids'
+        return $false
+    }
+    foreach ($field in $countFields) { if ([Int64]$Record.aggregate_format_counts.($field) -ne [Int64]$actualCounts[$field]) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "aggregate_format_counts.$field.coverage_sum"
+        return $false
+    } }
     $expectedArchiveDigest = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($Record.archives)
-    if ([string]$Record.archive_header_inventory_sha256 -cne $expectedArchiveDigest) { return $false }
+    if ([string]$Record.archive_header_inventory_sha256 -cne $expectedArchiveDigest) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'archive_header_inventory_sha256.coverage_digest'
+        return $false
+    }
     if ([string]$Record.status -ceq 'COMPLETE_DIAGNOSTIC' -and
         ([Int64]$Record.covered_archive_count -ne [Int64]$Record.requested_archive_count -or [Int64]$Record.blocked_archive_count -ne 0 -or
          [Int64]$Record.unexamined_archive_count -ne 0 -or @($Record.archives | Where-Object { [string]$_.status -cne 'COMPLETE_SUPPORTED' }).Count -ne 0 -or
-         $null -ne $Record.primary_error)) { return $false }
+         $null -ne $Record.primary_error)) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'status.COMPLETE_DIAGNOSTIC.coverage_or_primary_error'
+        return $false
+    }
     if ([string]$Record.status -ceq 'BLOCKED' -and ([Int64]$Record.blocked_archive_count -eq 0 -or
-        [String]::IsNullOrWhiteSpace([string]$Record.primary_error))) { return $false }
+        [String]::IsNullOrWhiteSpace([string]$Record.primary_error))) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'status.BLOCKED.blocked_count_or_primary_error'
+        return $false
+    }
     if ([string]$Record.status -ceq 'BUDGET_STOPPED' -and
-        ([Int64]$Record.unexamined_archive_count -eq 0 -and @($Record.archives | Where-Object { [string]$_.status -cne 'BUDGET_STOPPED' }).Count -eq 0 -or
-         [String]::IsNullOrWhiteSpace([string]$Record.primary_error))) { return $false }
+        (@($Record.archives | Where-Object { [string]$_.status -ceq 'BUDGET_STOPPED' }).Count -eq 0 -and [Int64]$Record.unexamined_archive_count -eq 0 -or
+         [String]::IsNullOrWhiteSpace([string]$Record.primary_error))) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'status.BUDGET_STOPPED.budget_row_unexamined_or_primary_error'
+        return $false
+    }
     return $true
 }

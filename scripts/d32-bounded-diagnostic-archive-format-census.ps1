@@ -34,44 +34,6 @@ function Test-D32ArchiveCensusFileReferenceExact {
         [string]$Actual.file_id_hex -ceq [string]$Expected.file_id_hex)
 }
 
-function New-D32ArchiveCensusCoverageRow {
-    param(
-        [Parameter(Mandatory = $true)][object]$Archive,
-        [Parameter(Mandatory = $true)][string]$Status,
-        [AllowNull()][object]$OpenedReference,
-        [AllowNull()][object]$Inventory,
-        [AllowNull()][string]$FailureReason
-    )
-    $zeroCounts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
-    $counts = if ($null -eq $Inventory) { $zeroCounts } else { $Inventory.format_counts }
-    return [PSCustomObject][ordered]@{
-        archive_id = [string]$Archive.name + '@' + [string]$Archive.version
-        source = [string]$Archive.source; name = [string]$Archive.name; version = [string]$Archive.version
-        checksum = [string]$Archive.checksum; archive_path = [string]$Archive.path; archive_bytes = [Int64]$Archive.bytes
-        archive_sha256 = [string]$Archive.sha256; archive_volume_serial_hex = [string]$Archive.volume_serial_hex
-        archive_file_id_hex = [string]$Archive.file_id_hex
-        opened_archive_bytes = if ($null -eq $OpenedReference) { $null } else { [Int64]$OpenedReference.bytes }
-        opened_archive_sha256 = if ($null -eq $OpenedReference) { $null } else { [string]$OpenedReference.sha256 }
-        opened_archive_volume_serial_hex = if ($null -eq $OpenedReference) { $null } else { [string]$OpenedReference.volume_serial_hex }
-        opened_archive_file_id_hex = if ($null -eq $OpenedReference) { $null } else { [string]$OpenedReference.file_id_hex }
-        status = $Status
-        expanded_bytes = if ($null -eq $Inventory) { 0L } else { [Int64]$Inventory.expanded_bytes }
-        header_count = if ($null -eq $Inventory) { 0L } else { [Int64]$Inventory.header_count }
-        format_counts = $counts
-        header_inventory_sha256 = if ($null -eq $Inventory) { $null } else { $Inventory.header_inventory_sha256 }
-        framing_verified = if ($null -eq $Inventory) { $false } else { [bool]$Inventory.framing_verified }
-        remainder_unknown = ($Status -cne 'COMPLETE_SUPPORTED')
-        first_failure_offset = if ($null -eq $Inventory) { $null } else { $Inventory.first_failure_offset }
-        first_failure_header_sha256 = if ($null -eq $Inventory) { $null } else { $Inventory.first_failure_header_sha256 }
-        first_failure_reason = if ($null -ne $FailureReason) { $FailureReason } elseif ($null -eq $Inventory) { $null } else { $Inventory.first_failure_reason }
-    }
-}
-
-function New-D32ArchiveCensusUnexaminedRow {
-    param([Parameter(Mandatory = $true)][object]$Archive, [Parameter(Mandatory = $true)][string]$Reason)
-    return New-D32ArchiveCensusCoverageRow -Archive $Archive -Status 'UNEXAMINED' -OpenedReference $null -Inventory $null -FailureReason $Reason
-}
-
 function Assert-D32ArchiveCensusDirectoryIdentity {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$VolumeSerialHex, [Parameter(Mandatory = $true)][string]$FileIdHex)
     $identity = Get-D32ProfileDirectoryIdentity -Path $Path
@@ -203,7 +165,6 @@ finally {
 
 $coverage = [System.Collections.Generic.List[object]]::new()
 $secondaryErrors = [System.Collections.Generic.List[string]]::new()
-$aggregateCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
 $aggregateExpanded = [Int64]0
 $aggregateMembers = [Int64]0
 $blocked = $false
@@ -217,7 +178,7 @@ for ($archiveIndex = 0; $archiveIndex -lt $archives.Count; $archiveIndex++) {
         $aggregateMembers -ge [Int64]$authorityDocument.resource_budget.max_aggregate_members) {
         $budgetStopped = $true
         for ($remainingIndex = $archiveIndex; $remainingIndex -lt $archives.Count; $remainingIndex++) {
-            $coverage.Add((New-D32ArchiveCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite global budget ended before this archive'))
+            $coverage.Add((New-D32BoundedDiagnosticArchiveFormatCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite global budget ended before this archive'))
         }
         break
     }
@@ -281,14 +242,11 @@ for ($archiveIndex = 0; $archiveIndex -lt $archives.Count; $archiveIndex++) {
     if ($null -ne $inventory) {
         $aggregateExpanded += [Int64]$inventory.expanded_bytes
         $aggregateMembers += [Int64]$inventory.member_count
-        foreach ($formatName in @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')) {
-            $aggregateCounts[$formatName] = [Int64]$aggregateCounts[$formatName] + [Int64]$inventory.format_counts.($formatName)
-        }
     }
     if ($null -eq $failureReason -and $rowStatus -cne 'COMPLETE_SUPPORTED') {
         $failureReason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: archive could not be fully covered under the approved format policy'
     }
-    $coverage.Add((New-D32ArchiveCensusCoverageRow -Archive $archive -Status $rowStatus -OpenedReference $openedReference -Inventory $inventory -FailureReason $failureReason))
+    $coverage.Add((New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $archive -Status $rowStatus -OpenedReference $openedReference -Inventory $inventory -FailureReason $failureReason))
     if ($null -ne $failureReason -and $secondaryErrors.Count -lt 64) { $secondaryErrors.Add($failureReason) }
     if ($rowStatus -ceq 'PREFLIGHT_BLOCKED') {
         try {
@@ -299,14 +257,14 @@ for ($archiveIndex = 0; $archiveIndex -lt $archives.Count; $archiveIndex++) {
         catch {
             $globalRootFailure = $true
             for ($remainingIndex = $archiveIndex + 1; $remainingIndex -lt $archives.Count; $remainingIndex++) {
-                $coverage.Add((New-D32ArchiveCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: root identity changed; later references were not opened'))
+                $coverage.Add((New-D32BoundedDiagnosticArchiveFormatCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: root identity changed; later references were not opened'))
             }
             break
         }
     }
     if ($rowStatus -ceq 'BUDGET_STOPPED') {
         for ($remainingIndex = $archiveIndex + 1; $remainingIndex -lt $archives.Count; $remainingIndex++) {
-            $coverage.Add((New-D32ArchiveCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite global budget ended before this archive'))
+            $coverage.Add((New-D32BoundedDiagnosticArchiveFormatCensusUnexaminedRow -Archive $archives[$remainingIndex] -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite global budget ended before this archive'))
         }
         break
     }
@@ -393,46 +351,41 @@ else {
     }
 }
 
-$unexaminedIds = @($coverage | Where-Object { [string]$_.status -ceq 'UNEXAMINED' } | ForEach-Object { [string]$_.archive_id })
 $blockedCount = @($coverage | Where-Object { [string]$_.status -cin @('UNSUPPORTED', 'PREFLIGHT_BLOCKED') }).Count
 $resultStatus = if ($budgetStopped) { 'BUDGET_STOPPED' } elseif ($blocked -or $globalRootFailure -or $blockedCount -gt 0) { 'BLOCKED' } else { 'COMPLETE_DIAGNOSTIC' }
 $primaryError = if ($resultStatus -ceq 'COMPLETE_DIAGNOSTIC') { $null }
     elseif ($secondaryErrors.Count -gt 0) { [string]$secondaryErrors[0] }
     elseif ($resultStatus -ceq 'BUDGET_STOPPED') { 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: one or more caller-pinned archive references remain unexamined' }
     else { 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: one or more caller-pinned archives did not satisfy strict format/identity coverage' }
-$result = [PSCustomObject][ordered]@{
-    schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType
-    registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'
-    formal_phase1_allowed = $false; formal_aggregate_allowed = $false; source_proof_checkpoint = $false
-    diagnostic_invocation_authority = 'NONE'; status = $resultStatus
-    candidate_sha = [string]$authorityDocument.candidate_sha; source_repo = [string]$authorityDocument.source_repo
-    source_plan_semantics_version = [Int64]$authorityDocument.source_plan_semantics_version
-    semantic_scope = [string]$authorityDocument.semantic_scope; registry_tuple_sha256 = [string]$authorityDocument.registry_tuple_sha256
-    repository_identity = $authorityDocument.repository_identity
-    census_authority_reference = $authorityFile.Record
-    lock_reference = $authorityDocument.lock_reference; dependency_origin = $authorityDocument.dependency_origin
-    historical_origin = $authorityDocument.historical_origin; source_pins = @($authorityDocument.source_pins)
-    output_candidate = $authorityDocument.output_candidate; resource_budget = $authorityDocument.resource_budget
-    run_id = [string]$authorityDocument.run_id; started_at_utc = $censusStartedAtUtc
-    completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o'); elapsed_milliseconds = [Int64]$censusTimer.ElapsedMilliseconds
-    requested_archive_count = [Int64]$archives.Count; covered_archive_count = [Int64](@($coverage | Where-Object { [string]$_.status -cne 'UNEXAMINED' }).Count)
-    blocked_archive_count = [Int64]$blockedCount; unexamined_archive_count = [Int64]$unexaminedIds.Count
-    archives = @($coverage.ToArray()); unexamined_archive_ids = $unexaminedIds
-    aggregate_format_counts = [PSCustomObject][ordered]@{
-        ustar_regular = [Int64]$aggregateCounts.ustar_regular; ustar_directory = [Int64]$aggregateCounts.ustar_directory
-        gnu_regular = [Int64]$aggregateCounts.gnu_regular; gnu_directory = [Int64]$aggregateCounts.gnu_directory
-    }
-    archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($coverage.ToArray())
-    payload_read_and_discarded = $true; payload_hashed = $false; payload_retained = $false; source_extraction_performed = $false
-    formal_gate_usable = $false; primary_error = $primaryError; secondary_errors = @($secondaryErrors.ToArray())
+$authorityReference = [PSCustomObject][ordered]@{
+    path = [string]$authorityFile.Record.path; bytes = [Int64]$authorityFile.Record.bytes
+    sha256 = [string]$authorityFile.Record.sha256; volume_serial_hex = [string]$authorityFile.Record.volume_serial_hex
+    file_id_hex = [string]$authorityFile.Record.file_id_hex
 }
-if (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $result)) {
-    throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: result failed its own strict non-gating coverage schema'
+$result = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $authorityDocument -AuthorityReference $authorityReference `
+    -Status $resultStatus -StartedAtUtc $censusStartedAtUtc -CompletedAtUtc ([DateTimeOffset]::UtcNow.ToString('o')) `
+    -ElapsedMilliseconds ([Int64]$censusTimer.ElapsedMilliseconds) -Archives ([object[]]$coverage.ToArray()) `
+    -PrimaryError $primaryError -SecondaryErrors ([string[]]$secondaryErrors.ToArray())
+$resultValidationFailures = [System.Collections.Generic.List[string]]::new()
+if (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $result -FailureReasons $resultValidationFailures)) {
+    $validationReason = if ($resultValidationFailures.Count -gt 0) { $resultValidationFailures -join '; ' } else { 'validator returned false without a reason' }
+    $firstCoverage = if ($result.archives.Count -gt 0) { [string]$result.archives[0].status + ':' + [string]$result.archives[0].archive_id } else { 'none' }
+    throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: result self-validation failed; validator=' + $validationReason +
+        '; primary_error=' + [string]$result.primary_error + '; requested=' + [Int64]$result.requested_archive_count +
+        '; covered=' + [Int64]$result.covered_archive_count + '; blocked=' + [Int64]$result.blocked_archive_count +
+        '; unexamined=' + [Int64]$result.unexamined_archive_count + '; first_coverage=' + $firstCoverage +
+        '; coverage_sha256=' + [string]$result.archive_header_inventory_sha256)
 }
-$resultJson = ConvertTo-Json -InputObject $result -Depth 100 -Compress -ErrorAction Stop
+$resultFailureContext = '; primary_error=' + [string]$result.primary_error +
+    '; requested=' + [Int64]$result.requested_archive_count + '; covered=' + [Int64]$result.covered_archive_count +
+    '; blocked=' + [Int64]$result.blocked_archive_count + '; unexamined=' + [Int64]$result.unexamined_archive_count +
+    '; coverage_sha256=' + [string]$result.archive_header_inventory_sha256
+try { $resultJson = ConvertTo-Json -InputObject $result -Depth 100 -Compress -ErrorAction Stop }
+catch { throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: result serialization failed: ' + $_.Exception.Message + $resultFailureContext) }
 $resultBytes = [Text.UTF8Encoding]::new($false).GetBytes($resultJson)
 if ([Int64]$resultBytes.Length -gt [Int64]$authorityDocument.resource_budget.maximum_output_bytes) {
-    throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: result exceeds its fixed 64 MiB persistence bound'
+    throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: result exceeds its fixed 64 MiB persistence bound; output_bytes=' +
+        [Int64]$resultBytes.Length + $resultFailureContext)
 }
 $null = Assert-D32ArchiveCensusDirectoryIdentity -Path ([string]$authorityDocument.output_candidate.parent_path) `
     -VolumeSerialHex ([string]$authorityDocument.output_candidate.parent_volume_serial_hex) `
@@ -443,11 +396,46 @@ if (Test-Path -LiteralPath ([string]$authorityDocument.output_candidate.path)) {
 $resultStream = [IO.FileStream]::new([string]$authorityDocument.output_candidate.path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
 try { $resultStream.Write($resultBytes, 0, $resultBytes.Length); $resultStream.Flush($true) }
 finally { $resultStream.Dispose() }
-$resultSnapshot = Get-D32ProfileFileSnapshot -Path ([string]$authorityDocument.output_candidate.path)
-if ([Int64]$resultSnapshot.Bytes -ne [Int64]$resultBytes.Length -or
-    [string]$resultSnapshot.Sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($resultBytes)).ToLowerInvariant()) {
-    throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: newly persisted result bytes differ from the validated in-memory document'
+$persistedResult = $null
+try {
+    $persistedResult = Open-D32PowerShellAuthorityFile -Path ([string]$authorityDocument.output_candidate.path) `
+        -DirectoryFences $fences -MaximumBytes ([Int64]$authorityDocument.resource_budget.maximum_output_bytes)
+    $expectedResultSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($resultBytes)).ToLowerInvariant()
+    if ([Int64]$persistedResult.Record.bytes -ne [Int64]$resultBytes.Length -or [string]$persistedResult.Record.sha256 -cne $expectedResultSha256) {
+        throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: persisted result bytes differ from producer output; primary_error=' +
+            [string]$result.primary_error + '; expected_bytes=' + $resultBytes.Length + '; actual_bytes=' + $persistedResult.Record.bytes +
+            '; expected_sha256=' + $expectedResultSha256 + '; actual_sha256=' + [string]$persistedResult.Record.sha256)
+    }
+    $readBackText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$persistedResult.Bytes)
+    $readBackJson = [System.Text.Json.JsonDocument]::Parse($readBackText)
+    try {
+        if ($readBackJson.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
+            (Test-D32PowerShellAuthorityJsonDuplicates -Element $readBackJson.RootElement)) {
+            throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: persisted result JSON root/duplicate-key check failed' + $resultFailureContext)
+        }
+        $readBackResult = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $readBackJson.RootElement
+    }
+    finally { $readBackJson.Dispose() }
+    $readBackValidationFailures = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $readBackResult -FailureReasons $readBackValidationFailures)) {
+        $validationReason = if ($readBackValidationFailures.Count -gt 0) { $readBackValidationFailures -join '; ' } else { 'validator returned false without a reason' }
+        throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: serialized result readback rejected; validator=' + $validationReason +
+            '; primary_error=' + [string]$result.primary_error + '; requested=' + [Int64]$result.requested_archive_count +
+            '; covered=' + [Int64]$result.covered_archive_count + '; blocked=' + [Int64]$result.blocked_archive_count +
+            '; unexamined=' + [Int64]$result.unexamined_archive_count + '; coverage_sha256=' + [string]$result.archive_header_inventory_sha256)
+    }
+    $authorityCoverageFailures = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $readBackResult -Authority $authorityDocument `
+        -ExpectedAuthorityReference $authorityReference -FailureReasons $authorityCoverageFailures)) {
+        $bindingReason = if ($authorityCoverageFailures.Count -gt 0) { $authorityCoverageFailures -join '; ' } else { 'authority binding returned false without a reason' }
+        throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: serialized result archive coverage differs from the caller-pinned finite authority; validator=' +
+            $bindingReason + '; primary_error=' + [string]$result.primary_error + '; requested=' + [Int64]$result.requested_archive_count +
+            '; covered=' + [Int64]$result.covered_archive_count + '; unexamined=' + [Int64]$result.unexamined_archive_count +
+            '; coverage_sha256=' + [string]$result.archive_header_inventory_sha256)
+    }
+    $result = $readBackResult
 }
+finally { if ($null -ne $persistedResult -and $null -ne $persistedResult.Stream) { $persistedResult.Stream.Dispose() } }
 Write-Output ('D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS: status=' + [string]$result.status + '; run_id=' + [string]$result.run_id +
-    '; path=' + [string]$authorityDocument.output_candidate.path + '; bytes=' + [Int64]$resultSnapshot.Bytes + '; sha256=' + [string]$resultSnapshot.Sha256)
+    '; path=' + [string]$authorityDocument.output_candidate.path + '; bytes=' + [Int64]$persistedResult.Record.bytes + '; sha256=' + [string]$persistedResult.Record.sha256)
 foreach ($fence in $fences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }

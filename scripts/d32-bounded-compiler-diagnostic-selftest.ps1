@@ -8,6 +8,21 @@ function Assert-D32BoundedCompilerDiagnosticSelfTest {
     if (-not $Condition) { throw "D32_BOUNDED_COMPILER_DIAGNOSTIC_SELFTEST_FAILED: $Name" }
 }
 
+function ConvertFrom-D32BoundedCompilerDiagnosticTestJson {
+    param([Parameter(Mandatory = $true)][string]$Json)
+    $document = [System.Text.Json.JsonDocument]::Parse($Json)
+    try {
+        if ((Test-D32PowerShellAuthorityJsonDuplicates -Element $document.RootElement)) { throw 'synthetic JSON fixture has duplicate property names' }
+        return ConvertFrom-D32PowerShellAuthorityJsonElement -Element $document.RootElement
+    }
+    finally { $document.Dispose() }
+}
+
+function Copy-D32BoundedCompilerDiagnosticTestJson {
+    param([Parameter(Mandatory = $true)][object]$Record)
+    return ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json (ConvertTo-Json -InputObject $Record -Depth 100 -Compress -ErrorAction Stop)
+}
+
 function Set-D32BoundedCompilerDiagnosticTestTarText {
     param([byte[]]$Header, [int]$Offset, [int]$Length, [string]$Value)
     $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
@@ -1507,19 +1522,24 @@ $authorityShapeCopyAst = $moduleAuthorityAst.Find({ param($node)
 $authoritySerializerAst = $moduleAuthorityAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'ConvertTo-D32PowerShellAuthorityJsonText'
 }, $true)
+$authorityDuplicateCheckerAst = $moduleAuthorityAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32PowerShellAuthorityJsonDuplicates'
+}, $true)
 $authorityDecoderAstContract = $moduleAuthorityParseErrors.Count -eq 0 -and $authorityDecoderAsts.Count -eq 1 -and
     $authorityShapeDecoderAsts.Count -eq 1 -and $null -ne $authorityShapeCopyAst -and $null -ne $authoritySerializerAst -and
+    $null -ne $authorityDuplicateCheckerAst -and
     $authorityShapeCopyAst.Extent.Text.Contains('ConvertFrom-D32PowerShellAuthorityJsonShapeElement') -and
     -not $authorityShapeCopyAst.Extent.Text.Contains('ConvertFrom-D32PowerShellAuthorityJsonElement')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'canonical authority decoder is not overwritten by the separate ordered-dictionary SelfTest shape decoder' $authorityDecoderAstContract
 
-# Evaluate only the four pure JSON conversion functions extracted from their
+# Evaluate only the pure JSON conversion and duplicate-check functions extracted from their
 # ASTs. This exercises the implementation without dot-sourcing the authority
 # module or invoking any file/native/process helpers.
 Invoke-Expression $authoritySerializerAst.Extent.Text
 Invoke-Expression $authorityDecoderAsts[0].Extent.Text
 Invoke-Expression $authorityShapeDecoderAsts[0].Extent.Text
 Invoke-Expression $authorityShapeCopyAst.Extent.Text
+Invoke-Expression $authorityDuplicateCheckerAst.Extent.Text
 $sourceProofRoundTripJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProofAuthority
 $sourceProofRoundTripDocument = [System.Text.Json.JsonDocument]::Parse($sourceProofRoundTripJson)
 try { $sourceProofRoundTrip = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $sourceProofRoundTripDocument.RootElement }
@@ -1864,61 +1884,61 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority exact-shape valida
     ($censusAuthorityMissingFieldRejected -and $censusAuthorityExtraFieldRejected -and
      (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityFixture -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$censusAuthorityRoundtrip = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress) -ErrorAction Stop
+$censusAuthorityRoundtrip = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress -ErrorAction Stop)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority exact finite schema survives canonical JSON serialization/deserialization' `
     (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityRoundtrip -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture)
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects policy substitution rather than widening/rewriting the approved format contract' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.source_plan_semantics_version = 1
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects old source-plan semantics and cannot reuse legacy V1 closure evidence' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.candidate_sha = '2' * 40
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects candidate rebind and exact candidate SHA substitution' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.dependency_origin.registry_archive_root.path += '-sibling'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive-root suffix sibling and does not infer trust from directory-name suffix' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.archive_refs[0].path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f-sibling\layout-crate-1.2.3.crate'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive path outside the exact pinned cache root even when its basename matches' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.source_pins[0].path = Join-Path $testRepo 'scripts\d32-bounded-compiler-diagnostic.ps1'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects substituting a source pin for the exact census entry path' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.lock_reference.path = Join-Path $testRepo 'vita-agent/Cargo.toml'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects manifest-as-lock path substitution' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.archive_refs[0].bytes = 268435457L
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects oversized archive reference before any file open' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.resource_budget.max_archive_members = 10001
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects expanded member-count budget and never accepts caller-supplied larger limits' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.output_candidate.path = 'C:\d32-diagnostic-policy-test\repo\result.json'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects an output path overlapping the candidate repository' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.archive_refs = @()
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects an empty finite archive set instead of treating empty coverage as success' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
@@ -1927,87 +1947,144 @@ $tooManyArchiveRefs = [System.Collections.Generic.List[object]]::new()
 for ($archiveIndex = 0; $archiveIndex -lt 1116; $archiveIndex++) {
     $tooManyArchiveRefs.Add((New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name 'crate' -Version ('1.0.' + $archiveIndex) -Sha256 ('a' * 64)))
 }
-$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
 $badCensusAuthority.archive_refs = @($tooManyArchiveRefs.ToArray())
 Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive reference set above the frozen 1115-package maximum' `
     (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
         -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
 
-$censusCompleteArchiveRow = [PSCustomObject][ordered]@{
-    archive_id = [string]$censusArchiveFixture.name + '@' + [string]$censusArchiveFixture.version
-    source = [string]$censusArchiveFixture.source; name = [string]$censusArchiveFixture.name; version = [string]$censusArchiveFixture.version
-    checksum = [string]$censusArchiveFixture.checksum; archive_path = [string]$censusArchiveFixture.path; archive_bytes = [Int64]$censusArchiveFixture.bytes
-    archive_sha256 = [string]$censusArchiveFixture.sha256; archive_volume_serial_hex = [string]$censusArchiveFixture.volume_serial_hex
-    archive_file_id_hex = [string]$censusArchiveFixture.file_id_hex; opened_archive_bytes = [Int64]$censusArchiveFixture.bytes
-    opened_archive_sha256 = [string]$censusArchiveFixture.sha256; opened_archive_volume_serial_hex = [string]$censusArchiveFixture.volume_serial_hex
-    opened_archive_file_id_hex = [string]$censusArchiveFixture.file_id_hex; status = 'COMPLETE_SUPPORTED'
+$censusCompleteInventory = [PSCustomObject][ordered]@{
     expanded_bytes = [Int64]$layoutScan.expanded_bytes; header_count = [Int64]$layoutScan.header_count
     format_counts = $layoutScan.format_counts; header_inventory_sha256 = [string]$layoutScan.header_inventory_sha256
-    framing_verified = $true; remainder_unknown = $false; first_failure_offset = $null; first_failure_header_sha256 = $null; first_failure_reason = $null
+    framing_verified = $true; first_failure_offset = $null; first_failure_header_sha256 = $null; first_failure_reason = $null
 }
-$censusCompleteResultFixture = [PSCustomObject][ordered]@{
-    schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType; registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
-    gate_authority = 'NONE'; formal_phase1_allowed = $false; formal_aggregate_allowed = $false; source_proof_checkpoint = $false
-    diagnostic_invocation_authority = 'NONE'; status = 'COMPLETE_DIAGNOSTIC'; candidate_sha = $testCandidate; source_repo = $testRepo
-    source_plan_semantics_version = 2L; semantic_scope = [string]$censusAuthorityFixture.semantic_scope
-    registry_tuple_sha256 = [string]$censusAuthorityFixture.registry_tuple_sha256
-    repository_identity = $censusAuthorityFixture.repository_identity
-    census_authority_reference = (New-D32BoundedCompilerDiagnosticTestReference 'C:\d32-diagnostic-policy-test\external\archive-census\authority.json')
-    lock_reference = $censusAuthorityFixture.lock_reference; dependency_origin = $censusAuthorityFixture.dependency_origin
-    historical_origin = $censusAuthorityFixture.historical_origin; source_pins = @($censusAuthorityFixture.source_pins)
-    output_candidate = $censusAuthorityFixture.output_candidate; resource_budget = $censusAuthorityFixture.resource_budget
-    run_id = 'b' * 32; started_at_utc = '2026-10-05T00:00:00.0000000+00:00'; completed_at_utc = '2026-10-05T00:00:01.0000000+00:00'
-    elapsed_milliseconds = 1000L; requested_archive_count = 1L; covered_archive_count = 1L; blocked_archive_count = 0L; unexamined_archive_count = 0L
-    archives = @($censusCompleteArchiveRow); unexamined_archive_ids = @()
-    aggregate_format_counts = $layoutScan.format_counts
-    archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($censusCompleteArchiveRow)
-    payload_read_and_discarded = $true; payload_hashed = $false; payload_retained = $false; source_extraction_performed = $false
-    formal_gate_usable = $false; primary_error = $null; secondary_errors = @()
+$censusCompleteOpenedReference = [PSCustomObject][ordered]@{
+    bytes = [Int64]$censusArchiveFixture.bytes; sha256 = [string]$censusArchiveFixture.sha256
+    volume_serial_hex = [string]$censusArchiveFixture.volume_serial_hex; file_id_hex = [string]$censusArchiveFixture.file_id_hex
 }
-Assert-D32BoundedCompilerDiagnosticSelfTest 'source-only census result is exact-schema, JSON-roundtrippable, complete-only-if-every-reference-is-supported, non-formal, and inventory-digest bound' `
-    ((Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $censusCompleteResultFixture) -and
-     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record (ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress))) -and
-     -not $censusCompleteResultFixture.formal_gate_usable -and -not $censusCompleteResultFixture.source_proof_checkpoint)
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$censusCompleteArchiveRow = New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $censusArchiveFixture `
+    -Status 'COMPLETE_SUPPORTED' -OpenedReference $censusCompleteOpenedReference -Inventory $censusCompleteInventory -FailureReason $null
+$censusAuthorityReferenceFixture = New-D32BoundedCompilerDiagnosticTestReference 'C:\d32-diagnostic-policy-test\external\archive-census\authority.json'
+$censusCompleteResultFixture = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $censusAuthorityFixture `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'COMPLETE_DIAGNOSTIC' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives @($censusCompleteArchiveRow) -PrimaryError $null -SecondaryErrors @()
+$censusResultFailures = [System.Collections.Generic.List[string]]::new()
+$censusResultValid = Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $censusCompleteResultFixture -FailureReasons $censusResultFailures
+$censusResultReadback = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress -ErrorAction Stop)
+$censusReadbackFailures = [System.Collections.Generic.List[string]]::new()
+$censusReadbackValid = Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $censusResultReadback -FailureReasons $censusReadbackFailures
+$censusCoverageFailures = [System.Collections.Generic.List[string]]::new()
+$censusAuthorityCoverageValid = Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $censusResultReadback `
+    -Authority $censusAuthorityFixture -ExpectedAuthorityReference $censusAuthorityReferenceFixture -FailureReasons $censusCoverageFailures
+Assert-D32BoundedCompilerDiagnosticSelfTest 'actual census coverage-row and result builders produce a strict object that survives JSON readback and binds each row to the finite authority set' `
+    ($censusResultValid -and $censusReadbackValid -and $censusAuthorityCoverageValid -and $censusResultFailures.Count -eq 0 -and $censusReadbackFailures.Count -eq 0)
+$badCensusResult = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusCompleteResultFixture
 $badCensusResult.PSObject.Properties.Remove('run_id')
-$censusResultMissingFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult)
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$censusResultMissingFieldFailures = [System.Collections.Generic.List[string]]::new()
+$censusResultMissingFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult -FailureReasons $censusResultMissingFieldFailures)
+$badCensusResult = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusCompleteResultFixture
 $badCensusResult | Add-Member -NotePropertyName unexpected_result_field -NotePropertyValue 'must fail closed'
 $censusResultExtraFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult)
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result exact schema rejects missing and extra top-level fields' ($censusResultMissingFieldRejected -and $censusResultExtraFieldRejected)
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.archive_header_inventory_sha256 = '0' * 64
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects substituted top-level whole-coverage digest' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.archives[0].header_inventory_sha256 = '0' * 64
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects a substituted per-archive header inventory digest when its whole-coverage binding is unchanged' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.archives[0].header_count += 1
-$badCensusResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($badCensusResult.archives)
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects header-count substitution against four per-format counts' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.archives[0].format_counts.gnu_regular = 0
-$badCensusResult.aggregate_format_counts.gnu_regular = 0
-$badCensusResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($badCensusResult.archives)
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects format-count substitution against scanner header total' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1'
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects registry policy substitution' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.source_proof_checkpoint = $true
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects any claim to be source-proof checkpoint or formal completion' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.dependency_origin.registry_archive_root.path += '-sibling'
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rebind to a sibling archive-root path is rejected even when root identity strings remain well-formed' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.source_pins[0].path = Join-Path $testRepo 'scripts/d32-bounded-compiler-diagnostic.ps1'
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result requires the exact census entry source pin, not a same-repository substitute' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.resource_budget.combined_milliseconds = 300001
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects resource budget expansion beyond the approved aggregate deadline' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
-$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$badCensusResult.output_candidate.path = Join-Path $testRepo 'output.json'
-Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects output authority rebound inside the repository' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result exact schema rejects missing and extra top-level fields with a field-set diagnostic' `
+    ($censusResultMissingFieldRejected -and $censusResultExtraFieldRejected -and $censusResultMissingFieldFailures[0] -like 'result.property_set.*')
+$orderedReferenceResult = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusCompleteResultFixture
+$orderedReferenceResult.census_authority_reference = [ordered]@{
+    path = [string]$censusAuthorityReferenceFixture.path; bytes = [Int64]$censusAuthorityReferenceFixture.bytes
+    sha256 = [string]$censusAuthorityReferenceFixture.sha256; volume_serial_hex = [string]$censusAuthorityReferenceFixture.volume_serial_hex
+    file_id_hex = [string]$censusAuthorityReferenceFixture.file_id_hex
+}
+$orderedReferenceFailures = [System.Collections.Generic.List[string]]::new()
+$orderedReferenceAccepted = Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $orderedReferenceResult -FailureReasons $orderedReferenceFailures
+Assert-D32BoundedCompilerDiagnosticSelfTest 'the prior Open authority ordered-dictionary shape fails with an exact census_authority_reference diagnostic while the real producer emits PSCustomObject' `
+    (-not $orderedReferenceAccepted -and $orderedReferenceFailures.Count -eq 1 -and
+     $orderedReferenceFailures[0] -ceq 'census_authority_reference.property_set_is_not_exact' -and
+     $censusCompleteResultFixture.census_authority_reference -is [PSCustomObject])
+
+$censusResultMutationCases = @(
+    [PSCustomObject]@{ name = 'top-level coverage digest'; mutate = { param($r) $r.archive_header_inventory_sha256 = '0' * 64 } },
+    [PSCustomObject]@{ name = 'per-archive header digest'; mutate = { param($r) $r.archives[0].header_inventory_sha256 = '0' * 64 } },
+    [PSCustomObject]@{ name = 'header-count to format-count binding'; mutate = { param($r) $r.archives[0].header_count += 1L; $r.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($r.archives) } },
+    [PSCustomObject]@{ name = 'format-count to header-count binding'; mutate = { param($r) $r.archives[0].format_counts.gnu_regular = 0L; $r.aggregate_format_counts.gnu_regular = 0L; $r.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($r.archives) } },
+    [PSCustomObject]@{ name = 'policy substitution'; mutate = { param($r) $r.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1' } },
+    [PSCustomObject]@{ name = 'formal/source-proof claim'; mutate = { param($r) $r.source_proof_checkpoint = $true } },
+    [PSCustomObject]@{ name = 'archive-root sibling rebind'; mutate = { param($r) $r.dependency_origin.registry_archive_root.path += '-sibling' } },
+    [PSCustomObject]@{ name = 'source pin substitution'; mutate = { param($r) $r.source_pins[0].path = Join-Path $testRepo 'scripts/d32-bounded-compiler-diagnostic.ps1' } },
+    [PSCustomObject]@{ name = 'resource budget expansion'; mutate = { param($r) $r.resource_budget.combined_milliseconds = 300001L } },
+    [PSCustomObject]@{ name = 'output authority rebound'; mutate = { param($r) $r.output_candidate.path = Join-Path $testRepo 'output.json' } },
+    [PSCustomObject]@{ name = 'ordered-dictionary file reference'; mutate = { param($r) $r.census_authority_reference = [ordered]@{ path = 'C:\external\authority.json'; bytes = 32L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' } } },
+    [PSCustomObject]@{ name = 'null nested reference'; mutate = { param($r) $r.lock_reference = $null } },
+    [PSCustomObject]@{ name = 'empty archive rows'; mutate = { param($r) $r.archives = @() } },
+    [PSCustomObject]@{ name = 'empty unexamined array mismatch'; mutate = { param($r) $r.unexamined_archive_ids = @([string]$r.archives[0].archive_id) } },
+    [PSCustomObject]@{ name = 'null aggregate format counts'; mutate = { param($r) $r.aggregate_format_counts = $null } },
+    [PSCustomObject]@{ name = 'negative aggregate numeric'; mutate = { param($r) $r.aggregate_format_counts.ustar_regular = -1L } },
+    [PSCustomObject]@{ name = 'fractional top-level numeric'; mutate = { param($r) $r.elapsed_milliseconds = 1.5 } },
+    [PSCustomObject]@{ name = 'zero requested bound'; mutate = { param($r) $r.requested_archive_count = 0L } },
+    [PSCustomObject]@{ name = 'malformed timestamp'; mutate = { param($r) $r.started_at_utc = 'yesterday' } },
+    [PSCustomObject]@{ name = 'timestamp order'; mutate = { param($r) $r.completed_at_utc = '2026-10-04T23:59:59.0000000+00:00' } },
+    [PSCustomObject]@{ name = 'error scalar type'; mutate = { param($r) $r.primary_error = $true } },
+    [PSCustomObject]@{ name = 'secondary error element type'; mutate = { param($r) $r.secondary_errors = @('valid', 7) } },
+    [PSCustomObject]@{ name = 'payload hash claim'; mutate = { param($r) $r.payload_hashed = $true } },
+    [PSCustomObject]@{ name = 'row ordered-dictionary shape'; mutate = { param($r) $r.archives[0] = [ordered]@{ archive_id = 'not-an-object' } } },
+    [PSCustomObject]@{ name = 'row null format counts'; mutate = { param($r) $r.archives[0].format_counts = $null } },
+    [PSCustomObject]@{ name = 'row unrecognized state'; mutate = { param($r) $r.archives[0].status = 'PASS' } },
+    [PSCustomObject]@{ name = 'partial opened identity tuple'; mutate = { param($r) $r.archives[0].opened_archive_file_id_hex = $null } },
+    [PSCustomObject]@{ name = 'fractional failure offset'; mutate = { param($r) $r.archives[0].first_failure_offset = 1.5 } },
+    [PSCustomObject]@{ name = 'coverage ID mismatch'; mutate = { param($r) $r.archives[0].archive_id = 'other@1.0.0' } }
+)
+foreach ($mutation in $censusResultMutationCases) {
+    $badCensusResult = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusCompleteResultFixture
+    & $mutation.mutate $badCensusResult
+    $mutationFailures = [System.Collections.Generic.List[string]]::new()
+    $mutationAccepted = Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult -FailureReasons $mutationFailures
+    Assert-D32BoundedCompilerDiagnosticSelfTest ("census result strict schema rejects $($mutation.name) and identifies a validator location") `
+        (-not $mutationAccepted -and $mutationFailures.Count -gt 0)
+}
+
+$synthetic870ArchiveRefs = [System.Collections.Generic.List[object]]::new()
+$synthetic870Rows = [System.Collections.Generic.List[object]]::new()
+$synthetic870FormatCounts = [PSCustomObject][ordered]@{ ustar_regular = 1L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+for ($index = 0; $index -lt 870; $index++) {
+    $syntheticId = ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [Text.UTF8Encoding]::new($false).GetBytes('D32-census-synthetic-metadata-' + $index))).ToLowerInvariant())
+    $archive = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name ('synthetic-crate-' + $index.ToString('D4')) `
+        -Version '1.0.0' -Sha256 $syntheticId -Bytes ([Int64](4096 + $index))
+    $archive.volume_serial_hex = '0123456789abcdef'; $archive.file_id_hex = $syntheticId.Substring(0, 32)
+    $synthetic870ArchiveRefs.Add($archive)
+    $opened = [PSCustomObject][ordered]@{
+        bytes = [Int64]$archive.bytes; sha256 = [string]$archive.sha256
+        volume_serial_hex = [string]$archive.volume_serial_hex; file_id_hex = [string]$archive.file_id_hex
+    }
+    $inventory = [PSCustomObject][ordered]@{
+        expanded_bytes = 1L; header_count = 1L; format_counts = $synthetic870FormatCounts
+        header_inventory_sha256 = 'e' * 64; framing_verified = $true
+        first_failure_offset = $null; first_failure_header_sha256 = $null; first_failure_reason = $null
+    }
+    $synthetic870Rows.Add((New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $archive -Status 'COMPLETE_SUPPORTED' `
+        -OpenedReference $opened -Inventory $inventory -FailureReason $null))
+}
+$synthetic870Authority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
+$synthetic870Authority.archive_refs = [object[]]$synthetic870ArchiveRefs.ToArray()
+$synthetic870Result = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $synthetic870Authority `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'COMPLETE_DIAGNOSTIC' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives ([object[]]$synthetic870Rows.ToArray()) -PrimaryError $null -SecondaryErrors @()
+$synthetic870Readback = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json (
+    ConvertTo-Json -InputObject $synthetic870Result -Depth 100 -Compress -ErrorAction Stop)
+$synthetic870Failures = [System.Collections.Generic.List[string]]::new()
+$synthetic870Valid = Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $synthetic870Readback -FailureReasons $synthetic870Failures
+$synthetic870BindingFailures = [System.Collections.Generic.List[string]]::new()
+$synthetic870Bound = Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $synthetic870Readback `
+    -Authority $synthetic870Authority -ExpectedAuthorityReference $censusAuthorityReferenceFixture -FailureReasons $synthetic870BindingFailures
+$synthetic870Tamper = Copy-D32BoundedCompilerDiagnosticTestJson -Record $synthetic870Readback
+$synthetic870Tamper.archives[869].archive_file_id_hex = '0' * 32
+$synthetic870TamperFailures = [System.Collections.Generic.List[string]]::new()
+$synthetic870TamperAccepted = Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $synthetic870Tamper `
+    -Authority $synthetic870Authority -ExpectedAuthorityReference $censusAuthorityReferenceFixture -FailureReasons $synthetic870TamperFailures
+Assert-D32BoundedCompilerDiagnosticSelfTest '870 synthetic finite archive references use the real row/result producers, survive strict JSON readback, bind in order through the final row, and reject a last-row identity substitution' `
+    ($synthetic870Valid -and $synthetic870Bound -and $synthetic870Failures.Count -eq 0 -and
+     $synthetic870BindingFailures.Count -eq 0 -and -not $synthetic870TamperAccepted -and
+     $synthetic870TamperFailures.Count -eq 1 -and $synthetic870TamperFailures[0] -ceq 'archives[869].authority_archive_reference_binding')
 
 $unsupportedArchiveBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
     $layoutGnuMembers[0], [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/rejected.rs"; kind = 'file'; type_flag = 'x'; content = [byte[]]@([byte]1) })
@@ -2015,65 +2092,66 @@ $unsupportedArchiveSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::
 $unsupportedScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $unsupportedArchiveBytes -ExpectedPackageRoot $layoutRoot `
     -ExpectedArchiveSha256 $unsupportedArchiveSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
 $unsupportedArchiveFixture = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Sha256 $unsupportedArchiveSha -Bytes $unsupportedArchiveBytes.Length
-$blockedRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
-$blockedRow.archive_id = [string]$unsupportedArchiveFixture.name + '@' + [string]$unsupportedArchiveFixture.version
-$blockedRow.source = [string]$unsupportedArchiveFixture.source; $blockedRow.name = [string]$unsupportedArchiveFixture.name
-$blockedRow.version = [string]$unsupportedArchiveFixture.version; $blockedRow.checksum = [string]$unsupportedArchiveFixture.checksum
-$blockedRow.archive_path = [string]$unsupportedArchiveFixture.path; $blockedRow.archive_bytes = [Int64]$unsupportedArchiveFixture.bytes
-$blockedRow.archive_sha256 = [string]$unsupportedArchiveFixture.sha256
-$blockedRow.archive_volume_serial_hex = [string]$unsupportedArchiveFixture.volume_serial_hex
-$blockedRow.archive_file_id_hex = [string]$unsupportedArchiveFixture.file_id_hex
-$blockedRow.opened_archive_bytes = [Int64]$unsupportedArchiveFixture.bytes
-$blockedRow.opened_archive_sha256 = [string]$unsupportedArchiveFixture.sha256
-$blockedRow.opened_archive_volume_serial_hex = [string]$unsupportedArchiveFixture.volume_serial_hex
-$blockedRow.opened_archive_file_id_hex = [string]$unsupportedArchiveFixture.file_id_hex
-$blockedRow.status = 'UNSUPPORTED'; $blockedRow.expanded_bytes = [Int64]$unsupportedScan.expanded_bytes
-$blockedRow.header_count = [Int64]$unsupportedScan.header_count; $blockedRow.format_counts = $unsupportedScan.format_counts
-$blockedRow.header_inventory_sha256 = [string]$unsupportedScan.header_inventory_sha256; $blockedRow.framing_verified = [bool]$unsupportedScan.framing_verified
-$blockedRow.remainder_unknown = $true; $blockedRow.first_failure_offset = [Int64]$unsupportedScan.first_failure_offset
-$blockedRow.first_failure_header_sha256 = [string]$unsupportedScan.first_failure_header_sha256
-$blockedRow.first_failure_reason = [string]$unsupportedScan.first_failure_reason
-$blockedResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$blockedResult.status = 'BLOCKED'; $blockedResult.blocked_archive_count = 1L; $blockedResult.archives = @($blockedRow)
-$blockedResult.aggregate_format_counts = $unsupportedScan.format_counts; $blockedResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($blockedRow)
-$blockedResult.primary_error = [string]$unsupportedScan.first_failure_reason
+$unsupportedOpenedReference = [PSCustomObject][ordered]@{
+    bytes = [Int64]$unsupportedArchiveFixture.bytes; sha256 = [string]$unsupportedArchiveFixture.sha256
+    volume_serial_hex = [string]$unsupportedArchiveFixture.volume_serial_hex; file_id_hex = [string]$unsupportedArchiveFixture.file_id_hex
+}
+$blockedRow = New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $unsupportedArchiveFixture `
+    -Status 'UNSUPPORTED' -OpenedReference $unsupportedOpenedReference -Inventory $unsupportedScan `
+    -FailureReason ([string]$unsupportedScan.first_failure_reason)
+$blockedAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
+$blockedAuthority.archive_refs = @($unsupportedArchiveFixture)
+$blockedResult = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $blockedAuthority `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'BLOCKED' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives @($blockedRow) -PrimaryError ([string]$unsupportedScan.first_failure_reason) `
+    -SecondaryErrors @([string]$unsupportedScan.first_failure_reason)
+$blockedCoverageFailures = [System.Collections.Generic.List[string]]::new()
+$blockedCoverageValid = Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $blockedResult `
+    -Authority $blockedAuthority -ExpectedAuthorityReference $censusAuthorityReferenceFixture -FailureReasons $blockedCoverageFailures
 Assert-D32BoundedCompilerDiagnosticSelfTest 'strict unsupported census coverage preserves first failing header offset/hash, unknown remainder, source archive identity, and a non-PASS result' `
     ($unsupportedScan.status -ceq 'BLOCKED' -and $null -ne $unsupportedScan.first_failure_offset -and
      $null -ne $unsupportedScan.first_failure_header_sha256 -and
      [string]$blockedResult.primary_error -ceq [string]$unsupportedScan.first_failure_reason -and
-     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $blockedResult))
+     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $blockedResult) -and $blockedCoverageValid)
+$preflightArchive = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name 'preflight-crate' -Version '1.0.0' -Sha256 ('d' * 64)
+$preflightRow = New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $preflightArchive -Status 'PREFLIGHT_BLOCKED' `
+    -OpenedReference $null -Inventory $null -FailureReason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: synthetic identity preflight failed'
+$preflightAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
+$preflightAuthority.archive_refs = @($preflightArchive)
+$preflightResult = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $preflightAuthority `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'BLOCKED' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives @($preflightRow) -PrimaryError ([string]$preflightRow.first_failure_reason) `
+    -SecondaryErrors @([string]$preflightRow.first_failure_reason)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'producer and strict consumer accept honest preflight-blocked coverage with absent opened-reference tuple and preserved primary reason' `
+    (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $preflightResult)
 $budgetArchiveTwo = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name 'second-crate' -Version '2.0.0' -Sha256 ('c' * 64)
-$budgetRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
-$budgetRow.status = 'BUDGET_STOPPED'; $budgetRow.expanded_bytes = 0L; $budgetRow.header_count = 0L; $budgetRow.format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
-$budgetRow.header_inventory_sha256 = $null; $budgetRow.framing_verified = $false; $budgetRow.remainder_unknown = $true
-$budgetRow.first_failure_offset = 0L; $budgetRow.first_failure_header_sha256 = $null; $budgetRow.first_failure_reason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: fixed test budget exhausted'
-$unexaminedRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
-$unexaminedRow.archive_id = [string]$budgetArchiveTwo.name + '@' + [string]$budgetArchiveTwo.version
-$unexaminedRow.source = [string]$budgetArchiveTwo.source; $unexaminedRow.name = [string]$budgetArchiveTwo.name
-$unexaminedRow.version = [string]$budgetArchiveTwo.version; $unexaminedRow.checksum = [string]$budgetArchiveTwo.checksum
-$unexaminedRow.archive_path = [string]$budgetArchiveTwo.path; $unexaminedRow.archive_bytes = [Int64]$budgetArchiveTwo.bytes
-$unexaminedRow.archive_sha256 = [string]$budgetArchiveTwo.sha256
-$unexaminedRow.archive_volume_serial_hex = [string]$budgetArchiveTwo.volume_serial_hex
-$unexaminedRow.archive_file_id_hex = [string]$budgetArchiveTwo.file_id_hex
-$unexaminedRow.opened_archive_bytes = $null; $unexaminedRow.opened_archive_sha256 = $null
-$unexaminedRow.opened_archive_volume_serial_hex = $null; $unexaminedRow.opened_archive_file_id_hex = $null
-$unexaminedRow.status = 'UNEXAMINED'; $unexaminedRow.expanded_bytes = 0L; $unexaminedRow.header_count = 0L
-$unexaminedRow.format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
-$unexaminedRow.header_inventory_sha256 = $null; $unexaminedRow.framing_verified = $false; $unexaminedRow.remainder_unknown = $true
-$unexaminedRow.first_failure_offset = $null; $unexaminedRow.first_failure_header_sha256 = $null
-$unexaminedRow.first_failure_reason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: later authorized reference not opened'
-$budgetResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
-$budgetResult.status = 'BUDGET_STOPPED'; $budgetResult.requested_archive_count = 2L; $budgetResult.covered_archive_count = 1L
-$budgetResult.unexamined_archive_count = 1L; $budgetResult.archives = @($budgetRow, $unexaminedRow)
-$budgetResult.unexamined_archive_ids = @([string]$unexaminedRow.archive_id)
-$budgetResult.blocked_archive_count = 0L; $budgetResult.aggregate_format_counts = $budgetRow.format_counts
-$budgetResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($budgetResult.archives)
-$budgetResult.primary_error = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite test archive set not fully read'
-$completeWithGap = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $budgetResult -Depth 100 -Compress)
+$budgetReason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: fixed test budget exhausted'
+$budgetRow = New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow -Archive $censusArchiveFixture -Status 'BUDGET_STOPPED' `
+    -OpenedReference $null -Inventory $null -FailureReason $budgetReason
+$unexaminedRow = New-D32BoundedDiagnosticArchiveFormatCensusUnexaminedRow -Archive $budgetArchiveTwo `
+    -Reason 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: later authorized reference not opened'
+$budgetAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
+$budgetAuthority.archive_refs = @($censusArchiveFixture, $budgetArchiveTwo)
+$budgetResult = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $budgetAuthority `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'BUDGET_STOPPED' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives @($budgetRow, $unexaminedRow) -PrimaryError $budgetReason `
+    -SecondaryErrors @($budgetReason, [string]$unexaminedRow.first_failure_reason)
+$budgetOnlyAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $censusAuthorityFixture
+$budgetOnlyAuthority.archive_refs = @($censusArchiveFixture)
+$budgetOnlyResult = New-D32BoundedDiagnosticArchiveFormatCensusResult -Authority $budgetOnlyAuthority `
+    -AuthorityReference $censusAuthorityReferenceFixture -Status 'BUDGET_STOPPED' `
+    -StartedAtUtc '2026-10-05T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-05T00:00:01.0000000+00:00' `
+    -ElapsedMilliseconds 1000L -Archives @($budgetRow) -PrimaryError $budgetReason -SecondaryErrors @($budgetReason)
+$completeWithGap = Copy-D32BoundedCompilerDiagnosticTestJson -Record $budgetResult
 $completeWithGap.status = 'COMPLETE_DIAGNOSTIC'; $completeWithGap.primary_error = $null
 $completeWithGap.blocked_archive_count = 0L
 Assert-D32BoundedCompilerDiagnosticSelfTest 'global budget result separates stopped archive and whole unexamined set, preserving explicit remainder uncertainty and never reporting COMPLETE' `
     ((Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $budgetResult) -and
+     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $budgetOnlyResult) -and
+     (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage -Result $budgetResult -Authority $budgetAuthority -ExpectedAuthorityReference $censusAuthorityReferenceFixture) -and
      -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $completeWithGap))
 
 $censusEntryPathActual = Join-Path $PSScriptRoot 'd32-bounded-diagnostic-archive-format-census.ps1'
@@ -2082,10 +2160,17 @@ $censusEntryAst = [Management.Automation.Language.Parser]::ParseFile($censusEntr
 $censusEntryCommands = @($censusEntryAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
 $censusForbiddenCommands = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -match '^(?i:Start-Process|Start-Job|Invoke-Expression|Invoke-WebRequest|Invoke-RestMethod|Import-Module|cargo|git|rustc)$' })
 $censusScannerCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'Get-D32BoundedDiagnosticArchiveFormatCensusInventory' })
-Assert-D32BoundedCompilerDiagnosticSelfTest 'separate census entry is parser-clean, source-pin-bound, create-new-only, has one bounded in-process scanner call, and contains no process/network/build/Git command' `
+$censusCoverageProducerCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow' })
+$censusResultProducerCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'New-D32BoundedDiagnosticArchiveFormatCensusResult' })
+$censusStrictResultValidatorCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'Test-D32BoundedDiagnosticArchiveFormatCensusResult' })
+$censusAuthorityCoverageCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityCoverage' })
+Assert-D32BoundedCompilerDiagnosticSelfTest 'separate census entry parses cleanly, uses real row/result producers, strict in-memory and serialized readback validators, finite authority-set binding, create-new persistence, and one bounded in-process scanner without external commands' `
     ($censusEntryParseErrors.Count -eq 0 -and $censusForbiddenCommands.Count -eq 0 -and $censusScannerCalls.Count -eq 1 -and
+     $censusCoverageProducerCalls.Count -eq 1 -and $censusResultProducerCalls.Count -eq 1 -and
+     $censusStrictResultValidatorCalls.Count -eq 2 -and $censusAuthorityCoverageCalls.Count -eq 1 -and
      [string]$censusEntryAst.Extent.Text -match 'Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape' -and
      [string]$censusEntryAst.Extent.Text -match 'CreateNew' -and
+     [string]$censusEntryAst.Extent.Text -match 'ConvertFrom-D32PowerShellAuthorityJsonElement' -and
      -not ([string]$censusEntryAst.Extent.Text).Contains('New-D32BoundedDiagnosticSourceProofCandidateDocument'))
 
 $legacyAuthorityShape = Copy-D32PowerShellAuthorityJsonShape -Value $authority

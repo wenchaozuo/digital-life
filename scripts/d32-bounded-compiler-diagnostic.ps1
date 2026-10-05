@@ -50,7 +50,7 @@ if ([String]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'D32_BOUNDED_DIAGNOSTI
 
 function Assert-D32BoundedDiagnosticBootstrapPins {
     param([Parameter(Mandatory = $true)][string]$Repo)
-    $expectedTop = @('schema_version', 'record_type', 'gate_authority', 'candidate_sha', 'source_repo', 'repository_identity',
+    $expectedTop = @('schema_version', 'record_type', 'registry_archive_policy', 'gate_authority', 'candidate_sha', 'source_repo', 'repository_identity',
         'toolchain_profile', 'module_authority', 'pinned_git', 'command', 'child_environment', 'git_queries', 'cargo_home',
         'dependency_origin', 'target', 'output', 'resource_budget', 'source_pins', 'image_grants', 'issued_at_utc')
     $authorityFull = [IO.Path]::GetFullPath($DiagnosticAuthorityPath)
@@ -76,7 +76,8 @@ function Assert-D32BoundedDiagnosticBootstrapPins {
             $bootstrap = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $jsonDocument.RootElement
         }
         finally { $jsonDocument.Dispose() }
-        if ([string]$bootstrap.record_type -cne 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1' -or
+        if ([int64]$bootstrap.schema_version -ne 2 -or [string]$bootstrap.record_type -cne 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V2' -or
+            [string]$bootstrap.registry_archive_policy -cne 'D32_REGISTRY_TAR_USTAR_GNU_REGULAR_V1' -or
             [string]$bootstrap.gate_authority -cne 'NONE' -or [string]$bootstrap.candidate_sha -cne $CandidateSha -or
             [string]$bootstrap.source_repo -cne $Repo -or $bootstrap.source_pins -isnot [Array] -or $bootstrap.source_pins.Count -ne 6) {
             throw 'D32_BOUNDED_DIAGNOSTIC_AUTHORITY_BLOCKED: module-free authority type/candidate/repository/source-pin boundary is invalid'
@@ -125,7 +126,7 @@ function Assert-D32BoundedDiagnosticBootstrapPins {
 function Assert-D32BoundedDiagnosticSourceProofBootstrap {
     param([Parameter(Mandatory = $true)][string]$Repo)
     $expectedTop = @('schema_version', 'record_type', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
-        'source_repo', 'repository_identity', 'toolchain_profile', 'source_pins', 'dependency_origin', 'proof_budget',
+        'registry_archive_policy', 'source_repo', 'repository_identity', 'toolchain_profile', 'source_pins', 'dependency_origin', 'proof_budget',
         'output_candidate', 'run_id', 'issued_at_utc')
     $authorityFull = [IO.Path]::GetFullPath($SourceProofAuthorityPath)
     $requiredOrigin = 'E:\d32\inv7\r\c'
@@ -156,7 +157,8 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
             $bootstrap = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $jsonDocument.RootElement
         }
         finally { $jsonDocument.Dispose() }
-        if ([int64]$bootstrap.schema_version -ne 1 -or [string]$bootstrap.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V1' -or
+        if ([int64]$bootstrap.schema_version -ne 2 -or [string]$bootstrap.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V2' -or
+            [string]$bootstrap.registry_archive_policy -cne 'D32_REGISTRY_TAR_USTAR_GNU_REGULAR_V1' -or
             [string]$bootstrap.gate_authority -cne 'NONE' -or [string]$bootstrap.candidate_sha -cne $CandidateSha -or
             [string]$bootstrap.historical_origin_candidate_sha -cne $HistoricalOriginCandidateSha -or
             [string]$bootstrap.source_repo -cne $Repo -or [string]$bootstrap.toolchain_profile.path -cne $ToolchainProfilePath -or
@@ -845,6 +847,15 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
             archive_volume_serial_hex = [string]$snapshot.VolumeSerialHex
             archive_file_id_hex = [string]$snapshot.FileIdHex
             archive_inventory_sha256 = [string]$inventory.inventory_sha256
+            registry_archive_policy = [string]$inventory.archive_policy_id
+            header_inventory_sha256 = [string]$inventory.header_inventory_sha256
+            header_count = [Int64]$inventory.header_inventory.Count
+            format_counts = [PSCustomObject][ordered]@{
+                ustar_regular = [Int64]$inventory.format_counts.ustar_regular
+                ustar_directory = [Int64]$inventory.format_counts.ustar_directory
+                gnu_regular = [Int64]$inventory.format_counts.gnu_regular
+                gnu_directory = [Int64]$inventory.format_counts.gnu_directory
+            }
             source_root = [string]$sourceProof.source_root
             source_root_volume_serial_hex = [string]$sourceProof.source_root_volume_serial_hex
             source_root_file_id_hex = [string]$sourceProof.source_root_file_id_hex
@@ -862,17 +873,11 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         $sourceRootBefore.VolumeSerialHex -cne $sourceRootAfter.VolumeSerialHex -or $sourceRootBefore.FileIdHex -cne $sourceRootAfter.FileIdHex) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: registry cache root identity changed during source verification'
     }
-    $canonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($row in $proofRows) {
-        $canonical.Add(([string]$row.name + "`t" + [string]$row.version + "`t" + [string]$row.checksum + "`t" +
-            [string]$row.archive_inventory_sha256 + "`t" + [string]$row.source_root_volume_serial_hex + "`t" + [string]$row.source_root_file_id_hex + "`t" +
-            [Int64]$row.source_file_count + "`t" + [Int64]$row.source_directory_count + "`t" + [Int64]$row.generated_metadata_count + "`t" +
-            [Int64]$row.source_bytes + "`t" + [string]$row.source_inventory_sha256))
-    }
-    $proofSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + "`n"))).ToLowerInvariant()
+    $proofSha = Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages @($proofRows.ToArray())
     $proof = [PSCustomObject][ordered]@{
-        schema_version = 2
-        record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2'
+        schema_version = 3
+        record_type = $script:D32BoundedDiagnosticRegistrySourceContentProofType
+        registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
         gate_authority = 'NONE'
         status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
         formal_gate_usable = $false
@@ -2055,8 +2060,9 @@ function New-D32BoundedDiagnosticResult {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: diagnostic result source-origin closure is not cross-bound to this current candidate and the immutable historical origin'
     }
     return [ordered]@{
-        schema_version = 1
-        record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'
+        schema_version = 2
+        record_type = $script:D32BoundedCompilerDiagnosticResultType
+        registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
         gate_authority = 'NONE'
         phase1_allowed = $false
         aggregate_allowed = $false

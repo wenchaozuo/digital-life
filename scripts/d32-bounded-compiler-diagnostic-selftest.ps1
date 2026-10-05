@@ -23,40 +23,108 @@ function Set-D32BoundedCompilerDiagnosticTestTarOctal {
     [Array]::Copy($bytes, 0, $Header, $Offset, $bytes.Length)
 }
 
+function Set-D32BoundedCompilerDiagnosticTestTarChecksum {
+    param([Parameter(Mandatory = $true)][byte[]]$Header)
+    for ($index = 148; $index -lt 156; $index++) { $Header[$index] = 32 }
+    $sum = [Int64]0
+    foreach ($value in $Header) { $sum += [Int64]$value }
+    $checksum = [Convert]::ToString($sum, 8).PadLeft(6, '0') + "`0 "
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes($checksum), 0, $Header, 148, 8)
+}
+
+function Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected {
+    param([Parameter(Mandatory = $true)][byte[]]$Header)
+    try { $null = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $Header; return $false }
+    catch { return $true }
+}
+
+function New-D32BoundedCompilerDiagnosticTestTarHeader {
+    param([Parameter(Mandatory = $true)][object]$Entry)
+    $header = [byte[]]::new(512)
+    $format = if ($null -ne $Entry.PSObject.Properties['format']) { [string]$Entry.format } else { 'USTAR' }
+    $name = if ($null -ne $Entry.PSObject.Properties['name_field']) { [string]$Entry.name_field } else { [string]$Entry.path }
+    Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 0 -Length 100 -Value $name
+    if ($format -ceq 'USTAR' -and $null -ne $Entry.PSObject.Properties['prefix_field']) {
+        Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 345 -Length 155 -Value ([string]$Entry.prefix_field)
+    }
+    Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 100 -Length 8 -Value $(if ($null -ne $Entry.PSObject.Properties['mode']) { [long]$Entry.mode } else { 420L })
+    Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 108 -Length 8 -Value $(if ($null -ne $Entry.PSObject.Properties['uid']) { [long]$Entry.uid } else { 0L })
+    Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 116 -Length 8 -Value $(if ($null -ne $Entry.PSObject.Properties['gid']) { [long]$Entry.gid } else { 0L })
+    $content = if ($null -eq $Entry.PSObject.Properties['content'] -or $null -eq $Entry.content) { [byte[]]::new(0) } else { [byte[]]$Entry.content }
+    $size = if ($null -ne $Entry.PSObject.Properties['size_override']) { [long]$Entry.size_override } else { [long]$content.Length }
+    Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 124 -Length 12 -Value $size
+    Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 136 -Length 12 -Value $(if ($null -ne $Entry.PSObject.Properties['mtime']) { [long]$Entry.mtime } else { 0L })
+    if ($format -ceq 'USTAR') {
+        [Array]::Copy([Text.Encoding]::ASCII.GetBytes("ustar`0"), 0, $header, 257, 6)
+        [Array]::Copy([Text.Encoding]::ASCII.GetBytes('00'), 0, $header, 263, 2)
+    }
+    elseif ($format -ceq 'GNU') {
+        [Array]::Copy([Text.Encoding]::ASCII.GetBytes('ustar '), 0, $header, 257, 6)
+        [Array]::Copy([byte[]]@(32, 0), 0, $header, 263, 2)
+        foreach ($field in @(
+            [PSCustomObject]@{ name = 'atime'; offset = 345 },
+            [PSCustomObject]@{ name = 'ctime'; offset = 357 },
+            [PSCustomObject]@{ name = 'multi_volume_offset'; offset = 369 },
+            [PSCustomObject]@{ name = 'real_size'; offset = 483 })) {
+            if ($null -ne $Entry.PSObject.Properties[[string]$field.name]) {
+                Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset ([int]$field.offset) -Length 12 -Value ([long]$Entry.([string]$field.name))
+            }
+        }
+        if ($null -ne $Entry.PSObject.Properties['tail_mutator']) { & $Entry.tail_mutator $header }
+    }
+    else { throw 'unsupported synthetic tar fixture format' }
+    if ($null -ne $Entry.PSObject.Properties['linkname_field']) {
+        Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 157 -Length 100 -Value ([string]$Entry.linkname_field)
+    }
+    if ($null -ne $Entry.PSObject.Properties['uname_field']) {
+        Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 265 -Length 32 -Value ([string]$Entry.uname_field)
+    }
+    if ($null -ne $Entry.PSObject.Properties['gname_field']) {
+        Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 297 -Length 32 -Value ([string]$Entry.gname_field)
+    }
+    if ($null -ne $Entry.PSObject.Properties['devmajor']) { Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 329 -Length 8 -Value ([long]$Entry.devmajor) }
+    if ($null -ne $Entry.PSObject.Properties['devminor']) { Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 337 -Length 8 -Value ([long]$Entry.devminor) }
+    if ($null -ne $Entry.PSObject.Properties['header_mutator']) { & $Entry.header_mutator $header }
+    $typeFlag = if ($null -ne $Entry.PSObject.Properties['type_flag']) { $Entry.type_flag } elseif ([string]$Entry.kind -ceq 'directory') { '5' } else { '0' }
+    if ($typeFlag -is [byte] -or $typeFlag -is [int]) { $header[156] = [byte]$typeFlag } else { $header[156] = [byte][char][string]$typeFlag }
+    Set-D32BoundedCompilerDiagnosticTestTarChecksum -Header $header
+    return ,$header
+}
+
 function New-D32BoundedCompilerDiagnosticTestTarGzip {
-    param([Parameter(Mandatory = $true)][object[]]$Entries)
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Entries,
+        [int]$TerminatorBlocks = 2,
+        [byte[]]$TrailingBytes = @(),
+        [switch]$CorruptGzipTrailer
+    )
     $tar = [IO.MemoryStream]::new()
     try {
         foreach ($entry in $Entries) {
-            $header = [byte[]]::new(512)
-            Set-D32BoundedCompilerDiagnosticTestTarText -Header $header -Offset 0 -Length 100 -Value ([string]$entry.path)
-            Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 100 -Length 8 -Value 420
-            Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 108 -Length 8 -Value 0
-            Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 116 -Length 8 -Value 0
+            $header = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry $entry
             $content = if ($null -eq $entry.content) { [byte[]]::new(0) } else { [byte[]]$entry.content }
-            Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 124 -Length 12 -Value $content.Length
-            Set-D32BoundedCompilerDiagnosticTestTarOctal -Header $header -Offset 136 -Length 12 -Value 0
-            [Array]::Copy([Text.Encoding]::ASCII.GetBytes("ustar`0"), 0, $header, 257, 6)
-            [Array]::Copy([Text.Encoding]::ASCII.GetBytes('00'), 0, $header, 263, 2)
-            $typeFlag = if ($null -ne $entry.type_flag) { [string]$entry.type_flag } elseif ([string]$entry.kind -ceq 'directory') { '5' } else { '0' }
-            $header[156] = [byte][char]$typeFlag
-            for ($index = 148; $index -lt 156; $index++) { $header[$index] = 32 }
-            $sum = [Int64]0
-            foreach ($value in $header) { $sum += [Int64]$value }
-            $checksum = [Convert]::ToString($sum, 8).PadLeft(6, '0') + "`0 "
-            [Array]::Copy([Text.Encoding]::ASCII.GetBytes($checksum), 0, $header, 148, 8)
             $tar.Write($header, 0, $header.Length)
             if ($content.Length -gt 0) { $tar.Write($content, 0, $content.Length) }
             $padding = (512 - ($content.Length % 512)) % 512
-            if ($padding -gt 0) { $tar.Write([byte[]]::new($padding), 0, $padding) }
+            if ($padding -gt 0) {
+                $paddingBytes = [byte[]]::new($padding)
+                if ($null -ne $entry.PSObject.Properties['padding_byte']) { $paddingBytes[0] = [byte]$entry.padding_byte }
+                $tar.Write($paddingBytes, 0, $padding)
+            }
         }
-        $tar.Write([byte[]]::new(1024), 0, 1024)
+        for ($terminatorIndex = 0; $terminatorIndex -lt $TerminatorBlocks; $terminatorIndex++) {
+            $zeroBlock = [byte[]]::new(512)
+            $tar.Write($zeroBlock, 0, $zeroBlock.Length)
+        }
+        if ($TrailingBytes.Length -gt 0) { $tar.Write($TrailingBytes, 0, $TrailingBytes.Length) }
         $compressed = [IO.MemoryStream]::new()
         try {
             $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Compress, $true)
             try { $bytes = $tar.ToArray(); $gzip.Write($bytes, 0, $bytes.Length) }
             finally { $gzip.Dispose() }
-            return ,$compressed.ToArray()
+            $result = $compressed.ToArray()
+            if ($CorruptGzipTrailer -and $result.Length -gt 0) { $result[$result.Length - 1] = $result[$result.Length - 1] -bxor 1 }
+            return ,$result
         }
         finally { $compressed.Dispose() }
     }
@@ -933,6 +1001,258 @@ $linkSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($link
 try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $linkBytes -ExpectedPackageRoot $archiveRoot -ExpectedArchiveSha256 $linkSha; $linkRejected = $false } catch { $linkRejected = $true }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'tar link member rejected' $linkRejected
 
+# Complete in-memory USTAR/GNU header and scanner matrix. These fixtures never
+# open registry cache paths; they exercise the same decoder used by both the
+# source-proof producer and the separately authorized diagnostic census.
+$prefixHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'lib.rs'; prefix_field = 'sample-crate-1.2.3/src'; kind = 'file'; content = [byte[]]@([byte]1)
+})
+$prefixRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $prefixHeader
+Assert-D32BoundedCompilerDiagnosticSelfTest 'USTAR prefix field is interpreted only under exact USTAR magic/version and builds the canonical path' `
+    ($prefixRecord.format -ceq 'USTAR' -and $prefixRecord.path -ceq 'sample-crate-1.2.3/src/lib.rs')
+$gnuFullWidthHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; name_field = ('g' * 100); path = ('g' * 100); kind = 'file'; atime = 1L; ctime = 2L; content = [byte[]]@([byte]1)
+})
+$gnuFullWidthRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $gnuFullWidthHeader
+Assert-D32BoundedCompilerDiagnosticSelfTest 'GNU fixed-width 100-byte name without a NUL is valid while text after first NUL remains forbidden' `
+    ($gnuFullWidthRecord.format -ceq 'GNU' -and $gnuFullWidthRecord.path -ceq ('g' * 100) -and $gnuFullWidthRecord.name.Length -eq 100 -and $gnuFullWidthRecord.size -eq 1)
+$gnuNamedHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; atime = 7L; ctime = 9L; uname_field = 'root'; gname_field = 'staff'
+})
+$gnuNamedRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $gnuNamedHeader
+Assert-D32BoundedCompilerDiagnosticSelfTest 'GNU nonnegative atime/ctime and strict UTF-8 zero-padded uname/gname positive fields remain supported' `
+    ($gnuNamedRecord.format -ceq 'GNU' -and $gnuNamedRecord.uname -ceq 'root' -and $gnuNamedRecord.gname -ceq 'staff')
+$gnuTailCases = @(
+    [PSCustomObject]@{ name = 'multivolume offset'; offset = 369; kind = 'octal' },
+    [PSCustomObject]@{ name = 'reserved bytes 381-384'; offset = 381; kind = 'byte' },
+    [PSCustomObject]@{ name = 'reserved byte 385'; offset = 385; kind = 'byte' },
+    [PSCustomObject]@{ name = 'sparse offset 1'; offset = 386; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse size 1'; offset = 398; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse offset 2'; offset = 410; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse size 2'; offset = 422; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse offset 3'; offset = 434; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse size 3'; offset = 446; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse offset 4'; offset = 458; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse size 4'; offset = 470; kind = 'octal' },
+    [PSCustomObject]@{ name = 'sparse continuation flag'; offset = 482; kind = 'byte' },
+    [PSCustomObject]@{ name = 'real-size'; offset = 483; kind = 'octal' },
+    [PSCustomObject]@{ name = 'GNU padding first byte'; offset = 495; kind = 'byte' },
+    [PSCustomObject]@{ name = 'GNU padding last byte'; offset = 511; kind = 'byte' })
+$gnuTailRejected = 0
+foreach ($tailCase in $gnuTailCases) {
+    $offset = [int]$tailCase.offset
+    $mutator = if ($tailCase.kind -ceq 'octal') {
+        [scriptblock]::Create("param(`$h) Set-D32BoundedCompilerDiagnosticTestTarOctal -Header `$h -Offset $offset -Length 12 -Value 1L")
+    } else {
+        [scriptblock]::Create("param(`$h) `$h[$offset] = 1")
+    }
+    $badHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+        format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; content = [byte[]]@([byte]1); tail_mutator = $mutator
+    })
+    if (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badHeader) { $gnuTailRejected++ }
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'GNU tail independently rejects multivolume, both reserved spans, all eight sparse numbers, continuation, real-size, and both padding endpoints' ($gnuTailRejected -eq $gnuTailCases.Count)
+$badUstarReserved = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[511] = 1 }
+})
+$badUstarVersion = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[264] = 49 }
+})
+$badMagic = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[262] = 0 }
+})
+Assert-D32BoundedCompilerDiagnosticSelfTest 'USTAR reserved bytes, unsupported version, and non-exact GNU magic/version dispatch are rejected' `
+    ((Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badUstarReserved) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badUstarVersion) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badMagic))
+$leadingSpaceHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = {
+        param($h) [Array]::Copy([byte[]]@(32, 54, 52, 52, 0, 32, 32, 32), 0, $h, 100, 8)
+    }
+})
+$leadingSpaceRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $leadingSpaceHeader
+$hiddenOctalHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = {
+        param($h) [Array]::Copy([byte[]]@(48, 0, 49, 0, 0, 0, 0, 0), 0, $h, 100, 8)
+    }
+})
+$unterminatedOctalHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = {
+        param($h) [Array]::Copy([byte[]]@(55, 55, 55, 55, 55, 55, 55, 55), 0, $h, 100, 8)
+    }
+})
+$base256Header = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[100] = 128 }
+})
+$signedOctalHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[100] = 45 }
+})
+$badAtimeHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; tail_mutator = { param($h) $h[345] = 45 }
+})
+$badCtimeHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; tail_mutator = { param($h) $h[357] = 128 }
+})
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict octal accepts leading spaces and rejects hidden digits, unterminated full-width digits, base-256, and signs' `
+    ($leadingSpaceRecord.mode -eq 420 -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $hiddenOctalHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $unterminatedOctalHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $base256Header) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $signedOctalHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badAtimeHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badCtimeHeader))
+$badUtf8Header = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[0] = 255 }
+})
+$badNamePaddingHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'x'; kind = 'file'; header_mutator = { param($h) $h[2] = 120 }
+})
+$badLinknameHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; linkname_field = 'link'
+})
+$badDeviceHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; devmajor = 1L
+})
+$badUnamePaddingHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; header_mutator = { param($h) $h[265] = 0; $h[266] = 120 }
+})
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict UTF-8 text, first-NUL zero padding, empty linkname, zero devices, and zero-padded uname/gname fields enforced' `
+    ((Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badUtf8Header) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badNamePaddingHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badLinknameHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badDeviceHeader) -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badUnamePaddingHeader))
+$badChecksumHeader = [byte[]]$prefixHeader.Clone(); $badChecksumHeader[148] = $badChecksumHeader[148] -bxor 1
+Assert-D32BoundedCompilerDiagnosticSelfTest 'header checksum is the unsigned 512-byte sum with checksum field treated as eight spaces' `
+    (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $badChecksumHeader)
+$unsupportedTypes = @('1', '2', '3', '4', '6', '7', 'x', 'g', 'L', 'K', 'S')
+$unsupportedTypeRejections = 0
+foreach ($unsupportedType in $unsupportedTypes) {
+    $typeHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+        format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; type_flag = $unsupportedType
+    })
+    if (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $typeHeader) { $unsupportedTypeRejections++ }
+}
+$positiveNulTypeHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'USTAR'; path = 'sample-crate-1.2.3/file'; kind = 'file'; type_flag = [byte]0
+})
+$positiveZeroTypeHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/file'; kind = 'file'; type_flag = '0'
+})
+$positiveDirectoryHeader = New-D32BoundedCompilerDiagnosticTestTarHeader -Entry ([PSCustomObject]@{
+    format = 'GNU'; path = 'sample-crate-1.2.3/dir/'; kind = 'directory'; type_flag = '5'; size_override = 1L
+})
+Assert-D32BoundedCompilerDiagnosticSelfTest 'NUL/0 regular files are accepted while hard/symbolic links, PAX/GNU extensions, sparse/device/FIFO/contiguous/unknown and nonzero-size directories reject' `
+    ($unsupportedTypeRejections -eq $unsupportedTypes.Count -and
+     (Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $positiveNulTypeHeader).kind -ceq 'file' -and
+     (Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $positiveZeroTypeHeader).kind -ceq 'file' -and
+     (Test-D32BoundedCompilerDiagnosticTestTarHeaderRejected -Header $positiveDirectoryHeader))
+
+$layoutRoot = 'layout-crate-1.2.3'
+$layoutManifest = [Text.Encoding]::UTF8.GetBytes('[package]' + "`n" + 'name = "layout-crate"' + "`n" + 'version = "1.2.3"' + "`n")
+$layoutUstarMembers = @(
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/src/lib.rs"; name_field = 'lib.rs'; prefix_field = "$layoutRoot/src"; kind = 'file'; content = [Text.Encoding]::UTF8.GetBytes('pub fn f() {}') })
+$layoutGnuMembers = @(
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/lib.rs"; name_field = "$layoutRoot/src/lib.rs"; kind = 'file'; content = [Text.Encoding]::UTF8.GetBytes('pub fn f() {}') })
+$layoutMixedMembers = @(
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/lib.rs"; name_field = "$layoutRoot/src/lib.rs"; kind = 'file'; content = [Text.Encoding]::UTF8.GetBytes('pub fn f() {}') })
+$layoutUstarBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutUstarMembers
+$layoutGnuBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutGnuMembers
+$layoutMixedBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutMixedMembers
+$layoutUstarSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($layoutUstarBytes)).ToLowerInvariant()
+$layoutGnuSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($layoutGnuBytes)).ToLowerInvariant()
+$layoutMixedSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($layoutMixedBytes)).ToLowerInvariant()
+$layoutUstarInventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $layoutUstarBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $layoutUstarSha
+$layoutGnuInventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $layoutGnuBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $layoutGnuSha
+$layoutMixedInventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $layoutMixedBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $layoutMixedSha
+$layoutProjection = { param($inventory) ConvertTo-Json -InputObject @($inventory.entries) -Depth 8 -Compress }
+$layoutUstarProjection = & $layoutProjection $layoutUstarInventory
+$layoutGnuProjection = & $layoutProjection $layoutGnuInventory
+$layoutMixedProjection = & $layoutProjection $layoutMixedInventory
+Assert-D32BoundedCompilerDiagnosticSelfTest 'USTAR-prefix, GNU-full-name, and mixed per-header dispatch produce identical member inventories without requiring an explicit package-root directory header' `
+    ($layoutUstarProjection -ceq $layoutGnuProjection -and
+     $layoutUstarProjection -ceq $layoutMixedProjection -and
+     $layoutUstarInventory.header_inventory_sha256 -cne $layoutGnuInventory.header_inventory_sha256 -and
+     $layoutMixedInventory.format_counts.ustar_regular -eq 1 -and $layoutMixedInventory.format_counts.gnu_regular -eq 1 -and
+     $layoutMixedInventory.entries.Count -eq 3)
+$layoutScanTimer = [Diagnostics.Stopwatch]::StartNew()
+$layoutScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $layoutMixedBytes -ExpectedPackageRoot $layoutRoot `
+    -ExpectedArchiveSha256 $layoutMixedSha -CensusTimer $layoutScanTimer
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof producer and census consumer bind the same mixed-format header digest, counts, offsets, and header inventory' `
+    ($layoutScan.status -ceq 'COMPLETE_DIAGNOSTIC' -and $layoutScan.header_count -eq $layoutMixedInventory.member_count -and
+     $layoutScan.header_inventory_sha256 -ceq $layoutMixedInventory.header_inventory_sha256 -and
+     $layoutScan.format_counts.ustar_regular -eq $layoutMixedInventory.format_counts.ustar_regular -and
+     $layoutScan.format_counts.gnu_regular -eq $layoutMixedInventory.format_counts.gnu_regular -and
+     $layoutScan.payload_hashed -eq $null -and $layoutScan.framing_verified)
+$explicitRootBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/"; kind = 'directory'; content = [byte[]]::new(0) }, $layoutGnuMembers[0], $layoutGnuMembers[1])
+$explicitRootSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($explicitRootBytes)).ToLowerInvariant()
+$explicitRootInventory = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $explicitRootBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $explicitRootSha
+$duplicateRootBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/"; kind = 'directory'; content = [byte[]]::new(0) },
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/"; kind = 'directory'; content = [byte[]]::new(0) }, $layoutGnuMembers[0])
+$duplicateRootSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($duplicateRootBytes)).ToLowerInvariant()
+try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $duplicateRootBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $duplicateRootSha; $duplicateRootRejected = $false } catch { $duplicateRootRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'package-root directory header may be absent or appear once only; duplicate root header rejects' `
+    ($explicitRootInventory.member_count -eq 3 -and $explicitRootInventory.entries.Count -eq 3 -and $duplicateRootRejected)
+
+$framingFailures = [System.Collections.Generic.List[string]]::new()
+$oneTerminatorBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutGnuMembers -TerminatorBlocks 1
+$oneTerminatorSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($oneTerminatorBytes)).ToLowerInvariant()
+$oneTerminatorScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $oneTerminatorBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $oneTerminatorSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
+$nonzeroTrailingBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutGnuMembers -TrailingBytes ([byte[]]@(0, 1, 0))
+$nonzeroTrailingSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($nonzeroTrailingBytes)).ToLowerInvariant()
+$nonzeroTrailingScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $nonzeroTrailingBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $nonzeroTrailingSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
+$badPaddingBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = [byte[]]@([byte]1); padding_byte = 1 })
+$badPaddingSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($badPaddingBytes)).ToLowerInvariant()
+$badPaddingScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $badPaddingBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $badPaddingSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
+$badGzipBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries $layoutGnuMembers -CorruptGzipTrailer
+$badGzipSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($badGzipBytes)).ToLowerInvariant()
+$badGzipScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $badGzipBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $badGzipSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
+$framingFailureCount = @(@($oneTerminatorScan, $nonzeroTrailingScan, $badPaddingScan, $badGzipScan) | Where-Object { $_.status -ceq 'BLOCKED' }).Count
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census stops on one zero block, nonzero post-terminator tail, nonzero member padding, and corrupt gzip trailer' `
+    ($framingFailureCount -eq 4 -and -not $oneTerminatorScan.framing_verified -and -not $nonzeroTrailingScan.framing_verified -and
+     -not $badPaddingScan.framing_verified -and -not $badGzipScan.framing_verified)
+$stoppedCensusTimer = [Diagnostics.Stopwatch]::new(); $stoppedCensusTimer.Stop()
+$stoppedCensusScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $layoutMixedBytes -ExpectedPackageRoot $layoutRoot `
+    -ExpectedArchiveSha256 $layoutMixedSha -CensusTimer $stoppedCensusTimer
+$memberLimitScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $layoutMixedBytes -ExpectedPackageRoot $layoutRoot `
+    -ExpectedArchiveSha256 $layoutMixedSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew()) -MaximumMembers 1
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census time and member bounds stop without resuming, silently truncating inventory, or marking framing complete' `
+    ($stoppedCensusScan.status -ceq 'BUDGET_STOPPED' -and $memberLimitScan.status -ceq 'BUDGET_STOPPED' -and
+     $stoppedCensusScan.remainder_unknown -and $memberLimitScan.remainder_unknown -and -not $stoppedCensusScan.framing_verified)
+$unicodeAliasBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/e$([char]0x0301).rs"; kind = 'file'; content = [byte[]]@([byte]1) })
+$unicodeAliasSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($unicodeAliasBytes)).ToLowerInvariant()
+try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $unicodeAliasBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $unicodeAliasSha; $decomposedUnicodeRejected = $false } catch { $decomposedUnicodeRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'non-NFC member names are rejected instead of normalized or repaired' $decomposedUnicodeRejected
+$badArchivePaths = @(
+    "$layoutRoot/../escape.rs", "$layoutRoot/./dot.rs", "$layoutRoot/src/NUL", "$layoutRoot/src/CON.txt",
+    "$layoutRoot/src/name.", "$layoutRoot/src/name ", "$layoutRoot/src/name:stream", "$layoutRoot/src\backslash.rs",
+    "$layoutRoot//double-separator.rs", '\\server\share\escape.rs', 'C:\escape.rs')
+$badPathRejectCount = 0
+foreach ($badArchivePath in $badArchivePaths) {
+    $pathBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+        [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+        [PSCustomObject]@{ format = 'GNU'; path = $badArchivePath; kind = 'file'; content = [byte[]]@([byte]1) })
+    $pathSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($pathBytes)).ToLowerInvariant()
+    try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $pathBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $pathSha }
+    catch { $badPathRejectCount++ }
+}
+$fileParentConflictBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/Cargo.toml"; kind = 'file'; content = $layoutManifest },
+    [PSCustomObject]@{ format = 'USTAR'; path = "$layoutRoot/src"; kind = 'file'; content = [byte[]]@([byte]1) },
+    [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/child.rs"; kind = 'file'; content = [byte[]]@([byte]2) })
+$fileParentConflictSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($fileParentConflictBytes)).ToLowerInvariant()
+try { $null = Get-D32BoundedCompilerDiagnosticCrateArchiveInventory -CompressedBytes $fileParentConflictBytes -ExpectedPackageRoot $layoutRoot -ExpectedArchiveSha256 $fileParentConflictSha; $fileParentConflictRejected = $false } catch { $fileParentConflictRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'archive path policy rejects traversal, dot/empty segments, reserved Windows devices, trailing dot/space, ADS, backslash, UNC/absolute paths, and file-parent conflicts without normalization' `
+    ($badPathRejectCount -eq $badArchivePaths.Count -and $fileParentConflictRejected)
+
 function New-D32BoundedCompilerDiagnosticTestReference {
     param([string]$Path)
     return [PSCustomObject][ordered]@{ path = $Path; bytes = 1L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' }
@@ -1002,8 +1322,9 @@ $testGitQueryList.Add([string[]]@('rev-parse', '--verify', '--end-of-options', '
 $testGitQueryList.Add([string[]]@('status', '--porcelain=v1', '--untracked-files=all'))
 $testGitQueries = $testGitQueryList.ToArray()
 $authority = [PSCustomObject][ordered]@{
-    schema_version = 1
-    record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1'
+    schema_version = 2
+    record_type = $script:D32BoundedCompilerDiagnosticAuthorityType
+    registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
     gate_authority = 'NONE'
     candidate_sha = $testCandidate
     source_repo = $testRepo
@@ -1105,7 +1426,7 @@ $sampleWrongCreation = [PSCustomObject]@{ available_physical_bytes = 7L; commit_
 $wrongCreationProjection = Get-D32BoundedCompilerDiagnosticSamplingSummary -Samples @($sampleWrongCreation) -RustcRecords @($rustcRecords[0]) -StopwatchFrequency 1000 -Complete $false -StopReason 'UNRELIABLE'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'PID reuse with a different creation time is not attributed to prior rustc identity' (-not $wrongCreationProjection.rustc_processes[0].sampled -and $null -eq $wrongCreationProjection.rustc_processes[0].observed_private_peak_bytes)
 
-$diagnosticRecord = [PSCustomObject]@{ record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'; gate_authority = 'NONE'; status = 'COMPLETED_DIAGNOSTIC' }
+$diagnosticRecord = [PSCustomObject]@{ schema_version = 2; record_type = $script:D32BoundedCompilerDiagnosticResultType; registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'; status = 'COMPLETED_DIAGNOSTIC' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'diagnostic result rejected by formal record gate' (Test-D32BoundedCompilerDiagnosticFormalReject $diagnosticRecord)
 $formalRecord = [PSCustomObject]@{ record_type = 'D32_PHASE0_MATRIX_RECORD_V8'; gate_authority = 'PHASE0'; status = 'PASS' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'formal Phase0 record remains outside diagnostic reject helper' (-not (Test-D32BoundedCompilerDiagnosticFormalReject $formalRecord))
@@ -1140,8 +1461,9 @@ $sourceProofOrigin = [PSCustomObject][ordered]@{
     })
 }
 $sourceProofAuthority = [PSCustomObject][ordered]@{
-    schema_version = 1
+    schema_version = 2
     record_type = $script:D32BoundedDiagnosticSourceProofAuthorityType
+    registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
     gate_authority = 'NONE'
     candidate_sha = $sourceProofCurrentSha
     historical_origin_candidate_sha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
@@ -1406,11 +1728,46 @@ $sourceProofCurrentClosure = [PSCustomObject]@{
         CurrentCandidateSha = $sourceProofCurrentSha
         HistoricalOriginCandidateSha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
         HistoricalAttemptState = 'BLOCKED'; HistoricalFetchCompletion = 'NOT_RETAINED'; HistoricalGateAuthority = 'NONE'
-        RegistryContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false; lock_sha256 = [string]$graphPlan.lock_sha256; verified_package_ids = @($graphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'registry' } | ForEach-Object { [string]$_.package_id }) }
+        RegistryContentProof = $null
         GitContentProof = [PSCustomObject]@{ record_type = 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V2'; status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false; lock_sha256 = [string]$graphPlan.lock_sha256; verified_package_ids = @(); sources = @() }
         SourceGraphProof = $graphProof
         CurrentManifestProof = @($graphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'workspace' } | ForEach-Object { [PSCustomObject]@{ manifest_path = [string]$_.manifest_path; bytes = 1L; sha256 = [string]$_.manifest_sha256; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' } }) + @([PSCustomObject]@{ manifest_path = 'src-tauri/Cargo.toml'; bytes = 1L; sha256 = 'd' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' })
     }
+$registryProofPackages = [System.Collections.Generic.List[object]]::new()
+foreach ($classification in @($graphProof.classifications | Where-Object { [string]$_.classification -ceq 'INCLUDED' -and [string]$_.source_kind -ceq 'registry' })) {
+    $locked = @($graphPlan.locked_packages | Where-Object { [string]$_.package_id -ceq [string]$classification.package_id })
+    if ($locked.Count -ne 1) { throw 'registry proof synthetic fixture lock row is missing or ambiguous' }
+    $packageRoot = [string]$locked[0].name + '-' + [string]$locked[0].version
+    $registryProofPackages.Add([PSCustomObject][ordered]@{
+        package_id = [string]$locked[0].package_id; name = [string]$locked[0].name; version = [string]$locked[0].version
+        checksum = [string]$locked[0].checksum
+        archive_path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f\' + $packageRoot + '.crate'
+        archive_bytes = 1024L; archive_file_sha256 = [string]$locked[0].checksum
+        archive_volume_serial_hex = '0123456789abcdef'; archive_file_id_hex = '0123456789abcdef0123456789abcdef'
+        archive_inventory_sha256 = 'a' * 64; registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
+        header_inventory_sha256 = 'b' * 64; header_count = 1L
+        format_counts = [PSCustomObject][ordered]@{ ustar_regular = 1L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+        source_root = 'E:\d32\inv7\r\c\registry\src\index.crates.io-1949cf8c6b5b557f\' + $packageRoot
+        source_root_volume_serial_hex = '0123456789abcdef'; source_root_file_id_hex = '0123456789abcdef0123456789abcdef'
+        source_file_count = 1L; source_directory_count = 0L; generated_metadata_count = 0L; source_bytes = 1L; source_inventory_sha256 = 'c' * 64
+    })
+}
+$registryPackageRows = @($registryProofPackages.ToArray())
+$registryContentProof = [PSCustomObject][ordered]@{
+    schema_version = 3; record_type = $script:D32BoundedDiagnosticRegistrySourceContentProofType
+    registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'
+    status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'; formal_gate_usable = $false
+    semantic_scope = 'EXACT_CALLER_PINNED_ARCHIVE_SUBSET_FOR_LOCKED_GRAPH_CANDIDATES'
+    source_proof_sha256 = Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages $registryPackageRows
+    verifier_managed_buffer_cap_bytes = 536870912L; maximum_buffered_registry_archive_bytes = 268435456L
+    concurrent_buffered_registry_archives = 1L; lock_sha256 = [string]$graphPlan.lock_sha256
+    registry_tuple_sha256 = [string]$graphPlan.registry_tuple_sha256; package_count = [Int64]$registryPackageRows.Count
+    locked_registry_catalog_count = [Int64]$graphPlan.registry_package_count
+    verified_package_ids = @($registryPackageRows | ForEach-Object { [string]$_.package_id })
+    compressed_bytes = [Int64]($registryPackageRows.Count * 1024); expanded_bytes = [Int64]($registryPackageRows.Count * 2048)
+    member_count = [Int64]$registryPackageRows.Count; elapsed_milliseconds = 1000L; packages = $registryPackageRows
+}
+$sourceProofCurrentClosure.RegistryContentProof = $registryContentProof
 $sourceProofCandidate = New-D32BoundedDiagnosticSourceProofCandidateDocument `
     -CandidateSha $sourceProofCurrentSha -HistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
     -Repository $testRepo -Status 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' `
@@ -1422,6 +1779,321 @@ $sourceProofCandidate = New-D32BoundedDiagnosticSourceProofCandidateDocument `
 $sourceProofCandidateReasons = [System.Collections.Generic.List[string]]::new()
 $sourceProofCandidateValid = Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate -FailureReasons $sourceProofCandidateReasons
 Assert-D32BoundedCompilerDiagnosticSelfTest ('current source-proof-only candidate is valid while remaining untrusted and non-gating (' + [string]::Join(',', [string[]]$sourceProofCandidateReasons.ToArray()) + ')') $sourceProofCandidateValid
+$registryHeaderDigestOriginal = [string]$registryContentProof.packages[0].header_inventory_sha256
+$registryContentProof.packages[0].header_inventory_sha256 = 'd' * 64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry V3 source-proof rejects a substituted header-inventory digest' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$registryContentProof.packages[0].header_inventory_sha256 = $registryHeaderDigestOriginal
+$registryRegularCountOriginal = [Int64]$registryContentProof.packages[0].format_counts.ustar_regular
+$registryContentProof.packages[0].format_counts.ustar_regular = $registryRegularCountOriginal + 1L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry V3 source-proof rejects substituted format counts and a header-count mismatch' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$registryContentProof.packages[0].format_counts.ustar_regular = $registryRegularCountOriginal
+$registryPolicyOriginal = [string]$registryContentProof.registry_archive_policy
+$registryContentProof.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry V3 source-proof rejects policy substitution rather than accepting old USTAR-only records' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$registryContentProof.registry_archive_policy = $registryPolicyOriginal
+$registryProofSchemaOriginal = [Int64]$registryContentProof.schema_version
+$registryContentProof.schema_version = 2L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry V2 source-content proof cannot be relabeled as the new V3 format proof' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
+$registryContentProof.schema_version = $registryProofSchemaOriginal
+
+function New-D32BoundedCompilerDiagnosticTestCensusArchiveReference {
+    param([string]$Name = 'layout-crate', [string]$Version = '1.2.3', [string]$Sha256 = ('a' * 64), [long]$Bytes = 4096L)
+    $root = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f'
+    return [PSCustomObject][ordered]@{
+        source = 'registry+https://github.com/rust-lang/crates.io-index'; name = $Name; version = $Version
+        checksum = $Sha256; path = Join-Path $root ($Name + '-' + $Version + '.crate'); bytes = $Bytes; sha256 = $Sha256
+        volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+    }
+}
+$censusEntryFixture = Join-Path $testRepo 'scripts\d32-bounded-diagnostic-archive-format-census.ps1'
+$censusPolicyFixture = Join-Path $testRepo 'scripts\d32-bounded-compiler-diagnostic-policy.ps1'
+$censusProfileFixture = Join-Path $testRepo 'scripts\d32-build-toolchain-profile.ps1'
+$censusModuleFixture = Join-Path $testRepo 'scripts\d32-powershell-module-authority.ps1'
+$censusArchiveFixture = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Bytes ([Int64]$layoutMixedBytes.Length) -Sha256 $layoutMixedSha
+$censusAuthorityFixture = [PSCustomObject][ordered]@{
+    schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusAuthorityType
+    registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; source_plan_semantics_version = 2
+    semantic_scope = 'EXACT_CALLER_PINNED_CURRENT_LOCK_ARCHIVE_FORMAT_SUBSET'; registry_tuple_sha256 = [string]$graphPlan.registry_tuple_sha256
+    gate_authority = 'NONE'; candidate_sha = $testCandidate; source_repo = $testRepo
+    repository_identity = [PSCustomObject][ordered]@{ volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' }
+    lock_reference = (New-D32BoundedCompilerDiagnosticTestReference (Join-Path $testRepo 'vita-agent\Cargo.lock'))
+    dependency_origin = [PSCustomObject][ordered]@{
+        path = 'E:\d32\inv7\r\c'; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+        registry_archive_root = [PSCustomObject][ordered]@{
+            path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f'
+            volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+        }
+    }
+    historical_origin = [PSCustomObject][ordered]@{
+        candidate_sha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha; attempt_state = 'BLOCKED'
+        fetch_completion = 'NOT_RETAINED'; gate_authority = 'NONE'
+        owner_record = (New-D32BoundedCompilerDiagnosticTestReference 'E:\d32\inv7\D32-PHASE0-OWNER.json')
+        blocked_diagnostic = (New-D32BoundedCompilerDiagnosticTestReference 'E:\d32\inv7\D32-PHASE0-BLOCKED-DIAGNOSTIC.json')
+    }
+    source_pins = @(
+        (New-D32BoundedCompilerDiagnosticTestReference $censusEntryFixture),
+        (New-D32BoundedCompilerDiagnosticTestReference $censusPolicyFixture),
+        (New-D32BoundedCompilerDiagnosticTestReference $censusProfileFixture),
+        (New-D32BoundedCompilerDiagnosticTestReference $censusModuleFixture))
+    archive_refs = @($censusArchiveFixture)
+    output_candidate = [PSCustomObject][ordered]@{
+        path = 'C:\d32-diagnostic-policy-test\external\archive-census\result.json'
+        parent_path = 'C:\d32-diagnostic-policy-test\external\archive-census'
+        parent_volume_serial_hex = '0123456789abcdef'; parent_file_id_hex = '0123456789abcdef0123456789abcdef'
+    }
+    run_id = 'a' * 32
+    resource_budget = [PSCustomObject][ordered]@{
+        combined_milliseconds = 300000L; managed_buffer_bytes = 536870912L; max_archive_bytes = 268435456L
+        max_archive_expanded_bytes = 1073741824L; max_archive_member_bytes = 134217728L; max_archive_members = 10000L
+        max_aggregate_expanded_bytes = 34359738368L; max_aggregate_members = 1000000L; maximum_output_bytes = 67108864L
+    }
+    issued_at_utc = '2026-10-05T00:00:00.0000000+00:00'
+}
+$censusAuthorityValid = Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityFixture `
+    -ExpectedCandidateSha $testCandidate -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture
+Assert-D32BoundedCompilerDiagnosticSelfTest 'new census authority V1 exact shape binds current candidate, V2 source plan, inv7 origin, historical BLOCKED/NONE metadata, four source pins, finite refs, resource bounds, and external create-new output' $censusAuthorityValid
+$censusAuthorityFixture.PSObject.Properties.Remove('registry_tuple_sha256')
+$censusAuthorityMissingFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityFixture `
+    -ExpectedCandidateSha $testCandidate -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture)
+$censusAuthorityFixture | Add-Member -NotePropertyName unexpected_authority_field -NotePropertyValue 'must fail closed'
+$censusAuthorityExtraFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityFixture `
+    -ExpectedCandidateSha $testCandidate -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture)
+$censusAuthorityFixture.PSObject.Properties.Remove('unexpected_authority_field')
+$censusAuthorityFixture | Add-Member -NotePropertyName registry_tuple_sha256 -NotePropertyValue ([string]$graphPlan.registry_tuple_sha256)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority exact-shape validator rejects missing and unexpected top-level fields before reaccepting restored shape' `
+    ($censusAuthorityMissingFieldRejected -and $censusAuthorityExtraFieldRejected -and
+     (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityFixture -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$censusAuthorityRoundtrip = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress) -ErrorAction Stop
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority exact finite schema survives canonical JSON serialization/deserialization' `
+    (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $censusAuthorityRoundtrip -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture)
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects policy substitution rather than widening/rewriting the approved format contract' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.source_plan_semantics_version = 1
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects old source-plan semantics and cannot reuse legacy V1 closure evidence' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.candidate_sha = '2' * 40
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects candidate rebind and exact candidate SHA substitution' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.dependency_origin.registry_archive_root.path += '-sibling'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive-root suffix sibling and does not infer trust from directory-name suffix' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.archive_refs[0].path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f-sibling\layout-crate-1.2.3.crate'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive path outside the exact pinned cache root even when its basename matches' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.source_pins[0].path = Join-Path $testRepo 'scripts\d32-bounded-compiler-diagnostic.ps1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects substituting a source pin for the exact census entry path' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.lock_reference.path = Join-Path $testRepo 'vita-agent/Cargo.toml'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects manifest-as-lock path substitution' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.archive_refs[0].bytes = 268435457L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects oversized archive reference before any file open' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.resource_budget.max_archive_members = 10001
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects expanded member-count budget and never accepts caller-supplied larger limits' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.output_candidate.path = 'C:\d32-diagnostic-policy-test\repo\result.json'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects an output path overlapping the candidate repository' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.archive_refs = @()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects an empty finite archive set instead of treating empty coverage as success' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+$tooManyArchiveRefs = [System.Collections.Generic.List[object]]::new()
+for ($archiveIndex = 0; $archiveIndex -lt 1116; $archiveIndex++) {
+    $tooManyArchiveRefs.Add((New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name 'crate' -Version ('1.0.' + $archiveIndex) -Sha256 ('a' * 64)))
+}
+$badCensusAuthority = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusAuthorityFixture -Depth 100 -Compress)
+$badCensusAuthority.archive_refs = @($tooManyArchiveRefs.ToArray())
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census authority rejects archive reference set above the frozen 1115-package maximum' `
+    (-not (Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape -Document $badCensusAuthority -ExpectedCandidateSha $testCandidate `
+        -Repository $testRepo -EntryScriptPath $censusEntryFixture -PolicyPath $censusPolicyFixture -ProfileScriptPath $censusProfileFixture))
+
+$censusCompleteArchiveRow = [PSCustomObject][ordered]@{
+    archive_id = [string]$censusArchiveFixture.name + '@' + [string]$censusArchiveFixture.version
+    source = [string]$censusArchiveFixture.source; name = [string]$censusArchiveFixture.name; version = [string]$censusArchiveFixture.version
+    checksum = [string]$censusArchiveFixture.checksum; archive_path = [string]$censusArchiveFixture.path; archive_bytes = [Int64]$censusArchiveFixture.bytes
+    archive_sha256 = [string]$censusArchiveFixture.sha256; archive_volume_serial_hex = [string]$censusArchiveFixture.volume_serial_hex
+    archive_file_id_hex = [string]$censusArchiveFixture.file_id_hex; opened_archive_bytes = [Int64]$censusArchiveFixture.bytes
+    opened_archive_sha256 = [string]$censusArchiveFixture.sha256; opened_archive_volume_serial_hex = [string]$censusArchiveFixture.volume_serial_hex
+    opened_archive_file_id_hex = [string]$censusArchiveFixture.file_id_hex; status = 'COMPLETE_SUPPORTED'
+    expanded_bytes = [Int64]$layoutScan.expanded_bytes; header_count = [Int64]$layoutScan.header_count
+    format_counts = $layoutScan.format_counts; header_inventory_sha256 = [string]$layoutScan.header_inventory_sha256
+    framing_verified = $true; remainder_unknown = $false; first_failure_offset = $null; first_failure_header_sha256 = $null; first_failure_reason = $null
+}
+$censusCompleteResultFixture = [PSCustomObject][ordered]@{
+    schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType; registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
+    gate_authority = 'NONE'; formal_phase1_allowed = $false; formal_aggregate_allowed = $false; source_proof_checkpoint = $false
+    diagnostic_invocation_authority = 'NONE'; status = 'COMPLETE_DIAGNOSTIC'; candidate_sha = $testCandidate; source_repo = $testRepo
+    source_plan_semantics_version = 2L; semantic_scope = [string]$censusAuthorityFixture.semantic_scope
+    registry_tuple_sha256 = [string]$censusAuthorityFixture.registry_tuple_sha256
+    repository_identity = $censusAuthorityFixture.repository_identity
+    census_authority_reference = (New-D32BoundedCompilerDiagnosticTestReference 'C:\d32-diagnostic-policy-test\external\archive-census\authority.json')
+    lock_reference = $censusAuthorityFixture.lock_reference; dependency_origin = $censusAuthorityFixture.dependency_origin
+    historical_origin = $censusAuthorityFixture.historical_origin; source_pins = @($censusAuthorityFixture.source_pins)
+    output_candidate = $censusAuthorityFixture.output_candidate; resource_budget = $censusAuthorityFixture.resource_budget
+    run_id = 'b' * 32; started_at_utc = '2026-10-05T00:00:00.0000000+00:00'; completed_at_utc = '2026-10-05T00:00:01.0000000+00:00'
+    elapsed_milliseconds = 1000L; requested_archive_count = 1L; covered_archive_count = 1L; blocked_archive_count = 0L; unexamined_archive_count = 0L
+    archives = @($censusCompleteArchiveRow); unexamined_archive_ids = @()
+    aggregate_format_counts = $layoutScan.format_counts
+    archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($censusCompleteArchiveRow)
+    payload_read_and_discarded = $true; payload_hashed = $false; payload_retained = $false; source_extraction_performed = $false
+    formal_gate_usable = $false; primary_error = $null; secondary_errors = @()
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-only census result is exact-schema, JSON-roundtrippable, complete-only-if-every-reference-is-supported, non-formal, and inventory-digest bound' `
+    ((Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $censusCompleteResultFixture) -and
+     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record (ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress))) -and
+     -not $censusCompleteResultFixture.formal_gate_usable -and -not $censusCompleteResultFixture.source_proof_checkpoint)
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.PSObject.Properties.Remove('run_id')
+$censusResultMissingFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult)
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult | Add-Member -NotePropertyName unexpected_result_field -NotePropertyValue 'must fail closed'
+$censusResultExtraFieldRejected = -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result exact schema rejects missing and extra top-level fields' ($censusResultMissingFieldRejected -and $censusResultExtraFieldRejected)
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.archive_header_inventory_sha256 = '0' * 64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects substituted top-level whole-coverage digest' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.archives[0].header_inventory_sha256 = '0' * 64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects a substituted per-archive header inventory digest when its whole-coverage binding is unchanged' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.archives[0].header_count += 1
+$badCensusResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($badCensusResult.archives)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects header-count substitution against four per-format counts' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.archives[0].format_counts.gnu_regular = 0
+$badCensusResult.aggregate_format_counts.gnu_regular = 0
+$badCensusResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($badCensusResult.archives)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects format-count substitution against scanner header total' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.registry_archive_policy = 'D32_REGISTRY_TAR_USTAR_ONLY_V1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects registry policy substitution' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.source_proof_checkpoint = $true
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects any claim to be source-proof checkpoint or formal completion' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.dependency_origin.registry_archive_root.path += '-sibling'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rebind to a sibling archive-root path is rejected even when root identity strings remain well-formed' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.source_pins[0].path = Join-Path $testRepo 'scripts/d32-bounded-compiler-diagnostic.ps1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result requires the exact census entry source pin, not a same-repository substitute' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.resource_budget.combined_milliseconds = 300001
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects resource budget expansion beyond the approved aggregate deadline' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+$badCensusResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$badCensusResult.output_candidate.path = Join-Path $testRepo 'output.json'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'census result rejects output authority rebound inside the repository' (-not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $badCensusResult))
+
+$unsupportedArchiveBytes = New-D32BoundedCompilerDiagnosticTestTarGzip -Entries @(
+    $layoutGnuMembers[0], [PSCustomObject]@{ format = 'GNU'; path = "$layoutRoot/src/rejected.rs"; kind = 'file'; type_flag = 'x'; content = [byte[]]@([byte]1) })
+$unsupportedArchiveSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($unsupportedArchiveBytes)).ToLowerInvariant()
+$unsupportedScan = Get-D32BoundedDiagnosticArchiveFormatCensusInventory -CompressedBytes $unsupportedArchiveBytes -ExpectedPackageRoot $layoutRoot `
+    -ExpectedArchiveSha256 $unsupportedArchiveSha -CensusTimer ([Diagnostics.Stopwatch]::StartNew())
+$unsupportedArchiveFixture = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Sha256 $unsupportedArchiveSha -Bytes $unsupportedArchiveBytes.Length
+$blockedRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
+$blockedRow.archive_id = [string]$unsupportedArchiveFixture.name + '@' + [string]$unsupportedArchiveFixture.version
+$blockedRow.source = [string]$unsupportedArchiveFixture.source; $blockedRow.name = [string]$unsupportedArchiveFixture.name
+$blockedRow.version = [string]$unsupportedArchiveFixture.version; $blockedRow.checksum = [string]$unsupportedArchiveFixture.checksum
+$blockedRow.archive_path = [string]$unsupportedArchiveFixture.path; $blockedRow.archive_bytes = [Int64]$unsupportedArchiveFixture.bytes
+$blockedRow.archive_sha256 = [string]$unsupportedArchiveFixture.sha256
+$blockedRow.archive_volume_serial_hex = [string]$unsupportedArchiveFixture.volume_serial_hex
+$blockedRow.archive_file_id_hex = [string]$unsupportedArchiveFixture.file_id_hex
+$blockedRow.opened_archive_bytes = [Int64]$unsupportedArchiveFixture.bytes
+$blockedRow.opened_archive_sha256 = [string]$unsupportedArchiveFixture.sha256
+$blockedRow.opened_archive_volume_serial_hex = [string]$unsupportedArchiveFixture.volume_serial_hex
+$blockedRow.opened_archive_file_id_hex = [string]$unsupportedArchiveFixture.file_id_hex
+$blockedRow.status = 'UNSUPPORTED'; $blockedRow.expanded_bytes = [Int64]$unsupportedScan.expanded_bytes
+$blockedRow.header_count = [Int64]$unsupportedScan.header_count; $blockedRow.format_counts = $unsupportedScan.format_counts
+$blockedRow.header_inventory_sha256 = [string]$unsupportedScan.header_inventory_sha256; $blockedRow.framing_verified = [bool]$unsupportedScan.framing_verified
+$blockedRow.remainder_unknown = $true; $blockedRow.first_failure_offset = [Int64]$unsupportedScan.first_failure_offset
+$blockedRow.first_failure_header_sha256 = [string]$unsupportedScan.first_failure_header_sha256
+$blockedRow.first_failure_reason = [string]$unsupportedScan.first_failure_reason
+$blockedResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$blockedResult.status = 'BLOCKED'; $blockedResult.blocked_archive_count = 1L; $blockedResult.archives = @($blockedRow)
+$blockedResult.aggregate_format_counts = $unsupportedScan.format_counts; $blockedResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($blockedRow)
+$blockedResult.primary_error = [string]$unsupportedScan.first_failure_reason
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict unsupported census coverage preserves first failing header offset/hash, unknown remainder, source archive identity, and a non-PASS result' `
+    ($unsupportedScan.status -ceq 'BLOCKED' -and $null -ne $unsupportedScan.first_failure_offset -and
+     $null -ne $unsupportedScan.first_failure_header_sha256 -and
+     [string]$blockedResult.primary_error -ceq [string]$unsupportedScan.first_failure_reason -and
+     (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $blockedResult))
+$budgetArchiveTwo = New-D32BoundedCompilerDiagnosticTestCensusArchiveReference -Name 'second-crate' -Version '2.0.0' -Sha256 ('c' * 64)
+$budgetRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
+$budgetRow.status = 'BUDGET_STOPPED'; $budgetRow.expanded_bytes = 0L; $budgetRow.header_count = 0L; $budgetRow.format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+$budgetRow.header_inventory_sha256 = $null; $budgetRow.framing_verified = $false; $budgetRow.remainder_unknown = $true
+$budgetRow.first_failure_offset = 0L; $budgetRow.first_failure_header_sha256 = $null; $budgetRow.first_failure_reason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: fixed test budget exhausted'
+$unexaminedRow = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteArchiveRow -Depth 100 -Compress)
+$unexaminedRow.archive_id = [string]$budgetArchiveTwo.name + '@' + [string]$budgetArchiveTwo.version
+$unexaminedRow.source = [string]$budgetArchiveTwo.source; $unexaminedRow.name = [string]$budgetArchiveTwo.name
+$unexaminedRow.version = [string]$budgetArchiveTwo.version; $unexaminedRow.checksum = [string]$budgetArchiveTwo.checksum
+$unexaminedRow.archive_path = [string]$budgetArchiveTwo.path; $unexaminedRow.archive_bytes = [Int64]$budgetArchiveTwo.bytes
+$unexaminedRow.archive_sha256 = [string]$budgetArchiveTwo.sha256
+$unexaminedRow.archive_volume_serial_hex = [string]$budgetArchiveTwo.volume_serial_hex
+$unexaminedRow.archive_file_id_hex = [string]$budgetArchiveTwo.file_id_hex
+$unexaminedRow.opened_archive_bytes = $null; $unexaminedRow.opened_archive_sha256 = $null
+$unexaminedRow.opened_archive_volume_serial_hex = $null; $unexaminedRow.opened_archive_file_id_hex = $null
+$unexaminedRow.status = 'UNEXAMINED'; $unexaminedRow.expanded_bytes = 0L; $unexaminedRow.header_count = 0L
+$unexaminedRow.format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+$unexaminedRow.header_inventory_sha256 = $null; $unexaminedRow.framing_verified = $false; $unexaminedRow.remainder_unknown = $true
+$unexaminedRow.first_failure_offset = $null; $unexaminedRow.first_failure_header_sha256 = $null
+$unexaminedRow.first_failure_reason = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: later authorized reference not opened'
+$budgetResult = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $censusCompleteResultFixture -Depth 100 -Compress)
+$budgetResult.status = 'BUDGET_STOPPED'; $budgetResult.requested_archive_count = 2L; $budgetResult.covered_archive_count = 1L
+$budgetResult.unexamined_archive_count = 1L; $budgetResult.archives = @($budgetRow, $unexaminedRow)
+$budgetResult.unexamined_archive_ids = @([string]$unexaminedRow.archive_id)
+$budgetResult.blocked_archive_count = 0L; $budgetResult.aggregate_format_counts = $budgetRow.format_counts
+$budgetResult.archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($budgetResult.archives)
+$budgetResult.primary_error = 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: finite test archive set not fully read'
+$completeWithGap = ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $budgetResult -Depth 100 -Compress)
+$completeWithGap.status = 'COMPLETE_DIAGNOSTIC'; $completeWithGap.primary_error = $null
+$completeWithGap.blocked_archive_count = 0L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'global budget result separates stopped archive and whole unexamined set, preserving explicit remainder uncertainty and never reporting COMPLETE' `
+    ((Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $budgetResult) -and
+     -not (Test-D32BoundedDiagnosticArchiveFormatCensusResult -Record $completeWithGap))
+
+$censusEntryPathActual = Join-Path $PSScriptRoot 'd32-bounded-diagnostic-archive-format-census.ps1'
+$censusEntryTokens = $null; $censusEntryParseErrors = $null
+$censusEntryAst = [Management.Automation.Language.Parser]::ParseFile($censusEntryPathActual, [ref]$censusEntryTokens, [ref]$censusEntryParseErrors)
+$censusEntryCommands = @($censusEntryAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+$censusForbiddenCommands = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -match '^(?i:Start-Process|Start-Job|Invoke-Expression|Invoke-WebRequest|Invoke-RestMethod|Import-Module|cargo|git|rustc)$' })
+$censusScannerCalls = @($censusEntryCommands | Where-Object { [string]$_.GetCommandName() -ceq 'Get-D32BoundedDiagnosticArchiveFormatCensusInventory' })
+Assert-D32BoundedCompilerDiagnosticSelfTest 'separate census entry is parser-clean, source-pin-bound, create-new-only, has one bounded in-process scanner call, and contains no process/network/build/Git command' `
+    ($censusEntryParseErrors.Count -eq 0 -and $censusForbiddenCommands.Count -eq 0 -and $censusScannerCalls.Count -eq 1 -and
+     [string]$censusEntryAst.Extent.Text -match 'Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape' -and
+     [string]$censusEntryAst.Extent.Text -match 'CreateNew' -and
+     -not ([string]$censusEntryAst.Extent.Text).Contains('New-D32BoundedDiagnosticSourceProofCandidateDocument'))
+
+$legacyAuthorityShape = Copy-D32PowerShellAuthorityJsonShape -Value $authority
+$legacyAuthorityShape.schema_version = 1L
+$legacyAuthorityShape.record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V1'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'compiler-diagnostic authority V1 is rejected by the strict V2 policy migration' (-not (Test-D32BoundedCompilerDiagnosticAuthorityShape -Document $legacyAuthorityShape -ExpectedCandidateSha $testCandidate -Repository $testRepo `
+    -ToolchainProfilePath $testProfilePath -ToolchainProfileSha256 ('2' * 64) -ModuleAuthorityPath $testModuleAuthorityPath `
+    -ModuleAuthoritySha256 ('3' * 64) -PinnedGitPath $testGitPath -PinnedGitSha256 ('4' * 64) -ExpectedEnvironment $expectedEnvironment))
 $legacySourceProofCandidate = [PSCustomObject][ordered]@{}
 foreach ($property in $sourceProofCandidate.PSObject.Properties) { $legacySourceProofCandidate | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value }
 $legacySourceProofCandidate.historical_origin = [ordered]@{ fetch_completion = 'NOT_RETAINED'; attempt_state = 'BLOCKED'; gate_authority = 'NONE' }
@@ -1568,7 +2240,7 @@ try { $null = Assert-D32BoundedCompilerDiagnosticStatus 'PASS'; $passStatusRejec
 Assert-D32BoundedCompilerDiagnosticSelfTest 'PASS status unavailable' $passStatusRejected
 $rawReplayStatuses = @('COMPLETED_DIAGNOSTIC', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED')
 foreach ($rawStatus in $rawReplayStatuses) {
-    $replay = [PSCustomObject]@{ record_type = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'; gate_authority = 'NONE'; status = $rawStatus; phase1_allowed = $false; aggregate_allowed = $false }
+    $replay = [PSCustomObject]@{ record_type = $script:D32BoundedCompilerDiagnosticResultType; schema_version = 2; registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'; status = $rawStatus; phase1_allowed = $false; aggregate_allowed = $false }
     Assert-D32BoundedCompilerDiagnosticStatus $rawStatus | Out-Null
     Assert-D32BoundedCompilerDiagnosticSelfTest "raw replay $rawStatus remains non-gating" (Test-D32BoundedCompilerDiagnosticFormalReject $replay -and -not [bool]$replay.phase1_allowed -and -not [bool]$replay.aggregate_allowed)
 }
@@ -1579,8 +2251,10 @@ $formalConsumerSchemas = @(
 )
 foreach ($consumer in $formalConsumerSchemas) {
     $consumerText = [IO.File]::ReadAllText($consumer.path, [Text.UTF8Encoding]::new($false, $true))
-    Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema: $([IO.Path]::GetFileName($consumer.path))" ($consumerText.Contains([string]$consumer.schema) -and -not $consumerText.Contains('D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'))
+    Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema and rejects diagnostic V2/census V1: $([IO.Path]::GetFileName($consumer.path))" `
+        ($consumerText.Contains([string]$consumer.schema) -and -not $consumerText.Contains('D32_BOUNDED_COMPILER_DIAGNOSTIC_V2') -and
+         -not $consumerText.Contains('D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_V1'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, canonical Cargo registry .cargo-ok bytes/snapshot and distinct empty Git marker rules, generated-versus-archive-member auxiliary metadata routing, bounded Cargo checksum metadata shape/path/digest/duplicate/BOM/trailing negative fixtures, bounded .git pointer syntax/relative-and-exact-root fixtures, source-proof result constructor success/failure/timeout/budget branches, PSCustomObject versus ordered-dictionary nested-record census, success/blocked JSON roundtrips, exact-field and candidate-pin negatives, primary-error-preserving BLOCKED fallback, proof-only entry/result AST wiring, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU full-width names and strict tail-field negatives, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, payload-discard-only census scanner, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V1 and census-result V1 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V3/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, exact formal-consumer schema rejection for diagnostic V2 and census V1, historical BLOCKED/NONE replay and all four diagnostic non-PASS statuses. Pure synthetic fixtures only: no Cargo, native child, network, registry cache, or archive content access.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

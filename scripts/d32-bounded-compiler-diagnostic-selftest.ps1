@@ -344,6 +344,11 @@ $authorityWithinAst = $moduleAuthorityAst.Find({ param($node) $node -is [System.
 $profileFullPathAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32ProfileFullPath' }, $true)
 $noReparseAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32ProfileNoReparsePath' }, $true)
 $fileReferenceAssertAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticFileReference' }, $true)
+$fileReferenceProjectionAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection' }, $true)
+$registryContentProofAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-D32BoundedDiagnosticRegistrySourceContentProof' }, $true)
+$inv7OriginAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true)
+$capturedStreamShapeAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape' }, $true)
+$fileReferenceFailureAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure' }, $true)
 $profileTestAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BuildToolchainProfile' }, $true)
 $profileCurrentAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BuildToolchainProfileCurrent' }, $true)
 $authorityWithinTokens = $null; $authorityWithinParseErrors = $null
@@ -351,7 +356,9 @@ $authorityWithinSyntaxAst = if ($null -ne $authorityWithinAst) { [System.Managem
 $pathHelperParseExact = $policyParseErrors.Count -eq 0 -and $runnerParseErrors.Count -eq 0 -and $profileLibraryParseErrors.Count -eq 0 -and
     $null -ne $authorityWithinSyntaxAst -and $authorityWithinParseErrors.Count -eq 0 -and
     $null -ne $profileWithinAst -and $null -ne $authorityWithinAst -and $null -ne $profileFullPathAst -and $null -ne $noReparseAst -and
-    $null -ne $fileReferenceAssertAst -and $null -ne $profileTestAst -and $null -ne $profileCurrentAst
+    $null -ne $fileReferenceAssertAst -and $null -ne $fileReferenceProjectionAst -and $null -ne $registryContentProofAst -and
+    $null -ne $inv7OriginAst -and $null -ne $capturedStreamShapeAst -and $null -ne $fileReferenceFailureAst -and
+    $null -ne $profileTestAst -and $null -ne $profileCurrentAst
 Assert-D32BoundedCompilerDiagnosticSelfTest 'all source-origin/root-containment functions parse for the synthetic containment census' $pathHelperParseExact
 Invoke-Expression $profileWithinAst.Extent.Text
 Invoke-Expression $authorityWithinAst.Extent.Text
@@ -403,13 +410,94 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'optional EvidenceRoot preserves nul
 Invoke-Expression $profileFullPathAst.Extent.Text
 Invoke-Expression ($noReparseAst.Extent.Text.Replace('function Test-D32ProfileNoReparsePath', 'function Test-D32ProfileNoReparsePathSynthetic'))
 Invoke-Expression $fileReferenceAssertAst.Extent.Text
+Invoke-Expression $fileReferenceProjectionAst.Extent.Text
 function Test-D32ProfileNoReparsePath { param([string]$Path) return $true }
 function Get-D32ProfileFileSnapshot {
     param([string]$Path)
+    if ($Path -ceq 'C:\D32-sourceproof-synthetic\logs\stdout.log') {
+        return [PSCustomObject]@{ Path = $Path; Bytes = 0L; Sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef' }
+    }
     return [PSCustomObject]@{ Path = $Path; Bytes = 1L; Sha256 = ('a' * 64); VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef' }
 }
 $syntheticRepoRoot = 'C:\D32-sourceproof-synthetic\repo'
 $syntheticProfileReference = [PSCustomObject]@{ path = 'C:\D32-sourceproof-synthetic\toolchain-profile.json'; bytes = 1L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' }
+$syntheticLogRoot = 'C:\D32-sourceproof-synthetic\logs'
+$syntheticEmptyStreamPath = Join-Path $syntheticLogRoot 'stdout.log'
+$syntheticEmptyStreamReference = [PSCustomObject][ordered]@{
+    path = $syntheticEmptyStreamPath; bytes = 0L; sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+}
+$zeroStreamStrictFileRefRejected = -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $syntheticEmptyStreamReference)
+$zeroStreamExactCaptureAccepted = Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape -Reference $syntheticEmptyStreamReference -ExpectedPath $syntheticEmptyStreamPath
+$zeroStreamWrongExpectedPathRejected = -not (Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape -Reference $syntheticEmptyStreamReference -ExpectedPath (Join-Path $syntheticLogRoot 'stderr.log'))
+$zeroStreamNegativeBytes = [PSCustomObject][ordered]@{
+    path = $syntheticEmptyStreamPath; bytes = -1L; sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+}
+$zeroStreamNegativeBytesRejected = -not (Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape -Reference $zeroStreamNegativeBytes -ExpectedPath $syntheticEmptyStreamPath)
+$zeroStreamExtraField = [PSCustomObject][ordered]@{
+    path = $syntheticEmptyStreamPath; bytes = 0L; sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'; status = 'CAPTURED'
+}
+$zeroStreamExtraFieldRejected = -not (Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape -Reference $zeroStreamExtraField -ExpectedPath $syntheticEmptyStreamPath)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'regular source-file references remain strictly positive while exact captured streams admit zero bytes' `
+    ($zeroStreamStrictFileRefRejected -and $zeroStreamExactCaptureAccepted -and $zeroStreamWrongExpectedPathRejected -and $zeroStreamNegativeBytesRejected -and $zeroStreamExtraFieldRejected)
+$zeroStreamGenericError = $null
+try {
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticEmptyStreamReference -MustBeWithin $syntheticLogRoot -MustNotBeWithin $syntheticRepoRoot `
+        -ReferenceField 'prior.blocked.ordered_stream_captures[0].reference' -Caller 'SyntheticStreamFixture'
+}
+catch { $zeroStreamGenericError = $_.Exception.Message }
+$zeroStreamExpectedRoot = Format-D32BoundedCompilerDiagnosticPathForError $syntheticLogRoot
+$zeroStreamActualPath = Format-D32BoundedCompilerDiagnosticPathForError $syntheticEmptyStreamPath
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict-reference rejection identifies caller, exact bytes field, actual ref, expected root and positive-byte reason' `
+    ($null -ne $zeroStreamGenericError -and $zeroStreamGenericError.Contains('caller=SyntheticStreamFixture') -and
+        $zeroStreamGenericError.Contains('field=prior.blocked.ordered_stream_captures[0].reference.bytes') -and
+        $zeroStreamGenericError.Contains('reason=bytes_must_be_positive') -and
+        $zeroStreamGenericError.Contains("actual_ref=$zeroStreamActualPath") -and $zeroStreamGenericError.Contains("expected_root=$zeroStreamExpectedRoot"))
+$zeroStreamExactCaptureAcceptedByAssert = $false
+try {
+    $snapshot = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticEmptyStreamReference -MustBeWithin $syntheticLogRoot -MustNotBeWithin $syntheticRepoRoot `
+        -ReferenceKind CapturedStream -ExactPath $syntheticEmptyStreamPath -ReferenceField 'prior.blocked.ordered_stream_captures[0].reference' `
+        -Caller 'SyntheticStreamFixture'
+    $zeroStreamExactCaptureAcceptedByAssert = $snapshot.Bytes -eq 0 -and $snapshot.Sha256 -ceq $syntheticEmptyStreamReference.sha256
+}
+catch { $zeroStreamExactCaptureAcceptedByAssert = $false }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'exact captured-stream exception still verifies zero-byte digest and opened identity under its authorized log root' $zeroStreamExactCaptureAcceptedByAssert
+$zeroStreamEscapeReported = $false
+try {
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticEmptyStreamReference -MustBeWithin 'C:\D32-sourceproof-synthetic\logs-sibling' -MustNotBeWithin $syntheticRepoRoot `
+        -ReferenceKind CapturedStream -ExactPath $syntheticEmptyStreamPath -ReferenceField 'prior.blocked.ordered_stream_captures[0].reference' `
+        -Caller 'SyntheticStreamFixture'
+}
+catch { $zeroStreamEscapeReported = $_.Exception.Message.Contains('source reference escaped its authorized root') -and $_.Exception.Message.Contains("actual_ref=$zeroStreamActualPath") -and $_.Exception.Message.Contains("expected_root=$(Format-D32BoundedCompilerDiagnosticPathForError 'C:\D32-sourceproof-synthetic\logs-sibling')") }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'captured-stream exception does not weaken exact-root containment or diagnostics' $zeroStreamEscapeReported
+$syntheticArchiveTuple = [PSCustomObject][ordered]@{
+    source = 'registry+https://github.com/rust-lang/crates.io-index'; name = 'synthetic-crate'; version = '1.0.0'; checksum = 'a' * 64
+    path = 'C:\D32-sourceproof-synthetic\registry-cache\synthetic-crate-1.0.0.crate'; bytes = 1L; sha256 = 'a' * 64
+    volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'
+}
+$syntheticArchiveProjection = New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $syntheticArchiveTuple
+$syntheticArchiveProjectionExact = $syntheticArchiveTuple -is [PSCustomObject] -and
+    -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $syntheticArchiveTuple) -and
+    (Test-D32BoundedCompilerDiagnosticExactProperties -Object $syntheticArchiveProjection -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -and
+    (Test-D32BoundedCompilerDiagnosticFileReferenceShape $syntheticArchiveProjection) -and
+    $syntheticArchiveProjection.bytes -is [long] -and [string]$syntheticArchiveProjection.path -ceq [string]$syntheticArchiveTuple.path
+Assert-D32BoundedCompilerDiagnosticSelfTest 'registry archive tuple is projected to an exact five-field file reference after strict nine-field validation without coercion or schema relaxation' $syntheticArchiveProjectionExact
+$badArchiveTupleRejected = $false
+try {
+    $null = New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference ([PSCustomObject][ordered]@{ path = $syntheticArchiveTuple.path; bytes = 1L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef'; extra = 'not-an-archive-tuple' })
+}
+catch { $badArchiveTupleRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: registry archive projection requires its exact nine-field caller schema*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'archive projection rejects a regular-file reference or arbitrary extra-field object instead of silently dropping unknown properties' $badArchiveTupleRejected
+$archiveProjectionConsumersExact = $registryContentProofAst.Extent.Text.Contains('New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive') -and
+    $registryContentProofAst.Extent.Text.Contains('-Reference $archiveFileReference') -and
+    $inv7OriginAst.Extent.Text.Contains('New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive') -and
+    $inv7OriginAst.Extent.Text.Contains('-Reference $archiveReference')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'both registry archive file-reference consumers project the validated catalog tuple before strict exact-shape validation' $archiveProjectionConsumersExact
+$capturedStreamOptInCalls = @($runnerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Assert-D32BoundedDiagnosticFileReference' -and $node.Extent.Text.Contains('-ReferenceKind CapturedStream') }, $true)).Count
+Assert-D32BoundedCompilerDiagnosticSelfTest 'zero-byte allowance is explicit and limited to the historical ordered capture consumer' ($capturedStreamOptInCalls -eq 1)
 $nullRequiredRootAccepted = $false
 try {
     $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticProfileReference -MustBeWithin $null -MustNotBeWithin $syntheticRepoRoot

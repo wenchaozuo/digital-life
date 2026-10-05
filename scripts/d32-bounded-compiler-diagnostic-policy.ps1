@@ -1370,12 +1370,34 @@ function Test-D32BoundedCompilerDiagnosticIdentityPair {
     return ([string]$Object.$VolumeName -cmatch '^[0-9a-f]{16}$' -and [string]$Object.$FileIdName -cmatch '^[0-9a-f]{32}$')
 }
 
+function Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure {
+    param([AllowNull()][object]$Reference, [switch]$AllowEmptyBytes)
+    if ($null -eq $Reference) { return 'reference_is_null' }
+    if ($Reference -is [string] -or $Reference -is [Array] -or $Reference -is [ValueType]) { return 'reference_is_not_an_object' }
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $Reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex'))) {
+        return 'property_set_is_not_exact'
+    }
+    if (-not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Reference.path)) { return 'path_must_be_canonical_absolute_string' }
+    if (-not (Test-D32BoundedCompilerDiagnosticInteger $Reference.bytes)) { return 'bytes_must_be_integer' }
+    if ($AllowEmptyBytes) {
+        if ([Int64]$Reference.bytes -lt 0) { return 'bytes_must_be_nonnegative' }
+    }
+    elseif ([Int64]$Reference.bytes -le 0) { return 'bytes_must_be_positive' }
+    if ([string]$Reference.sha256 -cnotmatch '^[0-9a-f]{64}$') { return 'sha256_must_be_lowercase_hex' }
+    if (-not (Test-D32BoundedCompilerDiagnosticIdentityPair $Reference)) { return 'volume_file_identity_must_be_exact_hex' }
+    return $null
+}
+
 function Test-D32BoundedCompilerDiagnosticFileReferenceShape {
     param([AllowNull()][object]$Reference)
-    return ((Test-D32BoundedCompilerDiagnosticExactProperties -Object $Reference -Expected @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -and
-        (Test-D32BoundedCompilerDiagnosticCanonicalPath $Reference.path) -and
-        (Test-D32BoundedCompilerDiagnosticInteger $Reference.bytes -Positive) -and
-        [string]$Reference.sha256 -cmatch '^[0-9a-f]{64}$' -and (Test-D32BoundedCompilerDiagnosticIdentityPair $Reference))
+    return ($null -eq (Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Reference))
+}
+
+function Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape {
+    param([AllowNull()][object]$Reference, [Parameter(Mandatory = $true)][string]$ExpectedPath)
+    if (-not (Test-D32BoundedCompilerDiagnosticCanonicalPath $ExpectedPath)) { return $false }
+    if ($null -ne (Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Reference -AllowEmptyBytes)) { return $false }
+    return [StringComparer]::OrdinalIgnoreCase.Equals([string]$Reference.path, $ExpectedPath)
 }
 
 function Test-D32BoundedCompilerDiagnosticGitContentReferenceShape {

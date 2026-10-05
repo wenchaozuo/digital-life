@@ -288,39 +288,96 @@ function Assert-D32BoundedDiagnosticFileReference {
         [Parameter(Mandatory = $true)][object]$Reference,
         [AllowNull()][object]$MustBeWithin,
         [AllowNull()][object]$MustNotBeWithin,
-        [Diagnostics.Stopwatch]$ProofTimer
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [ValidateSet('Regular', 'CapturedStream')][string]$ReferenceKind = 'Regular',
+        [string]$ReferenceField = 'file_reference',
+        [string]$Caller = 'unspecified',
+        [AllowNull()][string]$ExactPath
     )
     if ($null -ne $ProofTimer -and (-not $ProofTimer.IsRunning -or $ProofTimer.ElapsedMilliseconds -ge 300000)) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate source proof reached its 300-second ceiling during opened-file identity checks'
     }
-    if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Reference)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: exact source file reference is malformed' }
+    $shapeFailure = $null
+    if ($ReferenceKind -ceq 'CapturedStream') {
+        if ([String]::IsNullOrWhiteSpace($ExactPath) -or -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $ExactPath)) {
+            $shapeFailure = 'expected_capture_path_must_be_canonical_absolute_string'
+        }
+        elseif (-not (Test-D32BoundedCompilerDiagnosticCapturedStreamReferenceShape -Reference $Reference -ExpectedPath $ExactPath)) {
+            $shapeFailure = Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Reference -AllowEmptyBytes
+            if ($null -eq $shapeFailure) { $shapeFailure = 'path_must_equal_expected_capture_path' }
+        }
+    }
+    elseif (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Reference)) {
+        $shapeFailure = Get-D32BoundedCompilerDiagnosticFileReferenceShapeFailure -Reference $Reference
+    }
+    $callerValue = if ([String]::IsNullOrWhiteSpace($Caller)) { 'unspecified' } else { $Caller }
+    $referenceFieldValue = if ([String]::IsNullOrWhiteSpace($ReferenceField)) { 'file_reference' } else { $ReferenceField }
     $path = [string]$Reference.path
+    $actualReference = Format-D32BoundedCompilerDiagnosticPathForError $path
+    $expectedRoot = if ($null -eq $MustBeWithin) { 'null' } else { Format-D32BoundedCompilerDiagnosticPathForError $MustBeWithin }
+    $protectedRoot = if ($null -eq $MustNotBeWithin) { 'null' } else { Format-D32BoundedCompilerDiagnosticPathForError $MustNotBeWithin }
+    if ($null -ne $shapeFailure) {
+        $invalidField = switch -Regex ([string]$shapeFailure) {
+            '^(?:path_|path$|expected_capture_path)' { 'path' }
+            '^bytes_' { 'bytes' }
+            '^sha256_' { 'sha256' }
+            '^volume_file_identity_' { 'volume_serial_hex/file_id_hex' }
+            '^property_set_' { 'properties' }
+            default { 'reference' }
+        }
+        $fieldValue = if ($invalidField -ceq 'reference') { $referenceFieldValue } else { "$referenceFieldValue.$invalidField" }
+        throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: exact source file reference is malformed; caller=$callerValue; field=$fieldValue; reason=$shapeFailure; actual_ref=$actualReference; expected_root=$expectedRoot"
+    }
+    $referenceContext = "caller=$callerValue; field=$referenceFieldValue.path; actual_ref=$actualReference; expected_root=$expectedRoot"
     if ($null -ne $MustBeWithin) {
         if ($MustBeWithin -isnot [string] -or -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $MustBeWithin)) {
-            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: authorized containment root is invalid; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); expected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustBeWithin)"
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: authorized containment root is invalid; $referenceContext"
         }
         if (-not (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustBeWithin)) {
-            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source reference escaped its authorized root; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); expected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustBeWithin)"
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source reference escaped its authorized root; $referenceContext"
         }
     }
     if ($null -ne $MustNotBeWithin) {
         if ($MustNotBeWithin -isnot [string] -or -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $MustNotBeWithin)) {
-            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: protected source root is invalid; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); protected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustNotBeWithin)"
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: protected source root is invalid; $referenceContext; protected_root=$protectedRoot"
         }
         if (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustNotBeWithin) {
-            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: evidence reference overlaps a protected source root; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); protected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustNotBeWithin)"
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: evidence reference overlaps a protected source root; $referenceContext; protected_root=$protectedRoot"
         }
     }
-    if (-not (Test-D32ProfileNoReparsePath -Path $path)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source file reference is missing or traverses a reparse point' }
+    if (-not (Test-D32ProfileNoReparsePath -Path $path)) {
+        throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source file reference is missing or traverses a reparse point; $referenceContext"
+    }
     $snapshot = Get-D32ProfileFileSnapshot -Path $path
     if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate source proof reached its 300-second ceiling during opened-file hashing'
     }
     if ($snapshot.Bytes -ne [Int64]$Reference.bytes -or $snapshot.Sha256 -cne [string]$Reference.sha256 -or
         $snapshot.VolumeSerialHex -cne [string]$Reference.volume_serial_hex -or $snapshot.FileIdHex -cne [string]$Reference.file_id_hex) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: current source file bytes or opened-handle identity differ from the independently pinned reference'
+        throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: current source file bytes or opened-handle identity differ from the independently pinned reference; $referenceContext; protected_root=$protectedRoot"
     }
     return $snapshot
+}
+
+function New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection {
+    param([Parameter(Mandatory = $true)][object]$Reference)
+    $archiveFields = @('source', 'name', 'version', 'checksum', 'path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $Reference -Expected $archiveFields) -or
+        [string]$Reference.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
+        [string]$Reference.name -notmatch '^[A-Za-z0-9_-]+$' -or [string]$Reference.version -notmatch '^[0-9A-Za-z.+_-]+$' -or
+        [string]$Reference.checksum -cnotmatch '^[0-9a-f]{64}$' -or [string]$Reference.sha256 -cne [string]$Reference.checksum -or
+        -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Reference.path) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Reference.bytes -Positive) -or [Int64]$Reference.bytes -gt 268435456L -or
+        [string]$Reference.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$Reference.file_id_hex -cnotmatch '^[0-9a-f]{32}$') {
+        throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: registry archive projection requires its exact nine-field caller schema; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $Reference.path)"
+    }
+    return [PSCustomObject][ordered]@{
+        path = $Reference.path
+        bytes = $Reference.bytes
+        sha256 = $Reference.sha256
+        volume_serial_hex = $Reference.volume_serial_hex
+        file_id_hex = $Reference.file_id_hex
+    }
 }
 
 function Assert-D32BoundedDiagnosticDirectoryReference {
@@ -365,10 +422,13 @@ function Assert-D32BoundedDiagnosticSourcePins {
         'scripts/d32-powershell-module-authority.ps1'
     )
     $seen = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pinIndex = 0
     foreach ($pin in $Document.source_pins) {
-        $snapshot = Assert-D32BoundedDiagnosticFileReference -Reference $pin -MustBeWithin $Repo -MustNotBeWithin $null
+        $snapshot = Assert-D32BoundedDiagnosticFileReference -Reference $pin -MustBeWithin $Repo -MustNotBeWithin $null `
+            -ReferenceField "document.source_pins[$pinIndex]" -Caller 'Assert-D32BoundedDiagnosticSourcePins'
         $relative = [IO.Path]::GetRelativePath($Repo, [string]$pin.path).Replace('\', '/')
         if (-not $seen.TryAdd($relative, $snapshot)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source pin is duplicated' }
+        $pinIndex++
     }
     foreach ($relative in $requiredRelative) {
         if (-not $seen.ContainsKey($relative)) { throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: required source identity is not pinned: $relative" }
@@ -473,7 +533,8 @@ function Assert-D32BoundedDiagnosticPriorInv7Provenance {
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$Origin.blocked_diagnostic.path, $blockedPath)) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: prior inv7 input is not the exact retained blocked attempt'
     }
-    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.blocked_diagnostic -MustBeWithin $originRoot -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.blocked_diagnostic -MustBeWithin $originRoot -MustNotBeWithin $Repo `
+        -ProofTimer $ProofTimer -ReferenceField 'dependency_origin.blocked_diagnostic' -Caller 'Assert-D32BoundedDiagnosticPriorInv7Provenance'
     $blocked = Read-D32BoundedDiagnosticJson -Path $blockedPath -ExpectedReference $Origin.blocked_diagnostic
     $blockedFields = @('schema_version', 'record_type', 'candidate_sha', 'run_id', 'status', 'gate_authority', 'phase1_allowed',
         'aggregate_allowed', 'toolchain_profile', 'evidence_root', 'failing_fixed_command', 'raw_v2_trace', 'ordered_stream_captures',
@@ -530,7 +591,10 @@ function Assert-D32BoundedDiagnosticPriorInv7Provenance {
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$capture.reference.path, $expectedCapturePaths[$index])) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: retained inv7 final-command stdout/stderr capture identity is incomplete'
         }
-        $null = Assert-D32BoundedDiagnosticFileReference -Reference $capture.reference -MustBeWithin (Join-Path $originRoot 'logs') -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $capture.reference -MustBeWithin (Join-Path $originRoot 'logs') `
+            -MustNotBeWithin $Repo -ProofTimer $ProofTimer -ReferenceKind CapturedStream -ExactPath $expectedCapturePaths[$index] `
+            -ReferenceField "dependency_origin.blocked_diagnostic.ordered_stream_captures[$index].reference" `
+            -Caller 'Assert-D32BoundedDiagnosticPriorInv7Provenance'
     }
 
     return [PSCustomObject]@{
@@ -714,6 +778,7 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
     $totalExpanded = [Int64]0
     $totalEntries = [Int64]0
     $manifestBytesTotal = [Int64]0
+    $archiveIndex = 0
     foreach ($archive in $Origin.registry_archives) {
         if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate source proof reached its 300-second ceiling' }
         $key = [string]$archive.name + "`0" + [string]$archive.version
@@ -726,7 +791,11 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$archive.path, [string]$package.archive_path)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: registry archive reference does not exactly match its lock-derived package/checksum/path'
         }
-        $snapshot = Assert-D32BoundedDiagnosticFileReference -Reference $archive -MustBeWithin $Plan.registry_archive_root -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+        $archiveFileReference = New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive
+        $snapshot = Assert-D32BoundedDiagnosticFileReference -Reference $archiveFileReference -MustBeWithin $Plan.registry_archive_root `
+            -MustNotBeWithin $Repo -ProofTimer $ProofTimer -ReferenceField "dependency_origin.registry_archives[$archiveIndex].file_reference" `
+            -Caller 'New-D32BoundedDiagnosticRegistrySourceContentProof'
+        $archiveIndex++
         if ([Int64]$snapshot.Bytes -gt [Int64]$script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: compressed registry archive exceeds its fixed 256 MiB buffered-input bound' }
         $totalCompressed += [Int64]$snapshot.Bytes
         if ($totalCompressed -gt 17179869184L) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate registry archive bytes exceed 16 GiB' }
@@ -1440,13 +1509,19 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         $home = Test-D32CargoHome -Path $cargoHome -Repository $Repo
         if ([string]$home.Path -cne $cargoHome) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: optional CargoHome current path differs' }
     }
-    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.owner_record -MustBeWithin $originRoot -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.owner_record -MustBeWithin $originRoot -MustNotBeWithin $Repo `
+        -ProofTimer $ProofTimer -ReferenceField 'dependency_origin.owner_record' -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
     $owner = Assert-D32BoundedDiagnosticOwnerRecord -Reference $Origin.owner_record -Repo $Repo `
         -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha
     $priorProvenance = Assert-D32BoundedDiagnosticPriorInv7Provenance -Origin $Origin -Owner $owner -Repo $Repo `
         -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha -ProofTimer $ProofTimer
     $historicalFetchCompletion = 'NOT_RETAINED'
-    foreach ($fetch in $Origin.fetch_records) { $null = Assert-D32BoundedDiagnosticFileReference -Reference $fetch -MustBeWithin $originRoot -MustNotBeWithin $Repo -ProofTimer $ProofTimer }
+    $fetchIndex = 0
+    foreach ($fetch in $Origin.fetch_records) {
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $fetch -MustBeWithin $originRoot -MustNotBeWithin $Repo `
+            -ProofTimer $ProofTimer -ReferenceField "dependency_origin.fetch_records[$fetchIndex]" -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
+        $fetchIndex++
+    }
 
     $expectedManifestPaths = @(
         'vita-agent-protocol/Cargo.toml', 'vita-agent-protocol/Cargo.lock',
@@ -1454,10 +1529,13 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock'
     )
     $manifestByPath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $manifestIndex = 0
     foreach ($reference in $Origin.manifest_refs) {
-        $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repo -MustNotBeWithin $null -ProofTimer $ProofTimer
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repo -MustNotBeWithin $null `
+            -ProofTimer $ProofTimer -ReferenceField "dependency_origin.manifest_refs[$manifestIndex]" -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
         $relative = [IO.Path]::GetRelativePath($Repo, [string]$reference.path).Replace('\', '/')
         if (-not $manifestByPath.TryAdd($relative, $reference)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: manifest/lock reference is duplicated' }
+        $manifestIndex++
     }
     if ($manifestByPath.Count -ne $expectedManifestPaths.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: complete manifest/lock inventory is not pinned' }
     foreach ($relative in $expectedManifestPaths) {
@@ -1476,8 +1554,11 @@ function Assert-D32BoundedDiagnosticInv7Origin {
     $lockedPackages = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $vitaLockText)
     $lockedRegistry = @($lockedPackages | Where-Object { $_.source_kind -ceq 'registry' })
     $lockedGit = @($lockedPackages | Where-Object { $_.source_kind -ceq 'git' } | Group-Object -Property source | ForEach-Object { $_.Group[0] })
+    $manifestIndex = 0
     foreach ($reference in $Origin.manifest_refs) {
-        $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repo -MustNotBeWithin $null -ProofTimer $ProofTimer
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repo -MustNotBeWithin $null `
+            -ProofTimer $ProofTimer -ReferenceField "dependency_origin.manifest_refs[$manifestIndex]" -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
+        $manifestIndex++
     }
 
     if ($sourcePlan.registry_package_count -ne $lockedRegistry.Count -or $sourcePlan.git_source_count -ne $lockedGit.Count -or
@@ -1485,6 +1566,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: lock-derived registry tuple count/root differs from the pinned archive origin'
     }
     $archiveByKey = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $archiveIndex = 0
     foreach ($archive in $Origin.registry_archives) {
         $fields = @('source', 'name', 'version', 'checksum', 'path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $archive -Expected $fields) -or
@@ -1508,11 +1590,11 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         if ([string]$archive.checksum -cne [string]$package.checksum -or [string]$archive.sha256 -cne [string]$package.checksum) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: registry archive checksum differs from Cargo.lock'
         }
-        $archiveReference = [PSCustomObject][ordered]@{
-            path = [string]$archive.path; bytes = [Int64]$archive.bytes; sha256 = [string]$archive.sha256
-            volume_serial_hex = [string]$archive.volume_serial_hex; file_id_hex = [string]$archive.file_id_hex
-        }
-        $null = Assert-D32BoundedDiagnosticFileReference -Reference $archiveReference -MustBeWithin $registryRootExpected -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+        $archiveReference = New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $archiveReference -MustBeWithin $registryRootExpected -MustNotBeWithin $Repo `
+            -ProofTimer $ProofTimer -ReferenceField "dependency_origin.registry_archives[$archiveIndex].file_reference" `
+            -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
+        $archiveIndex++
     }
     if ($ProofTimer.ElapsedMilliseconds -ge 300000) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate registry/Git source proof reached its 300-second ceiling before content verification' }
     $registryContentResult = New-D32BoundedDiagnosticRegistrySourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
@@ -1520,7 +1602,8 @@ function Assert-D32BoundedDiagnosticInv7Origin {
     if (-not $SourceProofOnly -and $null -ne $Origin.git_source_authority) {
         # This optional reference is historical context only. Current source
         # content is proved from the lock, pack/index, and checkout below.
-        $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.git_source_authority -MustBeWithin $originRoot -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+        $null = Assert-D32BoundedDiagnosticFileReference -Reference $Origin.git_source_authority -MustBeWithin $originRoot -MustNotBeWithin $Repo `
+            -ProofTimer $ProofTimer -ReferenceField 'dependency_origin.git_source_authority' -Caller 'Assert-D32BoundedDiagnosticInv7Origin'
     }
     $gitContentResult = New-D32BoundedDiagnosticGitSourceContentProof -Plan $sourcePlan -Origin $Origin -Repo $Repo -ProofTimer $ProofTimer
     $manifestCandidates = [System.Collections.Generic.List[object]]::new()
@@ -2082,7 +2165,8 @@ function New-D32BoundedDiagnosticImageGrant {
         [AllowNull()][object]$SourceClosure
     )
     if ($null -eq $Reference) { return $null }
-    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Reference -MustBeWithin $null -MustNotBeWithin $Repository
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $Reference -MustBeWithin $null -MustNotBeWithin $Repository `
+        -ReferenceField "toolchain_profile.image_grants.$Kind" -Caller 'New-D32BoundedDiagnosticImageGrant'
     $current = Get-D32ProfileFileSnapshot -Path ([string]$Reference.path)
     if ([Int64]$current.Bytes -ne [Int64]$Reference.bytes -or [string]$current.Sha256 -cne [string]$Reference.sha256 -or
         [string]$current.VolumeSerialHex -cne [string]$Reference.volume_serial_hex -or
@@ -2231,7 +2315,8 @@ function Get-D32BoundedDiagnosticSourceProofProfile {
     param([Parameter(Mandatory = $true)][object]$Authority, [Parameter(Mandatory = $true)][string]$Repo,
         [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer)
     $profileReference = $Authority.toolchain_profile
-    $null = Assert-D32BoundedDiagnosticFileReference -Reference $profileReference -MustBeWithin $null -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $profileReference -MustBeWithin $null -MustNotBeWithin $Repo `
+        -ProofTimer $ProofTimer -ReferenceField 'authority.toolchain_profile' -Caller 'Get-D32BoundedDiagnosticSourceProofProfile'
     if ([Int64]$profileReference.bytes -le 0 -or [Int64]$profileReference.bytes -gt 4194304) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: caller-pinned Profile V2 exceeds its fixed 4 MiB input bound'
     }
@@ -2255,7 +2340,8 @@ function Get-D32BoundedDiagnosticSourceProofProfile {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: Profile V2 does not bind the exact currently opened manifest/lock tuple'
         }
     }
-    $after = Assert-D32BoundedDiagnosticFileReference -Reference $profileReference -MustBeWithin $null -MustNotBeWithin $Repo -ProofTimer $ProofTimer
+    $after = Assert-D32BoundedDiagnosticFileReference -Reference $profileReference -MustBeWithin $null -MustNotBeWithin $Repo `
+        -ProofTimer $ProofTimer -ReferenceField 'authority.toolchain_profile' -Caller 'Get-D32BoundedDiagnosticSourceProofProfile'
     if ([Int64]$after.Bytes -ne [Int64]$profileReference.bytes -or [string]$after.Sha256 -cne [string]$profileReference.sha256 -or
         [string]$after.VolumeSerialHex -cne [string]$profileReference.volume_serial_hex -or [string]$after.FileIdHex -cne [string]$profileReference.file_id_hex) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: Profile V2 changed while its current lock bindings were read'
@@ -2306,20 +2392,27 @@ function Invoke-D32BoundedDiagnosticSourceProofRun {
         }
         $persistAllowed = $true
 
+        $sourcePinIndex = 0
         foreach ($pin in $authority.source_pins) {
-            $pinSnapshot = Assert-D32BoundedDiagnosticFileReference -Reference $pin -MustBeWithin $Repository -MustNotBeWithin $null -ProofTimer $proofTimer
+            $pinSnapshot = Assert-D32BoundedDiagnosticFileReference -Reference $pin -MustBeWithin $Repository -MustNotBeWithin $null `
+                -ProofTimer $proofTimer -ReferenceField "authority.source_pins[$sourcePinIndex]" -Caller 'Invoke-D32BoundedDiagnosticSourceProofRun'
             if ([Int64]$pinSnapshot.Bytes -gt 16777216) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: source proof code input exceeds its fixed 16 MiB pin bound' }
             $sourcePinSummaries += [PSCustomObject]@{
                 path = [string]$pin.path; bytes = [Int64]$pinSnapshot.Bytes; sha256 = [string]$pinSnapshot.Sha256
                 volume_serial_hex = [string]$pinSnapshot.VolumeSerialHex; file_id_hex = [string]$pinSnapshot.FileIdHex
             }
+            $sourcePinIndex++
         }
 
+        $manifestIndex = 0
         foreach ($reference in $authority.dependency_origin.manifest_refs) {
             if ([Int64]$reference.bytes -gt [Int64]$authority.proof_budget.max_manifest_or_lock_file_bytes) {
                 throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: current manifest or lock pin exceeds its finite content-read bound'
             }
-            $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repository -MustNotBeWithin $null -ProofTimer $proofTimer
+            $null = Assert-D32BoundedDiagnosticFileReference -Reference $reference -MustBeWithin $Repository -MustNotBeWithin $null `
+                -ProofTimer $proofTimer -ReferenceField "authority.dependency_origin.manifest_refs[$manifestIndex]" `
+                -Caller 'Invoke-D32BoundedDiagnosticSourceProofRun'
+            $manifestIndex++
         }
         $profile = Get-D32BoundedDiagnosticSourceProofProfile -Authority $authority -Repo $Repository -ProofTimer $proofTimer
         $sourceClosure = Assert-D32BoundedDiagnosticInv7Origin -Origin $authority.dependency_origin -Profile $profile `

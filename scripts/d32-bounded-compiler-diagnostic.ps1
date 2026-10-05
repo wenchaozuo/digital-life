@@ -286,8 +286,8 @@ function Read-D32BoundedDiagnosticJson {
 function Assert-D32BoundedDiagnosticFileReference {
     param(
         [Parameter(Mandatory = $true)][object]$Reference,
-        [AllowNull()][string]$MustBeWithin,
-        [AllowNull()][string]$MustNotBeWithin,
+        [AllowNull()][object]$MustBeWithin,
+        [AllowNull()][object]$MustNotBeWithin,
         [Diagnostics.Stopwatch]$ProofTimer
     )
     if ($null -ne $ProofTimer -and (-not $ProofTimer.IsRunning -or $ProofTimer.ElapsedMilliseconds -ge 300000)) {
@@ -295,8 +295,22 @@ function Assert-D32BoundedDiagnosticFileReference {
     }
     if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Reference)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: exact source file reference is malformed' }
     $path = [string]$Reference.path
-    if ($null -ne $MustBeWithin -and -not (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustBeWithin)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source reference escaped its authorized root' }
-    if ($null -ne $MustNotBeWithin -and (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustNotBeWithin)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: evidence reference overlaps a protected source root' }
+    if ($null -ne $MustBeWithin) {
+        if ($MustBeWithin -isnot [string] -or -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $MustBeWithin)) {
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: authorized containment root is invalid; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); expected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustBeWithin)"
+        }
+        if (-not (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustBeWithin)) {
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source reference escaped its authorized root; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); expected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustBeWithin)"
+        }
+    }
+    if ($null -ne $MustNotBeWithin) {
+        if ($MustNotBeWithin -isnot [string] -or -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $MustNotBeWithin)) {
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: protected source root is invalid; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); protected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustNotBeWithin)"
+        }
+        if (Test-D32BoundedCompilerDiagnosticWithin -Child $path -Parent $MustNotBeWithin) {
+            throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: evidence reference overlaps a protected source root; actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $path); protected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $MustNotBeWithin)"
+        }
+    }
     if (-not (Test-D32ProfileNoReparsePath -Path $path)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source file reference is missing or traverses a reparse point' }
     $snapshot = Get-D32ProfileFileSnapshot -Path $path
     if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {

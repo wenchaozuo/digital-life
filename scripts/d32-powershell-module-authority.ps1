@@ -23,11 +23,24 @@ function Test-D32PowerShellAuthorityPathNoReparse {
 
 function Test-D32PowerShellAuthorityPathWithin {
     param([Parameter(Mandatory = $true)][string]$Child, [Parameter(Mandatory = $true)][string]$Parent)
+    if ($Child -isnot [string] -or $Parent -isnot [string] -or
+        [String]::IsNullOrWhiteSpace([string]$Child) -or [String]::IsNullOrWhiteSpace([string]$Parent) -or
+        -not [IO.Path]::IsPathFullyQualified([string]$Child) -or -not [IO.Path]::IsPathFullyQualified([string]$Parent)) { return $false }
     try {
-        $childFull = [IO.Path]::GetFullPath($Child).TrimEnd([char[]]@('\', '/'))
-        $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd([char[]]@('\', '/'))
-        if ([StringComparer]::OrdinalIgnoreCase.Equals($childFull, $parentFull)) { return $true }
-        return $childFull.StartsWith($parentFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+        $childFull = [IO.Path]::GetFullPath([string]$Child)
+        $parentFull = [IO.Path]::GetFullPath([string]$Parent)
+        $childRoot = [IO.Path]::GetPathRoot($childFull)
+        $parentRoot = [IO.Path]::GetPathRoot($parentFull)
+        if ([String]::IsNullOrWhiteSpace($childRoot) -or [String]::IsNullOrWhiteSpace($parentRoot)) { return $false }
+        $childComparable = if ($childFull.Length -gt $childRoot.Length) { $childFull.TrimEnd('\', '/') } else { $childRoot }
+        $parentComparable = if ($parentFull.Length -gt $parentRoot.Length) { $parentFull.TrimEnd('\', '/') } else { $parentRoot }
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($childComparable, $parentComparable)) { return $true }
+        $parentIsRoot = [StringComparer]::OrdinalIgnoreCase.Equals($parentComparable, $parentRoot) -or
+            [StringComparer]::OrdinalIgnoreCase.Equals($parentComparable.TrimEnd('\', '/'), $parentRoot.TrimEnd('\', '/'))
+        $parentPrefix = if ($parentIsRoot) {
+            if ($parentRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $parentRoot } else { $parentRoot + [IO.Path]::DirectorySeparatorChar }
+        } else { $parentComparable + [IO.Path]::DirectorySeparatorChar }
+        return $childFull.StartsWith($parentPrefix, [StringComparison]::OrdinalIgnoreCase)
     }
     catch { return $false }
 }

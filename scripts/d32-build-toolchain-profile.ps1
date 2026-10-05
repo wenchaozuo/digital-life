@@ -99,13 +99,26 @@ function Test-D32ProfileCanonicalPathString {
 }
 
 function Test-D32ProfilePathWithin {
-    param([string]$Child, [string]$Parent)
+    param([AllowNull()][object]$Child, [AllowNull()][object]$Parent)
+    if ($Child -isnot [string] -or $Parent -isnot [string] -or
+        [String]::IsNullOrWhiteSpace([string]$Child) -or [String]::IsNullOrWhiteSpace([string]$Parent) -or
+        -not [IO.Path]::IsPathFullyQualified([string]$Child) -or -not [IO.Path]::IsPathFullyQualified([string]$Parent)) { return $false }
 
     try {
-        $childFull = [System.IO.Path]::GetFullPath($Child).TrimEnd('\', '/')
-        $parentFull = [System.IO.Path]::GetFullPath($Parent).TrimEnd('\', '/')
-        if ($childFull.Equals($parentFull, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        return $childFull.StartsWith($parentFull + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+        $childFull = [System.IO.Path]::GetFullPath([string]$Child)
+        $parentFull = [System.IO.Path]::GetFullPath([string]$Parent)
+        $childRoot = [System.IO.Path]::GetPathRoot($childFull)
+        $parentRoot = [System.IO.Path]::GetPathRoot($parentFull)
+        if ([String]::IsNullOrWhiteSpace($childRoot) -or [String]::IsNullOrWhiteSpace($parentRoot)) { return $false }
+        $childComparable = if ($childFull.Length -gt $childRoot.Length) { $childFull.TrimEnd('\', '/') } else { $childRoot }
+        $parentComparable = if ($parentFull.Length -gt $parentRoot.Length) { $parentFull.TrimEnd('\', '/') } else { $parentRoot }
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($childComparable, $parentComparable)) { return $true }
+        $parentIsRoot = [StringComparer]::OrdinalIgnoreCase.Equals($parentComparable, $parentRoot) -or
+            [StringComparer]::OrdinalIgnoreCase.Equals($parentComparable.TrimEnd('\', '/'), $parentRoot.TrimEnd('\', '/'))
+        $parentPrefix = if ($parentIsRoot) {
+            if ($parentRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar)) { $parentRoot } else { $parentRoot + [System.IO.Path]::DirectorySeparatorChar }
+        } else { $parentComparable + [System.IO.Path]::DirectorySeparatorChar }
+        return $childFull.StartsWith($parentPrefix, [StringComparison]::OrdinalIgnoreCase)
     }
     catch { return $false }
 }
@@ -735,7 +748,7 @@ function Test-D32BuildToolchainProfile {
         [Parameter(Mandatory = $true)][string]$ProfilePath,
         [Parameter(Mandatory = $true)][string]$ExpectedSha256,
         [Parameter(Mandatory = $true)][string]$Repository,
-        [AllowNull()][string]$EvidenceRoot,
+        [AllowNull()][object]$EvidenceRoot,
         [string]$ExpectedTargetTriple = 'x86_64-pc-windows-msvc'
     )
 
@@ -766,9 +779,9 @@ function Test-D32BuildToolchainProfile {
 
         $repositoryFull = Assert-D32ProfileDirectory -Path $Repository
         if ((Test-D32ProfilePathWithin -Child $profileFull -Parent $repositoryFull) -or (Test-D32ProfilePathWithin -Child $repositoryFull -Parent $profileFull)) { throw 'toolchain profile file must be outside and non-overlapping with the repository' }
-        if ($EvidenceRoot) {
-            if (-not (Test-D32ProfileCanonicalPathString -Path $EvidenceRoot)) { throw 'evidence root path must be canonical' }
-            $evidenceFull = Get-D32ProfileFullPath -Path $EvidenceRoot
+        if ($null -ne $EvidenceRoot) {
+            if ($EvidenceRoot -isnot [string] -or -not (Test-D32ProfileCanonicalPathString -Path ([string]$EvidenceRoot))) { throw 'evidence root path must be canonical' }
+            $evidenceFull = Get-D32ProfileFullPath -Path ([string]$EvidenceRoot)
             if ((Test-D32ProfilePathWithin -Child $evidenceFull -Parent $repositoryFull) -or (Test-D32ProfilePathWithin -Child $repositoryFull -Parent $evidenceFull)) { throw 'evidence root must be outside and non-overlapping with the repository' }
         }
         if (-not (Test-D32ProfileNoReparsePath -Path $profileFull)) { throw 'profile path traverses a reparse point' }
@@ -900,7 +913,7 @@ function Test-D32BuildToolchainProfile {
         $result.Profile = $profile
         $result.ProfilePath = $profileFull
         $result.Repository = $repositoryFull
-        $result.EvidenceRoot = if ($EvidenceRoot) { [IO.Path]::GetFullPath($EvidenceRoot) } else { $null }
+        $result.EvidenceRoot = if ($null -ne $EvidenceRoot) { [IO.Path]::GetFullPath([string]$EvidenceRoot) } else { $null }
         $result.ExpectedTargetTriple = $ExpectedTargetTriple
         $result.Digest = $profileSnapshot.Sha256
         $result.Identity = $profileSnapshot
@@ -921,7 +934,7 @@ function Test-D32BuildToolchainProfileModuleFree {
         [Parameter(Mandatory = $true)][string]$ProfilePath,
         [Parameter(Mandatory = $true)][string]$ExpectedSha256,
         [Parameter(Mandatory = $true)][string]$Repository,
-        [AllowNull()][string]$EvidenceRoot,
+        [AllowNull()][object]$EvidenceRoot,
         [string]$ExpectedTargetTriple = 'x86_64-pc-windows-msvc'
     )
     if (-not (Microsoft.PowerShell.Core\Get-Command -Name Open-D32PowerShellAuthorityFile -CommandType Function -ErrorAction SilentlyContinue)) {
@@ -943,7 +956,8 @@ function Assert-D32BuildToolchainProfileCurrent {
     param([Parameter(Mandatory = $true)][object]$ValidatedProfile)
 
     if (-not [bool]$ValidatedProfile.IsValid) { throw 'validated profile object is not valid' }
-    $again = Test-D32BuildToolchainProfile -ProfilePath ([string]$ValidatedProfile.ProfilePath) -ExpectedSha256 ([string]$ValidatedProfile.Digest) -Repository ([string]$ValidatedProfile.Repository) -EvidenceRoot ([string]$ValidatedProfile.EvidenceRoot) -ExpectedTargetTriple ([string]$ValidatedProfile.ExpectedTargetTriple)
+    $evidenceRoot = $ValidatedProfile.EvidenceRoot
+    $again = Test-D32BuildToolchainProfile -ProfilePath ([string]$ValidatedProfile.ProfilePath) -ExpectedSha256 ([string]$ValidatedProfile.Digest) -Repository ([string]$ValidatedProfile.Repository) -EvidenceRoot $evidenceRoot -ExpectedTargetTriple ([string]$ValidatedProfile.ExpectedTargetTriple)
     if (-not $again.IsValid) { throw "build toolchain profile changed or failed current identity validation: $($again.Failure)" }
     if ($again.ExecutableInventory.Count -ne $ValidatedProfile.ExecutableInventory.Count) { throw 'build executable inventory count changed' }
     if ($again.ScriptInventory.Count -ne $ValidatedProfile.ScriptInventory.Count) { throw 'dormant PATH script inventory count changed' }

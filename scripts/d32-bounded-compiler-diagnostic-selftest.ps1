@@ -328,8 +328,148 @@ try { $null = Assert-D32BoundedCompilerDiagnosticNoGlobalWriter -ProcessProbe { 
 catch { $mismatchedIdleBlocked = $_.Exception.Message -like 'D32_BOUNDED_DIAGNOSTIC_CAPACITY_BLOCKED: PID-zero row*' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'borrowed Windows pseudo-process name cannot evade global census' $mismatchedIdleBlocked
 $runnerPath = Join-Path $PSScriptRoot 'd32-bounded-compiler-diagnostic.ps1'
+$policyPath = Join-Path $PSScriptRoot 'd32-bounded-compiler-diagnostic-policy.ps1'
+$policyTokens = $null; $policyParseErrors = $null
+$policyAst = [System.Management.Automation.Language.Parser]::ParseFile($policyPath, [ref]$policyTokens, [ref]$policyParseErrors)
 $runnerTokens = $null; $runnerParseErrors = $null
 $runnerAst = [System.Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$runnerTokens, [ref]$runnerParseErrors)
+$profileLibraryPath = Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'
+$profileLibraryTokens = $null; $profileLibraryParseErrors = $null
+$profileLibraryAst = [System.Management.Automation.Language.Parser]::ParseFile($profileLibraryPath, [ref]$profileLibraryTokens, [ref]$profileLibraryParseErrors)
+$moduleAuthorityPath = Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'
+$moduleAuthorityTokens = $null; $moduleAuthorityParseErrors = $null
+$moduleAuthorityAst = [System.Management.Automation.Language.Parser]::ParseFile($moduleAuthorityPath, [ref]$moduleAuthorityTokens, [ref]$moduleAuthorityParseErrors)
+$profileWithinAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32ProfilePathWithin' }, $true)
+$authorityWithinAst = $moduleAuthorityAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32PowerShellAuthorityPathWithin' }, $true)
+$profileFullPathAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32ProfileFullPath' }, $true)
+$noReparseAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32ProfileNoReparsePath' }, $true)
+$fileReferenceAssertAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticFileReference' }, $true)
+$profileTestAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BuildToolchainProfile' }, $true)
+$profileCurrentAst = $profileLibraryAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BuildToolchainProfileCurrent' }, $true)
+$authorityWithinTokens = $null; $authorityWithinParseErrors = $null
+$authorityWithinSyntaxAst = if ($null -ne $authorityWithinAst) { [System.Management.Automation.Language.Parser]::ParseInput($authorityWithinAst.Extent.Text, [ref]$authorityWithinTokens, [ref]$authorityWithinParseErrors) } else { $null }
+$pathHelperParseExact = $policyParseErrors.Count -eq 0 -and $runnerParseErrors.Count -eq 0 -and $profileLibraryParseErrors.Count -eq 0 -and
+    $null -ne $authorityWithinSyntaxAst -and $authorityWithinParseErrors.Count -eq 0 -and
+    $null -ne $profileWithinAst -and $null -ne $authorityWithinAst -and $null -ne $profileFullPathAst -and $null -ne $noReparseAst -and
+    $null -ne $fileReferenceAssertAst -and $null -ne $profileTestAst -and $null -ne $profileCurrentAst
+Assert-D32BoundedCompilerDiagnosticSelfTest 'all source-origin/root-containment functions parse for the synthetic containment census' $pathHelperParseExact
+Invoke-Expression $profileWithinAst.Extent.Text
+Invoke-Expression $authorityWithinAst.Extent.Text
+$containmentFunctions = @(
+    [PSCustomObject]@{ Name = 'source-proof policy'; Test = { param($Child, $Parent) Test-D32BoundedCompilerDiagnosticWithin -Child $Child -Parent $Parent } },
+    [PSCustomObject]@{ Name = 'Profile V2 source roots'; Test = { param($Child, $Parent) Test-D32ProfilePathWithin -Child $Child -Parent $Parent } },
+    [PSCustomObject]@{ Name = 'module bootstrap authorities'; Test = { param($Child, $Parent) Test-D32PowerShellAuthorityPathWithin -Child $Child -Parent $Parent } }
+)
+$containmentCases = @(
+    [PSCustomObject]@{ Name = 'same root'; Child = 'C:\D32-containment-fixture\repo'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'root itself with separator'; Child = 'C:\D32-containment-fixture\repo\'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'normal descendant'; Child = 'C:\D32-containment-fixture\repo\src\lib.rs'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'case-insensitive Windows child'; Child = 'c:\d32-CONTAINMENT-fixture\REPO\src\lib.rs'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'sibling prefix'; Child = 'C:\D32-containment-fixture\repo-sibling\file'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $false },
+    [PSCustomObject]@{ Name = 'parent traversal escape'; Child = 'C:\D32-containment-fixture\repo\..\outside\file'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $false },
+    [PSCustomObject]@{ Name = 'normalized traversal within root'; Child = 'C:\D32-containment-fixture\repo\src\..\Cargo.toml'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'different absolute drive'; Child = 'D:\D32-containment-fixture\repo\file'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $false },
+    [PSCustomObject]@{ Name = 'drive root child'; Child = 'C:\D32-containment-fixture\repo\file'; Parent = 'C:\'; Expected = $true },
+    [PSCustomObject]@{ Name = 'drive root itself'; Child = 'C:\'; Parent = 'C:\'; Expected = $true },
+    [PSCustomObject]@{ Name = 'UNC share root child'; Child = '\\d32-containment.invalid\share\repo\file'; Parent = '\\d32-containment.invalid\share\repo'; Expected = $true },
+    [PSCustomObject]@{ Name = 'UNC share root itself'; Child = '\\d32-containment.invalid\share\'; Parent = '\\d32-containment.invalid\share'; Expected = $true },
+    [PSCustomObject]@{ Name = 'UNC sibling share prefix'; Child = '\\d32-containment.invalid\share2\file'; Parent = '\\d32-containment.invalid\share'; Expected = $false },
+    [PSCustomObject]@{ Name = 'drive-relative path rejected'; Child = 'C:relative\file'; Parent = 'C:\D32-containment-fixture\repo'; Expected = $false },
+    [PSCustomObject]@{ Name = 'empty path rejected'; Child = ''; Parent = 'C:\D32-containment-fixture\repo'; Expected = $false }
+)
+foreach ($containmentFunction in $containmentFunctions) {
+    foreach ($containmentCase in $containmentCases) {
+        $observed = $false
+        try { $observed = [bool](& ([scriptblock]$containmentFunction.Test) ([string]$containmentCase.Child) ([string]$containmentCase.Parent)) } catch { $observed = $false }
+        Assert-D32BoundedCompilerDiagnosticSelfTest "$($containmentFunction.Name): $($containmentCase.Name)" ($observed -eq [bool]$containmentCase.Expected)
+    }
+}
+$sourceProofWithinAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32BoundedCompilerDiagnosticWithin' }, $true)
+$sourceReferenceNoReparseExact = $fileReferenceAssertAst.Extent.Text.Contains('Test-D32ProfileNoReparsePath -Path $path') -and
+    $fileReferenceAssertAst.Extent.Text.IndexOf('Test-D32BoundedCompilerDiagnosticWithin') -lt $fileReferenceAssertAst.Extent.Text.IndexOf('Test-D32ProfileNoReparsePath -Path $path') -and
+    $null -ne $sourceProofWithinAst -and $sourceProofWithinAst.Extent.Text.Contains('[IO.Path]::IsPathFullyQualified')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reference reparse guard remains after lexical source-root containment and roots require fully-qualified paths' $sourceReferenceNoReparseExact
+
+$profileTestText = [string]$profileTestAst.Extent.Text
+$profileCurrentText = [string]$profileCurrentAst.Extent.Text
+$evidenceRootNullBindingExact = $profileTestText.Contains('[AllowNull()][object]$EvidenceRoot') -and
+    $profileTestText.Contains('$null -ne $EvidenceRoot') -and
+    $profileTestText.Contains('Test-D32ProfileCanonicalPathString -Path ([string]$EvidenceRoot)') -and
+    $profileCurrentText.Contains('$evidenceRoot = $ValidatedProfile.EvidenceRoot') -and
+    $profileCurrentText.Contains('-EvidenceRoot $evidenceRoot') -and
+    -not $profileCurrentText.Contains('-EvidenceRoot ([string]$ValidatedProfile.EvidenceRoot)')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'optional EvidenceRoot preserves null and rejects explicit empty roots instead of truthiness-skipping the fence' $evidenceRootNullBindingExact
+
+Invoke-Expression $profileFullPathAst.Extent.Text
+Invoke-Expression ($noReparseAst.Extent.Text.Replace('function Test-D32ProfileNoReparsePath', 'function Test-D32ProfileNoReparsePathSynthetic'))
+Invoke-Expression $fileReferenceAssertAst.Extent.Text
+function Test-D32ProfileNoReparsePath { param([string]$Path) return $true }
+function Get-D32ProfileFileSnapshot {
+    param([string]$Path)
+    return [PSCustomObject]@{ Path = $Path; Bytes = 1L; Sha256 = ('a' * 64); VolumeSerialHex = '0123456789abcdef'; FileIdHex = '0123456789abcdef0123456789abcdef' }
+}
+$syntheticRepoRoot = 'C:\D32-sourceproof-synthetic\repo'
+$syntheticProfileReference = [PSCustomObject]@{ path = 'C:\D32-sourceproof-synthetic\toolchain-profile.json'; bytes = 1L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' }
+$nullRequiredRootAccepted = $false
+try {
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticProfileReference -MustBeWithin $null -MustNotBeWithin $syntheticRepoRoot
+    $nullRequiredRootAccepted = $true
+}
+catch { $nullRequiredRootAccepted = $false }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'explicitly absent required root remains null for Profile V2 while protected repository root still applies' $nullRequiredRootAccepted
+$escapedReferenceMessage = $null
+$escapedReferenceRejected = $false
+try {
+    $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticProfileReference -MustBeWithin $syntheticRepoRoot -MustNotBeWithin $null
+}
+catch { $escapedReferenceMessage = $_.Exception.Message; $escapedReferenceRejected = $true }
+$escapedActualPathJson = Format-D32BoundedCompilerDiagnosticPathForError $syntheticProfileReference.path
+$escapedExpectedRootJson = Format-D32BoundedCompilerDiagnosticPathForError $syntheticRepoRoot
+Assert-D32BoundedCompilerDiagnosticSelfTest 'escaped source reference reports safe actual_ref and expected_root and fails closed' `
+    ($escapedReferenceRejected -and $escapedReferenceMessage.Contains("actual_ref=$escapedActualPathJson") -and $escapedReferenceMessage.Contains("expected_root=$escapedExpectedRootJson"))
+$emptyRequiredRootRejected = $false
+try { $null = Assert-D32BoundedDiagnosticFileReference -Reference $syntheticProfileReference -MustBeWithin '' -MustNotBeWithin $null }
+catch { $emptyRequiredRootRejected = $_.Exception.Message.Contains('expected_root=""') }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'explicit empty required root is rejected rather than interpreted as an absent root' $emptyRequiredRootRejected
+$protectedReference = [PSCustomObject]@{ path = 'C:\D32-sourceproof-synthetic\repo\owner.json'; bytes = 1L; sha256 = 'a' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' }
+$protectedRootReported = $false
+try { $null = Assert-D32BoundedDiagnosticFileReference -Reference $protectedReference -MustBeWithin $null -MustNotBeWithin $syntheticRepoRoot }
+catch { $protectedRootReported = $_.Exception.Message.Contains("actual_ref=$(Format-D32BoundedCompilerDiagnosticPathForError $protectedReference.path)") -and $_.Exception.Message.Contains("protected_root=$(Format-D32BoundedCompilerDiagnosticPathForError $syntheticRepoRoot)") }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'protected-root overlap reports the actual reference and protected root' $protectedRootReported
+
+$reparseFixtureStatus = 'UNAVAILABLE'
+$reparseFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('D32-containment-fixture-' + [Guid]::NewGuid().ToString('N'))
+$reparseAuthorizedRoot = Join-Path $reparseFixtureRoot 'authorized'
+$reparseTargetRoot = Join-Path $reparseFixtureRoot 'outside'
+$reparseLinkPath = Join-Path $reparseAuthorizedRoot 'linked-outside'
+$reparseLinkCreated = $false
+try {
+    $null = [IO.Directory]::CreateDirectory($reparseAuthorizedRoot)
+    $null = [IO.Directory]::CreateDirectory($reparseTargetRoot)
+    try {
+        $null = [IO.Directory]::CreateSymbolicLink($reparseLinkPath, $reparseTargetRoot)
+        $reparseLinkCreated = $true
+    }
+    catch [System.Exception] {
+        $reparseFixtureStatus = 'UNAVAILABLE'
+        try { if (([IO.File]::GetAttributes($reparseLinkPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $reparseLinkCreated = $true } } catch { }
+    }
+    if ($reparseLinkCreated) {
+        $reparseChild = Join-Path $reparseLinkPath 'synthetic-source'
+        $lexicallyInside = Test-D32BoundedCompilerDiagnosticWithin -Child $reparseChild -Parent $reparseAuthorizedRoot
+        $reparseDenied = -not (Test-D32ProfileNoReparsePathSynthetic -Path $reparseChild)
+        $reparseFixtureStatus = if ($lexicallyInside -and $reparseDenied) { 'PASS' } else { 'FAIL' }
+        Assert-D32BoundedCompilerDiagnosticSelfTest 'synthetic reparse-point path is lexically beneath the root but rejected by the source no-reparse guard' ($lexicallyInside -and $reparseDenied)
+    }
+}
+finally {
+    if ($reparseLinkCreated) { [IO.Directory]::Delete($reparseLinkPath, $false) }
+    if ([IO.Directory]::Exists($reparseAuthorizedRoot)) { [IO.Directory]::Delete($reparseAuthorizedRoot, $false) }
+    if ([IO.Directory]::Exists($reparseTargetRoot)) { [IO.Directory]::Delete($reparseTargetRoot, $false) }
+    if ([IO.Directory]::Exists($reparseFixtureRoot)) { [IO.Directory]::Delete($reparseFixtureRoot, $false) }
+}
+$script:D32ContainmentReparseFixtureStatus = $reparseFixtureStatus
+
 $capacityAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32BoundedDiagnosticCapacity' }, $true)
 $capacityText = if ($null -eq $capacityAst) { '' } else { [string]$capacityAst.Extent.Text }
 $globalCensusWiringExact = $runnerParseErrors.Count -eq 0 -and $null -ne $capacityAst -and
@@ -1225,3 +1365,4 @@ foreach ($consumer in $formalConsumerSchemas) {
 }
 
 Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, source-proof result constructor success/failure/timeout/budget branches, PSCustomObject versus ordered-dictionary nested-record census, success/blocked JSON roundtrips, exact-field and candidate-pin negatives, primary-error-preserving BLOCKED fallback, proof-only entry/result AST wiring, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
+Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

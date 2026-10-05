@@ -965,8 +965,62 @@ function Test-D32BoundedDiagnosticSourceGraphProof {
     return $true
 }
 
+function Add-D32BoundedDiagnosticSourceProofCandidateFailureReason {
+    param([AllowNull()][System.Collections.Generic.List[string]]$FailureReasons, [Parameter(Mandatory = $true)][string]$Reason)
+    if ($null -ne $FailureReasons) { $FailureReasons.Add($Reason) }
+}
+
+function New-D32BoundedDiagnosticSourceProofCandidateDocument {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][string]$HistoricalOriginCandidateSha,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][ValidateSet('CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY', 'BLOCKED')][string]$Status,
+        [Parameter(Mandatory = $true)][string]$ProofAuthorityPath,
+        [Parameter(Mandatory = $true)][string]$ProofAuthoritySha256,
+        [Parameter(Mandatory = $true)][string]$ProofEntryPath,
+        [Parameter(Mandatory = $true)][string]$ProofEntrySha256,
+        [Parameter(Mandatory = $true)][string]$ProofStartedAtUtc,
+        [Parameter(Mandatory = $true)][string]$ProofCompletedAtUtc,
+        [Parameter(Mandatory = $true)][long]$ProofElapsedMilliseconds,
+        [Parameter(Mandatory = $true)][object]$ProofBudget,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$SourcePins,
+        [AllowNull()][object]$CurrentProfileLockBindings,
+        [AllowNull()][object]$CurrentSourceClosure,
+        [AllowNull()][object]$PrimaryError
+    )
+    return [PSCustomObject][ordered]@{
+        schema_version = 2
+        record_type = $script:D32BoundedDiagnosticSourceProofCandidateType
+        source_plan_semantics_version = 2
+        gate_authority = 'NONE'
+        candidate_sha = $CandidateSha
+        historical_origin_candidate_sha = $HistoricalOriginCandidateSha
+        source_repo = $Repository
+        status = $Status
+        formal_phase1_allowed = $false
+        formal_aggregate_allowed = $false
+        diagnostic_invocation_authority = 'NONE_UNTRUSTED_CANDIDATE_ONLY'
+        historical_origin = [PSCustomObject][ordered]@{
+            fetch_completion = 'NOT_RETAINED'
+            attempt_state = 'BLOCKED'
+            gate_authority = 'NONE'
+        }
+        proof_authority = [PSCustomObject][ordered]@{ path = $ProofAuthorityPath; sha256 = $ProofAuthoritySha256 }
+        proof_entry = [PSCustomObject][ordered]@{ path = $ProofEntryPath; sha256 = $ProofEntrySha256 }
+        proof_started_at_utc = $ProofStartedAtUtc
+        proof_completed_at_utc = $ProofCompletedAtUtc
+        proof_elapsed_milliseconds = $ProofElapsedMilliseconds
+        proof_budget = $ProofBudget
+        source_pins = @($SourcePins)
+        current_profile_lock_bindings = $CurrentProfileLockBindings
+        current_source_closure = $CurrentSourceClosure
+        primary_error = $PrimaryError
+    }
+}
+
 function Test-D32BoundedDiagnosticSourceProofCandidate {
-    param([AllowNull()][object]$Record)
+    param([AllowNull()][object]$Record, [AllowNull()][System.Collections.Generic.List[string]]$FailureReasons)
     $fields = @('schema_version', 'record_type', 'source_plan_semantics_version', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
         'source_repo', 'status', 'formal_phase1_allowed', 'formal_aggregate_allowed', 'diagnostic_invocation_authority',
         'historical_origin', 'proof_authority', 'proof_entry', 'proof_started_at_utc', 'proof_completed_at_utc',
@@ -997,66 +1051,150 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
         -not (Test-D32BoundedCompilerDiagnosticInteger $Record.proof_elapsed_milliseconds) -or
         (($Record.primary_error -isnot [string]) -and ($null -ne $Record.primary_error)) -or
         (($Record.current_profile_lock_bindings -isnot [Array]) -and ($null -ne $Record.current_profile_lock_bindings)) -or
-        (($null -ne $Record.current_source_closure) -and ([string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED'))) { return $false }
+        (($null -ne $Record.current_source_closure) -and ([string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED'))) {
+        $reason = if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields)) { 'candidate-exact-fields' }
+            elseif (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.historical_origin $historicalFields)) { 'historical-origin-object-shape' }
+            elseif (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.proof_authority @('path', 'sha256'))) { 'proof-authority-object-shape' }
+            elseif (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.proof_entry @('path', 'sha256'))) { 'proof-entry-object-shape' }
+            elseif ([string]$Record.status -ceq 'BLOCKED' -and [String]::IsNullOrWhiteSpace([string]$Record.primary_error)) { 'blocked-primary-error-missing' }
+            else { 'candidate-envelope-or-common-values' }
+        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason $reason
+        return $false
+    }
     if ($null -ne $Record.current_source_closure -and
         ([string]$Record.current_source_closure.CurrentCandidateSha -cne [string]$Record.candidate_sha -or
-         [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha)) { return $false }
-    if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -and
-        ($null -eq $Record.current_source_closure -or [Int64]$Record.proof_elapsed_milliseconds -gt 300000 -or $null -ne $Record.primary_error -or
-            $Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne 5 -or
-            $Record.current_profile_lock_bindings -isnot [Array] -or $Record.current_profile_lock_bindings.Count -ne 3 -or
+         [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha)) {
+        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'source-closure-current-historical-crossbind'
+        return $false
+    }
+    if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -and $null -ne $Record.current_source_closure -and
+        -not (Test-D32BoundedDiagnosticSourceGraphProof $Record.current_source_closure.SourceGraphProof)) {
+        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'source-graph-proof-shape-or-witness'
+        return $false
+    }
+    if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY') {
+        if ($null -eq $Record.current_source_closure -or [Int64]$Record.proof_elapsed_milliseconds -gt 300000 -or $null -ne $Record.primary_error) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'verified-result-closure-time-or-primary-error'
+            return $false
+        }
+        if ($Record.source_pins -isnot [Array] -or $Record.source_pins.Count -ne 5) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'verified-result-source-pin-count'
+            return $false
+        }
+        if ($Record.current_profile_lock_bindings -isnot [Array] -or $Record.current_profile_lock_bindings.Count -ne 3) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'verified-result-profile-lock-binding-count'
+            return $false
+        }
+        if (
             [string]$Record.current_source_closure.HistoricalAttemptState -cne 'BLOCKED' -or
             [string]$Record.current_source_closure.HistoricalFetchCompletion -cne 'NOT_RETAINED' -or
-            [string]$Record.current_source_closure.HistoricalGateAuthority -cne 'NONE' -or
+            [string]$Record.current_source_closure.HistoricalGateAuthority -cne 'NONE') {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'historical-origin-status-binding'
+            return $false
+        }
+        if (
             [string]$Record.current_source_closure.RegistryContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V2' -or
             [string]$Record.current_source_closure.GitContentProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_CONTENT_PROOF_V2' -or
             [string]$Record.current_source_closure.SourceGraphProof.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2' -or
             [string]$Record.current_source_closure.CurrentCandidateSha -cne [string]$Record.candidate_sha -or
-            [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha -or
-            -not (Test-D32BoundedDiagnosticSourceGraphProof $Record.current_source_closure.SourceGraphProof) -or
-            ([Int64]$Record.current_source_closure.SourceGraphProof.included_package_count + [Int64]$Record.current_source_closure.SourceGraphProof.excluded_package_count) -ne [Int64]$Record.current_source_closure.SourceGraphProof.locked_package_count -or
-            [string]$Record.current_source_closure.RegistryContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
-            [string]$Record.current_source_closure.GitContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
+            [string]$Record.current_source_closure.HistoricalOriginCandidateSha -cne [string]$Record.historical_origin_candidate_sha) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'proof-record-type-or-current-historical-binding'
+            return $false
+        }
+        if ([Int64]$Record.current_source_closure.SourceGraphProof.included_package_count + [Int64]$Record.current_source_closure.SourceGraphProof.excluded_package_count -ne [Int64]$Record.current_source_closure.SourceGraphProof.locked_package_count) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'source-graph-package-partition-count'
+            return $false
+        }
+        if ([string]$Record.current_source_closure.RegistryContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
             [bool]$Record.current_source_closure.RegistryContentProof.formal_gate_usable -or
-            [bool]$Record.current_source_closure.GitContentProof.formal_gate_usable -or
             [string]$Record.current_source_closure.RegistryContentProof.lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256 -or
+            $Record.current_source_closure.RegistryContentProof.verified_package_ids -isnot [Array]) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'registry-proof-status-lock-or-package-set'
+            return $false
+        }
+        if ([string]$Record.current_source_closure.GitContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
+            [bool]$Record.current_source_closure.GitContentProof.formal_gate_usable -or
             [string]$Record.current_source_closure.GitContentProof.lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256 -or
-            $Record.current_source_closure.RegistryContentProof.verified_package_ids -isnot [Array] -or
             $Record.current_source_closure.GitContentProof.verified_package_ids -isnot [Array] -or
-            $Record.current_source_closure.CurrentManifestProof -isnot [Array])) { return $false }
+            $Record.current_source_closure.CurrentManifestProof -isnot [Array]) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'git-proof-status-lock-package-or-manifest-set'
+            return $false
+        }
+    }
     if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY') {
         $registryIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($id in $Record.current_source_closure.RegistryContentProof.verified_package_ids) { if ($id -isnot [string] -or -not $registryIds.Add([string]$id)) { return $false } }
+        foreach ($id in $Record.current_source_closure.RegistryContentProof.verified_package_ids) {
+            if ($id -isnot [string] -or -not $registryIds.Add([string]$id)) {
+                Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'registry-proof-package-id-set'
+                return $false
+            }
+        }
         $gitIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($id in $Record.current_source_closure.GitContentProof.verified_package_ids) { if ($id -isnot [string] -or -not $gitIds.Add([string]$id)) { return $false } }
+        foreach ($id in $Record.current_source_closure.GitContentProof.verified_package_ids) {
+            if ($id -isnot [string] -or -not $gitIds.Add([string]$id)) {
+                Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'git-proof-package-id-set'
+                return $false
+            }
+        }
         $workspaceManifests = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($manifest in $Record.current_source_closure.CurrentManifestProof) {
             if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $manifest @('manifest_path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
                 [string]$manifest.manifest_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$' -or
                 -not (Test-D32BoundedCompilerDiagnosticInteger $manifest.bytes -Positive) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
                 [string]$manifest.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$manifest.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
-                -not $workspaceManifests.TryAdd([string]$manifest.manifest_path, [string]$manifest.sha256)) { return $false }
+                -not $workspaceManifests.TryAdd([string]$manifest.manifest_path, [string]$manifest.sha256)) {
+                Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'workspace-manifest-proof-shape-or-duplicate'
+                return $false
+            }
         }
-        if ($workspaceManifests.Count -ne $Record.current_profile_lock_bindings.Count) { return $false }
+        if ($workspaceManifests.Count -ne $Record.current_profile_lock_bindings.Count) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'workspace-manifest-to-profile-binding-count'
+            return $false
+        }
         foreach ($binding in $Record.current_profile_lock_bindings) {
-            if (-not $workspaceManifests.ContainsKey([string]$binding.manifest_path)) { return $false }
+            if (-not $workspaceManifests.ContainsKey([string]$binding.manifest_path)) {
+                Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'profile-binding-manifest-unmatched'
+                return $false
+            }
         }
         foreach ($class in $Record.current_source_closure.SourceGraphProof.classifications) {
             if ([string]$class.classification -cne 'INCLUDED') { continue }
             switch ([string]$class.source_kind) {
-                'workspace' { if (-not $workspaceManifests.ContainsKey([string]$class.manifest_path) -or $workspaceManifests[[string]$class.manifest_path] -cne [string]$class.manifest_sha256) { return $false } }
-                'registry' { if (-not $registryIds.Contains([string]$class.package_id) -or [string]$class.source_identity -cne 'registry+https://github.com/rust-lang/crates.io-index') { return $false } }
+                'workspace' {
+                    if (-not $workspaceManifests.ContainsKey([string]$class.manifest_path) -or $workspaceManifests[[string]$class.manifest_path] -cne [string]$class.manifest_sha256) {
+                        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'included-workspace-manifest-crossbind'
+                        return $false
+                    }
+                }
+                'registry' {
+                    if (-not $registryIds.Contains([string]$class.package_id) -or [string]$class.source_identity -cne 'registry+https://github.com/rust-lang/crates.io-index') {
+                        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'included-registry-package-crossbind'
+                        return $false
+                    }
+                }
                 'git' {
                     if (-not $gitIds.Contains([string]$class.package_id) -or
-                        @($Record.current_source_closure.GitContentProof.sources | Where-Object { [string]$_.source -ceq [string]$class.source_identity }).Count -ne 1) { return $false }
+                        @($Record.current_source_closure.GitContentProof.sources | Where-Object { [string]$_.source -ceq [string]$class.source_identity }).Count -ne 1) {
+                        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'included-git-package-crossbind'
+                        return $false
+                    }
                 }
-                default { return $false }
+                default {
+                    Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'included-package-source-kind-unknown'
+                    return $false
+                }
             }
         }
         $lockBinding = @($Record.current_profile_lock_bindings | Where-Object { [string]$_.lock_path -ceq 'vita-agent/Cargo.lock' })
-        if ($lockBinding.Count -ne 1 -or [string]$lockBinding[0].lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256) { return $false }
+        if ($lockBinding.Count -ne 1 -or [string]$lockBinding[0].lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256) {
+            Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'vita-agent-lock-profile-crossbind'
+            return $false
+        }
     }
-    if ([string]$Record.status -ceq 'BLOCKED' -and [String]::IsNullOrWhiteSpace([string]$Record.primary_error)) { return $false }
+    if ([string]$Record.status -ceq 'BLOCKED' -and [String]::IsNullOrWhiteSpace([string]$Record.primary_error)) {
+        Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'blocked-primary-error-missing'
+        return $false
+    }
     return $true
 }
 

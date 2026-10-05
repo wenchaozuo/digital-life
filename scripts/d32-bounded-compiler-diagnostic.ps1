@@ -2323,39 +2323,42 @@ function Invoke-D32BoundedDiagnosticSourceProofRun {
     finally {
         $completedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
         if ($persistAllowed) {
-            $record = [ordered]@{
-                schema_version = 2
-                record_type = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V2'
-                source_plan_semantics_version = 2
-                gate_authority = 'NONE'
-                candidate_sha = $CandidateSha
-                historical_origin_candidate_sha = $HistoricalOriginCandidateSha
-                source_repo = $Repository
-                status = $status
-                formal_phase1_allowed = $false
-                formal_aggregate_allowed = $false
-                diagnostic_invocation_authority = 'NONE_UNTRUSTED_CANDIDATE_ONLY'
-                historical_origin = [ordered]@{
-                    fetch_completion = 'NOT_RETAINED'
-                    attempt_state = 'BLOCKED'
-                    gate_authority = 'NONE'
-                }
-                proof_authority = [ordered]@{ path = $SourceProofAuthorityPath; sha256 = $ExpectedSourceProofAuthoritySha256 }
-                proof_entry = [ordered]@{
-                    path = $SourceProofEntryPath
-                    sha256 = [string](@($authority.source_pins | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path, $SourceProofEntryPath) })[0].sha256)
-                }
-                proof_started_at_utc = $startedAtUtc
-                proof_completed_at_utc = $completedAtUtc
-                proof_elapsed_milliseconds = $proofElapsedMilliseconds
-                proof_budget = $authority.proof_budget
-                source_pins = @($sourcePinSummaries)
-                current_profile_lock_bindings = if ($null -eq $profile) { $null } else { @($profile.LockInputs | ForEach-Object { [PSCustomObject]@{ manifest_path = $_.ManifestPath; lock_path = $_.LockPath; lock_bytes = [Int64]$_.LockBytes; lock_sha256 = [string]$_.LockSha256 } }) }
-                current_source_closure = $sourceClosure
-                primary_error = $primaryError
+            $entryPins = @($authority.source_pins | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path, $SourceProofEntryPath) })
+            if ($entryPins.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: exact source-proof entry pin is absent or ambiguous while constructing the result' }
+            $currentProfileLockBindings = if ($null -eq $profile) { $null } else {
+                @($profile.LockInputs | ForEach-Object { [PSCustomObject]@{ manifest_path = $_.ManifestPath; lock_path = $_.LockPath; lock_bytes = [Int64]$_.LockBytes; lock_sha256 = [string]$_.LockSha256 } })
             }
-            if (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record ([PSCustomObject]$record))) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: generated untrusted source-proof candidate failed its own non-gating result shape'
+            $record = New-D32BoundedDiagnosticSourceProofCandidateDocument `
+                -CandidateSha $CandidateSha -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha -Repository $Repository `
+                -Status $status -ProofAuthorityPath $SourceProofAuthorityPath -ProofAuthoritySha256 $ExpectedSourceProofAuthoritySha256 `
+                -ProofEntryPath $SourceProofEntryPath -ProofEntrySha256 ([string]$entryPins[0].sha256) `
+                -ProofStartedAtUtc $startedAtUtc -ProofCompletedAtUtc $completedAtUtc -ProofElapsedMilliseconds $proofElapsedMilliseconds `
+                -ProofBudget $authority.proof_budget -SourcePins @($sourcePinSummaries) `
+                -CurrentProfileLockBindings $currentProfileLockBindings -CurrentSourceClosure $sourceClosure -PrimaryError $primaryError
+            $shapeFailures = [System.Collections.Generic.List[string]]::new()
+            if (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $record -FailureReasons $shapeFailures)) {
+                $originalPrimaryError = $primaryError
+                $shapeFailureText = if ($shapeFailures.Count -gt 0) { [string]::Join(',', [string[]]$shapeFailures.ToArray()) } else { 'validator-rejected-without-specific-code' }
+                $fallbackPrimaryError = 'SOURCEPROOF_RESULT_SHAPE_REJECTED: ' + $shapeFailureText
+                if (-not [String]::IsNullOrWhiteSpace($originalPrimaryError)) {
+                    $fallbackPrimaryError = [string]$originalPrimaryError + '; ' + $fallbackPrimaryError
+                }
+                $status = 'BLOCKED'
+                $primaryError = Protect-D32BoundedDiagnosticText -Text $fallbackPrimaryError
+                # An invalid success payload is not retained as a proof claim. Its
+                # classification is downgraded, while the cause remains primary.
+                $record = New-D32BoundedDiagnosticSourceProofCandidateDocument `
+                    -CandidateSha $CandidateSha -HistoricalOriginCandidateSha $HistoricalOriginCandidateSha -Repository $Repository `
+                    -Status $status -ProofAuthorityPath $SourceProofAuthorityPath -ProofAuthoritySha256 $ExpectedSourceProofAuthoritySha256 `
+                    -ProofEntryPath $SourceProofEntryPath -ProofEntrySha256 ([string]$entryPins[0].sha256) `
+                    -ProofStartedAtUtc $startedAtUtc -ProofCompletedAtUtc $completedAtUtc -ProofElapsedMilliseconds $proofElapsedMilliseconds `
+                    -ProofBudget $authority.proof_budget -SourcePins @($sourcePinSummaries) `
+                    -CurrentProfileLockBindings $null -CurrentSourceClosure $null -PrimaryError $primaryError
+                $fallbackFailures = [System.Collections.Generic.List[string]]::new()
+                if (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $record -FailureReasons $fallbackFailures)) {
+                    $fallbackFailureText = if ($fallbackFailures.Count -gt 0) { [string]::Join(',', [string[]]$fallbackFailures.ToArray()) } else { 'validator-rejected-without-specific-code' }
+                    throw ('D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: blocked result candidate failed self-validation; initial=' + $shapeFailureText + '; blocked=' + $fallbackFailureText + '; original_primary_error=' + [string]$originalPrimaryError)
+                }
             }
             $null = Write-D32BoundedDiagnosticCreateNewJson -Path ([string]$output.path) -Document $record
             Write-Output ([PSCustomObject]@{ record_type = [string]$record.record_type; status = [string]$record.status; path = [string]$output.path })

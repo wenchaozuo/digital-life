@@ -1028,31 +1028,23 @@ $sourceProofInvocationWithoutHistoricalOrigin = @($sourceProofExpectedInvocation
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry invocation contract rejects omission of historical origin SHA parameter' ($sourceProofInvocationWithoutHistoricalOrigin.Count -ne $sourceProofExpectedInvocationElements.Count)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry passes current and historical SHA pins to distinct runner parameters' ($sourceProofInvocationExact -and
     $sourceProofInvocationElements[5] -ceq '$CandidateSha' -and $sourceProofInvocationElements[7] -ceq '$HistoricalOriginCandidateSha')
-$sourceProofCandidate = [PSCustomObject][ordered]@{
-    schema_version = 2
-    record_type = $script:D32BoundedDiagnosticSourceProofCandidateType
-    source_plan_semantics_version = 2
-    gate_authority = 'NONE'
-    candidate_sha = $sourceProofCurrentSha
-    historical_origin_candidate_sha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
-    source_repo = $testRepo
-    status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
-    formal_phase1_allowed = $false
-    formal_aggregate_allowed = $false
-    diagnostic_invocation_authority = 'NONE_UNTRUSTED_CANDIDATE_ONLY'
-    historical_origin = [PSCustomObject]@{ fetch_completion = 'NOT_RETAINED'; attempt_state = 'BLOCKED'; gate_authority = 'NONE' }
-    proof_authority = [PSCustomObject]@{ path = 'C:\d32-diagnostic-policy-test\external\source-proof-authority.json'; sha256 = 'a' * 64 }
-    proof_entry = [PSCustomObject]@{ path = $sourceProofEntryPath; sha256 = 'b' * 64 }
-    proof_started_at_utc = '2026-10-04T00:00:00.0000000+00:00'
-    proof_completed_at_utc = '2026-10-04T00:00:01.0000000+00:00'
-    proof_elapsed_milliseconds = 1000L
-    proof_budget = $sourceProofAuthority.proof_budget
-    source_pins = $sourceProofPins
-    current_profile_lock_bindings = @(
+$sourceProofResultBuilderCalls = @($sourceProofInvokerAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'New-D32BoundedDiagnosticSourceProofCandidateDocument'
+}, $true))
+$sourceProofResultSelfValidationCalls = @($sourceProofInvokerAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Test-D32BoundedDiagnosticSourceProofCandidate'
+}, $true))
+$sourceProofBlockedFallbackExact = $sourceProofResultBuilderCalls.Count -eq 2 -and $sourceProofResultSelfValidationCalls.Count -eq 2 -and
+    $sourceProofInvokerText.Contains('$originalPrimaryError') -and $sourceProofInvokerText.Contains('SOURCEPROOF_RESULT_SHAPE_REJECTED: ') -and
+    $sourceProofInvokerText.Contains('$status = ''BLOCKED''') -and $sourceProofInvokerText.Contains('-CurrentProfileLockBindings $null') -and
+    $sourceProofInvokerText.Contains('-CurrentSourceClosure $null') -and $sourceProofInvokerText.Contains('$fallbackFailures') -and
+    -not $sourceProofInvokerText.Contains('generated untrusted source-proof candidate failed its own non-gating result shape')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only runner preserves primary failures and downgrades rejected success payloads to self-validated BLOCKED records' $sourceProofBlockedFallbackExact
+$sourceProofCurrentProfileLockBindings = @(
         [PSCustomObject]@{ manifest_path = 'vita-agent-protocol/Cargo.toml'; lock_path = 'vita-agent-protocol/Cargo.lock'; lock_bytes = 10L; lock_sha256 = 'a' * 64 },
         [PSCustomObject]@{ manifest_path = 'vita-agent/Cargo.toml'; lock_path = 'vita-agent/Cargo.lock'; lock_bytes = 10L; lock_sha256 = [string]$graphPlan.lock_sha256 },
         [PSCustomObject]@{ manifest_path = 'src-tauri/Cargo.toml'; lock_path = 'src-tauri/Cargo.lock'; lock_bytes = 10L; lock_sha256 = 'c' * 64 })
-    current_source_closure = [PSCustomObject]@{
+$sourceProofCurrentClosure = [PSCustomObject]@{
         CurrentCandidateSha = $sourceProofCurrentSha
         HistoricalOriginCandidateSha = $script:D32BoundedDiagnosticHistoricalInv7CandidateSha
         HistoricalAttemptState = 'BLOCKED'; HistoricalFetchCompletion = 'NOT_RETAINED'; HistoricalGateAuthority = 'NONE'
@@ -1061,9 +1053,121 @@ $sourceProofCandidate = [PSCustomObject][ordered]@{
         SourceGraphProof = $graphProof
         CurrentManifestProof = @($graphProof.classifications | Where-Object { $_.classification -ceq 'INCLUDED' -and $_.source_kind -ceq 'workspace' } | ForEach-Object { [PSCustomObject]@{ manifest_path = [string]$_.manifest_path; bytes = 1L; sha256 = [string]$_.manifest_sha256; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' } }) + @([PSCustomObject]@{ manifest_path = 'src-tauri/Cargo.toml'; bytes = 1L; sha256 = 'd' * 64; volume_serial_hex = '0123456789abcdef'; file_id_hex = '0123456789abcdef0123456789abcdef' })
     }
-    primary_error = $null
+$sourceProofCandidate = New-D32BoundedDiagnosticSourceProofCandidateDocument `
+    -CandidateSha $sourceProofCurrentSha -HistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -Status 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' `
+    -ProofAuthorityPath 'C:\d32-diagnostic-policy-test\external\source-proof-authority.json' -ProofAuthoritySha256 ('a' * 64) `
+    -ProofEntryPath $sourceProofEntryPath -ProofEntrySha256 ('b' * 64) `
+    -ProofStartedAtUtc '2026-10-04T00:00:00.0000000+00:00' -ProofCompletedAtUtc '2026-10-04T00:00:01.0000000+00:00' `
+    -ProofElapsedMilliseconds 1000L -ProofBudget $sourceProofAuthority.proof_budget -SourcePins $sourceProofPins `
+    -CurrentProfileLockBindings $sourceProofCurrentProfileLockBindings -CurrentSourceClosure $sourceProofCurrentClosure -PrimaryError $null
+$sourceProofCandidateReasons = [System.Collections.Generic.List[string]]::new()
+$sourceProofCandidateValid = Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate -FailureReasons $sourceProofCandidateReasons
+Assert-D32BoundedCompilerDiagnosticSelfTest ('current source-proof-only candidate is valid while remaining untrusted and non-gating (' + [string]::Join(',', [string[]]$sourceProofCandidateReasons.ToArray()) + ')') $sourceProofCandidateValid
+$legacySourceProofCandidate = [PSCustomObject][ordered]@{}
+foreach ($property in $sourceProofCandidate.PSObject.Properties) { $legacySourceProofCandidate | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value }
+$legacySourceProofCandidate.historical_origin = [ordered]@{ fetch_completion = 'NOT_RETAINED'; attempt_state = 'BLOCKED'; gate_authority = 'NONE' }
+$legacySourceProofCandidate.proof_authority = [ordered]@{ path = [string]$sourceProofCandidate.proof_authority.path; sha256 = [string]$sourceProofCandidate.proof_authority.sha256 }
+$legacySourceProofCandidate.proof_entry = [ordered]@{ path = [string]$sourceProofCandidate.proof_entry.path; sha256 = [string]$sourceProofCandidate.proof_entry.sha256 }
+$legacyCandidateReasons = [System.Collections.Generic.List[string]]::new()
+$legacyNestedDictionaryRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $legacySourceProofCandidate -FailureReasons $legacyCandidateReasons)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'old producer shape with ordered-dictionary nested records is the exact strict-validator rejection cause' `
+    ($legacyNestedDictionaryRejected -and $legacyCandidateReasons.Count -eq 1 -and $legacyCandidateReasons[0] -ceq 'historical-origin-object-shape')
+$legacySourceProofCandidate.historical_origin = [PSCustomObject]@{ fetch_completion = 'NOT_RETAINED'; attempt_state = 'BLOCKED'; gate_authority = 'NONE' }
+$legacyCandidateReasons.Clear()
+$legacyAuthorityDictionaryRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $legacySourceProofCandidate -FailureReasons $legacyCandidateReasons)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'legacy proof-authority dictionary independently fails its exact nested record shape' `
+    ($legacyAuthorityDictionaryRejected -and $legacyCandidateReasons.Count -eq 1 -and $legacyCandidateReasons[0] -ceq 'proof-authority-object-shape')
+$legacySourceProofCandidate.proof_authority = [PSCustomObject]@{ path = [string]$sourceProofCandidate.proof_authority.path; sha256 = [string]$sourceProofCandidate.proof_authority.sha256 }
+$legacyCandidateReasons.Clear()
+$legacyEntryDictionaryRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $legacySourceProofCandidate -FailureReasons $legacyCandidateReasons)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'legacy proof-entry dictionary independently fails its exact nested record shape' `
+    ($legacyEntryDictionaryRejected -and $legacyCandidateReasons.Count -eq 1 -and $legacyCandidateReasons[0] -ceq 'proof-entry-object-shape')
+$dictionarySourceProofCandidate = Copy-D32PowerShellAuthorityJsonShape -Value $sourceProofCandidate
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof consumer rejects a dictionary root representation' `
+    ($dictionarySourceProofCandidate -is [System.Collections.IDictionary] -and -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $dictionarySourceProofCandidate))
+$nestedDictionarySourceProofCandidate = [PSCustomObject][ordered]@{}
+foreach ($property in $sourceProofCandidate.PSObject.Properties) { $nestedDictionarySourceProofCandidate | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value }
+$nestedDictionarySourceProofCandidate.proof_entry = [ordered]@{ path = [string]$sourceProofCandidate.proof_entry.path; sha256 = [string]$sourceProofCandidate.proof_entry.sha256 }
+$nestedCandidateReasons = [System.Collections.Generic.List[string]]::new()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof consumer rejects a nested dictionary even when the candidate root is a PSCustomObject' `
+    (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $nestedDictionarySourceProofCandidate -FailureReasons $nestedCandidateReasons) -and
+     $nestedCandidateReasons.Count -eq 1 -and $nestedCandidateReasons[0] -ceq 'proof-entry-object-shape')
+$sourceProofCandidateJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProofCandidate
+$sourceProofCandidateJsonDocument = [System.Text.Json.JsonDocument]::Parse($sourceProofCandidateJson)
+try { $sourceProofCandidateRoundTrip = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $sourceProofCandidateJsonDocument.RootElement }
+finally { $sourceProofCandidateJsonDocument.Dispose() }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof success candidate survives module-free JSON roundtrip with graph/manifest arrays and dual pins' `
+    ((Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidateRoundTrip) -and
+     $sourceProofCandidateRoundTrip.source_pins -is [Array] -and $sourceProofCandidateRoundTrip.source_pins.Count -eq 5 -and
+     $sourceProofCandidateRoundTrip.current_profile_lock_bindings -is [Array] -and $sourceProofCandidateRoundTrip.current_profile_lock_bindings.Count -eq 3 -and
+     [string]$sourceProofCandidateRoundTrip.candidate_sha -ceq $sourceProofCurrentSha -and
+     [string]$sourceProofCandidateRoundTrip.historical_origin_candidate_sha -ceq $script:D32BoundedDiagnosticHistoricalInv7CandidateSha)
+
+$sourceProofBlockedCases = @(
+    [PSCustomObject]@{ name = 'source exception'; elapsed = 412L; cause = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: registry source mismatch' },
+    [PSCustomObject]@{ name = 'exact deadline'; elapsed = 300000L; cause = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: combined proof deadline reached' },
+    [PSCustomObject]@{ name = 'budget overrun'; elapsed = 300001L; cause = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: combined proof budget exceeded' },
+    [PSCustomObject]@{ name = 'early bootstrap after persistence admission'; elapsed = 1L; cause = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: current profile unavailable' }
+)
+foreach ($blockedCase in $sourceProofBlockedCases) {
+    $blockedCandidate = New-D32BoundedDiagnosticSourceProofCandidateDocument `
+        -CandidateSha $sourceProofCurrentSha -HistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+        -Repository $testRepo -Status 'BLOCKED' `
+        -ProofAuthorityPath 'C:\d32-diagnostic-policy-test\external\source-proof-authority.json' -ProofAuthoritySha256 ('a' * 64) `
+        -ProofEntryPath $sourceProofEntryPath -ProofEntrySha256 ('b' * 64) `
+        -ProofStartedAtUtc '2026-10-04T00:00:00.0000000+00:00' -ProofCompletedAtUtc '2026-10-04T00:00:01.0000000+00:00' `
+        -ProofElapsedMilliseconds ([long]$blockedCase.elapsed) -ProofBudget $sourceProofAuthority.proof_budget -SourcePins @() `
+        -CurrentProfileLockBindings $null -CurrentSourceClosure $null -PrimaryError ([string]$blockedCase.cause)
+    $blockedReasons = [System.Collections.Generic.List[string]]::new()
+    $blockedValid = Test-D32BoundedDiagnosticSourceProofCandidate -Record $blockedCandidate -FailureReasons $blockedReasons
+    Assert-D32BoundedCompilerDiagnosticSelfTest "source-proof $($blockedCase.name) emits a valid non-gating failure candidate retaining primary cause" `
+        ($blockedValid -and $blockedReasons.Count -eq 0 -and [string]$blockedCandidate.status -ceq 'BLOCKED' -and
+         [string]$blockedCandidate.gate_authority -ceq 'NONE' -and [string]$blockedCandidate.primary_error -ceq [string]$blockedCase.cause -and
+         $blockedCandidate.source_pins -is [Array] -and $blockedCandidate.source_pins.Count -eq 0 -and
+         -not [bool]$blockedCandidate.formal_phase1_allowed -and -not [bool]$blockedCandidate.formal_aggregate_allowed)
 }
-Assert-D32BoundedCompilerDiagnosticSelfTest 'current source-proof-only candidate is valid while remaining untrusted and non-gating' (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate)
+
+$badResultGraphCount = [long]$sourceProofCandidate.current_source_closure.SourceGraphProof.locked_package_count
+$sourceProofCandidate.current_source_closure.SourceGraphProof.locked_package_count = $badResultGraphCount + 1
+$sourceProofShapeReasons = [System.Collections.Generic.List[string]]::new()
+$badSuccessResultRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate -FailureReasons $sourceProofShapeReasons)
+$sourceProofCandidate.current_source_closure.SourceGraphProof.locked_package_count = $badResultGraphCount
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof result shape rejection exposes a specific graph-schema/witness category without weakening validation' `
+    ($badSuccessResultRejected -and $sourceProofShapeReasons.Count -eq 1 -and $sourceProofShapeReasons[0] -ceq 'source-graph-proof-shape-or-witness')
+$sourceProofFallbackCause = 'SOURCEPROOF_RESULT_SHAPE_REJECTED: ' + [string]::Join(',', [string[]]$sourceProofShapeReasons.ToArray())
+$sourceProofFallback = New-D32BoundedDiagnosticSourceProofCandidateDocument `
+    -CandidateSha $sourceProofCurrentSha -HistoricalOriginCandidateSha $script:D32BoundedDiagnosticHistoricalInv7CandidateSha `
+    -Repository $testRepo -Status 'BLOCKED' `
+    -ProofAuthorityPath 'C:\d32-diagnostic-policy-test\external\source-proof-authority.json' -ProofAuthoritySha256 ('a' * 64) `
+    -ProofEntryPath $sourceProofEntryPath -ProofEntrySha256 ('b' * 64) `
+    -ProofStartedAtUtc '2026-10-04T00:00:00.0000000+00:00' -ProofCompletedAtUtc '2026-10-04T00:00:01.0000000+00:00' `
+    -ProofElapsedMilliseconds 1000L -ProofBudget $sourceProofAuthority.proof_budget -SourcePins $sourceProofPins `
+    -CurrentProfileLockBindings $null -CurrentSourceClosure $null -PrimaryError $sourceProofFallbackCause
+Assert-D32BoundedCompilerDiagnosticSelfTest 'invalid verified payload is downgraded to a legal blocked candidate that preserves the shape cause' `
+    ((Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofFallback) -and
+     [string]$sourceProofFallback.status -ceq 'BLOCKED' -and [string]$sourceProofFallback.primary_error -ceq $sourceProofFallbackCause -and
+     $null -eq $sourceProofFallback.current_source_closure -and [string]$sourceProofFallback.candidate_sha -ceq $sourceProofCurrentSha -and
+     [string]$sourceProofFallback.historical_origin_candidate_sha -ceq $script:D32BoundedDiagnosticHistoricalInv7CandidateSha)
+$sourceProofFallbackJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProofFallback
+$sourceProofFallbackJsonDocument = [System.Text.Json.JsonDocument]::Parse($sourceProofFallbackJson)
+try { $sourceProofFallbackRoundTrip = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $sourceProofFallbackJsonDocument.RootElement }
+finally { $sourceProofFallbackJsonDocument.Dispose() }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'blocked source-proof primary error and dual candidate pins survive module-free JSON roundtrip' `
+    ((Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofFallbackRoundTrip) -and
+     [string]$sourceProofFallbackRoundTrip.status -ceq 'BLOCKED' -and
+     [string]$sourceProofFallbackRoundTrip.primary_error -ceq $sourceProofFallbackCause -and
+     [string]$sourceProofFallbackRoundTrip.candidate_sha -ceq $sourceProofCurrentSha -and
+     [string]$sourceProofFallbackRoundTrip.historical_origin_candidate_sha -ceq $script:D32BoundedDiagnosticHistoricalInv7CandidateSha)
+
+$sourceProofCandidate.PSObject.Properties.Remove('primary_error')
+$sourceProofMissingResultFieldRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate)
+$sourceProofCandidate | Add-Member -NotePropertyName primary_error -NotePropertyValue $null
+$sourceProofCandidate | Add-Member -NotePropertyName unexpected_result_field -NotePropertyValue 'must fail closed'
+$sourceProofExtraResultFieldRejected = -not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate)
+$sourceProofCandidate.PSObject.Properties.Remove('unexpected_result_field')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof result exact-field negatives reject missing and extra top-level properties' `
+    ($sourceProofMissingResultFieldRejected -and $sourceProofExtraResultFieldRejected)
 $candidateClosureSha = [string]$sourceProofCandidate.current_source_closure.CurrentCandidateSha
 $sourceProofCandidate.current_source_closure.CurrentCandidateSha = [string]$sourceProofCandidate.historical_origin_candidate_sha
 Assert-D32BoundedCompilerDiagnosticSelfTest 'current source closure cannot be rebound to historical inv7 SHA' (-not (Test-D32BoundedDiagnosticSourceProofCandidate -Record $sourceProofCandidate))
@@ -1120,4 +1224,4 @@ foreach ($consumer in $formalConsumerSchemas) {
     Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema: $([IO.Path]::GetFileName($consumer.path))" ($consumerText.Contains([string]$consumer.schema) -and -not $consumerText.Contains('D32_BOUNDED_COMPILER_DIAGNOSTIC_V1'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, current-vs-historical SHA binding, source-proof authority and exact entry invocation contract negatives, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query bounds, global writer census positives/negatives and runner wiring, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 root/host/target/all-targets selection, complete declaration/lock edge reconciliation, workspace inheritance/path/patch/source/version binding, conservative features/cfg, exhaustive inclusion/exclusion witnesses and crossbinding tamper negatives, in-memory Git pack/index SHA-1/CRC/REF_DELTA/tree parsing and rejection cases, strict registry USTAR/path/hash parsing and source-proof timer rejection, source-proof result constructor success/failure/timeout/budget branches, PSCustomObject versus ordered-dictionary nested-record census, success/blocked JSON roundtrips, exact-field and candidate-pin negatives, primary-error-preserving BLOCKED fallback, proof-only entry/result AST wiring, PID+creation-time raw sampling replay, historical BLOCKED/NONE replay, resource/capture/deadline policy, cleanup and no-test-launch checks, exact formal-consumer schema rejection, all four non-PASS statuses. No Cargo, native child, external source, or inv7 content access.'

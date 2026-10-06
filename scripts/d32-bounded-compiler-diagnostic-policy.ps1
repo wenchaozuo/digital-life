@@ -32,11 +32,102 @@ $script:D32BoundedDiagnosticSourceProofPhase = 'bootstrap'
 $script:D32BoundedDiagnosticSourceProofProgress = 'not_started'
 $script:D32BoundedDiagnosticSourceProofTimer = $null
 $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds = 270000L
+$script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($phaseName in @(
+    'authority.output_preflight', 'authority.strict_shape', 'repository.identity', 'source_pins.current', 'manifest_refs.current',
+    'current_profile_and_locks', 'inv7_origin_and_source_graph', 'origin.root_identity', 'origin.registry_refs', 'origin.registry_complete',
+    'registry.archive', 'registry.archive_headers', 'registry.archive_inventory_rows', 'registry.archive_header_inventory_digest',
+    'registry.pair_inventory_digest', 'registry.control_metadata_digest', 'registry.extracted_directory', 'registry.extracted_inventory',
+    'registry.extracted_directory_identity', 'git.checkout_walk', 'git.checkout_entries', 'git.checkout_expected_coverage',
+    'git.checkout_metadata_inventory', 'git.tree_walk', 'git.manifest_candidates', 'graph.git_manifest_memory_estimate',
+    'graph.registry_manifest_memory_estimate', 'graph.workspace_manifest_capacity', 'source_graph.index_manifests',
+    'source_graph.index_edges', 'source_graph.index_packages', 'source_graph.canonical_manifests', 'source_graph.canonical_edges',
+    'source_graph.canonical_decisions', 'source_graph.witness_budget', 'source_graph.witness_materialize',
+    'source_graph.exclusion_materialize', 'source_graph.dependencies', 'source_graph.parents', 'source_graph.edge_candidates',
+    'source_proof.result_registry_ids', 'source_proof.result_git_ids', 'source_proof.result_current_manifests',
+    'source_proof.result_git_sources', 'source_proof.result_profile_bindings', 'proof.complete_before_persist_reserve',
+    'result.json_serialize', 'result.write', 'result.write_complete', 'result.flush_complete'
+)) { [void]$script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases.Add($phaseName) }
+$script:D32BoundedDiagnosticSourceProofProgressMarkerPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('registry.archive', [long]64)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('origin.registry_refs', [long]128)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('git.checkout_entries', [long]4096)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('git.checkout_expected_coverage', [long]4096)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('git.checkout_directory_identity', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('git.checkout_metadata_inventory', [long]2048)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('registry.archive_inventory_rows', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.canonical_manifests', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.canonical_edges', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.canonical_decisions', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.witness_budget', [long]2048)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.witness_materialize', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('source_graph.exclusion_materialize', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('registry.pair_inventory_digest', [long]1024)
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('registry.control_metadata_digest', [long]1024)
 
 function Set-D32BoundedDiagnosticSourceProofProgress {
     param([Parameter(Mandatory = $true)][string]$Phase, [Parameter(Mandatory = $true)][string]$Progress)
     $script:D32BoundedDiagnosticSourceProofPhase = [regex]::Replace($Phase, '[^A-Za-z0-9_.#-]', '_')
     $script:D32BoundedDiagnosticSourceProofProgress = [regex]::Replace($Progress, '[^A-Za-z0-9_.#=/-]', '_')
+
+    # Non-gating stdout only. Never serialize raw progress (which may contain a path,
+    # package identifier, or other caller data); emit phases and coarse numeric counts.
+    $timer = $script:D32BoundedDiagnosticSourceProofTimer
+    if ($null -eq $timer -or -not $timer.IsRunning) { return }
+    if ($script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable -or
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerCount -ge 120) { return }
+
+    $phaseValue = [string]$script:D32BoundedDiagnosticSourceProofPhase
+    if (-not $script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases.Contains($phaseValue)) { return }
+    $firstPhaseMarker = $script:D32BoundedDiagnosticSourceProofProgressMarkerPhases.Add($phaseValue)
+    $coarseStep = [long]0
+    $hasCoarseStep = $script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.TryGetValue($phaseValue, [ref]$coarseStep)
+    if (-not $firstPhaseMarker -and -not $hasCoarseStep) { return }
+
+    $counterValue = [long]-1
+    $counterText = 'none'
+    $counterMatch = [regex]::Match([string]$script:D32BoundedDiagnosticSourceProofProgress,
+        '(?:^|_)(?<key>pins|references|archives|archive|members|files|directories|rows|sources|trees|entries|paths|candidates|offset|bytes|pending|locks|count)=(?<current>[0-9]{1,12})(?:/(?<total>[0-9]{1,12}))?(?=_|$)')
+    if ($counterMatch.Success) {
+        $counterKey = [string]$counterMatch.Groups['key'].Value
+        $counterValue = [long]::Parse($counterMatch.Groups['current'].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $counterLabel = switch ($counterKey) {
+            'archives' { 'arc' } 'archive' { 'arc' } 'members' { 'mem' } 'files' { 'file' }
+            'directories' { 'dir' } 'rows' { 'row' } 'sources' { 'src' } 'trees' { 'tree' }
+            'entries' { 'ent' } 'paths' { 'path' } 'candidates' { 'cand' } 'references' { 'ref' }
+            'pins' { 'pin' } 'offset' { 'off' } 'bytes' { 'B' } 'pending' { 'pend' }
+            'locks' { 'lock' } 'count' { 'n' } default { $counterKey }
+        }
+        $counterText = [string]$counterLabel + '=' + $counterMatch.Groups['current'].Value
+        if ($counterMatch.Groups['total'].Success) { $counterText += '/' + $counterMatch.Groups['total'].Value }
+        if ($counterText.Length -gt 28) { $counterText = $counterText.Substring(0, 28) }
+    }
+
+    $coarseMilestone = $false
+    if (-not $firstPhaseMarker -and $hasCoarseStep -and $counterMatch.Success) {
+        $lastValue = [long]-1
+        if (-not $script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters.TryGetValue($phaseValue, [ref]$lastValue) -or
+            $counterValue -ge ($lastValue + $coarseStep)) { $coarseMilestone = $true }
+    }
+    if (-not $firstPhaseMarker -and -not $coarseMilestone) { return }
+
+    $line = 'D32SP1 p={0} t={1} n={2}' -f $phaseValue, [Int64]$timer.ElapsedMilliseconds, $counterText
+    if ($line.Length -gt 120) { $line = $line.Substring(0, 120) }
+    $lineBytes = [Text.Encoding]::ASCII.GetByteCount($line + [Environment]::NewLine)
+    if ($script:D32BoundedDiagnosticSourceProofProgressMarkerBytes + $lineBytes -gt 16000) {
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $true
+        return
+    }
+    try { [Console]::Out.WriteLine($line) }
+    catch {
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $true
+        return
+    }
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes += $lineBytes
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCount++
+    if ($counterMatch.Success) { $script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters[$phaseValue] = $counterValue }
 }
 
 function Get-D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds {
@@ -52,6 +143,15 @@ function Get-D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds {
 function Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline {
     param([long]$ElapsedMilliseconds, [long]$DeadlineMilliseconds)
     return ($ElapsedMilliseconds -ge 0 -and $DeadlineMilliseconds -gt 0 -and $ElapsedMilliseconds -lt $DeadlineMilliseconds)
+}
+
+function Get-D32BoundedDiagnosticSourceProofSupervisorDisposition {
+    param([long]$ElapsedMilliseconds, [bool]$ProcessExited)
+    if ($ElapsedMilliseconds -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: supervisor elapsed time is negative' }
+    if ($ProcessExited) { return 'CHILD_EXITED' }
+    if ($ElapsedMilliseconds -ge $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds) { return 'TOTAL_DEADLINE_EXPIRED' }
+    if ($ElapsedMilliseconds -ge $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds) { return 'WORK_DEADLINE_ADVISORY' }
+    return 'WORK_IN_PROGRESS'
 }
 
 function Assert-D32BoundedDiagnosticSourceProofDeadline {

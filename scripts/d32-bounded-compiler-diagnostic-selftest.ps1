@@ -466,6 +466,8 @@ $policyTokens = $null; $policyParseErrors = $null
 $policyAst = [System.Management.Automation.Language.Parser]::ParseFile($policyPath, [ref]$policyTokens, [ref]$policyParseErrors)
 $runnerTokens = $null; $runnerParseErrors = $null
 $runnerAst = [System.Management.Automation.Language.Parser]::ParseFile($runnerPath, [ref]$runnerTokens, [ref]$runnerParseErrors)
+$sourceProofProgressMarkerAst = $policyAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Set-D32BoundedDiagnosticSourceProofProgress' }, $true)
+$sourceProofProgressMarkerText = if ($null -eq $sourceProofProgressMarkerAst) { '' } else { [string]$sourceProofProgressMarkerAst.Extent.Text }
 $profileLibraryPath = Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1'
 $profileLibraryTokens = $null; $profileLibraryParseErrors = $null
 $profileLibraryAst = [System.Management.Automation.Language.Parser]::ParseFile($profileLibraryPath, [ref]$profileLibraryTokens, [ref]$profileLibraryParseErrors)
@@ -620,8 +622,21 @@ $gitAuxiliaryBranchesWired = $gitContentFunctionText.Contains('Test-D32BoundedDi
     $gitContentFunctionText.Contains('Test-D32BoundedDiagnosticExactGitPointerTarget') -and
     $gitContentFunctionText.Contains('Test-D32ProfileNoReparsePath') -and
     $gitContentFunctionText.Contains('checkout path case differs from its locked Git tree')
+$gitPointerReadCall = 'Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds'
+$gitMarkerReadCall = 'Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 0 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds'
+$gitPointerReadsBoundedAndRevalidated = ([regex]::Matches($gitContentFunctionText, [regex]::Escape($gitPointerReadCall))).Count -eq 2 -and
+    $gitContentFunctionText.Contains('$pointerBytes = [byte[]]$pointerBefore.Content') -and
+    $gitContentFunctionText.Contains('$pointerAfter.Sha256 -cne $pointerBefore.Sha256') -and
+    $gitContentFunctionText.Contains('$pointerAfter.FileIdHex -cne $pointerBefore.FileIdHex') -and
+    -not $gitContentFunctionText.Contains('[IO.File]::ReadAllBytes($full)') -and
+    -not $gitContentFunctionText.Contains('Get-D32ProfileFileSnapshot -Path $full')
+$gitMarkerReadIsZeroByteBounded = $gitContentFunctionText.Contains($gitMarkerReadCall) -and
+    $gitContentFunctionText.Contains('Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes ([Int64]$marker.Bytes)') -and
+    -not $gitContentFunctionText.Contains('Get-D32ProfileFileSnapshot -Path $full')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'registry generated-vs-archive auxiliary routing and checksum parser remain wired to archive proof' $registryAuxiliaryBranchesWired
 Assert-D32BoundedCompilerDiagnosticSelfTest 'Git empty marker rule remains wired without replacing locked tree comparison' $gitAuxiliaryBranchesWired
+Assert-D32BoundedCompilerDiagnosticSelfTest 'checkout .git pointer uses two deadline-aware 4096-byte snapshots and parses the bounded snapshot bytes' $gitPointerReadsBoundedAndRevalidated
+Assert-D32BoundedCompilerDiagnosticSelfTest 'checkout .cargo-ok rejects nonempty files before any unbounded content hashing' $gitMarkerReadIsZeroByteBounded
 
 Invoke-Expression $profileWithinAst.Extent.Text
 Invoke-Expression $authorityWithinAst.Extent.Text
@@ -881,6 +896,16 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof keeps its fixed 300-se
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof deadline comparison is strictly below the pinned ceiling' `
     ((Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline -ElapsedMilliseconds 269999L -DeadlineMilliseconds 270000L) -and
      -not (Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline -ElapsedMilliseconds 270000L -DeadlineMilliseconds 270000L))
+$supervisorBoundaries =
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 0L -ProcessExited $false) -ceq 'WORK_IN_PROGRESS') -and
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 269999L -ProcessExited $false) -ceq 'WORK_IN_PROGRESS') -and
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 270000L -ProcessExited $false) -ceq 'WORK_DEADLINE_ADVISORY') -and
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 299999L -ProcessExited $false) -ceq 'WORK_DEADLINE_ADVISORY') -and
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 300000L -ProcessExited $false) -ceq 'TOTAL_DEADLINE_EXPIRED') -and
+    ((Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds 300000L -ProcessExited $true) -ceq 'CHILD_EXITED')
+$negativeSupervisorElapsedRejected = $false
+try { $null = Get-D32BoundedDiagnosticSourceProofSupervisorDisposition -ElapsedMilliseconds -1L -ProcessExited $false } catch { $negativeSupervisorElapsedRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'supervisor leaves 270 seconds advisory-only, waits through the 30-second reserve, and terminates only at total expiry' ($supervisorBoundaries -and $negativeSupervisorElapsedRejected)
 $stoppedSourceProofTimer = [Diagnostics.Stopwatch]::new()
 $deadlineStreamBytes = [byte[]]@(1, 2, 3, 4)
 $deadlineMemoryStream = [IO.MemoryStream]::new($deadlineStreamBytes, $false)
@@ -2128,6 +2153,7 @@ $sourceProofDispatchExact = $runnerParseErrors.Count -eq 0 -and $sourceProofEntr
     -not $sourceProofEntryText.Contains('. $runnerPath') -and $null -ne $sourceProofInvokerAst -and
     $runnerAst.Extent.Text.Contains('$script:D32BoundedDiagnosticSourceProofWallTimer = if ($SourceProofOnly) { [Diagnostics.Stopwatch]::StartNew() } else { $null }') -and
     $sourceProofInvokerText.Contains('$script:D32BoundedDiagnosticSourceProofWallTimer') -and
+    $sourceProofInvokerText.Contains('$script:D32BoundedDiagnosticSourceProofTimer = $proofTimer') -and
     -not $sourceProofInvokerText.Contains('StartNew()') -and $sourceProofInvokerText.Contains('Assert-D32BoundedDiagnosticInv7Origin') -and
     -not $sourceProofInvokerText.Contains('Invoke-D32BoundedCompilerDiagnosticRun') -and
     -not $sourceProofInvokerText.Contains('Initialize-D32PowerShellModuleAuthority') -and
@@ -2135,6 +2161,105 @@ $sourceProofDispatchExact = $runnerParseErrors.Count -eq 0 -and $sourceProofEntr
     -not $sourceProofInvokerText.Contains('Get-CimInstance') -and -not $sourceProofInvokerText.Contains('PinnedGit')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'separate proof-only entry dispatches explicit source mode and its runner path does not invoke diagnostic admission, Cargo, Git, or installed imports' $sourceProofDispatchExact
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry exact mandatory parameter contract and sole direct runner invocation shape accepted' $sourceProofEntrySafetyExact
+$sourceProofProgressMarkerBounded = $null -ne $sourceProofProgressMarkerAst -and
+    $sourceProofProgressMarkerText.Contains('D32SP1 p={0} t={1} n={2}') -and
+    $sourceProofProgressMarkerText.Contains('ProgressMarkerCount -ge 120') -and
+    $sourceProofProgressMarkerText.Contains('ProgressMarkerBytes + $lineBytes -gt 16000') -and
+    $sourceProofProgressMarkerText.Contains('ProgressMarkerPhases.Add($phaseValue)') -and
+    $sourceProofProgressMarkerText.Contains('ProgressMarkerAllowedPhases.Contains($phaseValue)') -and
+    $sourceProofProgressMarkerText.Contains('ProgressMarkerCoarseSteps.TryGetValue') -and
+    $sourceProofProgressMarkerText.Contains('$line = ''D32SP1 p={0} t={1} n={2}'' -f $phaseValue, [Int64]$timer.ElapsedMilliseconds, $counterText') -and
+    -not $sourceProofProgressMarkerText.Contains('path=') -and
+    -not $sourceProofProgressMarkerText.Contains('volume_serial_hex') -and
+    -not $sourceProofProgressMarkerText.Contains('file_id_hex')
+$timerStartMarkerIndex = $runnerAst.Extent.Text.IndexOf('$script:D32BoundedDiagnosticSourceProofWallTimer = if ($SourceProofOnly) { [Diagnostics.Stopwatch]::StartNew() } else { $null }', [StringComparison]::Ordinal)
+$timerStartAdvisoryIndex = $runnerAst.Extent.Text.IndexOf("[Console]::Out.WriteLine('D32SP1 p=timer.start t=0 n=none')", [StringComparison]::Ordinal)
+$moduleBootstrapAfterTimerMarkerIndex = $runnerAst.Extent.Text.IndexOf(". ([IO.Path]::Combine(`$PSScriptRoot, 'd32-powershell-module-authority.ps1'))", [StringComparison]::Ordinal)
+$timerStartMarkerExact = $timerStartMarkerIndex -ge 0 -and $timerStartAdvisoryIndex -gt $timerStartMarkerIndex -and
+    $moduleBootstrapAfterTimerMarkerIndex -gt $timerStartAdvisoryIndex -and
+    ([Text.Encoding]::ASCII.GetByteCount('D32SP1 p=timer.start t=0 n=none' + [Environment]::NewLine) + 16000) -le 16384 -and
+    $runnerAst.Extent.Text.Contains('$script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $true')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only emits a fixed non-gating timer-start marker before bootstrap and caps all later phase/count markers' ($sourceProofProgressMarkerBounded -and $timerStartMarkerExact)
+
+Invoke-Expression $sourceProofProgressMarkerAst.Extent.Text
+$markerTimer = [Diagnostics.Stopwatch]::StartNew()
+$previousConsoleOut = [Console]::Out
+$markerWriter = [IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+try {
+    [Console]::SetOut($markerWriter)
+    $script:D32BoundedDiagnosticSourceProofTimer = $markerTimer
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes = [long]0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCount = 0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $false
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($safePhase in @('registry.archive', 'git.tree_walk')) { [void]$script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases.Add($safePhase) }
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps.Add('registry.archive', [long]64)
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'registry.archive' -Progress 'archive=0/870;package=fixture-private;path=C:\fixture-private'
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'registry.archive' -Progress 'archive=63/870;package=fixture-private;path=C:\fixture-private'
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'registry.archive' -Progress 'archive=64/870;package=fixture-private;path=C:\fixture-private'
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'git.tree_walk' -Progress 'trees=64;pending=2;path=C:\fixture-private'
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'C:\fixture-private\source-aaaaaaaa' -Progress 'files=99;path=C:\fixture-private'
+    $markerSampleText = $markerWriter.ToString()
+    $markerSampleLines = @($markerSampleText -split "`r?`n" | Where-Object { -not [String]::IsNullOrEmpty($_) })
+    $markerSampleSafe = $markerSampleLines.Count -eq 3 -and
+        $markerSampleLines[0].Contains('p=registry.archive') -and $markerSampleLines[0].Contains('arc=0/870') -and
+        $markerSampleLines[1].Contains('arc=64/870') -and $markerSampleLines[2].Contains('p=git.tree_walk') -and
+        ($markerSampleLines | Where-Object { $_.Length -gt 120 }).Count -eq 0 -and
+        -not $markerSampleText.Contains('fixture-private') -and -not $markerSampleText.Contains('C:\') -and
+        -not $markerSampleText.Contains('volume_serial_hex') -and -not $markerSampleText.Contains('file_id_hex')
+    $markerWriter.GetStringBuilder().Clear() | Out-Null
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes = [long]0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCount = 0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerPhases.Clear()
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters.Clear()
+    for ($markerIndex = 0; $markerIndex -lt 150; $markerIndex++) {
+        $syntheticMarkerPhase = 'synthetic.phase.{0}' -f $markerIndex
+        [void]$script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases.Add($syntheticMarkerPhase)
+        Set-D32BoundedDiagnosticSourceProofProgress -Phase $syntheticMarkerPhase -Progress 'no-data'
+    }
+    $markerCapLines = @($markerWriter.ToString() -split "`r?`n" | Where-Object { -not [String]::IsNullOrEmpty($_) })
+    $markerCapSafe = $markerCapLines.Count -eq 120 -and
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerCount -eq 120 -and
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes -le 16000 -and
+        [Text.Encoding]::ASCII.GetByteCount($markerWriter.ToString()) -le 16000
+}
+finally {
+    $markerTimer.Stop()
+    [Console]::SetOut($previousConsoleOut)
+    $markerWriter.Dispose()
+    $script:D32BoundedDiagnosticSourceProofTimer = $null
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'advisory progress emits only phase transitions and 64-row coarse milestones without raw fixture paths' $markerSampleSafe
+Assert-D32BoundedCompilerDiagnosticSelfTest 'advisory progress output stops at 120 lines and 16,000 bytes without affecting proof status' $markerCapSafe
+$previousConsoleOut = [Console]::Out
+$disposedMarkerWriter = [IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$disposedMarkerWriter.Dispose()
+$markerSinkFailureHandled = $false
+try {
+    [Console]::SetOut($disposedMarkerWriter)
+    $script:D32BoundedDiagnosticSourceProofTimer = [Diagnostics.Stopwatch]::StartNew()
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes = [long]0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCount = 0
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $false
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [void]$script:D32BoundedDiagnosticSourceProofProgressMarkerAllowedPhases.Add('registry.archive')
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerPhases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerLastCounters = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+    $script:D32BoundedDiagnosticSourceProofProgressMarkerCoarseSteps = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
+    $proofStatusBeforeMarkerFailure = 'BLOCKED'
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase 'registry.archive' -Progress 'archive=1/870'
+    $markerSinkFailureHandled = $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable -and
+        $script:D32BoundedDiagnosticSourceProofProgressMarkerCount -eq 0 -and $proofStatusBeforeMarkerFailure -ceq 'BLOCKED'
+}
+finally {
+    if ($null -ne $script:D32BoundedDiagnosticSourceProofTimer) { $script:D32BoundedDiagnosticSourceProofTimer.Stop() }
+    $script:D32BoundedDiagnosticSourceProofTimer = $null
+    [Console]::SetOut($previousConsoleOut)
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'advisory stdout failure is swallowed and does not mutate diagnostic status' $markerSinkFailureHandled
 $sourceProofInvocationWithoutHistoricalOrigin = @($sourceProofExpectedInvocationElements | Where-Object { $_ -cne '-HistoricalOriginCandidateSha' -and $_ -cne '$HistoricalOriginCandidateSha' })
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry invocation contract rejects omission of historical origin SHA parameter' ($sourceProofInvocationWithoutHistoricalOrigin.Count -ne $sourceProofExpectedInvocationElements.Count)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'proof-only entry passes current and historical SHA pins to distinct runner parameters' ($sourceProofInvocationExact -and
@@ -2825,5 +2950,5 @@ foreach ($consumer in $formalConsumerSchemas) {
          -not $consumerText.Contains('D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_V2'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, exact formal-consumer schema rejection for diagnostic V3 and census V2, historical BLOCKED/NONE replay and all four diagnostic non-PASS statuses. Pure synthetic fixtures only: no Cargo, native child, network, registry cache, or archive content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, 300s/270s supervisor advisory/total-deadline transition tests, bounded advisory stdout marker wiring and output cap, exact formal-consumer schema rejection for diagnostic V3 and census V2, historical BLOCKED/NONE replay and all four diagnostic non-PASS statuses. Pure synthetic fixtures only: no Cargo, native child, network, registry cache, or archive content access.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

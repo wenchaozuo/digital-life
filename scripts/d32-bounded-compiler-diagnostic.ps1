@@ -38,7 +38,14 @@ param(
     [string]$ExpectedSourceProofAuthoritySha256
 )
 
+$script:D32BoundedDiagnosticSourceProofProgressMarkerBytes = [long]0
+$script:D32BoundedDiagnosticSourceProofProgressMarkerCount = 0
+$script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $false
 $script:D32BoundedDiagnosticSourceProofWallTimer = if ($SourceProofOnly) { [Diagnostics.Stopwatch]::StartNew() } else { $null }
+if ($SourceProofOnly) {
+    try { [Console]::Out.WriteLine('D32SP1 p=timer.start t=0 n=none') }
+    catch { $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $true }
+}
 
 # Module-free bootstrap and diagnostic source/authority pins precede imports or
 # operational helpers. The approved PowerShell module authority runs only after
@@ -1090,10 +1097,10 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
             $isAtRoot = -not $relative.Contains('/')
             if ($relative -ceq '.git' -and -not $expected.ContainsKey($relative)) {
                 if ($isDirectory) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git indirection is a directory, not a bounded pointer file' }
-                $pointerBefore = Get-D32ProfileFileSnapshot -Path $full
+                $pointerBefore = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
                 if ([Int64]$pointerBefore.Bytes -le 0 -or [Int64]$pointerBefore.Bytes -gt 4096) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer is empty or exceeds 4096 bytes' }
-                $pointerBytes = [IO.File]::ReadAllBytes($full)
-                $pointerAfter = Get-D32ProfileFileSnapshot -Path $full
+                $pointerBytes = [byte[]]$pointerBefore.Content
+                $pointerAfter = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
                 if ($pointerBytes.Length -gt 4096 -or $pointerAfter.Bytes -ne $pointerBefore.Bytes -or $pointerAfter.Sha256 -cne $pointerBefore.Sha256 -or
                     $pointerAfter.VolumeSerialHex -cne $pointerBefore.VolumeSerialHex -or $pointerAfter.FileIdHex -cne $pointerBefore.FileIdHex) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer changed or exceeds its bounded read'
@@ -1112,7 +1119,7 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
             if ($relative -ceq '.cargo-ok' -and $isAtRoot -and
                 (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath $relative -AtRoot $true -ArchiveMember $expectedGitArchiveMember)) {
                 if ($isDirectory) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Cargo .cargo-ok metadata is not a regular file' }
-                $marker = Get-D32ProfileFileSnapshot -Path $full
+                $marker = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 0 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
                 Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes ([Int64]$marker.Bytes)
                 $sourceMetadata.Add(('cargo-ok' + "`t" + $relative + "`t" + [string]$marker.Sha256 + "`t" + [string]$marker.VolumeSerialHex + "`t" + [string]$marker.FileIdHex))
                 $metadataCount++

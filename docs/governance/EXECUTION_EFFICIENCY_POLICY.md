@@ -26,6 +26,7 @@
 | 执行次序 | discovery 与独立 baseline pin → formal Phase0 → Phase1 → aggregate → required real cases/ordered modes → 独立 Gate → D32 closure | SC-D32-V1 与 §16.1.5 |
 | 当前 outer schemas | fixture V7、discovery V2、baseline V2、Phase0 V8、release V9、aggregate V8 | PowerShell Content Authority V2 及后续澄清 |
 | 保持的 schemas | Profile V2、Trace V2、fixture manifest v3、D31 seeder V2；blocked diagnostic V1 只有失败诊断权 | 同上；相关 D32 ADR |
+| 有界归档诊断 | `D32_REGISTRY_TAR_USTAR_GNU_LONGNAME_V1`；SourceProof authority V3 / candidate V4 / registry proof V4 / compiler diagnostic authority+result V3 / census authority+result V2。均为诊断-only、Gate NONE；每次未来 census 使用新 authority 和独立 exact pins | ADR-D32-BOUNDED-REGISTRY-TAR-FORMAT-V1 与 ADR-D32-BOUNDED-REGISTRY-TAR-GNU-LONGNAME-V1 |
 | PowerShell admission | 独立 caller pin、module-free pre-import、protected distribution/resolver proof、实际 origins 校验 | Content Authority V2 与 Windows/volume-root clarifications |
 | 停止边界 | D32 完成、必要清理后停止；不建立 D33 Contract | Governance Reconciliation ADR、用户指令 |
 

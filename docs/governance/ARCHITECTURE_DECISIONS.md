@@ -29,6 +29,7 @@
 | ADR-D32-CARGO-PINNED-VCTIP-DESCENDANT-V1 | APPROVED WITH CONDITIONS | Exact Profile V2 VCTIP child under fixed Cargo roots | GPT-6 Sol Max | D32 Phase 0/Phase 1 Cargo process traces only |
 | ADR-D32-BOUNDED-COMPILER-DIAGNOSTIC-V1 | APPROVED WITH CONDITIONS | One-shot, bounded, non-gating compiler diagnostic for the exact blocked D32 candidate | GPT-6.1 Sol Max | Prospective diagnostic tooling and separately caller-pinned diagnostic use only; no formal gate authority |
 | ADR-D32-BOUNDED-REGISTRY-TAR-FORMAT-V1 | APPROVED WITH CONDITIONS | Strict per-header USTAR/GNU registry archive format and separate caller-pinned diagnostic census | GPT-6.1 Sol Max | Registry archive decoder/proof schemas and a separately authorized diagnostic census only; no formal gate authority |
+| ADR-D32-BOUNDED-REGISTRY-TAR-GNU-LONGNAME-V1 | APPROVED WITH CONDITIONS | Strict bounded GNU L long-name control records and fully cross-bound diagnostic census/proof schema migration | GPT-6.1 Sol Max | GNU L registry decoding/proof schemas and a separately authorized new-candidate census only; no source-proof or formal gate authority |
 
 ### ADR-D32-EVIDENCE-BUNDLE-V1 — D32-A Gate Evidence Bundle 与 Build Attestation
 
@@ -1004,6 +1005,80 @@ None. This is not a formal D32 gate or source-content canary.
 #### Supersedes / Superseded by
 
 Supersedes only ADR-D32-BOUNDED-COMPILER-DIAGNOSTIC-V1's strict USTAR-only registry archive format clause and the directly dependent registry-content-proof and diagnostic record versions listed above. Every other rule and gate remains in force. This decision authorizes no current census, SourceProofOnly run, compiler diagnostic, or formal execution.
+
+### ADR-D32-BOUNDED-REGISTRY-TAR-GNU-LONGNAME-V1 — Strict bounded GNU L long-name records
+
+- **Status:** APPROVED WITH CONDITIONS
+- **Decision authority:** GPT-6.1 Sol Max (complete decision forwarded by the Coordinator)
+- **Decision date:** 2026-10-06
+- **Related milestone:** D32 final-gate readiness (D32-A-R2)
+- **Related baseline:** `81a56e1129f368b8aa33d33391479399306fecd1`
+- **Supersedes:** Only ADR-D32-BOUNDED-REGISTRY-TAR-FORMAT-V1's rejection of GNU `L` records, the directly dependent pathname/header-inventory binding, and the diagnostic record versions listed below. All other trust, source, budget, process, formal-gate, and Stage Contract requirements remain unchanged.
+
+#### Context
+
+The prior approved format policy was strictly USTAR/GNU ordinary files and directories and rejected GNU `L`. This was a conservative format boundary, not an implementation defect. The caller-pinned 2026-10-06 archive-format census retained 870 rows: 859 `COMPLETE_SUPPORTED`, 11 `UNSUPPORTED`, and no globally unexamined rows. Its 33,262 counted headers included 830 USTAR regular, 32,421 GNU regular, and 11 rejected headers. The 11 unsupported rows retained `remainder_unknown=true` and `framing_verified=false`; row presence does not prove the archives were complete. The census elapsed time was 70,640 ms. A reported 382,128,128-byte working set is not a managed-memory high-water measurement. The Coordinator's finite first-header diagnostics support a narrowly bounded path-control record, but do not establish any next header or later archive contents. The observed package names and 101–119-byte path samples are not an allow-list.
+
+This decision allows one specific GNU `L` control-record subset and migrates only the records whose semantics change. It does not infer a clean or unlaunched prior attempt, make the old census complete, reuse its authority, prove current cache contents, expand any source root, or authorize another census/source-proof/diagnostic launch.
+
+#### Decision
+
+1. The new and sole registry archive policy identifier is `D32_REGISTRY_TAR_USTAR_GNU_LONGNAME_V1`. Every physical 512-byte header continues to be independently dispatched between the already approved strict USTAR and GNU layouts. All prior common numeric/checksum/text rules, GNU-tail restrictions, type rules, package-root containment, Windows namespace/alias/collision rules, body and padding checks, archive identity and lock checksum binding, two-zero-block termination, gzip/tar framing, and finite budgets remain in force.
+
+2. The only new control header is GNU type byte `0x4c` (`L`), with the approved GNU magic `757374617220` and version `2000`; USTAR `L` is rejected. Its 100-byte name field must be exactly `././@LongLink` followed only by zero padding. Its linkname is all zero. The entire GNU tail, metadata, device, multivolume, reserved, sparse, continuation, real-size, numeric, checksum, and padding validation still applies to an `L` header. Its strict-octal size is the control payload size. The placeholder is not a filesystem member and never enters the ordinary filesystem-name set, source inventory, or extracted-source comparison. Repeated placeholders are allowed only on distinct valid physical `L` records. `K`, PAX `x/g`, links, sparse, multivolume, dump-directory, device, FIFO, contiguous, and unknown types remain rejected; no fallback parser is introduced.
+
+3. The `L` payload contains only one effective path: size 2–4097 bytes; the last byte is exactly one NUL; preceding 1–4096 bytes are strict UTF-8. Interior/extra NUL, BOM, trailing payload, invalid UTF-8, non-NFC, unsafe Windows namespace, alias, or package-root escape is rejected without normalization or repair. A directory path may contain exactly one final `/`, and only a following directory header can validate it; then that one structural slash is removed from the effective path. A regular file may not use that slash, and repeated trailing slashes are rejected. The payload padding to the next 512-byte boundary must be all zero. No size, mode, uid/gid, mtime, link, source, or other attribute is parsed from the payload.
+
+4. At most one bounded pending long-name payload exists per archive. Its only valid sequence is `none → one validated L → the physically adjacent next ordinary regular/directory header → none`. The next header offset must equal the checked sum of the `L` header, payload, and padding. Chained controls, intervening headers/extensions, terminator, EOF, truncation, unknown next type, and dangling pending controls reject. The pending control cannot propagate, cross archives, or be manufactured from caller/global state. Next-member type, size, and other metadata come only from that ordinary header. Each control payload is bounded to 4097 bytes; raw payloads are not accumulated or retained in output.
+
+5. The control path is the unique effective path, and the following ordinary header must bind to it using exactly one accepted representation:
+
+   - **Full exact:** GNU `name` or USTAR `prefix/name` exactly equals the same encoded path.
+   - **Long-path truncation:** only when the effective path exceeds 100 UTF-8 bytes, a GNU name or a USTAR name with empty prefix may carry the exact first 100 raw bytes, or the longest valid UTF-8 scalar prefix using 99/100-byte capacity. Other truncation lengths, mismatches, nonzero padding, or a nonempty USTAR prefix combined with truncation are rejected.
+   - **Explicit empty:** only for an effective path exceeding 100 bytes and only in GNU, the following name field may be all zero as a pair-bound omission; it is not an alternate path.
+
+   A 100-byte raw field may split a UTF-8 scalar only in the exact pending-pair context and only when every raw byte matches that path projection. Those bytes are not decoded or used as a filesystem path. Without pending `L`, ordinary names retain strict UTF-8 validation. A nonempty USTAR prefix is accepted only for a complete exact path. `L` placeholders never stand in for the next member's name.
+
+6. Only the effective ordinary member enters the existing package-root/relative-path inventory. Root-directory optionality, inferred parents and their unique explicit-directory realization, duplicate/case/type collisions, file-as-parent rejection, manifest capture and parsing, member body hashing, and extracted-source comparison remain unchanged and use the effective path—not the placeholder or short fallback. Every `L` header, its bounded payload and padding count toward expanded-byte and raw-header/member ceilings. Ordinary body bytes use the ordinary member's own size and are the only source-file body bytes. No new bound, timeout reset, cache copy, or aggregate raw-payload storage is permitted.
+
+7. A deterministic pair inventory binds each accepted control and next header together, including: `L` offset/header SHA/size/control-payload SHA; next-header offset and SHA; ordinary format/type/size; raw name and bytes 345–499 field-slice digests; effective path and the exact fallback classification; and the ordinary inventory/content binding. The field-slice digest is not a pathname interpretation: under USTAR it accompanies the strict `prefix` parser, while GNU tail bytes are hashed only as raw header bytes and never treated as a prefix. The pair digest is deterministic in physical stream order. Header rows distinguish ordinary members and `GNU_LONGNAME_EXTENSION`; all `L` rows cross-bind to exactly one ordinary row. Reordering, omission, duplication, cross-pairing, fallback substitution, and cross-archive reuse fail closed. Four existing ordinary-format counts remain; add `gnu_longname_extension`, and require raw header count to equal the sum of all five. Also bind ordinary-header count, pair count, pair digest, long-name metadata count/bytes/digest. Inferred directories do not become raw headers or content members.
+
+8. Strict schema migration is limited to directly affected diagnostic records:
+
+   | Record | Previous | New |
+   |---|---|---|
+   | Source-proof authority | V2 / schema 2 | V3 / schema 3 |
+   | Source-proof candidate | V3 / schema 3 | V4 / schema 4 |
+   | Registry source-content proof | V3 / schema 3 | V4 / schema 4 |
+   | Compiler-diagnostic authority | V2 / schema 2 | V3 / schema 3 |
+   | Compiler-diagnostic result | V2 / schema 2 | V3 / schema 3 |
+   | Archive-format census authority | V1 / schema 1 | V2 / schema 2 |
+   | Archive-format census result | V1 / schema 1 | V2 / schema 2 |
+
+   Every affected bootstrap, producer, reader, validator, failure constructor, JSON roundtrip, and fixture binds the new policy and strict exact shape. Old/unknown versions, old policy, missing/extra/duplicate/wrong-type fields, and count/digest/pair substitutions reject. `LOCK_SOURCE_PLAN_V2`, `SOURCE_GRAPH_PROOF_V2`, `GIT_SOURCE_CONTENT_PROOF_V2`, and `source_plan_semantics_version=2` remain unchanged. Formal D32 schemas and SC-D32-V1 are not migrated; they continue to reject diagnostic-only records.
+
+9. A future census may hash the bounded `L` control metadata only to validate the path/pair/framing diagnostics. Ordinary source-file payload continues to be read/discarded without hashing, retention, or extraction. The new census result distinguishes ordinary payload flags from long-name metadata count/bytes/digest and never outputs raw control payload or ordinary body bytes. Census result statuses remain exactly `COMPLETE_DIAGNOSTIC`, `BLOCKED`, and `BUDGET_STOPPED`; `gate_authority=NONE`, formal Phase 0/aggregate flags false, source-proof checkpoint false, diagnostic invocation authority `NONE`, and formal-gate usability false. Complete requires all authorized archives and all pair/framing validation to complete as supported.
+
+   Implementation proceeds as one schema/parser/test batch, then a new clean exact candidate, then a separate create-new V2 census authority and independently pinned current references. The census must be rerun for its complete authorized set; old 859 rows may not be combined with a later 11-row scan. A census does not authorize source proof. Any later source proof requires its own new authority and explicit execution authorization, and does not automatically authorize Cargo.
+
+#### Frozen bounds, unknowns, and forbidden actions
+
+- Preserve all existing source roots and the existing 300,000 ms combined budget, 512 MiB managed cap, 256 MiB compressed archive bound, 1 GiB per-archive expanded bound, 128 MiB ordinary member bound, 10,000 raw headers per archive, 32 GiB aggregate expanded bound, 1,000,000 aggregate raw headers, and 64 MiB output limit. All checked arithmetic and stop/remainder semantics remain fail-closed.
+- Keep the prior `3eba2f3e160543b2b645c82bd016640d` census and its 11 unknown-remainder rows immutable. A prior `.Contains` type error caused a duplicate read of the same 11-row set; it is preserved in the attempt ledger but is not additional coverage, a second authority, or archive proof. Never concatenate that duplicate with existing rows.
+- The 153 missing catalog entries, 11 archives' subsequent content/framing, Git closure, complete source graph, and whether a future combined run can finish within existing budgets remain UNKNOWN.
+- No current census, SourceProofOnly run, compiler-diagnostic entry, Cargo/rustc/Git/helper/native process, network, fetch, cache write, or formal D32 execution is authorized by this decision. D32 remains NOT FROZEN, Gate NONE, and no D33 transition is authorized.
+
+#### Required module-free L0 evidence
+
+Use synthetic bytes and record mutations only; do not read real inv7 archive/cache contents. One integrated suite must cover positive ordinary USTAR/GNU/mixed layouts; multiple L pairs and placeholder reuse; Unicode and directory forms; every exact fallback including raw 100-byte split-scalar, 99/100 scalar-boundary, full exact and GNU empty representation; optional root/inferred/explicit parents and equivalent semantic inventories. Negative tests must cover header magic/version/checksum/tail and malformed placeholder, all payload length/NUL/BOM/UTF-8/NFC/path/padding cases, unsupported or nonadjacent/chain/dangling pairs, next-kind/size mismatch, truncation, fallback/prefix disagreement, collisions/aliases, and cross-archive/state reuse. Bind and mutate pair/header/control-payload/inventory digests and raw/ordinary/pair counts through actual producer → strict validator → serialized JSON readback → consumer paths. Verify old schema/policy refusal, all census statuses/remainder and budget stops, ordinary payload discard versus control-metadata hashing, primary error retention, no-auto-launch, formal-consumer refusal, and exact source/header/resource bounds. No real archive content, Cargo, child process, network, fetch, or cache write may be used.
+
+#### Required real canary
+
+None. A future diagnostic census is separately authorized and remains non-gating; this decision provides no source-content or formal D32 canary.
+
+#### Supersedes / Superseded by
+
+Supersedes only the prior registry-format decision's strict rejection of GNU `L`, the affected path/header-inventory binding, and the listed diagnostic schemas. Every other source-trust root, source-plan/graph/Git rule, Cargo auxiliary-file meaning, Profile V2/Trace V2/SC-D32-V1 contract, budget, formal consumer, and D32 gate remains unchanged. This decision grants no current census, source proof, compiler diagnostic, or formal execution.
 
 ## ADR 模板
 

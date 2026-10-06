@@ -1,14 +1,14 @@
 # Pure policy helpers for the D32 bounded compiler diagnostic.
 # This file defines functions only; it never imports modules or launches processes.
 
-$script:D32BoundedCompilerDiagnosticAuthorityType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V2'
-$script:D32BoundedCompilerDiagnosticResultType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V2'
-$script:D32BoundedDiagnosticSourceProofAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V2'
-$script:D32BoundedDiagnosticSourceProofCandidateType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V3'
-$script:D32BoundedDiagnosticRegistrySourceContentProofType = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V3'
-$script:D32BoundedDiagnosticRegistryArchivePolicy = 'D32_REGISTRY_TAR_USTAR_GNU_REGULAR_V1'
-$script:D32BoundedDiagnosticArchiveFormatCensusAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_AUTHORITY_V1'
-$script:D32BoundedDiagnosticArchiveFormatCensusType = 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_V1'
+$script:D32BoundedCompilerDiagnosticAuthorityType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_AUTHORITY_V3'
+$script:D32BoundedCompilerDiagnosticResultType = 'D32_BOUNDED_COMPILER_DIAGNOSTIC_V3'
+$script:D32BoundedDiagnosticSourceProofAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_AUTHORITY_V3'
+$script:D32BoundedDiagnosticSourceProofCandidateType = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_CANDIDATE_V4'
+$script:D32BoundedDiagnosticRegistrySourceContentProofType = 'D32_BOUNDED_DIAGNOSTIC_REGISTRY_SOURCE_CONTENT_PROOF_V4'
+$script:D32BoundedDiagnosticRegistryArchivePolicy = 'D32_REGISTRY_TAR_USTAR_GNU_LONGNAME_V1'
+$script:D32BoundedDiagnosticArchiveFormatCensusAuthorityType = 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_AUTHORITY_V2'
+$script:D32BoundedDiagnosticArchiveFormatCensusType = 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_V2'
 $script:D32BoundedDiagnosticHistoricalInv7CandidateSha = '2de30edf5de48aa4ed3216c3d3df13c3e2f0ac51'
 $script:D32BoundedCompilerDiagnosticGateAuthority = 'NONE'
 $script:D32BoundedCompilerDiagnosticStatuses = @('COMPLETED_DIAGNOSTIC', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED')
@@ -1054,7 +1054,7 @@ function New-D32BoundedDiagnosticSourceProofCandidateDocument {
         [AllowNull()][object]$PrimaryError
     )
     return [PSCustomObject][ordered]@{
-        schema_version = 3
+        schema_version = 4
         record_type = $script:D32BoundedDiagnosticSourceProofCandidateType
         source_plan_semantics_version = 2
         registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
@@ -1094,10 +1094,17 @@ function Get-D32BoundedDiagnosticRegistrySourceProofDigest {
             [string]$package.archive_inventory_sha256, [string]$package.registry_archive_policy,
             [string]$package.header_inventory_sha256,
             ([Int64]$package.header_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$package.ordinary_header_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$package.longname_pair_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$package.longname_pair_inventory_sha256,
+            ([Int64]$package.longname_control_metadata_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$package.longname_control_metadata_bytes).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$package.longname_control_metadata_sha256,
             ([Int64]$counts.ustar_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$counts.ustar_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$counts.gnu_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$counts.gnu_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$counts.gnu_longname_extension).ToString([Globalization.CultureInfo]::InvariantCulture),
             [string]$package.source_root_volume_serial_hex, [string]$package.source_root_file_id_hex,
             ([Int64]$package.source_file_count).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$package.source_directory_count).ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -1111,6 +1118,88 @@ function Get-D32BoundedDiagnosticRegistrySourceProofDigest {
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical))).ToLowerInvariant()
 }
 
+function New-D32BoundedDiagnosticRegistrySourceProofPackage {
+    param(
+        [Parameter(Mandatory = $true)][object]$Package,
+        [Parameter(Mandatory = $true)][object]$ArchiveReference,
+        [Parameter(Mandatory = $true)][object]$Inventory,
+        [Parameter(Mandatory = $true)][object]$SourceProof
+    )
+    return [PSCustomObject][ordered]@{
+        package_id = [string]$Package.package_id
+        name = [string]$Package.name
+        version = [string]$Package.version
+        checksum = [string]$Package.checksum
+        archive_path = [string]$ArchiveReference.path
+        archive_bytes = [Int64]$ArchiveReference.bytes
+        archive_file_sha256 = [string]$ArchiveReference.sha256
+        archive_volume_serial_hex = [string]$ArchiveReference.volume_serial_hex
+        archive_file_id_hex = [string]$ArchiveReference.file_id_hex
+        archive_inventory_sha256 = [string]$Inventory.inventory_sha256
+        registry_archive_policy = [string]$Inventory.archive_policy_id
+        header_inventory_sha256 = [string]$Inventory.header_inventory_sha256
+        header_count = [Int64]$Inventory.header_inventory.Count
+        ordinary_header_count = [Int64]$Inventory.ordinary_header_count
+        longname_pair_count = [Int64]$Inventory.longname_pair_count
+        longname_pair_inventory_sha256 = [string]$Inventory.longname_pair_inventory_sha256
+        longname_control_metadata_count = [Int64]$Inventory.longname_control_metadata_count
+        longname_control_metadata_bytes = [Int64]$Inventory.longname_control_metadata_bytes
+        longname_control_metadata_sha256 = [string]$Inventory.longname_control_metadata_sha256
+        format_counts = [PSCustomObject][ordered]@{
+            ustar_regular = [Int64]$Inventory.format_counts.ustar_regular
+            ustar_directory = [Int64]$Inventory.format_counts.ustar_directory
+            gnu_regular = [Int64]$Inventory.format_counts.gnu_regular
+            gnu_directory = [Int64]$Inventory.format_counts.gnu_directory
+            gnu_longname_extension = [Int64]$Inventory.format_counts.gnu_longname_extension
+        }
+        source_root = [string]$SourceProof.source_root
+        source_root_volume_serial_hex = [string]$SourceProof.source_root_volume_serial_hex
+        source_root_file_id_hex = [string]$SourceProof.source_root_file_id_hex
+        source_file_count = [Int64]$SourceProof.archived_file_count
+        source_directory_count = [Int64]$SourceProof.archived_directory_count
+        generated_metadata_count = [Int64]$SourceProof.generated_metadata_count
+        source_bytes = [Int64]$SourceProof.observed_source_bytes
+        source_inventory_sha256 = [string]$SourceProof.source_inventory_sha256
+    }
+}
+
+function New-D32BoundedDiagnosticRegistrySourceContentProofDocument {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Packages,
+        [Parameter(Mandatory = $true)][string]$LockSha256,
+        [Parameter(Mandatory = $true)][string]$RegistryTupleSha256,
+        [Parameter(Mandatory = $true)][long]$LockedRegistryCatalogCount,
+        [Parameter(Mandatory = $true)][long]$CompressedBytes,
+        [Parameter(Mandatory = $true)][long]$ExpandedBytes,
+        [Parameter(Mandatory = $true)][long]$MemberCount,
+        [Parameter(Mandatory = $true)][long]$ElapsedMilliseconds
+    )
+    $rows = [object[]]@($Packages)
+    return [PSCustomObject][ordered]@{
+        schema_version = 4
+        record_type = $script:D32BoundedDiagnosticRegistrySourceContentProofType
+        registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy
+        gate_authority = 'NONE'
+        status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY'
+        formal_gate_usable = $false
+        semantic_scope = 'EXACT_CALLER_PINNED_ARCHIVE_SUBSET_FOR_LOCKED_GRAPH_CANDIDATES'
+        source_proof_sha256 = Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages $rows
+        verifier_managed_buffer_cap_bytes = [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes
+        maximum_buffered_registry_archive_bytes = [Int64]$script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes
+        concurrent_buffered_registry_archives = 1
+        lock_sha256 = $LockSha256
+        registry_tuple_sha256 = $RegistryTupleSha256
+        package_count = [Int64]$rows.Count
+        locked_registry_catalog_count = $LockedRegistryCatalogCount
+        verified_package_ids = @($rows | ForEach-Object { [string]$_.package_id })
+        compressed_bytes = $CompressedBytes
+        expanded_bytes = $ExpandedBytes
+        member_count = $MemberCount
+        elapsed_milliseconds = $ElapsedMilliseconds
+        packages = $rows
+    }
+}
+
 function Test-D32BoundedDiagnosticRegistrySourceContentProof {
     param([AllowNull()][object]$Proof)
     $fields = @('schema_version', 'record_type', 'registry_archive_policy', 'gate_authority', 'status', 'formal_gate_usable',
@@ -1118,7 +1207,7 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
         'concurrent_buffered_registry_archives', 'lock_sha256', 'registry_tuple_sha256', 'package_count', 'locked_registry_catalog_count',
         'verified_package_ids', 'compressed_bytes', 'expanded_bytes', 'member_count', 'elapsed_milliseconds', 'packages')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Proof $fields) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $Proof.schema_version -Positive) -or [Int64]$Proof.schema_version -ne 3 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Proof.schema_version -Positive) -or [Int64]$Proof.schema_version -ne 4 -or
         $Proof.record_type -isnot [string] -or [string]$Proof.record_type -cne $script:D32BoundedDiagnosticRegistrySourceContentProofType -or
         $Proof.registry_archive_policy -isnot [string] -or [string]$Proof.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         $Proof.gate_authority -isnot [string] -or [string]$Proof.gate_authority -cne 'NONE' -or
@@ -1143,9 +1232,11 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
     $packageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $archiveFields = @('package_id', 'name', 'version', 'checksum', 'archive_path', 'archive_bytes', 'archive_file_sha256',
         'archive_volume_serial_hex', 'archive_file_id_hex', 'archive_inventory_sha256', 'registry_archive_policy',
-        'header_inventory_sha256', 'header_count', 'format_counts', 'source_root', 'source_root_volume_serial_hex',
+        'header_inventory_sha256', 'header_count', 'ordinary_header_count', 'longname_pair_count', 'longname_pair_inventory_sha256',
+        'longname_control_metadata_count', 'longname_control_metadata_bytes', 'longname_control_metadata_sha256',
+        'format_counts', 'source_root', 'source_root_volume_serial_hex',
         'source_root_file_id_hex', 'source_file_count', 'source_directory_count', 'generated_metadata_count', 'source_bytes', 'source_inventory_sha256')
-    $countsFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')
+    $countsFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory', 'gnu_longname_extension')
     $index = 0
     foreach ($package in $Proof.packages) {
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $package $archiveFields) -or
@@ -1164,6 +1255,15 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
             [string]$package.archive_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             [string]$package.header_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $package.header_count -Positive) -or [Int64]$package.header_count -gt 10000 -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $package.ordinary_header_count -Positive) -or
+            [Int64]$package.ordinary_header_count -gt 10000 -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $package.longname_pair_count) -or
+            [Int64]$package.longname_pair_count -gt 10000 -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $package.longname_control_metadata_count) -or
+            [Int64]$package.longname_control_metadata_count -gt 10000 -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $package.longname_control_metadata_bytes) -or
+            [string]$package.longname_pair_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$package.longname_control_metadata_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             -not (Test-D32BoundedCompilerDiagnosticExactProperties $package.format_counts $countsFields) -or
             [string]$package.source_root_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or
             [string]$package.source_root_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
@@ -1174,10 +1274,20 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
             [string]$package.source_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$') { return $false }
         $countSum = [Int64]0
         foreach ($countName in $countsFields) {
-            if (-not (Test-D32BoundedCompilerDiagnosticInteger $package.format_counts.($countName))) { return $false }
+            if (-not (Test-D32BoundedCompilerDiagnosticInteger $package.format_counts.($countName)) -or
+                [Int64]$package.format_counts.($countName) -gt 10000) { return $false }
             $countSum += [Int64]$package.format_counts.($countName)
         }
-        if ($countSum -ne [Int64]$package.header_count) { return $false }
+        $ordinarySum = [Int64]$package.format_counts.ustar_regular + [Int64]$package.format_counts.ustar_directory +
+            [Int64]$package.format_counts.gnu_regular + [Int64]$package.format_counts.gnu_directory
+        if ($countSum -ne [Int64]$package.header_count -or $ordinarySum -ne [Int64]$package.ordinary_header_count -or
+            [Int64]$package.longname_pair_count -ne [Int64]$package.format_counts.gnu_longname_extension -or
+            [Int64]$package.longname_control_metadata_count -ne [Int64]$package.longname_pair_count -or
+            ([Int64]$package.longname_control_metadata_count -eq 0 -and [Int64]$package.longname_control_metadata_bytes -ne 0) -or
+            ([Int64]$package.longname_control_metadata_count -gt 0 -and
+                ([Int64]$package.longname_control_metadata_bytes -lt ([Int64]$package.longname_control_metadata_count * 2L) -or
+                 [Int64]$package.longname_control_metadata_bytes -gt ([Int64]$package.longname_control_metadata_count * 4097L))) -or
+            [Int64]$package.header_count -gt 10000) { return $false }
         $index++
     }
     try { return ((Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages @($Proof.packages)) -ceq [string]$Proof.source_proof_sha256) }
@@ -1192,7 +1302,7 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
         'proof_elapsed_milliseconds', 'proof_budget', 'source_pins', 'current_profile_lock_bindings', 'current_source_closure', 'primary_error')
     $historicalFields = @('fetch_completion', 'attempt_state', 'gate_authority')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields) -or
-        [int64]$Record.schema_version -ne 3 -or [string]$Record.record_type -cne $script:D32BoundedDiagnosticSourceProofCandidateType -or
+        [int64]$Record.schema_version -ne 4 -or [string]$Record.record_type -cne $script:D32BoundedDiagnosticSourceProofCandidateType -or
         [int]$Record.source_plan_semantics_version -ne 2 -or
         [string]$Record.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         [string]$Record.gate_authority -cne 'NONE' -or
@@ -1380,7 +1490,7 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
         'source_repo', 'repository_identity', 'toolchain_profile', 'source_pins', 'dependency_origin', 'proof_budget',
         'output_candidate', 'run_id', 'issued_at_utc')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $Document -Expected $top) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [int]$Document.schema_version -ne 2 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [int]$Document.schema_version -ne 3 -or
         $Document.record_type -isnot [string] -or [string]$Document.record_type -cne $script:D32BoundedDiagnosticSourceProofAuthorityType -or
         $Document.registry_archive_policy -isnot [string] -or [string]$Document.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         $Document.gate_authority -isnot [string] -or [string]$Document.gate_authority -cne 'NONE' -or
@@ -1689,7 +1799,7 @@ function Test-D32BoundedCompilerDiagnosticAuthorityShape {
         'toolchain_profile', 'module_authority', 'pinned_git', 'command', 'child_environment', 'git_queries', 'cargo_home', 'dependency_origin',
         'target', 'output', 'resource_budget', 'source_pins', 'image_grants', 'issued_at_utc')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $Document -Expected $top) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [int]$Document.schema_version -ne 2 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [int]$Document.schema_version -ne 3 -or
         $Document.record_type -isnot [string] -or $Document.record_type -cne $script:D32BoundedCompilerDiagnosticAuthorityType -or
         $Document.registry_archive_policy -isnot [string] -or $Document.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         $Document.gate_authority -isnot [string] -or $Document.gate_authority -cne 'NONE' -or
@@ -2893,6 +3003,44 @@ function Get-D32BoundedCompilerDiagnosticTarText {
     catch { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar path is not strict UTF-8' }
 }
 
+function Get-D32BoundedCompilerDiagnosticTarTextField {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Header,
+        [Parameter(Mandatory = $true)][int]$Offset,
+        [Parameter(Mandatory = $true)][int]$Length,
+        [switch]$AllowInvalidUtf8
+    )
+    if ($Offset -lt 0 -or $Length -lt 1 -or ($Offset + $Length) -gt $Header.Length) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar text field is outside the fixed header'
+    }
+    $raw = [byte[]]$Header[$Offset..($Offset + $Length - 1)]
+    $contentLength = $Length
+    for ($index = 0; $index -lt $Length; $index++) {
+        if ($raw[$index] -eq 0) { $contentLength = $index; break }
+    }
+    for ($index = $contentLength; $index -lt $Length; $index++) {
+        if ($raw[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar text field has nonzero bytes after terminator' }
+    }
+    $content = [byte[]]::new($contentLength)
+    if ($contentLength -gt 0) { [Array]::Copy($raw, 0, $content, 0, $contentLength) }
+    $text = $null
+    $decoded = $true
+    try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($content, 0, $content.Length) }
+    catch {
+        if (-not $AllowInvalidUtf8) { throw ('D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar path field at byte offset ' + $Offset.ToString([Globalization.CultureInfo]::InvariantCulture) + ' is not strict UTF-8 (' + [string]$_.Exception.Message + ')') }
+        $decoded = $false
+    }
+    return [PSCustomObject][ordered]@{
+        text = $text
+        decoded = [bool]$decoded
+        content_bytes = $content
+        content_length = [Int64]$contentLength
+        field_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($raw)).ToLowerInvariant()
+        all_zero = [bool]($contentLength -eq 0)
+        raw_bytes = $raw
+    }
+}
+
 function Get-D32BoundedCompilerDiagnosticTarOctal {
     param([Parameter(Mandatory = $true)][byte[]]$Header, [Parameter(Mandatory = $true)][int]$Offset, [Parameter(Mandatory = $true)][int]$Length)
     if ($Offset -lt 0 -or $Length -lt 1 -or $Length -gt 16 -or ($Offset + $Length) -gt $Header.Length -or
@@ -2941,8 +3089,18 @@ function Test-D32BoundedCompilerDiagnosticTarZeroBytes {
     return $true
 }
 
+function Test-D32BoundedCompilerDiagnosticByteArraysEqual {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Left,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) { return $false }
+    for ($index = 0; $index -lt $Left.Length; $index++) { if ($Left[$index] -ne $Right[$index]) { return $false } }
+    return $true
+}
+
 function Get-D32BoundedDiagnosticRegistryArchiveHeader {
-    param([Parameter(Mandatory = $true)][byte[]]$Header)
+    param([Parameter(Mandatory = $true)][byte[]]$Header, [switch]$AllowRawNameProjection)
     if ($Header.Length -ne 512) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar header is not exactly 512 bytes' }
     $checksum = Get-D32BoundedCompilerDiagnosticTarOctal -Header $Header -Offset 148 -Length 8
     $actualChecksum = [Int64]0
@@ -2977,10 +3135,14 @@ function Get-D32BoundedDiagnosticRegistryArchiveHeader {
         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar device numbers must be zero'
     }
 
-    $name = Get-D32BoundedCompilerDiagnosticTarText -Header $Header -Offset 0 -Length 100
+    $nameField = Get-D32BoundedCompilerDiagnosticTarTextField -Header $Header -Offset 0 -Length 100 -AllowInvalidUtf8:$AllowRawNameProjection
+    $name = if ($nameField.decoded) { [string]$nameField.text } else { $null }
     $prefix = ''
+    $prefixFieldSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$Header[345..499])).ToLowerInvariant()
     if ($format -ceq 'USTAR') {
-        $prefix = Get-D32BoundedCompilerDiagnosticTarText -Header $Header -Offset 345 -Length 155
+        $prefixField = Get-D32BoundedCompilerDiagnosticTarTextField -Header $Header -Offset 345 -Length 155
+        $prefix = [string]$prefixField.text
+        $prefixFieldSha256 = [string]$prefixField.field_sha256
         if (-not (Test-D32BoundedCompilerDiagnosticTarZeroBytes -Bytes $Header -Offset 500 -Length 12)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: USTAR reserved tail bytes are nonzero'
         }
@@ -3003,20 +3165,32 @@ function Get-D32BoundedDiagnosticRegistryArchiveHeader {
         $null = $ctime
     }
     $typeFlag = [int]$Header[156]
-    $kind = if ($typeFlag -eq 53) { 'directory' } elseif ($typeFlag -eq 48 -or $typeFlag -eq 0) { 'file' } else { $null }
+    $kind = if ($typeFlag -eq 76) { 'longname' } elseif ($typeFlag -eq 53) { 'directory' } elseif ($typeFlag -eq 48 -or $typeFlag -eq 0) { 'file' } else { $null }
     if ($null -eq $kind) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: links, extended headers, sparse files, and special tar entries are unsupported'
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: links, non-longname extensions, sparse files, and special tar entries are unsupported'
+    }
+    if ($kind -ceq 'longname' -and ($format -cne 'GNU' -or $nameField.content_length -ne 13 -or
+        [Text.Encoding]::ASCII.GetString([byte[]]$nameField.content_bytes) -cne '././@LongLink' -or
+        $size -lt 2 -or $size -gt 4097)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname control header has an invalid format, placeholder, or bounded size'
     }
     if ($kind -ceq 'directory' -and $size -ne 0) {
         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar directory entry has nonzero data'
     }
-    $fullName = if ([String]::IsNullOrEmpty($prefix)) { $name } else { $prefix + '/' + $name }
-    if ($kind -ceq 'directory' -and $fullName.EndsWith('/')) { $fullName = $fullName.Substring(0, $fullName.Length - 1) }
+    $fullName = if ($null -eq $name) { $null } elseif ([String]::IsNullOrEmpty($prefix)) { $name } else { $prefix + '/' + $name }
+    if ($kind -ceq 'directory' -and $null -ne $fullName -and $fullName.EndsWith('/')) { $fullName = $fullName.Substring(0, $fullName.Length - 1) }
     return [PSCustomObject][ordered]@{
         format = $format
         name = $name
         prefix = $prefix
         path = $fullName
+        name_field_content_bytes = [byte[]]$nameField.content_bytes
+        name_field_raw_bytes = [byte[]]$nameField.raw_bytes
+        name_field_content_length = [Int64]$nameField.content_length
+        name_field_sha256 = [string]$nameField.field_sha256
+        name_field_all_zero = [bool]$nameField.all_zero
+        prefix_field_sha256 = [string]$prefixFieldSha256
+        name_field_decoded = [bool]$nameField.decoded
         type_flag = $typeFlag
         kind = $kind
         size = [Int64]$size
@@ -3029,6 +3203,152 @@ function Get-D32BoundedDiagnosticRegistryArchiveHeader {
         checksum = [Int64]$checksum
         header_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Header)).ToLowerInvariant()
     }
+}
+
+function ConvertFrom-D32BoundedCompilerDiagnosticGnuLongNamePayload {
+    param([Parameter(Mandatory = $true)][byte[]]$Payload, [Parameter(Mandatory = $true)][string]$NextKind)
+    if ($Payload.Length -lt 2 -or $Payload.Length -gt 4097 -or $Payload[$Payload.Length - 1] -ne 0) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload length or terminal NUL is invalid'
+    }
+    $pathLength = $Payload.Length - 1
+    if ($pathLength -lt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload path is empty' }
+    for ($index = 0; $index -lt $pathLength; $index++) {
+        if ($Payload[$index] -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload contains an interior NUL' }
+    }
+    $pathBytes = [byte[]]$Payload[0..($pathLength - 1)]
+    if ($pathBytes.Length -ge 3 -and $pathBytes[0] -eq 0xef -and $pathBytes[1] -eq 0xbb -and $pathBytes[2] -eq 0xbf) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload contains a UTF-8 BOM'
+    }
+    try { $path = [Text.UTF8Encoding]::new($false, $true).GetString($pathBytes) }
+    catch { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload is not strict UTF-8' }
+    if (-not [StringComparer]::Ordinal.Equals($path.Normalize([Text.NormalizationForm]::FormC), $path)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname payload is not already NFC'
+    }
+    $hadDirectorySlash = $path.EndsWith('/')
+    if ($hadDirectorySlash) {
+        if ($NextKind -cne 'directory' -or $path.EndsWith('//')) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname trailing slash is only valid once for a directory'
+        }
+        $path = $path.Substring(0, $path.Length - 1)
+        $pathBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($path)
+    }
+    if (-not (Test-D32BoundedCompilerDiagnosticTarPath $path)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname effective path is unsafe or noncanonical'
+    }
+    return [PSCustomObject][ordered]@{
+        encoded_path = [string]$path
+        effective_path = [string]$path
+        effective_path_bytes = [byte[]]$pathBytes
+        directory_structural_slash_removed = [bool]$hadDirectorySlash
+        control_payload_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Payload)).ToLowerInvariant()
+        control_payload_bytes = [Int64]$Payload.Length
+    }
+}
+
+function Get-D32BoundedCompilerDiagnosticGnuLongNameBinding {
+    param([Parameter(Mandatory = $true)][object]$Pending, [Parameter(Mandatory = $true)][object]$HeaderRecord)
+    if ([string]$HeaderRecord.kind -notin @('file', 'directory')) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname is not followed by an ordinary file or directory'
+    }
+    $expected = [byte[]]$Pending.effective_path_bytes
+    $nameBytes = [byte[]]$HeaderRecord.name_field_content_bytes
+    $prefixBytes = if ([string]$HeaderRecord.format -ceq 'USTAR' -and -not [String]::IsNullOrEmpty([string]$HeaderRecord.prefix)) {
+        [Text.UTF8Encoding]::new($false, $true).GetBytes([string]$HeaderRecord.prefix)
+    } else { [byte[]]::new(0) }
+    $exact = $false
+    if ([string]$HeaderRecord.format -ceq 'USTAR' -and $prefixBytes.Length -gt 0) {
+        $joined = [byte[]]::new($prefixBytes.Length + 1 + $nameBytes.Length)
+        [Array]::Copy($prefixBytes, 0, $joined, 0, $prefixBytes.Length)
+        $joined[$prefixBytes.Length] = 47
+        [Array]::Copy($nameBytes, 0, $joined, $prefixBytes.Length + 1, $nameBytes.Length)
+        $exact = Test-D32BoundedCompilerDiagnosticByteArraysEqual -Left $joined -Right $expected
+    }
+    else { $exact = Test-D32BoundedCompilerDiagnosticByteArraysEqual -Left $nameBytes -Right $expected }
+    if ($exact) { return 'FULL_EXACT' }
+
+    if ([string]$HeaderRecord.format -ceq 'GNU' -and [bool]$HeaderRecord.name_field_decoded -and
+        [bool]$HeaderRecord.name_field_all_zero -and $expected.Length -gt 100) { return 'GNU_EXPLICIT_EMPTY' }
+
+    if ([string]::IsNullOrEmpty([string]$HeaderRecord.prefix) -and $expected.Length -gt 100) {
+        if ($nameBytes.Length -eq 100) {
+            $prefix = [byte[]]$expected[0..99]
+            if (Test-D32BoundedCompilerDiagnosticByteArraysEqual -Left $nameBytes -Right $prefix) { return 'RAW_100_BYTE_PREFIX' }
+        }
+        $boundary = 0
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        for ($length = 99; $length -ge 1; $length--) {
+            try {
+                $candidate = $utf8.GetString([byte[]]$expected[0..($length - 1)])
+                if ($utf8.GetByteCount($candidate) -eq $length) { $boundary = $length; break }
+            } catch { }
+        }
+        if ($boundary -in @(99, 100) -and $nameBytes.Length -eq $boundary -and
+            (Test-D32BoundedCompilerDiagnosticByteArraysEqual -Left $nameBytes -Right ([byte[]]$expected[0..($boundary - 1)]))) {
+            return ('UTF8_BOUNDARY_' + $boundary.ToString([Globalization.CultureInfo]::InvariantCulture))
+        }
+    }
+    throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname fallback fields do not bind to the exact pending path'
+}
+
+function New-D32BoundedCompilerDiagnosticGnuLongNamePair {
+    param(
+        [Parameter(Mandatory = $true)][object]$Pending,
+        [Parameter(Mandatory = $true)][object]$HeaderRecord,
+        [Parameter(Mandatory = $true)][long]$NextHeaderOffset,
+        [Parameter(Mandatory = $true)][string]$FallbackKind,
+        [Parameter(Mandatory = $true)][string]$EffectivePath
+    )
+    return [PSCustomObject][ordered]@{
+        longname_offset = [Int64]$Pending.offset
+        longname_header_sha256 = [string]$Pending.header_sha256
+        longname_size = [Int64]$Pending.size
+        control_payload_sha256 = [string]$Pending.control_payload_sha256
+        next_header_offset = [Int64]$NextHeaderOffset
+        next_header_sha256 = [string]$HeaderRecord.header_sha256
+        ordinary_format = [string]$HeaderRecord.format
+        ordinary_type_flag = [Int64]$HeaderRecord.type_flag
+        ordinary_size = [Int64]$HeaderRecord.size
+        raw_name_field_sha256 = [string]$HeaderRecord.name_field_sha256
+        raw_prefix_field_sha256 = [string]$HeaderRecord.prefix_field_sha256
+        effective_path = $EffectivePath
+        fallback_kind = $FallbackKind
+    }
+}
+
+function Get-D32BoundedCompilerDiagnosticLongNamePairDigest {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs)
+    $canonical = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $Pairs) {
+        $canonical.Add([string]::Join("`t", [string[]]@(
+            ([Int64]$pair.longname_offset).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$pair.longname_header_sha256,
+            ([Int64]$pair.longname_size).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$pair.control_payload_sha256,
+            ([Int64]$pair.next_header_offset).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$pair.next_header_sha256,
+            [string]$pair.ordinary_format,
+            ([Int64]$pair.ordinary_type_flag).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$pair.ordinary_size).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$pair.raw_name_field_sha256,
+            [string]$pair.raw_prefix_field_sha256,
+            [string]$pair.effective_path,
+            [string]$pair.fallback_kind)))
+    }
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + $(if ($canonical.Count -gt 0) { "`n" } else { '' })))).ToLowerInvariant()
+}
+
+function Get-D32BoundedCompilerDiagnosticLongNameControlDigest {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs)
+    $canonical = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $Pairs) {
+        $offset = if ($null -ne $pair.PSObject.Properties['longname_offset']) { [Int64]$pair.longname_offset } else { [Int64]$pair.offset }
+        $size = if ($null -ne $pair.PSObject.Properties['longname_size']) { [Int64]$pair.longname_size } else { [Int64]$pair.size }
+        $canonical.Add($offset.ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
+            $size.ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + [string]$pair.control_payload_sha256)
+    }
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+        [Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + $(if ($canonical.Count -gt 0) { "`n" } else { '' })))).ToLowerInvariant()
 }
 
 function Test-D32BoundedCompilerDiagnosticTarPath {
@@ -3081,7 +3401,12 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $rootSeen = $false
         $manifestText = $null; $manifestContentSha256 = $null
         $headerRows = [System.Collections.Generic.List[object]]::new()
-        $formatCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+        $pairRows = [System.Collections.Generic.List[object]]::new()
+        $controlMetadataRows = [System.Collections.Generic.List[object]]::new()
+        $formatCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
+        $ordinaryHeaderCount = [Int64]0
+        $controlMetadataBytes = [Int64]0
+        $pendingLongName = $null
         $ended = $false
         while (-not $ended) {
             if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
@@ -3094,6 +3419,7 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
             $allZero = $true
             for ($index = 0; $index -lt 512; $index++) { if ($header[$index] -ne 0) { $allZero = $false; break } }
             if ($allZero) {
+                if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname pending at tar terminator without its adjacent ordinary header' }
                 $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
                 $expandedBytes += 512
                 for ($index = 0; $index -lt 512; $index++) { if ($second[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar terminator is not two complete zero blocks' } }
@@ -3110,12 +3436,55 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
             }
             $rawMemberCount++
             if ($rawMemberCount -gt $MaximumMembers) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member count exceeds its fixed ceiling' }
-            $headerRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $header
-            $fullName = [string]$headerRecord.path
+            $headerRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $header -AllowRawNameProjection:($null -ne $pendingLongName)
             $typeFlag = [int]$headerRecord.type_flag
             $size = [Int64]$headerRecord.size
             $isDirectory = [string]$headerRecord.kind -ceq 'directory'
             if ($size -lt 0 -or $size -gt $MaximumMemberBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar member exceeds its fixed byte ceiling' }
+            if ([string]$headerRecord.kind -ceq 'longname') {
+                if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: chained GNU longname controls are unsupported' }
+                $payload = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count ([int]$size)
+                $expandedBytes += [Int64]$size
+                if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling while reading GNU longname metadata' }
+                $payloadSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payload)).ToLowerInvariant()
+                $padding = [int]((512 - ($size % 512)) % 512)
+                if ($padding -gt 0) {
+                    $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding
+                    if (-not (Test-D32BoundedCompilerDiagnosticTarZeroBytes -Bytes $pad -Offset 0 -Length $pad.Length)) {
+                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname control padding is nonzero'
+                    }
+                    $expandedBytes += $padding
+                }
+                if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling after GNU longname metadata' }
+                $controlMetadataBytes += [Int64]$size
+                $controlMetadataRows.Add([PSCustomObject][ordered]@{ offset = $headerOffset; size = $size; control_payload_sha256 = $payloadSha })
+                $headerRows.Add([PSCustomObject][ordered]@{
+                    offset = $headerOffset; format = 'GNU_LONGNAME_EXTENSION'; path = ''; kind = 'control'
+                    size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256
+                    name_field_sha256 = [string]$headerRecord.name_field_sha256; prefix_field_sha256 = [string]$headerRecord.prefix_field_sha256
+                    fallback_kind = ''
+                })
+                $formatCounts.gnu_longname_extension = [Int64]$formatCounts.gnu_longname_extension + 1L
+                $pendingLongName = [PSCustomObject][ordered]@{
+                    offset = $headerOffset; header_sha256 = [string]$headerRecord.header_sha256; size = $size
+                    control_payload_sha256 = $payloadSha; expected_next_offset = [Int64]$expandedBytes; payload = $payload
+                }
+                continue
+            }
+            $fallbackKind = ''
+            $fullName = [string]$headerRecord.path
+            if ($null -ne $pendingLongName) {
+                if ([Int64]$pendingLongName.expected_next_offset -ne $headerOffset) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname is not physically adjacent to its ordinary header'
+                }
+                $longName = ConvertFrom-D32BoundedCompilerDiagnosticGnuLongNamePayload -Payload ([byte[]]$pendingLongName.payload) -NextKind ([string]$headerRecord.kind)
+                $fallbackKind = Get-D32BoundedCompilerDiagnosticGnuLongNameBinding -Pending $longName -HeaderRecord $headerRecord
+                $fullName = [string]$longName.effective_path
+            }
+            elseif ($null -eq $fullName) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: ordinary tar name is not strict UTF-8'
+            }
+            $ordinaryHeaderCount++
             if ($fullName -ceq $ExpectedPackageRoot) {
                 if (-not $isDirectory -or $rootSeen -or -not $rawNames.Add($fullName)) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: package root header is duplicated or not a directory' }
                 $rootSeen = $true
@@ -3183,13 +3552,18 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                         $expandedBytes += $padding
                     }
                     $expected.Add($relative, [PSCustomObject]@{ path = $relative; kind = 'file'; bytes = [Int64]$size; sha256 = $fileSha })
-                    $headerRows.Add([PSCustomObject]@{ offset = $headerOffset; format = [string]$headerRecord.format; path = $fullName; kind = 'file'; size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256 })
+                    $headerRows.Add([PSCustomObject][ordered]@{ offset = $headerOffset; format = [string]$headerRecord.format; path = $fullName; kind = 'file'; size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256; name_field_sha256 = [string]$headerRecord.name_field_sha256; prefix_field_sha256 = [string]$headerRecord.prefix_field_sha256; fallback_kind = $fallbackKind })
                     $countKey = ([string]$headerRecord.format).ToLowerInvariant() + '_regular'
                     $formatCounts[$countKey] = [Int64]$formatCounts[$countKey] + 1L
+                if ($null -ne $pendingLongName) {
+                    $pairRows.Add((New-D32BoundedCompilerDiagnosticGnuLongNamePair -Pending $pendingLongName -HeaderRecord $headerRecord -NextHeaderOffset $headerOffset -FallbackKind $fallbackKind -EffectivePath $fullName))
+                    $pendingLongName = $null
+                    $payload = $null
+                }
                     continue
                 }
             }
-            $headerRows.Add([PSCustomObject]@{ offset = $headerOffset; format = [string]$headerRecord.format; path = $fullName; kind = $(if ($isDirectory) { 'directory' } else { 'file' }); size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256 })
+            $headerRows.Add([PSCustomObject][ordered]@{ offset = $headerOffset; format = [string]$headerRecord.format; path = $fullName; kind = $(if ($isDirectory) { 'directory' } else { 'file' }); size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256; name_field_sha256 = [string]$headerRecord.name_field_sha256; prefix_field_sha256 = [string]$headerRecord.prefix_field_sha256; fallback_kind = $fallbackKind })
             $countKey = ([string]$headerRecord.format).ToLowerInvariant() + $(if ($isDirectory) { '_directory' } else { '_regular' })
             $formatCounts[$countKey] = [Int64]$formatCounts[$countKey] + 1L
             $paddingSize = [int]((512 - ($size % 512)) % 512)
@@ -3212,7 +3586,14 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 $expandedBytes += $paddingSize
             }
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
+            if ($null -ne $pendingLongName) {
+                $pairRows.Add((New-D32BoundedCompilerDiagnosticGnuLongNamePair -Pending $pendingLongName -HeaderRecord $headerRecord -NextHeaderOffset $headerOffset -FallbackKind $fallbackKind -EffectivePath $fullName))
+                $pendingLongName = $null
+                $payload = $null
+            }
         }
+        if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: dangling GNU longname control at archive end' }
+        if ($controlMetadataRows.Count -ne $pairRows.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: not every GNU longname control is bound to exactly one ordinary member' }
         if ($expected.Count -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member inventory is empty' }
         if ($null -eq $manifestText -or [string]$manifestContentSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: checksum-matched crate archive lacks one regular root Cargo.toml' }
         $paths = [string[]]@($expected.Keys)
@@ -3232,21 +3613,31 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $headerCanonical.Add(([Int64]$headerRow.offset).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
             [string]$headerRow.format + "`t" + [string]$headerRow.path + "`t" + [string]$headerRow.kind + "`t" +
             ([Int64]$headerRow.type_flag).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
-            ([Int64]$headerRow.size).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + [string]$headerRow.header_sha256)
+            ([Int64]$headerRow.size).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + [string]$headerRow.header_sha256 + "`t" +
+            [string]$headerRow.name_field_sha256 + "`t" + [string]$headerRow.prefix_field_sha256 + "`t" + [string]$headerRow.fallback_kind)
         }
         $headerInventorySha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($headerCanonical -join "`n") + "`n"))).ToLowerInvariant()
+        $pairInventorySha = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @($pairRows.ToArray())
+        $controlMetadataSha = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @($controlMetadataRows.ToArray())
         $formatCanonical = [string]::Join("`t", [string[]]@($script:D32BoundedDiagnosticRegistryArchivePolicy,
             ([Int64]$formatCounts.ustar_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.ustar_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.gnu_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
-            ([Int64]$formatCounts.gnu_directory).ToString([Globalization.CultureInfo]::InvariantCulture)))
+            ([Int64]$formatCounts.gnu_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$formatCounts.gnu_longname_extension).ToString([Globalization.CultureInfo]::InvariantCulture)))
         $inventorySha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(
-            ($canonical -join "`n") + "`n" + $headerInventorySha + "`n" + $formatCanonical + "`n"))).ToLowerInvariant()
+            ($canonical -join "`n") + "`n" + $headerInventorySha + "`n" + $pairInventorySha + "`n" + $formatCanonical + "`n"))).ToLowerInvariant()
         return [PSCustomObject][ordered]@{
             archive_sha256 = $archiveSha
             archive_policy_id = $script:D32BoundedDiagnosticRegistryArchivePolicy
             expanded_bytes = $expandedBytes
             member_count = [Int64]$rawMemberCount
+            ordinary_header_count = [Int64]$ordinaryHeaderCount
+            longname_pair_count = [Int64]$pairRows.Count
+            longname_pair_inventory_sha256 = $pairInventorySha
+            longname_control_metadata_count = [Int64]$controlMetadataRows.Count
+            longname_control_metadata_bytes = [Int64]$controlMetadataBytes
+            longname_control_metadata_sha256 = $controlMetadataSha
             entries = @($rows.ToArray())
             inventory_sha256 = $inventorySha
             header_inventory_sha256 = $headerInventorySha
@@ -3255,7 +3646,9 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 ustar_directory = [Int64]$formatCounts.ustar_directory
                 gnu_regular = [Int64]$formatCounts.gnu_regular
                 gnu_directory = [Int64]$formatCounts.gnu_directory
+                gnu_longname_extension = [Int64]$formatCounts.gnu_longname_extension
             }
+            longname_pairs = @($pairRows.ToArray())
             header_inventory = @($headerRows.ToArray())
             manifest_text = $manifestText
             manifest_sha256 = $manifestContentSha256
@@ -3279,7 +3672,12 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
         [int]$MaximumMembers = 10000
     )
     $headerRows = [System.Collections.Generic.List[string]]::new()
-    $formatCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $pairRows = [System.Collections.Generic.List[object]]::new()
+    $controlMetadataRows = [System.Collections.Generic.List[object]]::new()
+    $formatCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
+    $ordinaryHeaderCount = [Int64]0
+    $controlMetadataBytes = [Int64]0
+    $pendingLongName = $null
     $archiveSha = $null
     $expandedBytes = [Int64]0
     $memberCount = [Int64]0
@@ -3288,6 +3686,10 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
     $currentMemberHeader = $false
     $currentHeaderRecorded = $false
     $currentTypeFlag = $null
+    $currentHeaderFormat = $null
+    $currentHeaderSize = $null
+    $currentHeaderNameFieldSha = $null
+    $currentHeaderPrefixFieldSha = $null
     $failureReason = $null
     $status = 'COMPLETE_DIAGNOSTIC'
     $gzip = $null
@@ -3309,7 +3711,10 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
         } else { 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: caller archive checksum or package-root identity is malformed' }
         return [PSCustomObject][ordered]@{
             status = $preflightStatus; archive_sha256 = $null; expanded_bytes = 0L; header_count = 0L; member_count = 0L
-            format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+            ordinary_header_count = 0L; longname_pair_count = 0L; longname_pair_inventory_sha256 = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @()
+            longname_control_metadata_count = 0L; longname_control_metadata_bytes = 0L
+            longname_control_metadata_sha256 = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @()
+            format_counts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
             header_inventory_sha256 = $null; first_failure_offset = 0L; first_failure_header_sha256 = $null
             first_failure_reason = $preflightReason; remainder_unknown = $true; framing_verified = $false
         }
@@ -3329,6 +3734,10 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
             $currentMemberHeader = $false
             $currentHeaderRecorded = $false
             $currentTypeFlag = $null
+            $currentHeaderFormat = $null
+            $currentHeaderSize = $null
+            $currentHeaderNameFieldSha = $null
+            $currentHeaderPrefixFieldSha = $null
             $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
             $currentHeaderSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($header)).ToLowerInvariant()
             $expandedBytes += 512L
@@ -3336,6 +3745,7 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
             $allZero = $true
             for ($index = 0; $index -lt 512; $index++) { if ($header[$index] -ne 0) { $allZero = $false; break } }
             if ($allZero) {
+                if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: GNU longname pending at tar terminator without adjacent ordinary header' }
                 $secondOffset = [Int64]$expandedBytes
                 $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
                 $expandedBytes += 512L
@@ -3366,16 +3776,64 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
             $currentMemberHeader = $true
             $currentTypeFlag = [Int64][int]$header[156]
             if ($memberCount -gt $MaximumMembers) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: archive member-count limit reached' }
-            try { $headerRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $header }
+            try { $headerRecord = Get-D32BoundedDiagnosticRegistryArchiveHeader -Header $header -AllowRawNameProjection:($null -ne $pendingLongName) }
             catch {
                 $headerRows.Add([string]::Join("`t", [string[]]@(
-                ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'UNSUPPORTED', '', '',
-                    ([Int64][int]$header[156]).ToString([Globalization.CultureInfo]::InvariantCulture), '0', [string]$currentHeaderSha)))
+                    ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'UNSUPPORTED', '', 'unsupported',
+                    ([Int64][int]$header[156]).ToString([Globalization.CultureInfo]::InvariantCulture), '0', [string]$currentHeaderSha,
+                    '', '', '')))
                 $currentHeaderRecorded = $true
                 throw ('D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: ' + [string]$_.Exception.Message)
             }
+            $currentHeaderFormat = [string]$headerRecord.format
+            $currentHeaderSize = [Int64]$headerRecord.size
+            $currentHeaderNameFieldSha = [string]$headerRecord.name_field_sha256
+            $currentHeaderPrefixFieldSha = [string]$headerRecord.prefix_field_sha256
             if ([Int64]$headerRecord.size -gt $MaximumMemberBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: tar member exceeds the fixed per-member expanded-byte bound' }
+            if ([string]$headerRecord.kind -ceq 'longname') {
+                $formatCounts.gnu_longname_extension = [Int64]$formatCounts.gnu_longname_extension + 1L
+                if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: chained GNU longname controls are unsupported' }
+                $payload = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count ([int]$headerRecord.size)
+                $payloadSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payload)).ToLowerInvariant()
+                $controlMetadataRows.Add([PSCustomObject][ordered]@{
+                    offset = [Int64]$currentOffset; size = [Int64]$headerRecord.size; control_payload_sha256 = $payloadSha
+                })
+                $controlMetadataBytes += [Int64]$headerRecord.size
+                $expandedBytes += [Int64]$headerRecord.size
+                if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: expanded archive limit reached in GNU longname metadata' }
+                $padding = [int]((512 - ([Int64]$headerRecord.size % 512)) % 512)
+                if ($padding -gt 0) {
+                    $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding
+                    if (-not (Test-D32BoundedCompilerDiagnosticTarZeroBytes -Bytes $pad -Offset 0 -Length $pad.Length)) {
+                        throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: GNU longname control padding is nonzero'
+                    }
+                    $expandedBytes += $padding
+                }
+                if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: expanded archive limit reached after GNU longname metadata' }
+                $headerRows.Add([string]::Join("`t", [string[]]@(
+                    ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'GNU_LONGNAME_EXTENSION', '', 'control',
+                    '76', ([Int64]$headerRecord.size).ToString([Globalization.CultureInfo]::InvariantCulture), [string]$currentHeaderSha,
+                    [string]$headerRecord.name_field_sha256, [string]$headerRecord.prefix_field_sha256, '')))
+                $currentHeaderRecorded = $true
+                $pendingLongName = [PSCustomObject][ordered]@{
+                    offset = [Int64]$currentOffset; header_sha256 = [string]$currentHeaderSha; size = [Int64]$headerRecord.size
+                    control_payload_sha256 = $payloadSha; expected_next_offset = [Int64]$expandedBytes; payload = $payload
+                }
+                continue
+            }
+            $fallbackKind = ''
             $fullName = [string]$headerRecord.path
+            if ($null -ne $pendingLongName) {
+                if ([Int64]$pendingLongName.expected_next_offset -ne [Int64]$currentOffset) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: GNU longname is not physically adjacent to its ordinary header'
+                }
+                $longName = ConvertFrom-D32BoundedCompilerDiagnosticGnuLongNamePayload -Payload ([byte[]]$pendingLongName.payload) -NextKind ([string]$headerRecord.kind)
+                $fallbackKind = Get-D32BoundedCompilerDiagnosticGnuLongNameBinding -Pending $longName -HeaderRecord $headerRecord
+                $fullName = [string]$longName.effective_path
+            }
+            elseif ($null -eq $fullName) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: ordinary tar name is not strict UTF-8'
+            }
             $isDirectory = [string]$headerRecord.kind -ceq 'directory'
             if ($fullName -ceq $ExpectedPackageRoot) {
                 if (-not $isDirectory -or $rootSeen -or -not $rawNames.Add($fullName)) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: exact package root directory header is duplicated or malformed' }
@@ -3412,9 +3870,12 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
                 ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture),
                 [string]$headerRecord.format, [string]$fullName, [string]$headerRecord.kind,
                 ([Int64]$headerRecord.type_flag).ToString([Globalization.CultureInfo]::InvariantCulture),
-                ([Int64]$headerRecord.size).ToString([Globalization.CultureInfo]::InvariantCulture), [string]$currentHeaderSha))
+                ([Int64]$headerRecord.size).ToString([Globalization.CultureInfo]::InvariantCulture), [string]$currentHeaderSha,
+                [string]$headerRecord.name_field_sha256, [string]$headerRecord.prefix_field_sha256, $fallbackKind))
             $headerRows.Add($row)
             $currentHeaderRecorded = $true
+            if ($null -ne $pendingLongName) { $pairRows.Add((New-D32BoundedCompilerDiagnosticGnuLongNamePair -Pending $pendingLongName -HeaderRecord $headerRecord -NextHeaderOffset ([Int64]$currentOffset) -FallbackKind $fallbackKind -EffectivePath $fullName)) }
+            $ordinaryHeaderCount++
             $countKey = ([string]$headerRecord.format).ToLowerInvariant() + $(if ($isDirectory) { '_directory' } else { '_regular' })
             $formatCounts[$countKey] = [Int64]$formatCounts[$countKey] + 1L
             $remaining = [Int64]$headerRecord.size
@@ -3434,6 +3895,8 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
                 $expandedBytes += $padding
             }
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: expanded archive limit reached after member padding' }
+            if ($null -ne $pendingLongName) { $pendingLongName = $null }
+            $payload = $null
         }
         if ($memberCount -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: archive contains no member headers' }
         $currentOffset = $null
@@ -3444,10 +3907,18 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
         if ($failureReason -like 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED:*') { $status = 'BUDGET_STOPPED' }
         else { $status = 'BLOCKED' }
         if ($currentMemberHeader -and -not $currentHeaderRecorded -and $null -ne $currentOffset -and $null -ne $currentHeaderSha) {
-            $headerRows.Add([string]::Join("`t", [string[]]@(
-                ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'UNSUPPORTED', '', '',
-                $(if ($null -eq $currentTypeFlag) { '0' } else { ([Int64]$currentTypeFlag).ToString([Globalization.CultureInfo]::InvariantCulture) }),
-                '0', [string]$currentHeaderSha)))
+            if ($currentHeaderFormat -ceq 'GNU' -and $currentTypeFlag -eq 76 -and $null -ne $currentHeaderSize) {
+                $headerRows.Add([string]::Join("`t", [string[]]@(
+                    ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'GNU_LONGNAME_EXTENSION', '', 'control',
+                    '76', ([Int64]$currentHeaderSize).ToString([Globalization.CultureInfo]::InvariantCulture), [string]$currentHeaderSha,
+                    [string]$currentHeaderNameFieldSha, [string]$currentHeaderPrefixFieldSha, '')))
+            }
+            else {
+                $headerRows.Add([string]::Join("`t", [string[]]@(
+                    ([Int64]$currentOffset).ToString([Globalization.CultureInfo]::InvariantCulture), 'UNSUPPORTED', '', '',
+                    $(if ($null -eq $currentTypeFlag) { '0' } else { ([Int64]$currentTypeFlag).ToString([Globalization.CultureInfo]::InvariantCulture) }),
+                    '0', [string]$currentHeaderSha)))
+            }
         }
     }
     finally {
@@ -3458,18 +3929,33 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
     $headerInventorySha = if ($headerRows.Count -eq 0) { $null } else {
         [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($headerCanonical))).ToLowerInvariant()
     }
+    $pairInventorySha = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @($pairRows.ToArray())
+    $controlMetadataSha = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @($controlMetadataRows.ToArray())
     return [PSCustomObject][ordered]@{
         status = $status
         archive_sha256 = $archiveSha
         expanded_bytes = $expandedBytes
         header_count = [Int64]$headerRows.Count
         member_count = $memberCount
+        ordinary_header_count = $ordinaryHeaderCount
+        longname_pair_count = [Int64]$pairRows.Count
+        longname_pair_inventory_sha256 = $pairInventorySha
+        longname_control_metadata_count = [Int64]$controlMetadataRows.Count
+        longname_control_metadata_bytes = $controlMetadataBytes
+        longname_control_metadata_sha256 = $controlMetadataSha
         format_counts = [PSCustomObject][ordered]@{
             ustar_regular = [Int64]$formatCounts.ustar_regular
             ustar_directory = [Int64]$formatCounts.ustar_directory
             gnu_regular = [Int64]$formatCounts.gnu_regular
             gnu_directory = [Int64]$formatCounts.gnu_directory
+            gnu_longname_extension = [Int64]$formatCounts.gnu_longname_extension
         }
+        ordinary_payload_read_and_discarded = $true
+        ordinary_payload_hashed = $false
+        ordinary_payload_retained = $false
+        longname_control_metadata_hashed = $true
+        longname_control_metadata_retained = $false
+        source_extraction_performed = $false
         header_inventory_sha256 = $headerInventorySha
         first_failure_offset = $currentOffset
         first_failure_header_sha256 = $currentHeaderSha
@@ -3493,7 +3979,7 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusAuthorityShape {
         'dependency_origin', 'historical_origin', 'source_pins', 'archive_refs',
         'output_candidate', 'run_id', 'resource_budget', 'issued_at_utc')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Document $top) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [Int64]$Document.schema_version -ne 1 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Document.schema_version -Positive) -or [Int64]$Document.schema_version -ne 2 -or
         $Document.record_type -isnot [string] -or [string]$Document.record_type -cne $script:D32BoundedDiagnosticArchiveFormatCensusAuthorityType -or
         $Document.registry_archive_policy -isnot [string] -or [string]$Document.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         -not (Test-D32BoundedCompilerDiagnosticInteger $Document.source_plan_semantics_version -Positive) -or [Int64]$Document.source_plan_semantics_version -ne 2 -or
@@ -3597,10 +4083,17 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest {
             [string]$archive.opened_archive_bytes, [string]$archive.opened_archive_sha256,
             [string]$archive.opened_archive_volume_serial_hex, [string]$archive.opened_archive_file_id_hex,
             ([Int64]$archive.header_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$archive.ordinary_header_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$archive.longname_pair_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$archive.longname_pair_inventory_sha256,
+            ([Int64]$archive.longname_control_metadata_count).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$archive.longname_control_metadata_bytes).ToString([Globalization.CultureInfo]::InvariantCulture),
+            [string]$archive.longname_control_metadata_sha256,
             ([Int64]$archive.format_counts.ustar_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$archive.format_counts.ustar_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$archive.format_counts.gnu_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$archive.format_counts.gnu_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
+            ([Int64]$archive.format_counts.gnu_longname_extension).ToString([Globalization.CultureInfo]::InvariantCulture),
             [string]$archive.status, [string]$archive.first_failure_offset,
             [string]$archive.first_failure_header_sha256, [string]$archive.first_failure_reason,
             [string]$archive.framing_verified, [string]$archive.remainder_unknown)
@@ -3618,7 +4111,7 @@ function New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow {
         [AllowNull()][object]$Inventory,
         [AllowNull()][object]$FailureReason
     )
-    $zeroCounts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $zeroCounts = [PSCustomObject][ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
     $counts = if ($null -eq $Inventory) { $zeroCounts } else { $Inventory.format_counts }
     $openedBytes = $null
     $openedSha256 = $null
@@ -3626,6 +4119,12 @@ function New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow {
     $openedFileIdHex = $null
     $expandedBytes = 0L
     $headerCount = 0L
+    $ordinaryHeaderCount = 0L
+    $longnamePairCount = 0L
+    $longnamePairInventorySha256 = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @()
+    $longnameControlMetadataCount = 0L
+    $longnameControlMetadataBytes = 0L
+    $longnameControlMetadataSha256 = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @()
     $headerInventorySha256 = $null
     $framingVerified = $false
     $firstFailureOffset = $null
@@ -3640,6 +4139,12 @@ function New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow {
     if ($null -ne $Inventory) {
         $expandedBytes = [Int64]$Inventory.expanded_bytes
         $headerCount = [Int64]$Inventory.header_count
+        $ordinaryHeaderCount = [Int64]$Inventory.ordinary_header_count
+        $longnamePairCount = [Int64]$Inventory.longname_pair_count
+        $longnamePairInventorySha256 = [string]$Inventory.longname_pair_inventory_sha256
+        $longnameControlMetadataCount = [Int64]$Inventory.longname_control_metadata_count
+        $longnameControlMetadataBytes = [Int64]$Inventory.longname_control_metadata_bytes
+        $longnameControlMetadataSha256 = [string]$Inventory.longname_control_metadata_sha256
         if ($null -ne $Inventory.header_inventory_sha256) { $headerInventorySha256 = [string]$Inventory.header_inventory_sha256 }
         $framingVerified = [bool]$Inventory.framing_verified
         if ($null -ne $Inventory.first_failure_offset) { $firstFailureOffset = $Inventory.first_failure_offset }
@@ -3660,6 +4165,12 @@ function New-D32BoundedDiagnosticArchiveFormatCensusCoverageRow {
         status = $Status
         expanded_bytes = $expandedBytes
         header_count = $headerCount
+        ordinary_header_count = $ordinaryHeaderCount
+        longname_pair_count = $longnamePairCount
+        longname_pair_inventory_sha256 = $longnamePairInventorySha256
+        longname_control_metadata_count = $longnameControlMetadataCount
+        longname_control_metadata_bytes = $longnameControlMetadataBytes
+        longname_control_metadata_sha256 = $longnameControlMetadataSha256
         format_counts = $counts
         header_inventory_sha256 = $headerInventorySha256
         framing_verified = $framingVerified
@@ -3692,11 +4203,23 @@ function New-D32BoundedDiagnosticArchiveFormatCensusResult {
     $unexamined = [string[]]@($rows | Where-Object { [string]$_.status -ceq 'UNEXAMINED' } | ForEach-Object { [string]$_.archive_id })
     $blockedCount = [Int64]@($rows | Where-Object { [string]$_.status -cin @('UNSUPPORTED', 'PREFLIGHT_BLOCKED') }).Count
     $coveredCount = [Int64]@($rows | Where-Object { [string]$_.status -cne 'UNEXAMINED' }).Count
-    $aggregateCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $aggregateCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
+    $aggregateOrdinaryHeaders = [Int64]0
+    $aggregatePairs = [Int64]0
+    $aggregateControlCount = [Int64]0
+    $aggregateControlBytes = [Int64]0
+    $controlDigestRows = [System.Collections.Generic.List[string]]::new()
+    $pairDigestRows = [System.Collections.Generic.List[string]]::new()
     foreach ($row in $rows) {
-        foreach ($formatName in @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')) {
+        foreach ($formatName in @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory', 'gnu_longname_extension')) {
             $aggregateCounts[$formatName] = [Int64]$aggregateCounts[$formatName] + [Int64]$row.format_counts.($formatName)
         }
+        $aggregateOrdinaryHeaders += [Int64]$row.ordinary_header_count
+        $aggregatePairs += [Int64]$row.longname_pair_count
+        $aggregateControlCount += [Int64]$row.longname_control_metadata_count
+        $aggregateControlBytes += [Int64]$row.longname_control_metadata_bytes
+        $controlDigestRows.Add([string]$row.archive_id + "`t" + [string]$row.longname_control_metadata_sha256)
+        $pairDigestRows.Add([string]$row.archive_id + "`t" + [string]$row.longname_pair_inventory_sha256)
     }
     $effectivePrimaryError = if ($null -eq $PrimaryError) { $null } else { [string]$PrimaryError }
     if ($Status -cne 'COMPLETE_DIAGNOSTIC' -and [String]::IsNullOrWhiteSpace($effectivePrimaryError)) {
@@ -3708,7 +4231,7 @@ function New-D32BoundedDiagnosticArchiveFormatCensusResult {
         file_id_hex = [string]$AuthorityReference.file_id_hex
     }
     return [PSCustomObject][ordered]@{
-        schema_version = 1; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType
+        schema_version = 2; record_type = $script:D32BoundedDiagnosticArchiveFormatCensusType
         registry_archive_policy = $script:D32BoundedDiagnosticRegistryArchivePolicy; gate_authority = 'NONE'
         formal_phase1_allowed = $false; formal_aggregate_allowed = $false; source_proof_checkpoint = $false
         diagnostic_invocation_authority = 'NONE'; status = $Status
@@ -3728,9 +4251,17 @@ function New-D32BoundedDiagnosticArchiveFormatCensusResult {
         aggregate_format_counts = [PSCustomObject][ordered]@{
             ustar_regular = [Int64]$aggregateCounts.ustar_regular; ustar_directory = [Int64]$aggregateCounts.ustar_directory
             gnu_regular = [Int64]$aggregateCounts.gnu_regular; gnu_directory = [Int64]$aggregateCounts.gnu_directory
+            gnu_longname_extension = [Int64]$aggregateCounts.gnu_longname_extension
         }
+        ordinary_header_count = $aggregateOrdinaryHeaders
+        longname_pair_count = $aggregatePairs
+        longname_pair_inventory_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($pairDigestRows -join "`n") + "`n"))).ToLowerInvariant()
+        longname_control_metadata_count = $aggregateControlCount
+        longname_control_metadata_bytes = $aggregateControlBytes
+        longname_control_metadata_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($controlDigestRows -join "`n") + "`n"))).ToLowerInvariant()
         archive_header_inventory_sha256 = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives $rows
-        payload_read_and_discarded = $true; payload_hashed = $false; payload_retained = $false; source_extraction_performed = $false
+        ordinary_payload_read_and_discarded = $true; ordinary_payload_hashed = $false; ordinary_payload_retained = $false
+        longname_control_metadata_hashed = $true; longname_control_metadata_retained = $false; source_extraction_performed = $false
         formal_gate_usable = $false; primary_error = $effectivePrimaryError; secondary_errors = [string[]]@($SecondaryErrors)
     }
 }
@@ -3793,9 +4324,12 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         'dependency_origin', 'historical_origin', 'source_pins', 'output_candidate', 'resource_budget', 'run_id',
         'started_at_utc', 'completed_at_utc', 'elapsed_milliseconds', 'requested_archive_count', 'covered_archive_count',
         'blocked_archive_count', 'unexamined_archive_count', 'archives', 'unexamined_archive_ids', 'aggregate_format_counts',
-        'archive_header_inventory_sha256', 'payload_read_and_discarded', 'payload_hashed', 'payload_retained', 'source_extraction_performed',
+        'ordinary_header_count', 'longname_pair_count', 'longname_pair_inventory_sha256',
+        'longname_control_metadata_count', 'longname_control_metadata_bytes', 'longname_control_metadata_sha256',
+        'archive_header_inventory_sha256', 'ordinary_payload_read_and_discarded', 'ordinary_payload_hashed', 'ordinary_payload_retained',
+        'longname_control_metadata_hashed', 'longname_control_metadata_retained', 'source_extraction_performed',
         'formal_gate_usable', 'primary_error', 'secondary_errors')
-    $countFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory')
+    $countFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory', 'gnu_longname_extension')
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Record $fields)) {
         if ($null -eq $Record -or $Record -is [string] -or $Record -is [Array] -or $Record -is [ValueType]) {
             Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'result.object_shape'
@@ -3823,7 +4357,7 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'started_at_utc_or_completed_at_utc.roundtrip_order'
         return $false
     }
-    if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.schema_version -Positive) -or [Int64]$Record.schema_version -ne 1 -or
+    if (-not (Test-D32BoundedCompilerDiagnosticInteger $Record.schema_version -Positive) -or [Int64]$Record.schema_version -ne 2 -or
         [string]$Record.record_type -cne $script:D32BoundedDiagnosticArchiveFormatCensusType -or
         [string]$Record.registry_archive_policy -cne $script:D32BoundedDiagnosticRegistryArchivePolicy -or
         [string]$Record.gate_authority -cne 'NONE' -or $Record.formal_phase1_allowed -isnot [bool] -or [bool]$Record.formal_phase1_allowed -or
@@ -3848,10 +4382,18 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         $Record.archives.Count -ne [Int64]$Record.requested_archive_count -or
         [Int64]$Record.covered_archive_count + [Int64]$Record.unexamined_archive_count -ne [Int64]$Record.requested_archive_count -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $Record.aggregate_format_counts $countFields) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.ordinary_header_count) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.longname_pair_count) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.longname_control_metadata_count) -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Record.longname_control_metadata_bytes) -or
+        [string]$Record.longname_pair_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Record.longname_control_metadata_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [string]$Record.archive_header_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $Record.payload_read_and_discarded -isnot [bool] -or [bool]$Record.payload_read_and_discarded -ne $true -or
-        $Record.payload_hashed -isnot [bool] -or [bool]$Record.payload_hashed -or
-        $Record.payload_retained -isnot [bool] -or [bool]$Record.payload_retained -or
+        $Record.ordinary_payload_read_and_discarded -isnot [bool] -or [bool]$Record.ordinary_payload_read_and_discarded -ne $true -or
+        $Record.ordinary_payload_hashed -isnot [bool] -or [bool]$Record.ordinary_payload_hashed -or
+        $Record.ordinary_payload_retained -isnot [bool] -or [bool]$Record.ordinary_payload_retained -or
+        $Record.longname_control_metadata_hashed -isnot [bool] -or [bool]$Record.longname_control_metadata_hashed -ne $true -or
+        $Record.longname_control_metadata_retained -isnot [bool] -or [bool]$Record.longname_control_metadata_retained -or
         $Record.source_extraction_performed -isnot [bool] -or [bool]$Record.source_extraction_performed -or
         $Record.formal_gate_usable -isnot [bool] -or [bool]$Record.formal_gate_usable -or
         (($Record.primary_error -isnot [string]) -and ($null -ne $Record.primary_error)) -or
@@ -3972,6 +4514,11 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "aggregate_format_counts.$field.integer"
         return $false
     } }
+    if ([string]$Record.longname_pair_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Record.longname_control_metadata_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'aggregate_longname_digest.lowercase_hex'
+        return $false
+    }
     $unexamined = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $unexaminedIndex = 0
     foreach ($id in $Record.unexamined_archive_ids) { if ($id -isnot [string] -or -not $unexamined.Add([string]$id)) {
@@ -3980,11 +4527,21 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
     }; $unexaminedIndex++ }
     $coverageFields = @('archive_id', 'source', 'name', 'version', 'checksum', 'archive_path', 'archive_bytes', 'archive_sha256',
         'archive_volume_serial_hex', 'archive_file_id_hex', 'opened_archive_bytes', 'opened_archive_sha256',
-        'opened_archive_volume_serial_hex', 'opened_archive_file_id_hex', 'status', 'expanded_bytes', 'header_count', 'format_counts',
+        'opened_archive_volume_serial_hex', 'opened_archive_file_id_hex', 'status', 'expanded_bytes', 'header_count',
+        'ordinary_header_count', 'longname_pair_count', 'longname_pair_inventory_sha256', 'longname_control_metadata_count',
+        'longname_control_metadata_bytes', 'longname_control_metadata_sha256', 'format_counts',
         'header_inventory_sha256', 'framing_verified', 'remainder_unknown', 'first_failure_offset', 'first_failure_header_sha256', 'first_failure_reason')
     $coverageIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $computedUnexamined = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $actualCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L }
+    $actualCounts = [ordered]@{ ustar_regular = 0L; ustar_directory = 0L; gnu_regular = 0L; gnu_directory = 0L; gnu_longname_extension = 0L }
+    $actualOrdinaryHeaderCount = [Int64]0
+    $actualPairCount = [Int64]0
+    $actualControlCount = [Int64]0
+    $actualControlBytes = [Int64]0
+    $aggregateExpandedBytes = [Int64]0
+    $aggregateHeaderCount = [Int64]0
+    $pairDigestRows = [System.Collections.Generic.List[string]]::new()
+    $controlDigestRows = [System.Collections.Generic.List[string]]::new()
     $archiveIndex = 0
     foreach ($archive in $Record.archives) {
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $archive $coverageFields)) {
@@ -4008,6 +4565,15 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
             [string]$archive.status -cnotin @('COMPLETE_SUPPORTED', 'UNSUPPORTED', 'PREFLIGHT_BLOCKED', 'BUDGET_STOPPED', 'UNEXAMINED') -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $archive.expanded_bytes) -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $archive.header_count) -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $archive.ordinary_header_count) -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $archive.longname_pair_count) -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $archive.longname_control_metadata_count) -or
+            -not (Test-D32BoundedCompilerDiagnosticInteger $archive.longname_control_metadata_bytes) -or
+            [Int64]$archive.expanded_bytes -gt 1073741824 -or [Int64]$archive.header_count -gt 10000 -or
+            [Int64]$archive.ordinary_header_count -gt 10000 -or [Int64]$archive.longname_pair_count -gt 10000 -or
+            [Int64]$archive.longname_control_metadata_count -gt 10000 -or
+            [string]$archive.longname_pair_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$archive.longname_control_metadata_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
             -not (Test-D32BoundedCompilerDiagnosticExactProperties $archive.format_counts $countFields) -or
             ([Int64]$archive.header_count -gt 0 -and [string]$archive.header_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$') -or
             ([Int64]$archive.header_count -eq 0 -and $null -ne $archive.header_inventory_sha256) -or
@@ -4042,20 +4608,44 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
             }
         }
         foreach ($field in $countFields) {
-            if (-not (Test-D32BoundedCompilerDiagnosticInteger $archive.format_counts.($field))) {
+            if (-not (Test-D32BoundedCompilerDiagnosticInteger $archive.format_counts.($field)) -or
+                [Int64]$archive.format_counts.($field) -gt 10000) {
                 Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].format_counts.$field.integer"
                 return $false
             }
             $actualCounts[$field] = [Int64]$actualCounts[$field] + [Int64]$archive.format_counts.($field)
         }
         $formatTotal = [Int64]$archive.format_counts.ustar_regular + [Int64]$archive.format_counts.ustar_directory +
+            [Int64]$archive.format_counts.gnu_regular + [Int64]$archive.format_counts.gnu_directory +
+            [Int64]$archive.format_counts.gnu_longname_extension
+        $ordinaryFormatTotal = [Int64]$archive.format_counts.ustar_regular + [Int64]$archive.format_counts.ustar_directory +
             [Int64]$archive.format_counts.gnu_regular + [Int64]$archive.format_counts.gnu_directory
+        $actualOrdinaryHeaderCount += [Int64]$archive.ordinary_header_count
+        $actualPairCount += [Int64]$archive.longname_pair_count
+        $actualControlCount += [Int64]$archive.longname_control_metadata_count
+        $actualControlBytes += [Int64]$archive.longname_control_metadata_bytes
+        $aggregateExpandedBytes += [Int64]$archive.expanded_bytes
+        $aggregateHeaderCount += [Int64]$archive.header_count
+        $pairDigestRows.Add([string]$archive.archive_id + "`t" + [string]$archive.longname_pair_inventory_sha256)
+        $controlDigestRows.Add([string]$archive.archive_id + "`t" + [string]$archive.longname_control_metadata_sha256)
         if ($formatTotal -gt [Int64]$archive.header_count) {
             Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].format_counts.header_count_bound"
             return $false
         }
+        if ($ordinaryFormatTotal -ne [Int64]$archive.ordinary_header_count -or
+            [Int64]$archive.longname_pair_count -gt [Int64]$archive.longname_control_metadata_count -or
+            [Int64]$archive.longname_control_metadata_count -gt [Int64]$archive.format_counts.gnu_longname_extension -or
+            ([Int64]$archive.longname_control_metadata_count -gt 0 -and [Int64]$archive.longname_control_metadata_bytes -lt ([Int64]$archive.longname_control_metadata_count * 2L)) -or
+            [Int64]$archive.longname_control_metadata_bytes -gt ([Int64]$archive.longname_control_metadata_count * 4097L) -or
+            ([Int64]$archive.longname_control_metadata_count -eq 0 -and [Int64]$archive.longname_control_metadata_bytes -ne 0)) {
+            Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "archives[$archiveIndex].ordinary_pair_control_count_or_byte_bound"
+            return $false
+        }
         if ([string]$archive.status -ceq 'COMPLETE_SUPPORTED') {
-            if ($formatTotal -ne [Int64]$archive.header_count -or [bool]$archive.remainder_unknown -or -not [bool]$archive.framing_verified -or
+            if ($formatTotal -ne [Int64]$archive.header_count -or
+                [Int64]$archive.longname_pair_count -ne [Int64]$archive.format_counts.gnu_longname_extension -or
+                [Int64]$archive.longname_control_metadata_count -ne [Int64]$archive.longname_pair_count -or
+                [bool]$archive.remainder_unknown -or -not [bool]$archive.framing_verified -or
                 [string]$archive.header_inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
                 [Int64]$archive.opened_archive_bytes -ne [Int64]$archive.archive_bytes -or
                 [string]$archive.opened_archive_sha256 -cne [string]$archive.checksum -or
@@ -4083,10 +4673,23 @@ function Test-D32BoundedDiagnosticArchiveFormatCensusResult {
         Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'coverage_counts_or_unexamined_archive_ids'
         return $false
     }
+    if ($aggregateExpandedBytes -gt 34359738368 -or $aggregateHeaderCount -gt 1000000) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'coverage.aggregate_expanded_bytes_or_member_count_bound'
+        return $false
+    }
     foreach ($field in $countFields) { if ([Int64]$Record.aggregate_format_counts.($field) -ne [Int64]$actualCounts[$field]) {
         Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason "aggregate_format_counts.$field.coverage_sum"
         return $false
     } }
+    if ([Int64]$Record.ordinary_header_count -ne $actualOrdinaryHeaderCount -or
+        [Int64]$Record.longname_pair_count -ne $actualPairCount -or
+        [Int64]$Record.longname_control_metadata_count -ne $actualControlCount -or
+        [Int64]$Record.longname_control_metadata_bytes -ne $actualControlBytes -or
+        [string]$Record.longname_pair_inventory_sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($pairDigestRows -join "`n") + "`n"))).ToLowerInvariant() -or
+        [string]$Record.longname_control_metadata_sha256 -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($controlDigestRows -join "`n") + "`n"))).ToLowerInvariant()) {
+        Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'aggregate_longname_counts_or_digests.coverage_sum'
+        return $false
+    }
     $expectedArchiveDigest = Get-D32BoundedDiagnosticArchiveFormatCensusCoverageDigest -Archives @($Record.archives)
     if ([string]$Record.archive_header_inventory_sha256 -cne $expectedArchiveDigest) {
         Add-D32BoundedDiagnosticArchiveFormatCensusValidationFailure -FailureReasons $FailureReasons -Reason 'archive_header_inventory_sha256.coverage_digest'

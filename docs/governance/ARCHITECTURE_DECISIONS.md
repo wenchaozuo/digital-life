@@ -1234,6 +1234,174 @@ Archive-format support is not source closure. The 153 missing entries, Git/sourc
 
 D32 remains NOT FROZEN with Gate NONE. This decision itself authorizes no implementation/build/helper/native probe, archive/cache additional reads, Cargo/Git/source-proof/census/network or other launch. No D33 is established.
 
+## ADR-D32-BOUNDED-SOURCEPROOF-NON-SOURCE-L1-V1 — Isolated short non-source lifecycle validation
+
+**Status:** APPROVED WITH CONDITIONS — implementation contract only
+
+**Decision authority:** GPT-6.1 Sol Max
+
+**Decision date:** 2026-10-06
+
+**Related milestone:** D32
+
+**Related baseline:** `d95b08f431bfb4befc03a5118a4b05ad019cc709` (clean, read-only verified)
+
+**Baseline controller SHA-256:** `6f3dd8068035f3584a8c097554dcd8436e4687c36d76b4c010b026e30688baed`
+
+**Baseline reader entry SHA-256:** `dc7b7d213280fc44b9f6ec2d104ab23d70dcc0af95142117b2d5c0db0763acd4`
+
+This decision closes only the minimal non-source lifecycle-validation path required by `ADR-D32-BOUNDED-SOURCEPROOF-LIFECYCLE-V1`. It does not alter SourceProof timing, GNU archive policy/schema, SC-D32-V1, or any formal gate. It does not authorize a probe or launch.
+
+### 1. Isolated mode and fixed code closure
+
+Add a mutually exclusive `NON_SOURCE_L1` parameter set to the existing controller and `scripts/d32-bounded-diagnostic-sourceproof.ps1`. Do not add a fixture executable, arbitrary script path, free command, shell, extra observer, or helper process.
+
+Retain and independently pin exactly the existing six-file closure:
+
+1. SourceProof controller
+2. SourceProof entry
+3. compiler-diagnostic runner
+4. compiler-diagnostic policy
+5. build-toolchain-profile implementation
+6. PowerShell module-authority implementation
+
+The reader's L1 branch must be selected and explicitly terminate before any SourceProofOnly runner call, source-proof authority/Profile/source-origin handling, or fall-through. Mixed parameters, unknown modes, or a wrong authority type are refused.
+
+Both actual launch cases reuse the same native creation, suspended admission, Job, retained-handle, capture/join, and cleanup implementation as SourceProofOnly. Do not copy a looser launcher for L1. Only purpose, fixed fixture behavior, record type, and short deadlines differ.
+
+### 2. Allowed and prohibited reads
+
+L1 may read only:
+
+- the independent caller-pinned L1 authority;
+- the six fixed code pins;
+- the fixed Program Files PowerShell 7 runtime and protected inputs required for runtime admission;
+- its own bounded L1 records.
+
+Code-pin reads are not application-source investigation. Do not read application source, Cargo manifests/locks, `.git`, inv7 or other cache/source content, or real user Codex/Git/Cargo/provider/shell configuration.
+
+Do not require an inner SourceProof authority, dependency-origin, or current-lock binding. The L1 runtime reference is independent and caller-provided; do not call full Profile validation in a way that indirectly reads manifests or locks.
+
+Do not add compilation, build, or compiler processes or generate a fixture binary. Reuse only the existing module-free native-surface initialization permission; do not expand it to an external compiler, helper, or new native image. The reader fixture performs fixed managed behavior only and does not load SourceProof implementation.
+
+### 3. The only fixed validation batch
+
+One authority, one controller invocation, and exactly three ordered cases, with at most two reader `CreateProcess` attempts:
+
+| Case | Fixed behavior | Expected native creation |
+| --- | --- | ---: |
+| `NORMAL_EXIT` | Emit bounded stdout/stderr and identity token, exit 0, verify ordinary cleanup | 1 |
+| `FORCED_OWNED_TERMINATION` | Emit ready token, perform a finite wait; controller sends exactly one planned termination to the exact owned Job and verifies cleanup | 1 |
+| `ENTRY_PIN_BINDING_REFUSAL` | Run real pre-create pin validation for the fixed reader entry with an internally derived single-SHA mismatch; confirm refusal before `CreateProcess` | 0 |
+
+The third case is the binding negative; do **not** add a real controller-kill/abrupt-owner-abort case. Owner-abort L0 and kill-on-close configuration checks remain. The L1 record explicitly says abrupt owner abort is `NOT_RUN`, and no wider coverage claim is permitted.
+
+Derive the negative reference only within that fixed case from the correct entry reference by changing one predefined SHA bit. Keep path, identity target, and all other fields unchanged. Do not write a bad script, tamper with runtime/authority, accept a caller-supplied bad path/command, or merely compare preset strings: traverse the actual shared opened-handle pre-create validation.
+
+### 4. Short deadlines and stop rules
+
+Use the independent policy `D32_SOURCEPROOF_NON_SOURCE_L1_V1`:
+
+- The whole batch starts at one shared monotonic `BatchT0` and lasts at most 60,000 ms, including admission, initialization, launches, cleanup, and records.
+- Each case starts from its `CaseT0` captured before admission and is bounded by: active/admission/fixture 5,000 ms; owned termination/cleanup 10,000 ms; audit and case completion 15,000 ms.
+- No case may exceed the absolute batch deadline. A deadline is an upper bound, not a required wait; advance immediately on completion. All clocks, checked arithmetic, lateness, and cross-process bindings follow LIFECYCLE principles and may not reset.
+- Fixture waits have finite termination; no infinite sleep. Natural exit cannot stand in for a successful forced-termination case.
+- Each actual case has one creation attempt; failure consumes it. Case two permits at most one planned termination request. Safety fail-safe termination is recorded separately and cannot impersonate planned success or trigger retry.
+
+If ownership or cleanup is unknown, stop the batch and all later native creation; do not start SourceProof, census, Cargo, or another related execution. If cleanup is verified but an ordinary validation fails, finish remaining fixed cases within the same authority and remaining budget for a batched blocker report; never rerun a failed case.
+
+Short deadlines validate only the native boundary. They cannot be labeled as proof of the real 300-second SourceProof expiry, source-budget sufficiency, or source closure. Real timing semantics remain covered by required fake-clock L0.
+
+### 5. Runtime, argv, environment, and fixture
+
+Use only the independently pinned runtime:
+
+`<fixed drive>:\Program Files\PowerShell\7\pwsh.exe`
+
+The controller and reader actual image must match the same canonical runtime reference and retain existing version, 64-bit, namespace, identity, and runtime-admission rules. Do not resolve through PATH, copy a tool image, or substitute another PowerShell.
+
+The fixed reader argv begins:
+
+`-NoLogo -NoProfile -NonInteractive -File <fixed reader entry> -NonSourceL1`
+
+Only fixed roles may follow: L1 authority path/independent SHA, batch/case IDs, the unique nonce, and controller-bound clock context. No SourceProofAuthority, Profile, origin, custom script/command, duration, or budget override is accepted.
+
+Use a fresh, external, owner-bound L1 root as working directory, not the repository or source/cache root. Use a fixed environment allowlist without inheriting the parent environment:
+
+- existing SystemRoot/WINDIR, constrained PATH, and PSHOME module path;
+- module autoload disabled and telemetry opt-out;
+- TEMP/TMP and user directory/config/cache variables redirected to this run's L1 root.
+
+User-directory redirection is a fixed enumerated set of variables and root-derived values; the authority cannot supply an arbitrary environment dictionary. Protected Program Files/Windows runtime inputs do not grant access to real user configuration.
+
+The fixture may emit only bounded fixed tokens/diagnostics and perform a finite managed wait. It must not enumerate files, read application content, use network, create children, import modules, allocate large payloads, or emit SourceProof records. Stdout is a behavior token, not process-ownership authority.
+
+### 6. Required actual identity and cleanup evidence
+
+For both actual cases, verify:
+
+- current candidate, controller/entry code, and runtime opened-handle pins;
+- exact argv/environment and case/batch/nonce binding;
+- retained native process handle, PID, and creation identity;
+- actual process image bound to the caller-pinned executable;
+- suspended creation → Job assignment/admission → resume order;
+- independent non-breakaway, kill-on-close Job with exactly one reader;
+- exit observed through the retained handle;
+- Job active count zero and Job process accounting consistent with the sole reader;
+- stdout/stderr capture completion and joined threads;
+- deterministic closure of Job/process/thread/pipe/admission handles, with failures recorded.
+
+Terminate only through the retained owned Job/process. Do not use names, global enumeration, or ambiguous PID. `.Kill()`, a `TerminateJobObject` return, exit code 0, or a token alone cannot replace the required checks.
+
+The normal case expects no planned termination. The forced case must prove the request occurred while the fixture was active and observe its corresponding exit. Lost capture, truncation, identity mismatch, unreliable Job accounting, or unverified cleanup cannot produce a completed status.
+
+Do not expand formal Trace V2, introduce a CREATE exception, or claim whole-process formal-gate completion.
+
+### 7. Independent fixture authority and result
+
+Add exactly these strict records:
+
+- `D32_BOUNDED_SOURCEPROOF_NON_SOURCE_L1_AUTHORITY_V1`
+- `D32_BOUNDED_SOURCEPROOF_NON_SOURCE_L1_V1`
+
+Both use `schema_version = 1`, fixed purpose `NATIVE_LIFECYCLE_VALIDATION_ONLY`, policy `D32_SOURCEPROOF_NON_SOURCE_L1_V1`, and `gate_authority = NONE`.
+
+The authority exact shape binds the clean current candidate, canonical repository identity, batch/run/owner, six fixed file pins, independent runtime reference, three ordered cases and expected creation counts, unique nonces, fixed argv/environment policies, a fresh owner-bound L1 root and create-new record/journal paths with parent identities, finite limits, and issue time. It accepts no SourceProof authority/reference/output path, free case list, free argv, extra fixture file, or configurable deadline. Only the independent caller supplies its SHA; an authority candidate cannot authorize itself.
+
+The result binds authority/current code/runtime pins, actual invocation, shared and per-case clocks, native attempts/identities/Job facts, capture summaries, exit/termination/cleanup, primary/secondary errors, observed lateness, and all executed/unexecuted cases. A negative case with no native attempt cannot fabricate PID/Job/cleanup evidence. Reject missing/extra/duplicate/wrong-type/unknown-version/policy and cross-candidate/run/case/nonce/process/artifact combinations.
+
+Do not change SourceProof execution authority/result V1 or GNU-related schemas. Their strict consumers must reject the L1 types; never translate the short fixture budget into real SourceProof authority.
+
+### 8. Bounded output, states, and submission confirmation
+
+L1-owned buffers are capped at 16 MiB; the fixture holds no large payload. Existing runtime initialization is not relabeled as buffer peak or working-set evidence and the SourceProof 512 MiB cap is unchanged. Each stream retains the 16,000-byte hard cap and expected fixture output is at most 1,024 bytes. Batch result and journal are each at most 64 KiB and contain no source or raw fixture authority content. All outputs are create-new; never delete, overwrite, or reuse a failed path.
+
+Batch statuses are exactly:
+
+- `COMPLETE_NON_SOURCE_L1`
+- `BLOCKED`
+- `BUDGET_STOPPED`
+- `REFUSED`
+- `UNRESOLVED`
+
+Case statuses distinguish verified actual native boundary, verified expected refusal, and failure/unknown. Completion requires both actual cases fully verified, the third actual refusal with zero creation, and all records/submission/caller return within deadlines. Reuse execution-record persisted-fact and caller reconciliation principles: a pre-flush snapshot is not proof of submission. The final journal fact binds result path/bytes/SHA/file identity and observed submission time. Missing, partial, late return, or unverified submission is unresolved. The result cannot attest its own post-flush completion.
+
+Every result fixes: source-proof checkpoint false; source closure not established; diagnostic invocation authority `NONE`; formal gate usability false; formal phase and aggregate allowed flags false.
+
+### 9. Minimal validation and future joint admission
+
+Do one integrated implementation/L0 batch covering mode mutual exclusion, rejection between both authority domains, fixed cases/argv/environment, deadlines/bounds, zero-create refusal, identity/capture/cleanup failures, record submission, and producer → strict validator → JSON → consumer closure. Reuse existing clock/ownership negatives. Do not add long runs, stress, a comprehensive native matrix, real 300-second timeout, or source scan tests.
+
+After Luna implementation and a new clean candidate, the Coordinator may prepare independently pinned, new L1 authority and fresh output, then separately authorize exactly one fixed batch. This ADR itself does not launch and does not reuse DE398 preparation or any execution authority absent from d95.
+
+Any future real SourceProof admission jointly rechecks: (1) a valid L1 result and journal chain for the same current candidate and fixed runtime/code boundary; (2) required L0 lifecycle/timing/schema evidence; (3) existing census admission for the current candidate; and (4) independent fresh SourceProof authority V3 and execution authority V1, complete current pins, and one-shot execution authorization.
+
+L1 closes only native-entry/cleanup admission; it proves neither source content nor that work fits within 270 seconds. Changes to native boundary, entry/admission, related policy, or runtime require revalidation of affected fixed items; old-candidate evidence is not inherited. Ordinary implementation issues are batched by the Coordinator without another architecture decision or new test domain.
+
+### 10. Current conclusion
+
+The role/permission gap has a complete executable contract; real L1 remains `NOT VERIFIED`. No current probe or SourceProof launch is authorized. The 153 missing entries, Git/source-graph closure, and actual completion within 270 seconds remain `UNKNOWN`. D32 stays `NOT FROZEN`, Gate `NONE`; no formal SC/Gate change and no D33.
+
 ## ADR 模板
 
 ### ADR-XXXX — <标题>

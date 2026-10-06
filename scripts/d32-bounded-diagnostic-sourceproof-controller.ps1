@@ -1,12 +1,16 @@
 # Durable module-free supervisor for one caller-authorized SourceProofOnly run.
 # No shell, helper executable, retry, or free-form child argv is accepted.
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'SourceProofOnly')]
 param(
-    [Parameter(Mandatory = $true)][string]$Repository,
-    [Parameter(Mandatory = $true)][string]$CandidateSha,
-    [Parameter(Mandatory = $true)][string]$ExecutionAuthorityPath,
-    [Parameter(Mandatory = $true)][string]$ExpectedExecutionAuthoritySha256,
-    [Parameter(Mandatory = $true)][long]$LifecycleT0Ticks
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$Repository,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$CandidateSha,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExecutionAuthorityPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExpectedExecutionAuthoritySha256,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][long]$LifecycleT0Ticks,
+    [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][switch]$NonSourceL1,
+    [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$L1AuthorityPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$ExpectedL1AuthoritySha256,
+    [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][long]$L1T0Ticks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +54,22 @@ $script:D32LifecycleCleanupRecord = [PSCustomObject]@{
 }
 $script:D32LifecycleCleanupRoutineStarted = $false
 $script:D32LifecycleControllerEntryTicks = [Diagnostics.Stopwatch]::GetTimestamp()
+$script:D32NonSourceL1Now = { [Diagnostics.Stopwatch]::GetTimestamp() }
+$script:D32NonSourceL1Authority = $null
+$script:D32NonSourceL1AuthorityReference = $null
+$script:D32NonSourceL1AdmissionValidated = $false
+$script:D32NonSourceL1Opened = [System.Collections.Generic.List[object]]::new()
+$script:D32NonSourceL1Secondary = [System.Collections.Generic.List[string]]::new()
+$script:D32NonSourceL1Primary = $null
+$script:D32NonSourceL1Cases = [System.Collections.Generic.List[object]]::new()
+$script:D32NonSourceL1JournalStream = $null
+$script:D32NonSourceL1JournalBytes = [long]0
+$script:D32NonSourceL1CreateAttempts = [long]0
+$script:D32NonSourceL1PlannedTerminations = [long]0
+$script:D32NonSourceL1FailSafeTerminations = [long]0
+$script:D32NonSourceL1OwnedBuffers = [long]0
+$script:D32NonSourceL1Status = 'REFUSED'
+$script:D32NonSourceL1BatchDeadline = [long]0
 
 # The caller captures T0 before invoking this entry. Parameter binding, this
 # script's admission, native type initialization, and child creation all spend
@@ -83,9 +103,13 @@ public sealed class D32LifecycleOwnedProcessV1 {
     public IntPtr StderrRead;
     public uint ProcessId;
     public long CreationFileTime;
+    public string ImagePath;
     public string JobInstanceId;
     public bool JobKillOnClose;
+    public bool JobActiveProcessLimitOne;
     public bool JobClosedByNative;
+    public bool TemporaryHandlesClosed;
+    public bool PrelaunchHandlesClosed;
     public bool CreateProcessAttempted;
     public long CreateProcessAttemptTicks;
     public long ReaderResumeTicks;
@@ -105,6 +129,7 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
     const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
     const uint CREATE_NO_WINDOW = 0x08000000;
     const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
     const int JobObjectBasicAccountingInformation = 1;
     const int JobObjectExtendedLimitInformation = 9;
     const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
@@ -168,6 +193,7 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
     [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder image, ref uint size);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(IntPtr file, byte[] buffer, uint count, out uint read, IntPtr overlapped);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(IntPtr file, out ByHandleFileInformation info);
@@ -202,6 +228,12 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
             if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(actual), Path.GetFullPath(path))) throw new IOException("directory final path differs from requested path");
             return identity;
         } finally { CloseHandle(handle); }
+    }
+
+    public static string GetProcessImagePath(IntPtr process) {
+        StringBuilder image = new StringBuilder(32768); uint size = (uint)image.Capacity;
+        if (!QueryFullProcessImageNameW(process, 0, image, ref size) || size == 0 || size >= image.Capacity) throw LastError("QueryFullProcessImageNameW failed");
+        return image.ToString();
     }
 
     public static string QuoteArgument(string value) {
@@ -253,9 +285,11 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
         ProcessInformation pi = new ProcessInformation();
         try {
             owned.Job = CreateJobObjectW(IntPtr.Zero, null); if (owned.Job == IntPtr.Zero) throw LastError("CreateJobObjectW failed");
-            ExtendedLimitInformation limits = new ExtendedLimitInformation(); limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            ExtendedLimitInformation limits = new ExtendedLimitInformation();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = 1;
             if (!SetInformationJobObject(owned.Job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf<ExtendedLimitInformation>())) throw LastError("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed");
-            owned.JobKillOnClose = true; owned.JobInstanceId = Guid.NewGuid().ToString("N");
+            owned.JobKillOnClose = true; owned.JobActiveProcessLimitOne = true; owned.JobInstanceId = Guid.NewGuid().ToString("N");
             SecurityAttributes sa = new SecurityAttributes(); sa.nLength = Marshal.SizeOf<SecurityAttributes>(); sa.bInheritHandle = 1;
             stdin = CreateFileW("NUL", 0x80000000, 3, IntPtr.Zero, 3, 0x80, IntPtr.Zero); if (stdin == new IntPtr(-1)) throw LastError("open NUL stdin failed");
             InitPipe(out owned.StdoutRead, out stdoutWrite); InitPipe(out owned.StderrRead, out stderrWrite);
@@ -275,12 +309,16 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
                 CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
                 env, workingDirectory, ref startup, out pi)) { owned.Failure = LastError("CreateProcessW failed").Message; return owned; }
             owned.Process = pi.hProcess; owned.Thread = pi.hThread; owned.ProcessId = pi.dwProcessId;
-            FileTime created, exited, kernel, user;
-            if (!GetProcessTimes(owned.Process, out created, out exited, out kernel, out user)) { owned.Failure = LastError("GetProcessTimes(reader) failed").Message; TerminateProcess(owned.Process, 0xD3203001); return owned; }
-            owned.CreationFileTime = created.Value;
             if (!AssignProcessToJobObject(owned.Job, owned.Process)) { owned.Failure = LastError("AssignProcessToJobObject failed").Message; TerminateProcess(owned.Process, 0xD3203002); return owned; }
             owned.Assigned = true;
             owned.JobAssignmentTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            FileTime created, exited, kernel, user;
+            if (!GetProcessTimes(owned.Process, out created, out exited, out kernel, out user)) { owned.Failure = LastError("GetProcessTimes(reader) failed").Message; TerminateJobObject(owned.Job, 0xD3203001); return owned; }
+            owned.CreationFileTime = created.Value;
+            owned.ImagePath = GetProcessImagePath(owned.Process);
+            if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(owned.ImagePath), Path.GetFullPath(image))) {
+                owned.Failure = "actual process image differs from the fixed caller-pinned runtime"; TerminateJobObject(owned.Job, 0xD3203007); return owned;
+            }
             if (System.Diagnostics.Stopwatch.GetTimestamp() >= workDeadlineTicks) { owned.Failure = "proof-work cutoff reached before reader resume"; TerminateJobObject(owned.Job, 0xD3203006); return owned; }
             uint previousSuspendCount = ResumeThread(owned.Thread);
             if (previousSuspendCount != 1) { owned.Failure = previousSuspendCount == UInt32.MaxValue ? LastError("ResumeThread failed").Message : "ResumeThread did not observe exactly one suspended count"; TerminateJobObject(owned.Job, 0xD3203003); return owned; }
@@ -293,11 +331,21 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
         }
         catch (Exception ex) { owned.Failure = ex.GetType().Name + ": " + ex.Message; return owned; }
         finally {
-            Close(ref stdin); Close(ref stdoutWrite); Close(ref stderrWrite);
-            if (attr != IntPtr.Zero) { DeleteProcThreadAttributeList(attr); Marshal.FreeHGlobal(attr); }
-            if (attrValue != IntPtr.Zero) Marshal.FreeHGlobal(attrValue);
-            if (env != IntPtr.Zero) Marshal.FreeHGlobal(env);
-            if (owned.Failure != null && owned.Process == IntPtr.Zero) { Close(ref owned.StdoutRead); Close(ref owned.StderrRead); Close(ref owned.Job); owned.JobClosedByNative = true; }
+            bool temporaryClosed = Close(ref stdin);
+            temporaryClosed = Close(ref stdoutWrite) && temporaryClosed;
+            temporaryClosed = Close(ref stderrWrite) && temporaryClosed;
+            if (attr != IntPtr.Zero) { DeleteProcThreadAttributeList(attr); Marshal.FreeHGlobal(attr); attr = IntPtr.Zero; }
+            if (attrValue != IntPtr.Zero) { Marshal.FreeHGlobal(attrValue); attrValue = IntPtr.Zero; }
+            if (env != IntPtr.Zero) { Marshal.FreeHGlobal(env); env = IntPtr.Zero; }
+            owned.TemporaryHandlesClosed = temporaryClosed;
+            if (!temporaryClosed && owned.Failure == null) owned.Failure = "temporary native launch handles did not all close";
+            if (owned.Failure != null && owned.Process == IntPtr.Zero) {
+                bool readPipesClosed = Close(ref owned.StdoutRead) && Close(ref owned.StderrRead);
+                bool jobClosed = Close(ref owned.Job);
+                owned.JobClosedByNative = jobClosed;
+                owned.PrelaunchHandlesClosed = temporaryClosed && readPipesClosed && jobClosed;
+                if ((!readPipesClosed || !jobClosed) && String.IsNullOrEmpty(owned.Failure)) owned.Failure = "failed native launch handles remain unverified";
+            } else { owned.PrelaunchHandlesClosed = temporaryClosed; }
         }
     }
 
@@ -307,6 +355,8 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
     public static bool TerminateJob(IntPtr job, uint code) { return job != IntPtr.Zero && TerminateJobObject(job, code); }
     public static bool TerminateExactProcess(IntPtr process, uint code) { return process != IntPtr.Zero && TerminateProcess(process, code); }
     public static int? ActiveProcesses(IntPtr job) { BasicAccountingInformation info = new BasicAccountingInformation(); uint returned; return QueryInformationJobObject(job, JobObjectBasicAccountingInformation, ref info, (uint)Marshal.SizeOf<BasicAccountingInformation>(), out returned) ? (int?)info.ActiveProcesses : null; }
+    public static int? TotalProcesses(IntPtr job) { BasicAccountingInformation info = new BasicAccountingInformation(); uint returned; return QueryInformationJobObject(job, JobObjectBasicAccountingInformation, ref info, (uint)Marshal.SizeOf<BasicAccountingInformation>(), out returned) ? (int?)info.TotalProcesses : null; }
+    public static string CaptureText(D32LifecycleCaptureV1 capture) { lock (capture.Sync) { return Encoding.UTF8.GetString(capture.Prefix.ToArray()); } }
     public static bool JoinCaptures(D32LifecycleOwnedProcessV1 process, int milliseconds) {
         bool a = process.StdoutThread == null || process.StdoutThread.Join(milliseconds);
         bool b = process.StderrThread == null || process.StderrThread.Join(Math.Max(0, milliseconds));
@@ -729,6 +779,513 @@ function Invoke-D32LifecycleCleanupAndAudit {
         $script:D32LifecycleStatus = 'UNRESOLVED'
         if (-not $script:D32LifecyclePrimary) { $script:D32LifecyclePrimary = 'Terminal journal closure crossed the fixed audit boundary.' }
     }
+}
+
+function Get-D32NonSourceL1Now { return [Int64](& $script:D32NonSourceL1Now) }
+
+function Get-D32NonSourceL1DeadlineTicks {
+    param([long]$T0Ticks, [long]$Frequency, [long]$Milliseconds)
+    if ($T0Ticks -le 0 -or $Frequency -le 0 -or $Milliseconds -le 0) { throw 'D32_NON_SOURCE_L1_REFUSED: invalid monotonic deadline input' }
+    try {
+        $delta = [decimal]$Frequency * [decimal]$Milliseconds / [decimal]1000
+        if ($delta -lt 1 -or $delta -gt [decimal][Int64]::MaxValue) { throw 'deadline overflow' }
+        $rounded = [Int64][Math]::Ceiling($delta)
+        if ([decimal]$T0Ticks + [decimal]$rounded -gt [decimal][Int64]::MaxValue) { throw 'deadline overflow' }
+        return [Int64]($T0Ticks + $rounded)
+    } catch { throw 'D32_NON_SOURCE_L1_BLOCKED: checked monotonic deadline arithmetic failed' }
+}
+
+function Add-D32NonSourceL1JournalFact {
+    param([Parameter(Mandatory = $true)][string]$Event, [string]$CaseId = '',
+        [AllowNull()][long]$ScheduledTicks = $null, [Parameter(Mandatory = $true)][long]$ObservedTicks,
+        [AllowNull()][object]$ResultReference = $null)
+    if ($null -eq $script:D32NonSourceL1JournalStream) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result journal is unavailable' }
+    $fact = [PSCustomObject][ordered]@{
+        event = $Event; case_id = $CaseId; scheduled_ticks = $ScheduledTicks; observed_ticks = $ObservedTicks
+        lateness_ticks = if ($null -eq $ScheduledTicks) { $null } else { [Int64]($ObservedTicks - $ScheduledTicks) }
+        result_path = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.path }
+        result_bytes = if ($null -eq $ResultReference) { $null } else { [Int64]$ResultReference.bytes }
+        result_sha256 = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.sha256 }
+        result_volume_serial_hex = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.volume_serial_hex }
+        result_file_id_hex = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.file_id_hex }
+        gate_authority = 'NONE'
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $fact -Depth 8 -Compress) + "`n")
+    if ($script:D32NonSourceL1JournalBytes + $bytes.Length -gt 65536 -or $ObservedTicks -ge $script:D32NonSourceL1BatchDeadline) {
+        throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed journal cap or batch deadline reached'
+    }
+    $script:D32NonSourceL1JournalStream.Write($bytes, 0, $bytes.Length); $script:D32NonSourceL1JournalStream.Flush($true)
+    $script:D32NonSourceL1JournalBytes += $bytes.Length
+}
+
+function Get-D32NonSourceL1ErrorText {
+    param([System.Exception]$Exception)
+    $text = if ($null -eq $Exception) { 'unspecified NON_SOURCE_L1 failure' } else { [string]$Exception.GetType().Name + ': ' + [string]$Exception.Message }
+    $text = [regex]::Replace($text, '[\r\n\t]', ' ')
+    if ($text.Length -gt 2048) { $text = $text.Substring(0, 2048) }
+    return $text
+}
+
+function Get-D32NonSourceL1ReferenceFromOpened {
+    param([Parameter(Mandatory = $true)][object]$Opened)
+    return [PSCustomObject][ordered]@{
+        path = [string]$Opened.Record.path; bytes = [Int64]$Opened.Record.bytes; sha256 = [string]$Opened.Record.sha256
+        volume_serial_hex = [string]$Opened.Record.volume_serial_hex; file_id_hex = [string]$Opened.Record.file_id_hex
+    }
+}
+
+function Open-D32NonSourceL1PinnedFile {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][object]$Pin)
+    if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed code/runtime pin read crossed the batch deadline' }
+    $opened = Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $script:D32LifecycleFences -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+    $script:D32NonSourceL1OwnedBuffers += [Int64]$opened.Record.bytes
+    if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { if ($null -ne $opened.Stream) { $opened.Stream.Dispose() }; throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: probe-owned input buffers exceed 16 MiB' }
+    foreach ($name in @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) {
+        if ([string]$opened.Record.($name) -cne [string]$Pin.($name)) {
+            if ($null -ne $opened.Stream) { $opened.Stream.Dispose() }
+            throw ('D32_NON_SOURCE_L1_REFUSED: fixed pin mismatch for ' + $name)
+        }
+    }
+    $script:D32NonSourceL1Opened.Add($opened)
+    return $opened
+}
+
+function Get-D32NonSourceL1MutatedSha256 {
+    param([Parameter(Mandatory = $true)][string]$Sha256)
+    if ($Sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_NON_SOURCE_L1_REFUSED: fixed entry pin is malformed' }
+    $replacement = if ($Sha256[0] -ceq '0') { '1' } else { '0' }
+    return $replacement + $Sha256.Substring(1)
+}
+
+function New-D32NonSourceL1PreCreatePlan {
+    param([Parameter(Mandatory = $true)][string]$CaseId, [Parameter(Mandatory = $true)][string]$Nonce,
+        [Parameter(Mandatory = $true)][long]$CaseT0Ticks, [Parameter(Mandatory = $true)][long]$ActiveDeadlineTicks,
+        [switch]$DeriveEntryPinMismatch)
+    $entryPin = $script:D32NonSourceL1Authority.source_pins[1]
+    $runtimePin = $script:D32NonSourceL1Authority.powershell_runtime
+    $entryOpened = Open-D32NonSourceL1PinnedFile -Path ([string]$entryPin.path) -Pin $entryPin
+    $runtimeOpened = Open-D32NonSourceL1PinnedFile -Path ([string]$runtimePin.path) -Pin ([PSCustomObject]@{
+        path = $runtimePin.path; bytes = $runtimePin.bytes; sha256 = $runtimePin.sha256
+        volume_serial_hex = $runtimePin.volume_serial_hex; file_id_hex = $runtimePin.file_id_hex
+    })
+    $expectedEntrySha = if ($DeriveEntryPinMismatch) { Get-D32NonSourceL1MutatedSha256 -Sha256 ([string]$entryPin.sha256) } else { [string]$entryPin.sha256 }
+    # Both the negative and positive cases traverse this same opened-handle
+    # pre-create binding check. The negative differs only in one derived SHA bit.
+    if ([string]$entryOpened.Record.sha256 -cne $expectedEntrySha) {
+        if ($DeriveEntryPinMismatch -and [string]$entryOpened.Record.sha256 -ceq [string]$entryPin.sha256 -and $expectedEntrySha -cne [string]$entryPin.sha256) {
+            return [PSCustomObject]@{ admitted = $false; refusal = 'ENTRY_PIN_BINDING_REFUSAL' }
+        }
+        throw 'D32_NON_SOURCE_L1_REFUSED: common pre-create entry binding did not match its caller-pinned code reference'
+    }
+    if ($DeriveEntryPinMismatch) { throw 'D32_NON_SOURCE_L1_BLOCKED: derived negative entry pin unexpectedly matched' }
+    if ([string]$runtimeOpened.Record.path -cne [IO.Path]::GetFullPath([string]$script:D32NonSourceL1Authority.powershell_runtime.path) -or
+        (Get-D32NonSourceL1Now) -ge $ActiveDeadlineTicks) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed runtime/entry pre-create admission missed the active deadline' }
+    $entryPath = [string]$entryPin.path
+    $args = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $entryPath,
+        '-NonSourceL1', '-L1AuthorityPath', $L1AuthorityPath, '-ExpectedL1AuthoritySha256', $ExpectedL1AuthoritySha256,
+        '-L1CandidateSha', $CandidateSha, '-L1BatchId', [string]$script:D32NonSourceL1Authority.batch_id,
+        '-L1CaseId', $CaseId, '-L1Nonce', $Nonce, '-L1T0Ticks', [string]$L1T0Ticks,
+        '-L1CounterFrequency', [string][Diagnostics.Stopwatch]::Frequency, '-L1CaseT0Ticks', [string]$CaseT0Ticks,
+        '-L1ActiveDeadlineTicks', [string]$ActiveDeadlineTicks)
+    $commandLine = [D32BoundedSourceProofLifecycleNativeV1]::QuoteArgument([string]$runtimePin.path) + ' ' +
+        [string]::Join(' ', @($args | ForEach-Object { [D32BoundedSourceProofLifecycleNativeV1]::QuoteArgument([string]$_) }))
+    $env = $script:D32NonSourceL1Authority.invocation.child_environment
+    $names = @('SystemRoot', 'WINDIR', 'PATH', 'PSHOME', 'PSModulePath', 'PSModuleAutoLoadingPreference',
+        'POWERSHELL_TELEMETRY_OPTOUT', 'DOTNET_CLI_TELEMETRY_OPTOUT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH')
+    $items = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $names) { $items.Add(('{0}={1}' -f $name, [string]$env.$name)) }
+    $array = $items.ToArray(); [Array]::Sort($array, [StringComparer]::OrdinalIgnoreCase)
+    return [PSCustomObject]@{ admitted = $true; image = [string]$runtimePin.path; command_line = $commandLine
+        environment_block = ([string]::Join("`0", $array) + "`0`0"); working_directory = [string]$script:D32NonSourceL1Authority.output.root_path }
+}
+
+function Get-D32NonSourceL1RemainingWaitMilliseconds {
+    param([long]$DeadlineTicks)
+    $now = Get-D32NonSourceL1Now
+    if ($now -ge $DeadlineTicks) { return [uint32]0 }
+    $remaining = [decimal]($DeadlineTicks - $now) * [decimal]1000 / [decimal][Diagnostics.Stopwatch]::Frequency
+    return [uint32][Math]::Max(1, [Math]::Min(50, [Math]::Ceiling($remaining)))
+}
+
+function Join-D32NonSourceL1CapturesUntilDeadline {
+    param([Parameter(Mandatory = $true)][object]$Native, [Parameter(Mandatory = $true)][long]$DeadlineTicks)
+    while ((Get-D32NonSourceL1Now) -lt $DeadlineTicks) {
+        if ([D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, 20)) { return $true }
+    }
+    return [D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, 0)
+}
+
+function Invoke-D32NonSourceL1Case {
+    param([Parameter(Mandatory = $true)][int]$Index)
+    $caseAuthority = $script:D32NonSourceL1Authority.cases[$Index]
+    $caseId = [string]$caseAuthority.case_id
+    $caseT0 = Get-D32NonSourceL1Now
+    $caseDeadlines = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseDeadlines -CaseT0Ticks $caseT0 -Frequency ([Diagnostics.Stopwatch]::Frequency) -BatchDeadlineTicks $script:D32NonSourceL1BatchDeadline
+    $active = [Int64]$caseDeadlines.active_deadline_ticks; $cleanup = [Int64]$caseDeadlines.cleanup_deadline_ticks; $audit = [Int64]$caseDeadlines.audit_deadline_ticks
+    $row = New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $caseId -CaseT0Ticks $caseT0 `
+        -ActiveDeadlineTicks $active -CleanupDeadlineTicks $cleanup -AuditDeadlineTicks $audit -AdmissionObservedTicks (Get-D32NonSourceL1Now)
+    if ((Get-D32NonSourceL1Now) -ge $active) { $row.state = 'BUDGET_STOPPED'; $row.primary_error = 'case admission reached active deadline'; return $row }
+    $native = $null; $cleanupKnown = $true; $processExited = $false; $activeCount = $null; $totalCount = $null
+    try {
+        $plan = New-D32NonSourceL1PreCreatePlan -CaseId $caseId -Nonce ([string]$caseAuthority.nonce) -CaseT0Ticks $caseT0 -ActiveDeadlineTicks $active -DeriveEntryPinMismatch:($caseId -ceq 'ENTRY_PIN_BINDING_REFUSAL')
+        if ($caseId -ceq 'ENTRY_PIN_BINDING_REFUSAL') {
+            if ([bool]$plan.admitted -or [string]$plan.refusal -cne 'ENTRY_PIN_BINDING_REFUSAL') { throw 'expected pre-create entry-pin refusal was not observed' }
+            $row.state = 'EXPECTED_REFUSAL_VERIFIED'; $row.primary_error = 'fixed reader entry SHA mismatch was rejected by common opened-handle pre-create binding'; return $row
+        }
+        if (-not [bool]$plan.admitted -or (Get-D32NonSourceL1Now) -ge $active) { throw 'fixed pre-create admission did not complete before active deadline' }
+        $native = [D32BoundedSourceProofLifecycleNativeV1]::StartSuspendedAssignedAndResume(
+            [string]$plan.image, [string]$plan.command_line, [string]$plan.working_directory, [string]$plan.environment_block, [Int64]$active)
+        if ($native.CreateProcessAttempted) { $script:D32NonSourceL1CreateAttempts++; $row.create_attempt_count = 1L; $row.create_attempt_ticks = [Int64]$native.CreateProcessAttemptTicks }
+        $row.job_instance_id = if ([string]$native.JobInstanceId -match '^[0-9a-f]{32}$') { [string]$native.JobInstanceId } else { $null }
+        $row.job_assigned = [bool]$native.Assigned; $row.resume_ticks = if ($native.Resumed) { [Int64]$native.ReaderResumeTicks } else { $null }
+        $row.process_id = if ($native.Process -ne [IntPtr]::Zero) { [Int64]$native.ProcessId } else { $null }
+        $row.creation_filetime_ticks = if ($native.CreationFileTime -gt 0) { [Int64]$native.CreationFileTime } else { $null }
+        $row.process_image_path = if ([string]$native.ImagePath -match '^[A-Za-z]:\\') { [IO.Path]::GetFullPath([string]$native.ImagePath) } else { $null }
+        $row.process_image_binding_verified = ($null -ne $row.process_image_path -and [StringComparer]::OrdinalIgnoreCase.Equals([string]$row.process_image_path, [string]$plan.image))
+        $row.kill_on_close_enabled = [bool]$native.JobKillOnClose
+        $row.job_active_process_limit_one = [bool]$native.JobActiveProcessLimitOne
+        if (-not $native.TemporaryHandlesClosed) { throw 'native temporary launch handle close could not be verified' }
+        if ($native.Process -eq [IntPtr]::Zero) {
+            $cleanupKnown = [bool]$native.PrelaunchHandlesClosed
+            $row.job_closed = [bool]$native.JobClosedByNative
+            if (-not $cleanupKnown) { $row.state = 'UNRESOLVED'; $row.primary_error = 'native prelaunch handle cleanup has not been verified' }
+            elseif ($native.CreateProcessAttempted) { $row.state = 'BLOCKED'; $row.primary_error = 'the single CreateProcess attempt did not create the fixed reader' }
+            else { $row.state = 'BUDGET_STOPPED'; $row.primary_error = 'active deadline expired before CreateProcess was attempted' }
+            return $row
+        }
+        if (-not $native.Assigned -or -not $native.Resumed -or -not $row.process_image_binding_verified -or
+            [string]$native.Failure) { throw 'retained child identity, Job admission, resume, or actual image verification failed' }
+
+        $ready = 'D32NSL1|' + $caseId + '|' + [string]$caseAuthority.nonce + '|READY'
+        $plannedTerminationObserved = $false
+        while ((Get-D32NonSourceL1Now) -lt $active) {
+            if ([D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $processExited = $true; break }
+            if ($caseId -ceq 'NORMAL_EXIT') { }
+            else {
+                $captureText = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stdout)
+                if ($captureText.Contains($ready) -and -not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) {
+                    $terminationTicks = Get-D32NonSourceL1Now
+                    if ($terminationTicks -lt $active -and [D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210002)) {
+                        $plannedTerminationObserved = $true; $script:D32NonSourceL1PlannedTerminations++
+                        $row.planned_termination_count = 1L; $row.planned_termination_ticks = $terminationTicks
+                    } else { $row.primary_error = 'planned termination was not accepted while the retained child remained active' }
+                    break
+                }
+            }
+            $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $active
+            if ($waitMs -eq 0) { break }
+            $waitState = [D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs)
+            if ($waitState -eq [uint32]0) { $processExited = $true; break }
+            if ($waitState -ne [uint32]258) { throw 'retained process wait failed inside active window' }
+        }
+        if ([D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $processExited = $true }
+        if (-not $processExited -and -not $plannedTerminationObserved) {
+            $row.primary_error = if ($row.primary_error) { [string]$row.primary_error } else { 'fixed child did not complete or become ready within the active deadline' }
+            $failSafeTicks = Get-D32NonSourceL1Now
+            if ($failSafeTicks -lt $cleanup -and [D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210003)) {
+                $script:D32NonSourceL1FailSafeTerminations++; $row.fail_safe_termination_count = 1L; $row.fail_safe_termination_ticks = $failSafeTicks
+            }
+        }
+        while (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+            $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $cleanup
+            if ($waitMs -eq 0) { break }
+            $waitState = [D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs)
+            if ($waitState -eq [uint32]0) { break }
+            if ($waitState -ne [uint32]258) { throw 'retained process wait failed inside cleanup window' }
+        }
+        $processExited = [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)
+        if (-not $processExited) { $cleanupKnown = $false; throw 'owned reader exit remained unknown at cleanup deadline' }
+        $row.exit_ticks = Get-D32NonSourceL1Now
+        $row.exit_code = [D32BoundedSourceProofLifecycleNativeV1]::ExitCode($native.Process)
+        $activeCount = [D32BoundedSourceProofLifecycleNativeV1]::ActiveProcesses($native.Job)
+        $totalCount = [D32BoundedSourceProofLifecycleNativeV1]::TotalProcesses($native.Job)
+        $row.job_active_process_count = $activeCount; $row.job_total_process_count = $totalCount
+        $joined = Join-D32NonSourceL1CapturesUntilDeadline -Native $native -DeadlineTicks $cleanup
+        $row.capture_join_verified = [bool]$joined
+        if ($null -ne $native.Stdout) { $row.stdout_bytes = [Int64]$native.Stdout.Bytes; $row.stdout_sha256 = [string]$native.Stdout.Sha256; $row.stdout_truncated = [bool]$native.Stdout.Truncated }
+        if ($null -ne $native.Stderr) { $row.stderr_bytes = [Int64]$native.Stderr.Bytes; $row.stderr_sha256 = [string]$native.Stderr.Sha256; $row.stderr_truncated = [bool]$native.Stderr.Truncated }
+        if (-not $joined -or $row.stdout_truncated -or $row.stderr_truncated -or $row.stdout_bytes -gt 1024 -or $row.stderr_bytes -gt 1024 -or
+            [String]::IsNullOrEmpty([string]$native.Stdout.Failure) -eq $false -or [String]::IsNullOrEmpty([string]$native.Stderr.Failure) -eq $false -or
+            $null -eq $activeCount -or [Int64]$activeCount -ne 0 -or $null -eq $totalCount -or [Int64]$totalCount -ne 1) {
+            $row.primary_error = if ($row.primary_error) { [string]$row.primary_error } else { 'capture, Job accounting, or output bound did not verify' }
+        }
+        $expectedStdout = 'D32NSL1|' + $caseId + '|' + [string]$caseAuthority.nonce + '|READY'
+        $expectedStderr = if ($caseId -ceq 'NORMAL_EXIT') { 'D32NSL1|FIXED|NORMAL' } else { 'D32NSL1|FIXED|FORCED' }
+        $actualStdout = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stdout).TrimEnd([char[]]@("`r", "`n"))
+        $actualStderr = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stderr).TrimEnd([char[]]@("`r", "`n"))
+        $row.stdout_token_verified = ($joined -and -not $row.stdout_truncated -and $row.stdout_bytes -le 1024 -and $actualStdout -ceq $expectedStdout)
+        $row.stderr_token_verified = ($joined -and -not $row.stderr_truncated -and $row.stderr_bytes -le 1024 -and $actualStderr -ceq $expectedStderr)
+        if ($actualStdout -cne $expectedStdout -or $actualStderr -cne $expectedStderr) { $row.primary_error = 'fixed fixture behavior token/capture did not match the exact case' }
+        if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($native)) { $cleanupKnown = $false; throw 'owned kill-on-close Job handle did not close' }
+        $row.job_closed = $true
+        if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($native) -or -not $native.TemporaryHandlesClosed) { $cleanupKnown = $false; throw 'retained native process/thread/pipe cleanup did not verify' }
+        $row.cleanup_observed_ticks = Get-D32NonSourceL1Now
+        if (-not $cleanupKnown) { $row.state = 'UNRESOLVED' }
+        elseif ($caseId -ceq 'NORMAL_EXIT' -and $row.exit_code -eq 0 -and $row.stdout_bytes -le 1024 -and $row.stderr_bytes -le 1024 -and -not $row.stdout_truncated -and -not $row.stderr_truncated -and $row.capture_join_verified -and $row.job_active_process_count -eq 0 -and $row.job_total_process_count -eq 1 -and $row.job_closed -and $row.kill_on_close_enabled) { $row.state = 'NATIVE_BOUNDARY_VERIFIED' }
+        elseif ($caseId -ceq 'FORCED_OWNED_TERMINATION' -and $plannedTerminationObserved -and $row.planned_termination_count -eq 1 -and $row.planned_termination_ticks -lt $row.exit_ticks -and $row.exit_code -ne 0 -and $row.stdout_bytes -le 1024 -and $row.stderr_bytes -le 1024 -and -not $row.stdout_truncated -and -not $row.stderr_truncated -and $row.capture_join_verified -and $row.job_active_process_count -eq 0 -and $row.job_total_process_count -eq 1 -and $row.job_closed -and $row.kill_on_close_enabled) { $row.state = 'NATIVE_BOUNDARY_VERIFIED' }
+        else { $row.state = 'BLOCKED'; if (-not $row.primary_error) { $row.primary_error = 'case did not satisfy its fixed native-boundary expectation' } }
+    } catch {
+        if (-not $row.primary_error) { $row.primary_error = Get-D32NonSourceL1ErrorText -Exception $_.Exception }
+        else { if ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += (Get-D32NonSourceL1ErrorText -Exception $_.Exception) } }
+        if ($null -ne $native -and $native.Process -ne [IntPtr]::Zero) {
+            try {
+                if (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+                    $script:D32NonSourceL1FailSafeTerminations++
+                    $row.fail_safe_termination_count = 1L; $row.fail_safe_termination_ticks = Get-D32NonSourceL1Now
+                    if ($native.Job -ne [IntPtr]::Zero -and $native.Assigned) { [void][D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210003) }
+                    else { [void][D32BoundedSourceProofLifecycleNativeV1]::TerminateExactProcess($native.Process, 0xD3210003) }
+                    while (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+                        $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $cleanup
+                        if ($waitMs -eq 0) { break }
+                        if ([D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs) -eq [uint32]0) { break }
+                    }
+                }
+                if (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $cleanupKnown = $false }
+                else {
+                    $row.exit_ticks = Get-D32NonSourceL1Now; $row.exit_code = [D32BoundedSourceProofLifecycleNativeV1]::ExitCode($native.Process)
+                    $row.job_active_process_count = if ($native.Job -ne [IntPtr]::Zero) { [D32BoundedSourceProofLifecycleNativeV1]::ActiveProcesses($native.Job) } else { $null }
+                    $row.job_total_process_count = if ($native.Job -ne [IntPtr]::Zero) { [D32BoundedSourceProofLifecycleNativeV1]::TotalProcesses($native.Job) } else { $null }
+                    $row.capture_join_verified = Join-D32NonSourceL1CapturesUntilDeadline -Native $native -DeadlineTicks $cleanup
+                    if ($null -ne $native.Stdout) { $row.stdout_bytes = [Int64]$native.Stdout.Bytes; $row.stdout_sha256 = [string]$native.Stdout.Sha256; $row.stdout_truncated = [bool]$native.Stdout.Truncated }
+                    if ($null -ne $native.Stderr) { $row.stderr_bytes = [Int64]$native.Stderr.Bytes; $row.stderr_sha256 = [string]$native.Stderr.Sha256; $row.stderr_truncated = [bool]$native.Stderr.Truncated }
+                    if ($native.Job -ne [IntPtr]::Zero) { $row.job_closed = [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($native) }
+                    if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($native)) { $cleanupKnown = $false }
+                    $row.cleanup_observed_ticks = Get-D32NonSourceL1Now
+                }
+            } catch { $cleanupKnown = $false; if ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += (Get-D32NonSourceL1ErrorText -Exception $_.Exception) } }
+        } elseif ($null -ne $native) {
+            $cleanupKnown = $cleanupKnown -and [bool]$native.PrelaunchHandlesClosed
+            $row.job_closed = [bool]$native.JobClosedByNative
+        }
+        $row.state = if ($cleanupKnown) { if ((Get-D32NonSourceL1Now) -ge $active) { 'BUDGET_STOPPED' } else { 'BLOCKED' } } else { 'UNRESOLVED' }
+    }
+    return $row
+}
+
+function Invoke-D32NonSourceL1 {
+    $script:D32NonSourceL1StartedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $script:D32NonSourceL1CaseStop = $false
+    $resultWritten = $false; $journalClosed = $false; $returnCode = 87
+    $authorityRaw = $null; $authorityRawReference = $null; $moduleRaw = $null
+    try {
+        if ($PSVersionTable.PSVersion -lt [version]'7.5' -or -not [Environment]::Is64BitProcess -or
+            $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $ExpectedL1AuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $L1T0Ticks -le 0 -or [Diagnostics.Stopwatch]::Frequency -le 0 -or
+            $script:D32LifecycleControllerEntryTicks -lt $L1T0Ticks -or
+            [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository) -or
+            [IO.Path]::GetFullPath($L1AuthorityPath) -cne $L1AuthorityPath -or -not (Test-D32LifecycleNoReparsePath -Path $L1AuthorityPath)) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: fixed candidate/repository/runtime/caller clock input invalid'
+        }
+        $script:D32NonSourceL1Now = { [Diagnostics.Stopwatch]::GetTimestamp() }
+        $frequency = [Int64][Diagnostics.Stopwatch]::Frequency
+        $script:D32NonSourceL1BatchDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $L1T0Ticks -Frequency $frequency -Milliseconds 60000L
+        if ((Get-D32NonSourceL1Now) -lt $L1T0Ticks -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: controller admission reached batch deadline' }
+
+        # The initial L1 record read is caller-pinned and bounded. The path is
+        # re-opened through the fixed module-free authority loader below.
+        $authorityRaw = Get-D32LifecycleReferenceBytes -Path $L1AuthorityPath -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $script:D32NonSourceL1OwnedBuffers += [Int64]$authorityRaw.Reference.bytes
+        $authorityRawReference = $authorityRaw.Reference
+        if ($authorityRaw.Reference.sha256 -cne $ExpectedL1AuthoritySha256 -or $script:D32NonSourceL1OwnedBuffers -gt 16777216) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: caller-pinned L1 authority hash or buffer bound mismatch'
+        }
+        $authorityJson = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$authorityRaw.Bytes))
+        try {
+            if ($authorityJson.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32LifecycleJsonDuplicates -Element $authorityJson.RootElement)) { throw 'D32_NON_SOURCE_L1_REFUSED: authority root/duplicate check failed' }
+            $script:D32NonSourceL1Authority = ConvertFrom-D32LifecycleJsonElement -Element $authorityJson.RootElement
+        } finally { $authorityJson.Dispose() }
+        if ($null -ne $authorityRaw.Stream) { $authorityRaw.Stream.Dispose(); $authorityRaw = $null }
+
+        # Bootstrap solely from the independently caller-pinned six-file L1
+        # authority. This branch never reads SourceProof authority/Profile/origin.
+        $modulePath = [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-powershell-module-authority.ps1'))
+        $modulePin = @($script:D32NonSourceL1Authority.source_pins | Where-Object { [string]$_.path -ceq $modulePath })
+        if ($modulePin.Count -ne 1) { throw 'D32_NON_SOURCE_L1_REFUSED: exact fixed authority loader pin absent' }
+        $moduleRaw = Get-D32LifecycleReferenceBytes -Path $modulePath -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $script:D32NonSourceL1OwnedBuffers += [Int64]$moduleRaw.Reference.bytes
+        foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$moduleRaw.Reference.($name) -cne [string]$modulePin[0].($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: bootstrap loader pin mismatch' } }
+        if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed bootstrap buffers exceed 16 MiB' }
+        . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$moduleRaw.Bytes)))
+        if ($null -ne $moduleRaw.Stream) { $moduleRaw.Stream.Dispose(); $moduleRaw = $null }
+        $script:D32LifecycleFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+        $authorityOpened = Open-D32PowerShellAuthorityFile -Path $L1AuthorityPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $script:D32NonSourceL1Opened.Add($authorityOpened)
+        $script:D32NonSourceL1OwnedBuffers += [Int64]$authorityOpened.Record.bytes
+        foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$authorityOpened.Record.($name) -cne [string]$authorityRawReference.($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: authority reopened identity differs from initial caller pin' } }
+        if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: reopened authority buffer exceeds 16 MiB' }
+        $authorityJson = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$authorityOpened.Bytes))
+        try {
+            if ($authorityJson.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $authorityJson.RootElement)) { throw 'D32_NON_SOURCE_L1_REFUSED: strict authority JSON duplicates or root shape invalid' }
+            $script:D32NonSourceL1Authority = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $authorityJson.RootElement
+        } finally { $authorityJson.Dispose() }
+        $script:D32NonSourceL1AuthorityReference = Get-D32NonSourceL1ReferenceFromOpened -Opened $authorityOpened
+
+        $policyPath = [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
+        $policyPin = @($script:D32NonSourceL1Authority.source_pins | Where-Object { [string]$_.path -ceq $policyPath })
+        if ($policyPin.Count -ne 1) { throw 'D32_NON_SOURCE_L1_REFUSED: fixed policy pin absent' }
+        $policyOpened = Open-D32PowerShellAuthorityFile -Path $policyPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $script:D32NonSourceL1Opened.Add($policyOpened); $script:D32NonSourceL1OwnedBuffers += [Int64]$policyOpened.Record.bytes
+        foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$policyOpened.Record.($name) -cne [string]$policyPin[0].($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: pinned strict L1 policy drifted' } }
+        if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: verified code buffers exceed 16 MiB' }
+        . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$policyOpened.Bytes)))
+
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $script:D32NonSourceL1Authority -ExpectedCandidateSha $CandidateSha -Repository $Repository) -or
+            [string]$script:D32NonSourceL1Authority.source_pins[0].path -cne [IO.Path]::GetFullPath($PSCommandPath) -or
+            [string]$script:D32NonSourceL1Authority.invocation.entry_path -cne [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-diagnostic-sourceproof.ps1')) -or
+            (Test-D32PowerShellAuthorityPathWithin -Child $L1AuthorityPath -Parent $Repository) -or
+            (Test-D32PowerShellAuthorityPathWithin -Child $L1AuthorityPath -Parent 'E:\d32\inv7\r\c') -or
+            (Test-D32PowerShellAuthorityPathWithin -Child $L1AuthorityPath -Parent ([string]$script:D32NonSourceL1Authority.output.root_path))) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: strict L1 authority or fixed external role bindings failed'
+        }
+        if ([string]$script:D32NonSourceL1Authority.source_repo -cne $Repository -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$script:D32NonSourceL1Authority.powershell_runtime.path), [IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName))) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: current repository/runtime role binding mismatch'
+        }
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try { if ([string]$currentIdentity.User.Value -cne [string]$script:D32NonSourceL1Authority.owner_id) { throw 'D32_NON_SOURCE_L1_REFUSED: current Windows owner differs from the authority owner binding' } }
+        finally { $currentIdentity.Dispose() }
+        $repoIdentity = Get-D32LifecycleDirectoryIdentity $Repository
+        if ($repoIdentity.VolumeSerialHex -cne [string]$script:D32NonSourceL1Authority.repository_identity.volume_serial_hex -or $repoIdentity.FileIdHex -cne [string]$script:D32NonSourceL1Authority.repository_identity.file_id_hex) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: repository directory identity drift'
+        }
+        $rootIdentity = Get-D32LifecycleDirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.root_path)
+        $parentIdentity = Get-D32LifecycleDirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.parent_path)
+        foreach ($pair in @(@('root_volume_serial_hex', 'root_file_id_hex', $rootIdentity), @('parent_volume_serial_hex', 'parent_file_id_hex', $parentIdentity))) {
+            if ([string]$script:D32NonSourceL1Authority.output.($pair[0]) -cne [string]$pair[2].VolumeSerialHex -or [string]$script:D32NonSourceL1Authority.output.($pair[1]) -cne [string]$pair[2].FileIdHex) { throw 'D32_NON_SOURCE_L1_REFUSED: external root/parent opened identity drift' }
+        }
+        if ((Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent $Repository) -or
+            (Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent 'E:\d32\inv7\r\c')) { throw 'D32_NON_SOURCE_L1_REFUSED: external L1 root violates fixed containment' }
+        foreach ($path in @([string]$script:D32NonSourceL1Authority.output.result_path, [string]$script:D32NonSourceL1Authority.output.journal_path)) {
+            if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw 'D32_NON_SOURCE_L1_REFUSED: create-new result/journal path already exists' }
+        }
+        $script:D32NonSourceL1AdmissionValidated = $true
+        $script:D32NonSourceL1JournalStream = [IO.File]::Open([string]$script:D32NonSourceL1Authority.output.journal_path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        Add-D32NonSourceL1JournalFact -Event 'AUTHORITY_ADMISSION' -ScheduledTicks $L1T0Ticks -ObservedTicks (Get-D32NonSourceL1Now)
+
+        # Open and hash only the six fixed script pins, plus the fixed runtime.
+        # Profile V2 is treated as a pinned script byte sequence only: it is not
+        # semantically parsed and no manifest/lock/config path is traversed.
+        for ($index = 0; $index -lt 6; $index++) {
+            $pin = $script:D32NonSourceL1Authority.source_pins[$index]
+            $opened = Open-D32NonSourceL1PinnedFile -Path ([string]$pin.path) -Pin $pin
+            if ($index -eq 3) { } # strict policy was already dot-sourced from these verified bytes
+        }
+        $runtimePin = $script:D32NonSourceL1Authority.powershell_runtime
+        $runtimeOpened = Open-D32NonSourceL1PinnedFile -Path ([string]$runtimePin.path) -Pin ([PSCustomObject]@{
+            path = $runtimePin.path; bytes = $runtimePin.bytes; sha256 = $runtimePin.sha256
+            volume_serial_hex = $runtimePin.volume_serial_hex; file_id_hex = $runtimePin.file_id_hex
+        })
+        $script:D32NonSourceL1Opened.Add($runtimeOpened)
+        Add-Type -TypeDefinition $nativeSource -Language CSharp -ErrorAction Stop | Out-Null
+
+        for ($index = 0; $index -lt 3; $index++) {
+            if ($script:D32NonSourceL1CaseStop -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { break }
+            $row = Invoke-D32NonSourceL1Case -Index $index
+            $row.case_completed_ticks = Get-D32NonSourceL1Now
+            if ($row.state -cne 'UNRESOLVED' -and [Int64]$row.case_completed_ticks -ge [Int64]$row.audit_deadline_ticks) {
+                $row.state = 'BUDGET_STOPPED'
+                $auditError = 'case audit/completion returned at or beyond its fixed 15-second/batch-bounded deadline'
+                if (-not $row.primary_error) { $row.primary_error = $auditError }
+                elseif ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += $auditError }
+            }
+            $script:D32NonSourceL1Cases.Add($row)
+            Add-D32NonSourceL1JournalFact -Event ('CASE_' + [string]$row.state) -CaseId ([string]$row.case_id) `
+                -ObservedTicks ([Int64]$row.case_completed_ticks)
+            if ([string]$row.state -ceq 'UNRESOLVED') { $script:D32NonSourceL1CaseStop = $true }
+        }
+        while ($script:D32NonSourceL1Cases.Count -lt 3) {
+            $nextCase = [string]$script:D32NonSourceL1Authority.cases[$script:D32NonSourceL1Cases.Count].case_id
+            $script:D32NonSourceL1Cases.Add((New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $nextCase))
+        }
+        $batchOutcome = Resolve-D32BoundedDiagnosticSourceProofNonSourceL1BatchOutcome -Cases @($script:D32NonSourceL1Cases.ToArray()) `
+            -CreateProcessAttemptCount $script:D32NonSourceL1CreateAttempts -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations `
+            -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
+            -BatchDeadlineReached:((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline)
+        $script:D32NonSourceL1Status = [string]$batchOutcome.status
+        if (-not $script:D32NonSourceL1Primary -and $null -ne $batchOutcome.primary_error) { $script:D32NonSourceL1Primary = [string]$batchOutcome.primary_error }
+    } catch {
+        $script:D32NonSourceL1Primary = Get-D32NonSourceL1ErrorText -Exception $_.Exception
+        $script:D32NonSourceL1Status = if ([string]$script:D32NonSourceL1Primary -match 'BUDGET_STOPPED|BLOCKED:') { 'BUDGET_STOPPED' } else { 'REFUSED' }
+    } finally {
+        if ($null -ne $authorityRaw -and $null -ne $authorityRaw.Stream) { $authorityRaw.Stream.Dispose() }
+        if ($null -ne $moduleRaw -and $null -ne $moduleRaw.Stream) { $moduleRaw.Stream.Dispose() }
+        foreach ($opened in $script:D32NonSourceL1Opened) { if ($null -ne $opened.Stream -and -not $opened.Stream.SafeFileHandle.IsClosed) { $opened.Stream.Dispose() } }
+        foreach ($fence in $script:D32LifecycleFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+    }
+
+    if (-not $script:D32NonSourceL1AdmissionValidated) { return 87 }
+    if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) {
+        $script:D32NonSourceL1Status = 'BUDGET_STOPPED'
+        if (-not $script:D32NonSourceL1Primary) { $script:D32NonSourceL1Primary = 'batch deadline reached before bounded result persistence' }
+    }
+    try {
+        $record = New-D32BoundedDiagnosticSourceProofNonSourceL1ResultCandidate -CandidateSha $CandidateSha `
+            -BatchId ([string]$script:D32NonSourceL1Authority.batch_id) -RunId ([string]$script:D32NonSourceL1Authority.run_id) `
+            -AuthorityReference $script:D32NonSourceL1AuthorityReference -SourcePins @($script:D32NonSourceL1Authority.source_pins) `
+            -PowerShellRuntime ([PSCustomObject][ordered]@{ path = $script:D32NonSourceL1Authority.powershell_runtime.path; bytes = $script:D32NonSourceL1Authority.powershell_runtime.bytes; sha256 = $script:D32NonSourceL1Authority.powershell_runtime.sha256; volume_serial_hex = $script:D32NonSourceL1Authority.powershell_runtime.volume_serial_hex; file_id_hex = $script:D32NonSourceL1Authority.powershell_runtime.file_id_hex }) `
+            -Output $script:D32NonSourceL1Authority.output `
+            -Clock ([PSCustomObject][ordered]@{ counter_origin = 'QueryPerformanceCounter'; frequency = $frequency; batch_t0_ticks = $L1T0Ticks; batch_deadline_ticks = $script:D32NonSourceL1BatchDeadline; controller_entry_ticks = $script:D32LifecycleControllerEntryTicks }) `
+            -Controller ([PSCustomObject][ordered]@{ process_id = [Int64]$PID; creation_filetime_ticks = (Get-D32LifecycleProcessCreationFileTime) }) `
+            -Cases @($script:D32NonSourceL1Cases.ToArray()) -CreateProcessAttemptCount $script:D32NonSourceL1CreateAttempts `
+            -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
+            -Status $script:D32NonSourceL1Status -PrimaryError $script:D32NonSourceL1Primary -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) `
+            -StartedAtUtc $script:D32NonSourceL1StartedAtUtc -CompletedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $record)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: exact result schema rejected producer record' }
+        $json = ConvertTo-Json -InputObject $record -Depth 32 -Compress -ErrorAction Stop
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+        if ($bytes.Length -gt 65536 -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: result size or batch persistence deadline exceeded' }
+        $resultStream = [IO.File]::Open([string]$script:D32NonSourceL1Authority.output.result_path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        try { $resultStream.Write($bytes, 0, $bytes.Length); $resultStream.Flush($true) } finally { $resultStream.Dispose() }
+        if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result flush returned after batch deadline' }
+        $resultOpened = Open-D32PowerShellAuthorityFile -Path ([string]$script:D32NonSourceL1Authority.output.result_path) -DirectoryFences ([System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)) -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $resultDocument = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$resultOpened.Bytes))
+        try {
+            if ($resultDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $resultDocument.RootElement)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: persisted L1 result JSON is duplicate or non-object' }
+            $readback = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $resultDocument.RootElement
+        } finally { $resultDocument.Dispose(); if ($null -ne $resultOpened.Stream) { $resultOpened.Stream.Dispose() } }
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $readback)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: persisted L1 result failed strict readback' }
+        $persistedFact = [PSCustomObject][ordered]@{
+            event = 'L1_RESULT_PERSISTED'; case_id = ''; scheduled_ticks = $null; observed_ticks = Get-D32NonSourceL1Now; lateness_ticks = $null
+            result_path = [string]$resultOpened.Record.path; result_bytes = [Int64]$resultOpened.Record.bytes
+            result_sha256 = [string]$resultOpened.Record.sha256; result_volume_serial_hex = [string]$resultOpened.Record.volume_serial_hex
+            result_file_id_hex = [string]$resultOpened.Record.file_id_hex; gate_authority = 'NONE'
+        }
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings -Record $readback -Authority $script:D32NonSourceL1Authority `
+            -AuthorityReference $script:D32NonSourceL1AuthorityReference -ExpectedAuthorityPath $L1AuthorityPath -ExpectedAuthoritySha256 $ExpectedL1AuthoritySha256 `
+            -PersistedFact $persistedFact -ResultReference $resultOpened.Record)) {
+            throw 'D32_NON_SOURCE_L1_UNRESOLVED: persisted result authority/source/runtime/case/flush chain failed binding'
+        }
+        Add-D32NonSourceL1JournalFact -Event 'L1_RESULT_PERSISTED' -ObservedTicks ([Int64]$persistedFact.observed_ticks) -ResultReference $resultOpened.Record
+        $journalClosed = $false
+        if ($null -ne $script:D32NonSourceL1JournalStream) {
+            try { $script:D32NonSourceL1JournalStream.Flush($true); $script:D32NonSourceL1JournalStream.Dispose(); $script:D32NonSourceL1JournalStream = $null; $journalClosed = $true } catch { $journalClosed = $false }
+        }
+        $resultWritten = $true
+        $journalFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+        $journalOpened = Open-D32PowerShellAuthorityFile -Path ([string]$script:D32NonSourceL1Authority.output.journal_path) -DirectoryFences $journalFences -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        try {
+            $journalCallerObserved = Get-D32NonSourceL1Now
+            if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence -Record $readback -PersistedFact $persistedFact `
+                -ResultReference $resultOpened.Record -JournalReference $journalOpened.Record -JournalBytes ([byte[]]$journalOpened.Bytes) -CallerObservedTicks $journalCallerObserved)) {
+                throw 'D32_NON_SOURCE_L1_UNRESOLVED: caller journal re-readback or persistence reconciliation failed'
+            }
+        } finally {
+            if ($null -ne $journalOpened.Stream) { $journalOpened.Stream.Dispose() }
+            foreach ($fence in $journalFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+        }
+        if ($readback.status -ceq 'COMPLETE_NON_SOURCE_L1' -and $journalClosed -and (Get-D32NonSourceL1Now) -lt $script:D32NonSourceL1BatchDeadline) { $returnCode = 0 }
+        elseif ($readback.status -ceq 'BUDGET_STOPPED') { $returnCode = 86 }
+        else { $returnCode = 87 }
+    } catch {
+        if ($null -ne $script:D32NonSourceL1JournalStream) { try { $script:D32NonSourceL1JournalStream.Flush($true); $script:D32NonSourceL1JournalStream.Dispose() } catch { } }
+        if ($script:D32NonSourceL1Secondary.Count -lt 8) { $script:D32NonSourceL1Secondary.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+        $returnCode = 87
+    }
+    return $returnCode
+}
+
+if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
+    exit (Invoke-D32NonSourceL1)
 }
 
 try {

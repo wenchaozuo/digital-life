@@ -83,7 +83,8 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
     }
     function Test-D32NonSourceL1ReaderAuthority {
         param([System.Text.Json.JsonElement]$Authority, [string]$CaseId, [string]$Nonce,
-            [string]$CandidateSha, [string]$BatchId, [string]$AuthorityPath)
+            [string]$CandidateSha, [string]$BatchId, [string]$AuthorityPath,
+            [string]$RuntimePath, [string]$OwnerId, [string]$SystemRoot)
         $authorityFields = @('schema_version', 'record_type', 'purpose', 'policy', 'gate_authority', 'candidate_sha', 'source_repo', 'repository_identity',
             'batch_id', 'run_id', 'owner_id', 'source_pins', 'powershell_runtime', 'invocation', 'cases', 'output', 'limits', 'issued_at_utc')
         if (-not (Test-D32NonSourceL1ReaderExactProperties -Element $Authority -Names $authorityFields)) { return $false }
@@ -104,8 +105,7 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
         $run = $Authority.GetProperty('run_id'); $owner = $Authority.GetProperty('owner_id')
         if ($run.ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $run.GetString() -cnotmatch '^[0-9a-f]{32}$' -or
             $owner.ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $owner.GetString() -cnotmatch '^[A-Za-z0-9._:-]{1,128}$') { return $false }
-        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        try { if ($currentIdentity.User.Value -cne $owner.GetString()) { return $false } } finally { $currentIdentity.Dispose() }
+        if ([String]::IsNullOrWhiteSpace($OwnerId) -or $owner.GetString() -cne $OwnerId) { return $false }
 
         $repository = [IO.Path]::GetFullPath($repo.GetString())
         if ($repository -cne $repo.GetString()) { return $false }
@@ -130,13 +130,13 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
             $runtime.GetProperty('sha256').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $runtime.GetProperty('sha256').GetString() -cnotmatch '^[0-9a-f]{64}$' -or
             $runtime.GetProperty('volume_serial_hex').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $runtime.GetProperty('volume_serial_hex').GetString() -cnotmatch '^[0-9a-f]{16}$' -or
             $runtime.GetProperty('file_id_hex').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $runtime.GetProperty('file_id_hex').GetString() -cnotmatch '^[0-9a-f]{32}$' -or
-            $runtime.GetProperty('path').GetString() -cne [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -or
+            $runtime.GetProperty('path').GetString() -cne $RuntimePath -or
             $runtime.GetProperty('path').GetString() -cnotmatch '^[A-Za-z]:\\Program Files\\PowerShell\\7\\pwsh\.exe$' -or
             $runtime.GetProperty('powershell_home').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
             $runtime.GetProperty('powershell_home').GetString() -cne [IO.Path]::GetDirectoryName($runtime.GetProperty('path').GetString()) -or
             $runtime.GetProperty('system_root').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
             $runtime.GetProperty('system_root').GetString() -notmatch '^[A-Za-z]:\\Windows$' -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals($runtime.GetProperty('system_root').GetString(), [Environment]::GetEnvironmentVariable('SystemRoot'))) { return $false }
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($runtime.GetProperty('system_root').GetString(), $SystemRoot)) { return $false }
 
         $output = $Authority.GetProperty('output')
         if (-not (Test-D32NonSourceL1ReaderExactProperties $output @('root_path', 'parent_path', 'root_volume_serial_hex', 'root_file_id_hex', 'parent_volume_serial_hex', 'parent_file_id_hex', 'result_path', 'journal_path'))) { return $false }
@@ -201,6 +201,18 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
         try { $null = [DateTimeOffset]::Parse($issued.GetString(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { return $false }
         return $true
     }
+    function Get-D32NonSourceL1ReaderRefusalText {
+        param([System.Exception]$Exception)
+        $detail = if ($null -eq $Exception) { 'fixed L1 reader admission refused' } else { [string]$Exception.GetType().Name + ': ' + [string]$Exception.Message }
+        $detail = [regex]::Replace($detail, '[\r\n\t]+', ' ')
+        $detail = [regex]::Replace($detail, '(?i)["''](?:[a-z]:\\|\\\\)[^"'']*["'']', '[path]')
+        $detail = [regex]::Replace($detail, '(?i)(?:[a-z]:\\|\\\\)[^\s,;)]*', '[path]')
+        $detail = [regex]::Replace($detail, '(?i)\b(password|secret|token|nonce|credential|authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+', '$1=[redacted]')
+        $detail = [regex]::Replace($detail, '(?i)\b[0-9a-f]{32,64}\b', '[id]')
+        $detail = [regex]::Replace($detail, '[^\x20-\x7e]', '?')
+        if ($detail.Length -gt 512) { $detail = $detail.Substring(0, 512) }
+        return $detail
+    }
     try {
         if ($PSVersionTable.PSVersion -lt [version]'7.5' -or -not [Environment]::Is64BitProcess -or
             $ExpectedL1AuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or $L1CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
@@ -222,7 +234,12 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
         $authorityDocument = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString($authorityBytes))
         try {
             $authority = $authorityDocument.RootElement
-            if (-not (Test-D32NonSourceL1ReaderAuthority -Authority $authority -CaseId $L1CaseId -Nonce $L1Nonce -CandidateSha $L1CandidateSha -BatchId $L1BatchId -AuthorityPath $L1AuthorityPath)) {
+            $currentImagePath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            try { $currentOwnerId = [string]$currentIdentity.User.Value } finally { $currentIdentity.Dispose() }
+            $currentSystemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+            if (-not (Test-D32NonSourceL1ReaderAuthority -Authority $authority -CaseId $L1CaseId -Nonce $L1Nonce -CandidateSha $L1CandidateSha `
+                -BatchId $L1BatchId -AuthorityPath $L1AuthorityPath -RuntimePath $currentImagePath -OwnerId $currentOwnerId -SystemRoot $currentSystemRoot)) {
                 throw 'fixed L1 authority binding refused'
             }
             $limits = $authority.GetProperty('limits')
@@ -273,7 +290,11 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
         Start-Sleep -Milliseconds 4500
         exit 0
     } catch {
-        try { [Console]::Error.WriteLine('D32NSL1|REFUSED') } catch { }
+        try {
+            $readerErrorText = Get-D32NonSourceL1ReaderRefusalText -Exception $_.Exception
+            [Console]::Error.WriteLine(('D32NSL1|REFUSED|' + $readerErrorText))
+            [Console]::Error.Flush()
+        } catch { }
         exit 87
     }
 }

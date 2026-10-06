@@ -3245,11 +3245,10 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'unknown cleanup remains UNRESOLVED 
 $l1Repository = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $l1CandidateSha = 'a' * 40; $l1BatchId = 'b' * 32; $l1RunId = 'c' * 32
 $l1Root = 'C:\d32-l1-selftest\external\fresh-root'; $l1Parent = Split-Path -Parent $l1Root
-$l1RuntimePath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$l1RuntimePath = 'C:\Program Files\PowerShell\7\pwsh.exe'
 $l1RuntimeHome = Split-Path -Parent $l1RuntimePath
-$l1SystemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
-$l1OwnerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-try { $l1OwnerId = $l1OwnerIdentity.User.Value } finally { $l1OwnerIdentity.Dispose() }
+$l1SystemRoot = 'C:\Windows'
+$l1OwnerId = 'S-1-5-21-0-0-0-1000'
 $l1SourcePaths = Get-D32BoundedDiagnosticSourceProofNonSourceL1SourcePaths -Repository $l1Repository
 $l1SourcePins = @(); $l1PinIndex = 0
 foreach ($l1Path in $l1SourcePaths) {
@@ -3321,7 +3320,8 @@ $l1EntryPath = Join-Path $PSScriptRoot 'd32-bounded-diagnostic-sourceproof.ps1'
 $l1EntryTokens = $null; $l1EntryErrors = $null
 $l1EntryAst = [Management.Automation.Language.Parser]::ParseFile($l1EntryPath, [ref]$l1EntryTokens, [ref]$l1EntryErrors)
 foreach ($functionName in @('Test-D32NonSourceL1ReaderJsonDuplicates', 'Test-D32NonSourceL1ReaderExactProperties', 'Test-D32NonSourceL1ReaderString',
-    'Test-D32NonSourceL1ReaderPositiveInteger', 'Test-D32NonSourceL1ReaderNonnegativeInteger', 'Test-D32NonSourceL1ReaderFileReference', 'Test-D32NonSourceL1ReaderAuthority')) {
+    'Test-D32NonSourceL1ReaderPositiveInteger', 'Test-D32NonSourceL1ReaderNonnegativeInteger', 'Test-D32NonSourceL1ReaderFileReference',
+    'Test-D32NonSourceL1ReaderAuthority', 'Get-D32NonSourceL1ReaderRefusalText')) {
     $functionAst = $l1EntryAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName }, $true)
     Assert-D32BoundedCompilerDiagnosticSelfTest "reader strict consumer helper exists: $functionName" ($null -ne $functionAst)
     if ($null -ne $functionAst) {
@@ -3331,9 +3331,15 @@ foreach ($functionName in @('Test-D32NonSourceL1ReaderJsonDuplicates', 'Test-D32
 $l1ReaderDocument = [System.Text.Json.JsonDocument]::Parse($l1AuthorityJson)
 try {
     $l1ReaderAuthorityAccepted = Test-D32NonSourceL1ReaderAuthority -Authority $l1ReaderDocument.RootElement -CaseId 'NORMAL_EXIT' `
-        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath
+        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath `
+        -RuntimePath $l1RuntimePath -OwnerId $l1OwnerId -SystemRoot $l1SystemRoot
 } finally { $l1ReaderDocument.Dispose() }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed module-free child authority consumer accepts the actual producer JSON without SourceProof authority/profile reads' $l1ReaderAuthorityAccepted
+$l1ReaderRefusalDetail = Get-D32NonSourceL1ReaderRefusalText -Exception ([InvalidOperationException]::new('reader token=private nonce=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at "C:\private user\source\authority.json"'))
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reader admission failures emit a bounded sanitized refusal detail without paths, nonce values, or long IDs' `
+    ($l1ReaderRefusalDetail.StartsWith('InvalidOperationException:', [StringComparison]::Ordinal) -and
+     -not $l1ReaderRefusalDetail.Contains('private') -and -not $l1ReaderRefusalDetail.Contains('authority.json') -and
+     -not $l1ReaderRefusalDetail.Contains('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') -and $l1ReaderRefusalDetail.Length -le 512)
 $l1DuplicateAuthorityJson = $l1AuthorityJson.Replace('"gate_authority":"NONE"', '"gate_authority":"NONE","gate_authority":"PHASE0"')
 $l1DuplicateDoc = [System.Text.Json.JsonDocument]::Parse($l1DuplicateAuthorityJson)
 try { $l1DuplicateRejected = Test-D32NonSourceL1ReaderJsonDuplicates -Element $l1DuplicateDoc.RootElement }
@@ -3342,14 +3348,16 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 reader rejects duplicate authori
 $l1UnknownAuthorityJson = $l1AuthorityJson.TrimEnd('}') + ',"unexpected":true}'
 $l1UnknownDoc = [System.Text.Json.JsonDocument]::Parse($l1UnknownAuthorityJson)
 try { $l1UnknownRejected = -not (Test-D32NonSourceL1ReaderAuthority -Authority $l1UnknownDoc.RootElement -CaseId 'NORMAL_EXIT' `
-        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath) }
+        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath `
+        -RuntimePath $l1RuntimePath -OwnerId $l1OwnerId -SystemRoot $l1SystemRoot) }
 finally { $l1UnknownDoc.Dispose() }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 reader strict consumer rejects unknown authority properties' $l1UnknownRejected
 $l1WrongTypeAuthorityJson = $l1AuthorityJson.Replace('"schema_version":1', '"schema_version":"1"')
 $l1WrongTypeDocument = [System.Text.Json.JsonDocument]::Parse($l1WrongTypeAuthorityJson)
 try {
     $l1WrongTypeRejected = -not (Test-D32NonSourceL1ReaderAuthority -Authority $l1WrongTypeDocument.RootElement -CaseId 'NORMAL_EXIT' `
-        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath)
+        -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath `
+        -RuntimePath $l1RuntimePath -OwnerId $l1OwnerId -SystemRoot $l1SystemRoot)
 } finally { $l1WrongTypeDocument.Dispose() }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 reader strict consumer rejects a string where an integer schema field is required' $l1WrongTypeRejected
 
@@ -3554,6 +3562,42 @@ $l1PartialJournalRef = [PSCustomObject][ordered]@{ path = $l1Output.journal_path
 Assert-D32BoundedCompilerDiagnosticSelfTest 'strict L1 persistence accepts durable BLOCKED result with only admission and persisted facts' `
     (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence -Record $l1Partial -PersistedFact $l1PartialFact -ResultReference $l1PartialRef `
         -JournalReference $l1PartialJournalRef -JournalBytes $l1PartialJournalBytes -CallerObservedTicks ($l1T0 + 2000L))
+$l1RefusedResult = New-D32BoundedDiagnosticSourceProofNonSourceL1ResultCandidate -CandidateSha $l1CandidateSha -BatchId $l1BatchId -RunId $l1RunId `
+    -AuthorityReference $l1AuthorityRef -SourcePins $l1SourcePins -PowerShellRuntime $l1RuntimeRef -Output $l1Output -Clock $l1Clock -Controller $l1Controller `
+    -Cases @((New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId 'NORMAL_EXIT'),
+        (New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId 'FORCED_OWNED_TERMINATION'),
+        (New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId 'ENTRY_PIN_BINDING_REFUSAL')) `
+    -CreateProcessAttemptCount 0L -PlannedTerminationCount 0L -FailSafeTerminationCount 0L -Status 'REFUSED' `
+    -PrimaryError 'InvalidOperationException: fixed lifecycle identity type unavailable' `
+    -StartedAtUtc '2026-10-06T00:00:01.0000000+00:00' -CompletedAtUtc '2026-10-06T00:00:02.0000000+00:00'
+$l1RefusedJsonBytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $l1RefusedResult -Depth 50 -Compress))
+$l1RefusedResultRef = [PSCustomObject][ordered]@{ path = $l1Output.result_path; bytes = [Int64]$l1RefusedJsonBytes.Length
+    sha256 = (& $l1Sha $l1RefusedJsonBytes); volume_serial_hex = '7777777777777777'; file_id_hex = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+$l1RefusedPersistedFact = [PSCustomObject][ordered]@{ event = 'L1_RESULT_PERSISTED'; case_id = ''; scheduled_ticks = $null
+    observed_ticks = ($l1T0 + 1000L); lateness_ticks = $null; result_path = $l1RefusedResultRef.path; result_bytes = $l1RefusedResultRef.bytes
+    result_sha256 = $l1RefusedResultRef.sha256; result_volume_serial_hex = $l1RefusedResultRef.volume_serial_hex
+    result_file_id_hex = $l1RefusedResultRef.file_id_hex; gate_authority = 'NONE' }
+$l1RefusedJournalRows = @(
+    [PSCustomObject][ordered]@{ event = 'AUTHORITY_ADMISSION'; case_id = ''; scheduled_ticks = $l1T0; observed_ticks = ($l1T0 + 50L)
+        lateness_ticks = 50L; result_path = $null; result_bytes = $null; result_sha256 = $null; result_volume_serial_hex = $null
+        result_file_id_hex = $null; gate_authority = 'NONE' },
+    $l1RefusedPersistedFact)
+$l1RefusedJournalBytes = [Text.UTF8Encoding]::new($false).GetBytes(((($l1RefusedJournalRows | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 12 -Compress }) -join "`n") + "`n"))
+$l1RefusedJournalRef = [PSCustomObject][ordered]@{ path = $l1Output.journal_path; bytes = [Int64]$l1RefusedJournalBytes.Length
+    sha256 = (& $l1Sha $l1RefusedJournalBytes); volume_serial_hex = '8888888888888888'; file_id_hex = 'cccccccccccccccccccccccccccccccc' }
+$l1RefusedResultReadback = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json ([Text.UTF8Encoding]::new($false).GetString($l1RefusedJsonBytes))
+$l1RefusedShapePass = Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape -Record $l1RefusedResultReadback
+Assert-D32BoundedCompilerDiagnosticSelfTest 'pre-case REFUSED producer→JSON→strict reader preserves primary error with only NOT_RUN rows after authority admission' `
+    ($l1RefusedShapePass -and
+     [string]$l1RefusedResultReadback.status -ceq 'REFUSED' -and
+     [string]$l1RefusedResultReadback.primary_error -ceq [string]$l1RefusedResult.primary_error)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'pre-case REFUSED result still requires exact authority binding and persisted journal reconciliation' `
+    ((Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings -Record $l1RefusedResultReadback -Authority $l1AuthorityReadback `
+        -AuthorityReference $l1AuthorityRef -ExpectedAuthorityPath $l1AuthorityRef.path -ExpectedAuthoritySha256 $l1AuthorityRef.sha256 `
+        -PersistedFact $l1RefusedPersistedFact -ResultReference $l1RefusedResultRef) -and
+     (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence -Record $l1RefusedResultReadback `
+        -PersistedFact $l1RefusedPersistedFact -ResultReference $l1RefusedResultRef -JournalReference $l1RefusedJournalRef `
+        -JournalBytes $l1RefusedJournalBytes -CallerObservedTicks ($l1T0 + 1200L)))
 $l1LateResultBytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $l1LateResult -Depth 50 -Compress))
 $l1LateResultRef = [PSCustomObject][ordered]@{ path = $l1Output.result_path; bytes = [Int64]$l1LateResultBytes.Length; sha256 = (& $l1Sha $l1LateResultBytes)
     volume_serial_hex = '7777777777777777'; file_id_hex = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
@@ -3645,9 +3689,102 @@ $l1ControllerModeIsolation = $l1PlanText.Contains("@('-NoLogo', '-NoProfile', '-
     -not $l1PlanText.Contains('HistoricalOriginCandidateSha') -and
     $l1RefusalIndex -ge 0 -and $l1CreateIndex -gt $l1RefusalIndex -and
     $l1CaseText.Contains('-DeriveEntryPinMismatch:($caseId -ceq ''ENTRY_PIN_BINDING_REFUSAL'')') -and
-    $l1ControllerBranchText.Contains('exit (Invoke-D32NonSourceL1)') -and
+    $l1ControllerBranchText.Contains('try { $l1ExitCode = [int](Invoke-D32NonSourceL1) }') -and
     -not $l1ControllerBranchText.Contains('Invoke-D32BoundedDiagnosticSourceProofRun')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 fixed controller argv/roles exclude SourceProof inputs; actual zero-create refusal returns before the only case launch' $l1ControllerModeIsolation
+$l1InvokeAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32NonSourceL1'
+}, $true)
+$l1InvokeText = if ($null -eq $l1InvokeAst) { '' } else { [string]$l1InvokeAst.Extent.Text }
+$l1NativeInitAt = $l1InvokeText.IndexOf('Add-Type -TypeDefinition $nativeSource', [StringComparison]::Ordinal)
+$l1AuthorityReadAt = $l1InvokeText.IndexOf('Get-D32LifecycleReferenceBytes -Path $L1AuthorityPath', [StringComparison]::Ordinal)
+$l1AdmissionValidatedAt = $l1InvokeText.IndexOf('$script:D32NonSourceL1AdmissionValidated = $true', [StringComparison]::Ordinal)
+$l1FirstCaseAt = $l1InvokeText.IndexOf('Invoke-D32NonSourceL1Case -Index $index', [StringComparison]::Ordinal)
+$l1NativeBootstrapOrder = $l1NativeInitAt -ge 0 -and $l1AuthorityReadAt -gt $l1NativeInitAt -and
+    $l1AdmissionValidatedAt -gt $l1AuthorityReadAt -and $l1FirstCaseAt -gt $l1AdmissionValidatedAt -and
+    ([regex]::Matches($l1InvokeText, 'Add-Type -TypeDefinition \$nativeSource')).Count -eq 1
+Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 initializes its existing in-process identity surface before the first pinned-handle read and launches cases only after admission' $l1NativeBootstrapOrder
+$l1ErrorFormatterAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32NonSourceL1ErrorText'
+}, $true)
+$l1ErrorAccumulatorAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Add-D32NonSourceL1Error'
+}, $true)
+$l1FailureStatusAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32NonSourceL1FailureStatus'
+}, $true)
+$l1DiagnosticWriterAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Write-D32NonSourceL1Diagnostic'
+}, $true)
+$l1ReaderRefusalExtractorAst = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32NonSourceL1ReaderRefusalError'
+}, $true)
+$l1ErrorFormatterLoaded = $false; $l1ErrorAccumulatorLoaded = $false; $l1FailureStatusLoaded = $false; $l1DiagnosticWriterLoaded = $false; $l1ReaderRefusalExtractorLoaded = $false
+if ($null -ne $l1ErrorFormatterAst) { . ([ScriptBlock]::Create([string]$l1ErrorFormatterAst.Extent.Text)); $l1ErrorFormatterLoaded = $true }
+if ($null -ne $l1ErrorAccumulatorAst) { . ([ScriptBlock]::Create([string]$l1ErrorAccumulatorAst.Extent.Text)); $l1ErrorAccumulatorLoaded = $true }
+if ($null -ne $l1FailureStatusAst) { . ([ScriptBlock]::Create([string]$l1FailureStatusAst.Extent.Text)); $l1FailureStatusLoaded = $true }
+if ($null -ne $l1DiagnosticWriterAst) { . ([ScriptBlock]::Create([string]$l1DiagnosticWriterAst.Extent.Text)); $l1DiagnosticWriterLoaded = $true }
+if ($null -ne $l1ReaderRefusalExtractorAst) { . ([ScriptBlock]::Create([string]$l1ReaderRefusalExtractorAst.Extent.Text)); $l1ReaderRefusalExtractorLoaded = $true }
+$l1ErrorDetail = Get-D32NonSourceL1ErrorText -Exception ([InvalidOperationException]::new('bad token=secret-value nonce=0123456789abcdef0123456789abcdef at "C:\private user\settings.json" 0123456789abcdef0123456789abcdef01234567' + "`r`nsecondary line"))
+$l1DiagnosticWriter = [IO.StringWriter]::new()
+$l1DiagnosticWriteSucceeded = Write-D32NonSourceL1Diagnostic -Status 'REFUSED' -PrimaryError $l1ErrorDetail `
+    -SecondaryErrors @('secondary token=not-secret at \\\\server\\private\\proof.json', 'second secondary') -Writer $l1DiagnosticWriter
+$l1DiagnosticCapture = $l1DiagnosticWriter.ToString()
+$l1DiagnosticLine = $l1DiagnosticCapture.TrimEnd([char[]]@("`r", "`n"))
+$l1DiagnosticSafe = $l1ErrorFormatterLoaded -and $l1ErrorAccumulatorLoaded -and $l1FailureStatusLoaded -and $l1DiagnosticWriterLoaded -and $l1ReaderRefusalExtractorLoaded -and $l1DiagnosticWriteSucceeded -and
+    $l1DiagnosticLine.StartsWith('D32_NON_SOURCE_L1 status=REFUSED primary=', [StringComparison]::Ordinal) -and
+    -not $l1DiagnosticCapture.Contains('secret-value') -and -not $l1DiagnosticCapture.Contains('C:\private') -and
+    -not $l1DiagnosticCapture.Contains('private user') -and -not $l1DiagnosticCapture.Contains('0123456789abcdef0123456789abcdef') -and
+    -not $l1DiagnosticCapture.Contains('server') -and $l1DiagnosticCapture.Contains('secondary0=') -and
+    -not $l1DiagnosticLine.Contains("`r") -and -not $l1DiagnosticLine.Contains("`n") -and
+     [Text.Encoding]::UTF8.GetByteCount($l1DiagnosticCapture) -le 4096
+Assert-D32BoundedCompilerDiagnosticSelfTest 'early L1 errors become one bounded stderr-compatible line with path/token redaction' $l1DiagnosticSafe
+$l1ControllerReaderRefusalError = Get-D32NonSourceL1ReaderRefusalError -StderrCapture 'D32NSL1|REFUSED|RuntimeException: rejected token=hidden at "C:\private source\authority.json"'
+$l1UnknownReaderError = Get-D32NonSourceL1ReaderRefusalError -StderrCapture 'D32NSL1|FIXED|NORMAL'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'controller preserves only the reader refusal detail with its exact fixed prefix and keeps other stderr mismatches generic' `
+    ($l1ControllerReaderRefusalError -like '*reader admission refused*' -and -not $l1ControllerReaderRefusalError.Contains('hidden') -and
+     -not $l1ControllerReaderRefusalError.Contains('private source') -and $null -eq $l1UnknownReaderError)
+$l1SavedPrimary = $script:D32NonSourceL1Primary; $l1SavedSecondary = $script:D32NonSourceL1Secondary
+try {
+    $script:D32NonSourceL1Primary = $null
+    $script:D32NonSourceL1Secondary = [System.Collections.Generic.List[string]]::new()
+    $null = Add-D32NonSourceL1Error -Exception ([InvalidOperationException]::new('first failure'))
+    $null = Add-D32NonSourceL1Error -Exception ([InvalidOperationException]::new('secondary cleanup failure'))
+    $script:D32NonSourceL1AdmissionValidated = $false
+    $l1PreadmissionStatus = Get-D32NonSourceL1FailureStatus -ErrorText 'reader authority refused'
+    $script:D32NonSourceL1AdmissionValidated = $true
+    $l1PostAdmissionStatus = Get-D32NonSourceL1FailureStatus -ErrorText 'unexpected controller exception'
+    $l1ErrorsPreserved = $script:D32NonSourceL1Primary -like '*first failure*' -and
+        $script:D32NonSourceL1Secondary.Count -eq 1 -and $script:D32NonSourceL1Secondary[0] -like '*secondary cleanup failure*' -and
+        $l1PreadmissionStatus -ceq 'REFUSED' -and $l1PostAdmissionStatus -ceq 'UNRESOLVED'
+} finally {
+    $script:D32NonSourceL1Primary = $l1SavedPrimary; $script:D32NonSourceL1Secondary = $l1SavedSecondary
+    Remove-Variable -Scope Script -Name D32NonSourceL1AdmissionValidated -ErrorAction SilentlyContinue
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 preserves the first failure, bounds secondary cleanup errors, and distinguishes pre-admission refusal from post-admission unresolved state' $l1ErrorsPreserved
+$l1LongDiagnosticWriter = [IO.StringWriter]::new()
+$l1LongWriteSucceeded = Write-D32NonSourceL1Diagnostic -Status 'UNRECOGNIZED' -PrimaryError ('X' * 10000) -Writer $l1LongDiagnosticWriter
+$l1LongCapture = $l1LongDiagnosticWriter.ToString()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 diagnostic fallback maps unknown states to UNRESOLVED and remains under the stream cap' `
+    ($l1LongWriteSucceeded -and $l1LongCapture.StartsWith('D32_NON_SOURCE_L1 status=UNRESOLVED ', [StringComparison]::Ordinal) -and
+     [Text.Encoding]::UTF8.GetByteCount($l1LongCapture) -le 4096)
+$l1ErrorWriterBranch = $l1ControllerBranchText.Contains('if ($l1ExitCode -ne 0 -or $diagnosticStatus -cne ''COMPLETE_NON_SOURCE_L1'')') -and
+    $l1ControllerBranchText.Contains('Write-D32NonSourceL1Diagnostic') -and
+    $l1ControllerBranchText.Contains('-SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray())') -and
+    $l1ControllerBranchText.IndexOf('Write-D32NonSourceL1Diagnostic', [StringComparison]::Ordinal) -lt $l1ControllerBranchText.LastIndexOf('exit $l1ExitCode', [StringComparison]::Ordinal)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 controller catches escaped exceptions and emits diagnostics before preserving its fixed exit code' $l1ErrorWriterBranch
+$l1ReaderText = [string]$l1EntryAst.Extent.Text
+$l1ReaderOwnRuntimeBinding = $l1ReaderText.Contains('$currentImagePath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName') -and
+    $l1ReaderText.Contains('$currentOwnerId = [string]$currentIdentity.User.Value') -and
+    $l1ReaderText.Contains('$currentSystemRoot = [Environment]::GetEnvironmentVariable(''SystemRoot'')') -and
+    $l1ReaderText.Contains('-RuntimePath $currentImagePath -OwnerId $currentOwnerId -SystemRoot $currentSystemRoot') -and
+    $l1ReaderText.Contains("[Console]::Error.WriteLine(('D32NSL1|REFUSED|' + `$readerErrorText))")
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reader runtime/owner/system-root remain bound to actual process identity while refusal output is bounded and sanitized' $l1ReaderOwnRuntimeBinding
+$l1CleanupCatches = [regex]::Matches($l1InvokeText, 'catch \{ \$cleanupFailed = \$true; \$null = Add-D32NonSourceL1Error -Exception \$_\.Exception \}').Count -ge 3
+$l1PrimaryCatchPreserved = $l1InvokeText.Contains('$null = Add-D32NonSourceL1Error -Exception $_.Exception -Message $caughtError') -and
+    $l1InvokeText.Contains("if (`$cleanupFailed) { `$script:D32NonSourceL1Status = 'UNRESOLVED' }") -and
+    $l1InvokeText.Contains("if (-not `$script:D32NonSourceL1AdmissionValidated) { return 87 }")
+Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 cleanup errors are collected without bypassing trusted pre-admission refusal or later result persistence' ($l1CleanupCatches -and $l1PrimaryCatchPreserved)
 $controllerClockFunction = $controllerAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32LifecycleNow'
 }, $true)

@@ -821,9 +821,74 @@ function Add-D32NonSourceL1JournalFact {
 function Get-D32NonSourceL1ErrorText {
     param([System.Exception]$Exception)
     $text = if ($null -eq $Exception) { 'unspecified NON_SOURCE_L1 failure' } else { [string]$Exception.GetType().Name + ': ' + [string]$Exception.Message }
-    $text = [regex]::Replace($text, '[\r\n\t]', ' ')
+    $text = [regex]::Replace($text, '[\r\n\t]+', ' ')
+    $text = [regex]::Replace($text, '(?i)["''](?:[a-z]:\\|\\\\)[^"'']*["'']', '[path]')
+    $text = [regex]::Replace($text, '(?i)(?:[a-z]:\\|\\\\)[^\s,;)]*', '[path]')
+    $text = [regex]::Replace($text, '(?i)\b(password|secret|token|nonce|credential|authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+', '$1=[redacted]')
+    $text = [regex]::Replace($text, '(?i)\b[0-9a-f]{32,64}\b', '[id]')
+    $text = [regex]::Replace($text, '[^\x20-\x7e]', '?')
     if ($text.Length -gt 2048) { $text = $text.Substring(0, 2048) }
     return $text
+}
+
+function Add-D32NonSourceL1Error {
+    param([AllowNull()][System.Exception]$Exception, [AllowNull()][string]$Message)
+    $text = if ($null -ne $Exception) { Get-D32NonSourceL1ErrorText -Exception $Exception } else { [string]$Message }
+    if ([String]::IsNullOrWhiteSpace($text)) { $text = 'unspecified NON_SOURCE_L1 failure' }
+    if (-not $script:D32NonSourceL1Primary) { $script:D32NonSourceL1Primary = $text }
+    elseif ($script:D32NonSourceL1Secondary.Count -lt 8) { $script:D32NonSourceL1Secondary.Add($text) }
+    return $text
+}
+
+function Get-D32NonSourceL1FailureStatus {
+    param([AllowNull()][string]$ErrorText)
+    if ([string]$ErrorText -match 'D32_NON_SOURCE_L1_BUDGET_STOPPED') { return 'BUDGET_STOPPED' }
+    if ([string]$ErrorText -match 'D32_NON_SOURCE_L1_BLOCKED') { return 'BLOCKED' }
+    if ($script:D32NonSourceL1AdmissionValidated) { return 'UNRESOLVED' }
+    return 'REFUSED'
+}
+
+function Get-D32NonSourceL1ReaderRefusalError {
+    param([AllowNull()][string]$StderrCapture)
+    $prefix = 'D32NSL1|REFUSED|'
+    if ([String]::IsNullOrEmpty($StderrCapture) -or -not $StderrCapture.StartsWith($prefix, [StringComparison]::Ordinal)) { return $null }
+    $detail = $StderrCapture.Substring($prefix.Length)
+    if ($detail.Length -gt 512) { $detail = $detail.Substring(0, 512) }
+    return Get-D32NonSourceL1ErrorText -Exception ([InvalidOperationException]::new('fixed reader admission refused: ' + $detail))
+}
+
+function Write-D32NonSourceL1Diagnostic {
+    param([Parameter(Mandatory = $true)][string]$Status,
+        [AllowNull()][string]$PrimaryError,
+        [AllowNull()][object[]]$SecondaryErrors = @(),
+        [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer)
+    $allowedStatuses = @('COMPLETE_NON_SOURCE_L1', 'BLOCKED', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED')
+    if ($Status -cnotin $allowedStatuses) { $Status = 'UNRESOLVED' }
+    $sanitize = {
+        param([AllowNull()][string]$Value, [int]$MaximumLength)
+        $value = if ([String]::IsNullOrWhiteSpace($Value)) { 'error unavailable' } else { [string]$Value }
+        $value = [regex]::Replace($value, '[\r\n\t]+', ' ')
+        $value = [regex]::Replace($value, '(?i)["''](?:[a-z]:\\|\\\\)[^"'']*["'']', '[path]')
+        $value = [regex]::Replace($value, '(?i)(?:[a-z]:\\|\\\\)[^\s,;)]*', '[path]')
+        $value = [regex]::Replace($value, '(?i)\b(password|secret|token|nonce|credential|authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+', '$1=[redacted]')
+        $value = [regex]::Replace($value, '(?i)\b[0-9a-f]{32,64}\b', '[id]')
+        $value = [regex]::Replace($value, '[^\x20-\x7e]', '?')
+        if ($value.Length -gt $MaximumLength) { $value = $value.Substring(0, $MaximumLength) }
+        return $value
+    }
+    $detail = & $sanitize $PrimaryError 2048
+    $line = 'D32_NON_SOURCE_L1 status=' + $Status + ' primary=' + $detail
+    $secondaryIndex = 0
+    foreach ($secondary in @($SecondaryErrors | Select-Object -First 2)) {
+        $line += ' secondary' + $secondaryIndex + '=' + (& $sanitize ([string]$secondary) 768)
+        $secondaryIndex++
+    }
+    if ($line.Length -gt 4094) { $line = $line.Substring(0, 4094) }
+    try {
+        $Writer.WriteLine($line)
+        $Writer.Flush()
+        return $true
+    } catch { return $false }
 }
 
 function Get-D32NonSourceL1ReferenceFromOpened {
@@ -1015,7 +1080,10 @@ function Invoke-D32NonSourceL1Case {
         $actualStderr = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stderr).TrimEnd([char[]]@("`r", "`n"))
         $row.stdout_token_verified = ($joined -and -not $row.stdout_truncated -and $row.stdout_bytes -le 1024 -and $actualStdout -ceq $expectedStdout)
         $row.stderr_token_verified = ($joined -and -not $row.stderr_truncated -and $row.stderr_bytes -le 1024 -and $actualStderr -ceq $expectedStderr)
-        if ($actualStdout -cne $expectedStdout -or $actualStderr -cne $expectedStderr) { $row.primary_error = 'fixed fixture behavior token/capture did not match the exact case' }
+        if ($actualStdout -cne $expectedStdout -or $actualStderr -cne $expectedStderr) {
+            $readerRefusalError = Get-D32NonSourceL1ReaderRefusalError -StderrCapture $actualStderr
+            $row.primary_error = if ($readerRefusalError) { [string]$readerRefusalError } else { 'fixed fixture behavior token/capture did not match the exact case' }
+        }
         if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($native)) { $cleanupKnown = $false; throw 'owned kill-on-close Job handle did not close' }
         $row.job_closed = $true
         if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($native) -or -not $native.TemporaryHandlesClosed) { $cleanupKnown = $false; throw 'retained native process/thread/pipe cleanup did not verify' }
@@ -1080,6 +1148,12 @@ function Invoke-D32NonSourceL1 {
         $frequency = [Int64][Diagnostics.Stopwatch]::Frequency
         $script:D32NonSourceL1BatchDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $L1T0Ticks -Frequency $frequency -Milliseconds 60000L
         if ((Get-D32NonSourceL1Now) -lt $L1T0Ticks -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: controller admission reached batch deadline' }
+
+        # The fixed lifecycle type is used by the first caller-pinned byte read
+        # to bind the opened authority identity. Initialize only this existing,
+        # in-process native surface before that read; no native entry call occurs
+        # until the authority, output root, and all code/runtime pins are admitted.
+        Add-Type -TypeDefinition $nativeSource -Language CSharp -ErrorAction Stop | Out-Null
 
         # The initial L1 record read is caller-pinned and bounded. The path is
         # re-opened through the fixed module-free authority loader below.
@@ -1176,7 +1250,6 @@ function Invoke-D32NonSourceL1 {
             volume_serial_hex = $runtimePin.volume_serial_hex; file_id_hex = $runtimePin.file_id_hex
         })
         $script:D32NonSourceL1Opened.Add($runtimeOpened)
-        Add-Type -TypeDefinition $nativeSource -Language CSharp -ErrorAction Stop | Out-Null
 
         for ($index = 0; $index -lt 3; $index++) {
             if ($script:D32NonSourceL1CaseStop -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { break }
@@ -1204,13 +1277,28 @@ function Invoke-D32NonSourceL1 {
         $script:D32NonSourceL1Status = [string]$batchOutcome.status
         if (-not $script:D32NonSourceL1Primary -and $null -ne $batchOutcome.primary_error) { $script:D32NonSourceL1Primary = [string]$batchOutcome.primary_error }
     } catch {
-        $script:D32NonSourceL1Primary = Get-D32NonSourceL1ErrorText -Exception $_.Exception
-        $script:D32NonSourceL1Status = if ([string]$script:D32NonSourceL1Primary -match 'BUDGET_STOPPED|BLOCKED:') { 'BUDGET_STOPPED' } else { 'REFUSED' }
+        $caughtError = Get-D32NonSourceL1ErrorText -Exception $_.Exception
+        $null = Add-D32NonSourceL1Error -Exception $_.Exception -Message $caughtError
+        $script:D32NonSourceL1Status = Get-D32NonSourceL1FailureStatus -ErrorText $caughtError
     } finally {
-        if ($null -ne $authorityRaw -and $null -ne $authorityRaw.Stream) { $authorityRaw.Stream.Dispose() }
-        if ($null -ne $moduleRaw -and $null -ne $moduleRaw.Stream) { $moduleRaw.Stream.Dispose() }
-        foreach ($opened in $script:D32NonSourceL1Opened) { if ($null -ne $opened.Stream -and -not $opened.Stream.SafeFileHandle.IsClosed) { $opened.Stream.Dispose() } }
-        foreach ($fence in $script:D32LifecycleFences.Values) { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+        $cleanupFailed = $false
+        if ($null -ne $authorityRaw -and $null -ne $authorityRaw.Stream) {
+            try { $authorityRaw.Stream.Dispose() } catch { $cleanupFailed = $true; $null = Add-D32NonSourceL1Error -Exception $_.Exception }
+        }
+        if ($null -ne $moduleRaw -and $null -ne $moduleRaw.Stream) {
+            try { $moduleRaw.Stream.Dispose() } catch { $cleanupFailed = $true; $null = Add-D32NonSourceL1Error -Exception $_.Exception }
+        }
+        foreach ($opened in $script:D32NonSourceL1Opened) {
+            try { if ($null -ne $opened.Stream -and -not $opened.Stream.SafeFileHandle.IsClosed) { $opened.Stream.Dispose() } }
+            catch { $cleanupFailed = $true; $null = Add-D32NonSourceL1Error -Exception $_.Exception }
+        }
+        if ($null -ne $script:D32LifecycleFences) {
+            foreach ($fence in $script:D32LifecycleFences.Values) {
+                try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+                catch { $cleanupFailed = $true; $null = Add-D32NonSourceL1Error -Exception $_.Exception }
+            }
+        }
+        if ($cleanupFailed) { $script:D32NonSourceL1Status = 'UNRESOLVED' }
     }
 
     if (-not $script:D32NonSourceL1AdmissionValidated) { return 87 }
@@ -1277,15 +1365,38 @@ function Invoke-D32NonSourceL1 {
         elseif ($readback.status -ceq 'BUDGET_STOPPED') { $returnCode = 86 }
         else { $returnCode = 87 }
     } catch {
-        if ($null -ne $script:D32NonSourceL1JournalStream) { try { $script:D32NonSourceL1JournalStream.Flush($true); $script:D32NonSourceL1JournalStream.Dispose() } catch { } }
-        if ($script:D32NonSourceL1Secondary.Count -lt 8) { $script:D32NonSourceL1Secondary.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+        $caughtError = Get-D32NonSourceL1ErrorText -Exception $_.Exception
+        $null = Add-D32NonSourceL1Error -Exception $_.Exception -Message $caughtError
+        if ($null -ne $script:D32NonSourceL1JournalStream) {
+            try { $script:D32NonSourceL1JournalStream.Flush($true); $script:D32NonSourceL1JournalStream.Dispose(); $script:D32NonSourceL1JournalStream = $null }
+            catch { $null = Add-D32NonSourceL1Error -Exception $_.Exception }
+        }
         $returnCode = 87
     }
     return $returnCode
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
-    exit (Invoke-D32NonSourceL1)
+    $l1ExitCode = 87
+    try { $l1ExitCode = [int](Invoke-D32NonSourceL1) }
+    catch {
+        $escapedError = Get-D32NonSourceL1ErrorText -Exception $_.Exception
+        $null = Add-D32NonSourceL1Error -Exception $_.Exception -Message $escapedError
+        if ($script:D32NonSourceL1AdmissionValidated) { $script:D32NonSourceL1Status = 'UNRESOLVED' }
+        else { $script:D32NonSourceL1Status = Get-D32NonSourceL1FailureStatus -ErrorText $escapedError }
+        $l1ExitCode = 87
+    }
+    $diagnosticStatus = [string]$script:D32NonSourceL1Status
+    $diagnosticPrimary = [string]$script:D32NonSourceL1Primary
+    if ($l1ExitCode -ne 0 -or $diagnosticStatus -cne 'COMPLETE_NON_SOURCE_L1') {
+        if ([String]::IsNullOrWhiteSpace($diagnosticPrimary) -and $script:D32NonSourceL1Secondary.Count -gt 0) {
+            $diagnosticPrimary = [string]$script:D32NonSourceL1Secondary[0]
+        }
+        if ($diagnosticStatus -ceq 'COMPLETE_NON_SOURCE_L1') { $diagnosticStatus = 'UNRESOLVED' }
+        $null = Write-D32NonSourceL1Diagnostic -Status $diagnosticStatus -PrimaryError $diagnosticPrimary `
+            -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) -Writer ([Console]::Error)
+    }
+    exit $l1ExitCode
 }
 
 try {

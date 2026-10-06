@@ -304,7 +304,13 @@ public static class D32BuildProfileFileIdentityV1
 
     public static D32BuildProfileFileRecordV1 Read(string path, long maximumElapsedMilliseconds)
     {
+        return ReadUntil(path, maximumElapsedMilliseconds, 0);
+    }
+
+    public static D32BuildProfileFileRecordV1 ReadUntil(string path, long maximumElapsedMilliseconds, long deadlineTicks)
+    {
         if (maximumElapsedMilliseconds <= 0) throw new IOException("file snapshot has no remaining source-proof time");
+        if (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks) throw new IOException("file snapshot reached the shared source-proof work deadline before opening");
         string full = Path.GetFullPath(path);
         Stopwatch timer = Stopwatch.StartNew();
         using (FileStream stream = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -319,16 +325,18 @@ public static class D32BuildProfileFileIdentityV1
                 long remaining = before.Bytes;
                 while (remaining > 0)
                 {
-                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("file snapshot reached its remaining source-proof deadline");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("file snapshot reached its remaining source-proof deadline");
                     int read = stream.Read(buffer, 0, (int)Math.Min((long)buffer.Length, remaining));
                     if (read <= 0) throw new IOException("file ended before its opened-handle length");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("late file-read bytes discarded at the shared source-proof work deadline");
                     sha.AppendData(buffer, 0, read);
                     remaining -= read;
                 }
-                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("file snapshot reached its remaining source-proof deadline");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("file snapshot reached its remaining source-proof deadline");
                 if (stream.Length != before.Bytes) throw new IOException("file length changed while hashing");
                 NativeRecord after = ReadNative(stream.SafeFileHandle);
                 if (!Same(before, after)) throw new IOException("file identity or metadata changed while hashing");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("file snapshot reached its remaining source-proof deadline before digest finalization");
                 byte[] digest = sha.GetHashAndReset();
                 return new D32BuildProfileFileRecordV1 {
                     FullName = full,
@@ -370,7 +378,13 @@ public static class D32BuildProfileFileIdentityV1
 
     public static D32BuildProfileFileRecordV1 ReadContent(string path, long maximumBytes, long maximumElapsedMilliseconds)
     {
+        return ReadContentUntil(path, maximumBytes, maximumElapsedMilliseconds, 0);
+    }
+
+    public static D32BuildProfileFileRecordV1 ReadContentUntil(string path, long maximumBytes, long maximumElapsedMilliseconds, long deadlineTicks)
+    {
         if (maximumBytes < 0 || maximumElapsedMilliseconds <= 0) throw new IOException("content snapshot bounds are invalid");
+        if (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks) throw new IOException("content snapshot reached the shared source-proof work deadline before opening");
         string full = Path.GetFullPath(path);
         Stopwatch timer = Stopwatch.StartNew();
         using (FileStream stream = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -385,17 +399,19 @@ public static class D32BuildProfileFileIdentityV1
                 int offset = 0;
                 while (offset < content.Length)
                 {
-                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("content snapshot reached its remaining source-proof deadline");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("content snapshot reached its remaining source-proof deadline");
                     int take = Math.Min(65536, content.Length - offset);
                     int read = stream.Read(content, offset, take);
                     if (read <= 0) throw new IOException("file ended before its opened-handle length");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("late content-read bytes discarded at the shared source-proof work deadline");
                     sha.AppendData(content, offset, read);
                     offset += read;
                 }
-                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("content snapshot reached its remaining source-proof deadline");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("content snapshot reached its remaining source-proof deadline");
                 if (stream.Length != before.Bytes) throw new IOException("file length changed while reading content");
                 NativeRecord after = ReadNative(stream.SafeFileHandle);
                 if (!Same(before, after)) throw new IOException("file identity or metadata changed while reading content");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("content snapshot reached its remaining source-proof deadline before digest finalization");
                 byte[] digest = sha.GetHashAndReset();
                 return new D32BuildProfileFileRecordV1 {
                     FullName = full, Bytes = after.Bytes, Sha256 = BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant(),
@@ -408,8 +424,14 @@ public static class D32BuildProfileFileIdentityV1
 
     public static D32BuildProfileFileRecordV1 ReadAndHashGitBlob(string path, long expectedBytes, long maximumElapsedMilliseconds)
     {
+        return ReadAndHashGitBlobUntil(path, expectedBytes, maximumElapsedMilliseconds, 0);
+    }
+
+    public static D32BuildProfileFileRecordV1 ReadAndHashGitBlobUntil(string path, long expectedBytes, long maximumElapsedMilliseconds, long deadlineTicks)
+    {
         if (expectedBytes < 0 || expectedBytes > 64L * 1024L * 1024L || maximumElapsedMilliseconds <= 0)
             throw new IOException("Git blob snapshot bounds are invalid");
+        if (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks) throw new IOException("Git blob snapshot reached the shared source-proof work deadline before opening");
         string full = Path.GetFullPath(path);
         Stopwatch timer = Stopwatch.StartNew();
         using (FileStream stream = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -427,17 +449,21 @@ public static class D32BuildProfileFileIdentityV1
                 long remaining = before.Bytes;
                 while (remaining > 0)
                 {
-                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("Git blob hashing reached its remaining source-proof deadline");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("Git blob hashing reached its remaining source-proof deadline");
                     int read = stream.Read(buffer, 0, (int)Math.Min((long)buffer.Length, remaining));
                     if (read <= 0) throw new IOException("Git blob ended before its opened-handle length");
+                    if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("late Git blob bytes discarded at the shared source-proof work deadline");
                     sha256.AppendData(buffer, 0, read);
                     gitSha1.AppendData(buffer, 0, read);
                     remaining -= read;
                 }
-                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new IOException("Git blob hashing reached its remaining source-proof deadline");
-                if (stream.ReadByte() != -1 || stream.Length != before.Bytes) throw new IOException("Git blob length changed while hashing");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("Git blob hashing reached its remaining source-proof deadline");
+                int trailingByte = stream.ReadByte();
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("late Git blob framing observation discarded at the shared source-proof work deadline");
+                if (trailingByte != -1 || stream.Length != before.Bytes) throw new IOException("Git blob length changed while hashing");
                 NativeRecord after = ReadNative(stream.SafeFileHandle);
                 if (!Same(before, after)) throw new IOException("Git blob identity or metadata changed while hashing");
+                if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds || (deadlineTicks > 0 && Stopwatch.GetTimestamp() >= deadlineTicks)) throw new IOException("Git blob hashing reached its remaining source-proof deadline before digest finalization");
                 byte[] sha256Digest = sha256.GetHashAndReset();
                 byte[] gitDigest = gitSha1.GetHashAndReset();
                 return new D32BuildProfileFileRecordV1 {
@@ -492,13 +518,14 @@ public static class D32BuildProfileFileIdentityV1
 function Get-D32ProfileFileSnapshot {
     param([Parameter(Mandatory = $true)][string]$Path,
         [Diagnostics.Stopwatch]$ProofTimer,
-        [long]$DeadlineMilliseconds = 300000)
+        [long]$DeadlineMilliseconds = 300000,
+        [long]$DeadlineTicks = 0)
 
     if (-not (Test-D32ProfileWindows)) { throw 'profile executable file IDs require Windows opened-handle identity' }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "path is missing or traverses a reparse point: $Path" }
     if ($null -ne $script:D32ProfileModuleFreeFences) {
         if (-not (Microsoft.PowerShell.Core\Get-Command -Name Open-D32PowerShellAuthorityFile -CommandType Function -ErrorAction SilentlyContinue)) { throw 'module-free Profile V2 validation requires the candidate-owned PowerShell bootstrap' }
-        $opened = Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $script:D32ProfileModuleFreeFences
+        $opened = Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $script:D32ProfileModuleFreeFences -DeadlineTicks $DeadlineTicks
         try {
             return [PSCustomObject]@{
                 Path = [string]$opened.Record.path
@@ -517,7 +544,7 @@ function Get-D32ProfileFileSnapshot {
     if ($null -ne $ProofTimer) {
         if (-not $ProofTimer.IsRunning -or $DeadlineMilliseconds -le [Int64]$ProofTimer.ElapsedMilliseconds) { throw 'profile file snapshot reached the remaining source-proof deadline before hashing' }
         $remainingMilliseconds = $DeadlineMilliseconds - [Int64]$ProofTimer.ElapsedMilliseconds
-        $native = [D32BuildProfileFileIdentityV1]::Read($Path, $remainingMilliseconds)
+        $native = if ($DeadlineTicks -gt 0) { [D32BuildProfileFileIdentityV1]::ReadUntil($Path, $remainingMilliseconds, $DeadlineTicks) } else { [D32BuildProfileFileIdentityV1]::Read($Path, $remainingMilliseconds) }
     }
     else { $native = [D32BuildProfileFileIdentityV1]::Read($Path) }
     return [PSCustomObject]@{
@@ -555,14 +582,15 @@ function Get-D32ProfileFileContentSnapshot {
     param([Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][long]$MaximumBytes,
         [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer,
-        [long]$DeadlineMilliseconds = 300000)
+        [long]$DeadlineMilliseconds = 300000,
+        [long]$DeadlineTicks = 0)
 
     if (-not (Test-D32ProfileWindows)) { throw 'profile executable file IDs require Windows opened-handle identity' }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "path is missing or traverses a reparse point: $Path" }
     if (-not $ProofTimer.IsRunning -or $DeadlineMilliseconds -le [Int64]$ProofTimer.ElapsedMilliseconds) { throw 'profile content snapshot has no remaining source-proof time' }
     Initialize-D32ProfileFileIdentityType
     $remainingMilliseconds = $DeadlineMilliseconds - [Int64]$ProofTimer.ElapsedMilliseconds
-    $native = [D32BuildProfileFileIdentityV1]::ReadContent($Path, $MaximumBytes, $remainingMilliseconds)
+    $native = if ($DeadlineTicks -gt 0) { [D32BuildProfileFileIdentityV1]::ReadContentUntil($Path, $MaximumBytes, $remainingMilliseconds, $DeadlineTicks) } else { [D32BuildProfileFileIdentityV1]::ReadContent($Path, $MaximumBytes, $remainingMilliseconds) }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "path changed or traverses a reparse point: $Path" }
     return [PSCustomObject]@{
         Path = [string]$native.FullName; Bytes = [Int64]$native.Bytes; Sha256 = [string]$native.Sha256
@@ -576,14 +604,15 @@ function Get-D32ProfileGitBlobSnapshot {
     param([Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][long]$ExpectedBytes,
         [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer,
-        [long]$DeadlineMilliseconds = 300000)
+        [long]$DeadlineMilliseconds = 300000,
+        [long]$DeadlineTicks = 0)
 
     if (-not (Test-D32ProfileWindows)) { throw 'profile executable file IDs require Windows opened-handle identity' }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "path is missing or traverses a reparse point: $Path" }
     if (-not $ProofTimer.IsRunning -or $DeadlineMilliseconds -le [Int64]$ProofTimer.ElapsedMilliseconds) { throw 'Git blob snapshot has no remaining source-proof time' }
     Initialize-D32ProfileFileIdentityType
     $remainingMilliseconds = $DeadlineMilliseconds - [Int64]$ProofTimer.ElapsedMilliseconds
-    $native = [D32BuildProfileFileIdentityV1]::ReadAndHashGitBlob($Path, $ExpectedBytes, $remainingMilliseconds)
+    $native = if ($DeadlineTicks -gt 0) { [D32BuildProfileFileIdentityV1]::ReadAndHashGitBlobUntil($Path, $ExpectedBytes, $remainingMilliseconds, $DeadlineTicks) } else { [D32BuildProfileFileIdentityV1]::ReadAndHashGitBlob($Path, $ExpectedBytes, $remainingMilliseconds) }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw "path changed or traverses a reparse point: $Path" }
     return [PSCustomObject]@{
         Path = [string]$native.FullName; Bytes = [Int64]$native.Bytes; Sha256 = [string]$native.Sha256
@@ -875,7 +904,8 @@ function Test-D32ProfileScriptInventory {
 function Get-D32BuildToolchainLockInputs {
     param([Parameter(Mandatory = $true)][string]$Repository,
         [Diagnostics.Stopwatch]$ProofTimer,
-        [long]$DeadlineMilliseconds = 300000)
+        [long]$DeadlineMilliseconds = 300000,
+        [long]$DeadlineTicks = 0)
 
     $expected = @(
         [ordered]@{ manifest_path = 'vita-agent-protocol/Cargo.toml'; lock_path = 'vita-agent-protocol/Cargo.lock' },
@@ -891,7 +921,7 @@ function Get-D32BuildToolchainLockInputs {
         $lock = [IO.Path]::Combine($Repository, [string]$entry.lock_path)
         if (-not (Test-D32ProfileNoReparsePath -Path $manifest) -or -not (Test-D32ProfileNoReparsePath -Path $lock)) { throw "locked manifest input is missing or traverses reparse point: $($entry.manifest_path)" }
         if ($null -ne $ProofTimer) {
-            $lockContent = Get-D32ProfileFileContentSnapshot -Path $lock -MaximumBytes 8388608L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+            $lockContent = Get-D32ProfileFileContentSnapshot -Path $lock -MaximumBytes 8388608L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks $DeadlineTicks
             $lockDigest = $lockContent
             try { $lockText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$lockContent.Content) }
             catch { throw "locked Cargo.lock is not strict UTF-8: $($entry.lock_path)" }
@@ -922,7 +952,7 @@ function Test-D32CargoLockGitSources {
     $count = 0
     $lineIndex = 0
     foreach ($line in $LockText -split '\r?\n') {
-        if ($null -ne $ProofTimer -and (($lineIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'profile.lock_git_scan' -Progress ("lines={0}" -f $lineIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'profile.lock_git_scan' -Progress ("lines={0}" -f $lineIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' -NoProgress }
         $lineIndex++
         if ($line -notmatch '^\s*source\s*=\s*"(git\+[^"\r\n]+)"\s*$') { continue }
         $source = [string]$Matches[1]

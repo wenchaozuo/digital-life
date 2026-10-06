@@ -1080,6 +1080,160 @@ None. A future diagnostic census is separately authorized and remains non-gating
 
 Supersedes only the prior registry-format decision's strict rejection of GNU `L`, the affected path/header-inventory binding, and the listed diagnostic schemas. Every other source-trust root, source-plan/graph/Git rule, Cargo auxiliary-file meaning, Profile V2/Trace V2/SC-D32-V1 contract, budget, formal consumer, and D32 gate remains unchanged. This decision grants no current census, source proof, compiler diagnostic, or formal execution.
 
+## ADR-D32-BOUNDED-SOURCEPROOF-LIFECYCLE-V1 — bounded SourceProof lifecycle and durable supervisor
+
+**Status:** APPROVED WITH CONDITIONS
+**Decision authority:** GPT-6.1 Sol Max
+**Decision date:** 2026-10-06
+**Related milestone:** D32
+**Related baseline:** `de398b823bb8ea292ab9773bc761d4950a4addae` (read-only verified clean Integration candidate)
+
+### Scope and supersession
+
+This decision governs timing, owned-process supervision, termination, cleanup audit, and future execution authority for standalone `SourceProofOnly`. It supersedes only the prior bounded-diagnostic ADR's ambiguity about standalone source-proof timing boundaries and the temporary outer-wrapper execution method. It does not authorize implementation, probe, census, source-proof, Cargo, or any other launch by itself.
+
+### Context and historical evidence
+
+The reader's existing stopwatch starts after parameter binding at reader entry. It does not account for earlier process creation/controller admission or later outer termination and cleanup. Deadline checks within source streams, manifests, graphs, and Git are necessary, but cannot hard-interrupt synchronous OS I/O, JSON serialization, or persistence, or guarantee cleanup and records finish at a deadline.
+
+Reject the interpretation that termination, cleanup, and persistence must take zero time at 300000 ms. The 300000 ms proof limit must not thereby become 360000 ms of source-work permission.
+
+- The Coordinator-reported `fe4085` outer stop at approximately 300055 ms with no result remains a consumed attempt; its 55 ms controller lateness proves neither an internal deadline failure nor source closure.
+- The Coordinator-reported `af919` outer kill at 270000 ms, which removed the finalization reserve, remains an execution deviation. It does not prove that the inner reserve or deadline implementation failed.
+- The later `de398` preparation is not execution authority; an unlaunched preparation is neither consumed nor successful.
+- Actual child phase, the 153 missing entries, Git closure, and source-graph closure remain UNKNOWN. Prior format census is not a source-proof checkpoint.
+
+### Fixed lifecycle clock
+
+The timing policy is `D32_SOURCEPROOF_LIFECYCLE_V1`.
+
+| Interval from the same monotonic `T0` | Permitted work |
+|---|---|
+| `[0, 270000 ms)` | Admission and all current-source/proof work |
+| `[270000, 300000 ms)` | Finalize already-complete proof, persist its result, and normal process exit/cleanup only |
+| `[300000, 345000 ms)` | Terminate owned process, bounded join, verify cleanup, and finite audit capture only |
+| `[345000, 360000 ms)` | Persist finite terminal-audit metadata only; do not wait for proof completion |
+| `>=360000 ms` | This attempt's management authority expires; incomplete facts remain UNVERIFIED/UNRESOLVED |
+
+This is a 300-second proof-permission window plus a separate 60-second cleanup/audit-only reserve. It is not 360 seconds of source-work budget and is not a physical promise that eliminates OS/scheduler lateness.
+
+Every boundary uses the same monotonic counter's raw ticks with checked arithmetic; a boundary value is expired. UTC is an audit label only. Missing, backward, overflowing, or mismatched counter/frequency bindings fail closed.
+
+### `T0`, admission, and cross-process clock
+
+`T0` is captured before this attempt's durable-controller admission and before its first owned launch. Process creation, startup, parameter binding, authority/profile/code-pin admission all consume the same window.
+
+If a controller host is created specifically for this attempt, its caller captures and passes the shared clock context before that creation call. The controller may not reset the 300-second budget at its own entry. When the controller runs in an already trusted host, it captures the counter at the boundary above.
+
+Independent pin preparation may precede the attempt; actual current-source verification, origin verification, and closure work may not be moved outside the timed window.
+
+Clock context binds timing policy, candidate, execution authority, run/owner, actual controller/reader PID plus creation identity, counter origin/frequency, and all absolute deadlines. The reader uses those shared deadlines; it may not calculate a new budget from its own entry time. Existing V4 `proof_elapsed_milliseconds` is not relabeled as the outer total. The separate execution record reports the shared window and reader-entry offset. Stdout markers do not establish clock context.
+
+### 270-second work cutoff
+
+All registry/Git/source-content reads, manifest/lock parsing, source-plan/graph construction, origin revalidation, closure checks, and canonical proof inventories/digests must finish before 270000 ms.
+
+At and after the work cutoff:
+
+- Do not start or continue source, cache, Git-object, manifest/lock, or code-pin content reads.
+- Do not add packages, edges, witnesses, inventory, or missing proof content.
+- Bytes returned late from in-flight I/O must not be parsed, hashed, merged, or used to claim proof; discard them and record failure only.
+- Check the shared deadline before and after blocking operations and bounded chunks; an operation started before expiry receives no late-completion exemption.
+
+At 270000 ms the supervisor observes a cooperative work-stop/advisory boundary; it does not automatically kill the reader. It must not remove the remaining 30-second finalization window merely because work time ended. Other explicit safety violations may stop immediately.
+
+### 30-second finalization and 300-second expiry
+
+Within `[270000, 300000 ms)`, permit only exact-shape checks on an already closed, bounded record, pure record-consistency validation, JSON serialization, create-new write/flush, artifact identity/hash binding, and normal process exit/owned cleanup. Pure-record validation may not construct proof, reread sources, or relabel incomplete graph/content work as finalization.
+
+The complete SOURCE_PROOF candidate and its required bindings must be durably persisted before 300000 ms. After expiry, do not finish or rewrite a candidate, append success fields, rewrite partial output, or create a new successful candidate.
+
+At 300000 ms all reader proof/finalization authority expires. At the first executable observation, the controller requests termination of the still-active or not-yet-verified owned process/Job. The reserve is derived from fixed `T0`, never restarted from a late observation or kill time. After expiry, only exact owned Job/process stop, retained-handle bounded wait/join, actual exit/Job/capture-worker/handle lifecycle checks, draining capped already-buffered advisory/error data, and finite cleanup/terminal-audit metadata are allowed.
+
+No source/code/cache reads, candidate-content reads or hashes, closure derivation, compiler/Git/helper launch, source repair, or new proof authority is allowed after expiry. If cleanup remains unverified at 345000 ms, do not extend the join: record UNVERIFIED, apply the fixed kill-on-close fail-safe, and proceed to terminal audit. If the audit is not fully submitted by 360000 ms, remain UNRESOLVED; do not wait indefinitely, retry, or rewrite merely to finish it.
+
+Terminal audit may preserve only a bounded snapshot of facts already established before its relevant deadline; it cannot first establish source proof success in the reserve. It always has `gate_authority=NONE` and grants no launch permission.
+
+### Durable controller and process ownership
+
+Add a version-controlled, module-free durable controller at `scripts/d32-bounded-diagnostic-sourceproof-controller.ps1`. The fixed minimum source-pin closure is that controller plus the existing five source-proof source files. An authority-provided arbitrary script set cannot replace the closure; no additional native executable/helper is introduced.
+
+The controller must provide:
+
+- Exactly one reader creation attempt; a failed create attempt still consumes that execution attempt.
+- Exact pinned PowerShell image, fixed SourceProofOnly entry/argv/environment; no shell, custom command, or extra child.
+- Retained process handle and PID plus creation identity; never kill by name, ambiguous PID, or global process list.
+- An independent non-breakaway, kill-on-close Job before reader execution; failed assignment/admission must not continue to run.
+- Job/process ownership coverage independent of stdout markers; `.Kill()` returning is not cleanup proof.
+- Deadline supervision that cannot be blocked by reader synchronous I/O, stdout/stderr draining, or controller result writes.
+- Owned-reader fail-safe on caller interruption/controller failure. Unknown ownership/cleanup may not be overridden by a `finally` block or exit code 0.
+
+Implementation may reuse existing pinned in-process ownership facilities. Do not change formal Trace V2 or introduce a trace exception/field.
+
+### Schema and execution authority
+
+Keep all approved GNU long-name policy/schemas unchanged:
+
+- `D32_REGISTRY_TAR_USTAR_GNU_LONGNAME_V1`
+- SourceProof authority V3, candidate V4, registry proof V4
+- Compiler diagnostic authority/result V3
+- Census authority/result V2
+- Source-plan, source-graph, and Git proof V2
+
+Do not smuggle lifecycle fields into those exact records. Add two separate strict records:
+
+- `D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_EXECUTION_AUTHORITY_V1`
+- `D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_EXECUTION_V1`
+
+The execution authority is independently caller-pinned and binds exact clean candidate/repository identity and unique run/owner; the unchanged inner SourceProof authority's canonical path/bytes/SHA/file identity; Profile/runtime; the fixed six-file closure and invocation roles; create-new candidate/audit/journal paths and parent identities; fixed timing policy, deadlines, and finite output/buffer limits. Its SHA comes only from the independent caller; self-authority, self-declared SHA, arbitrary budgets, and free argv are forbidden.
+
+The execution result exact-shape binds authority refs, actual source/runtime pins, the shared clock, actual launch/PID/creation/Job identity, observed phase deadlines and exit time, candidate artifact state, stop/cleanup facts, primary/secondary errors and lateness/overshoot. It has no status outside `COMPLETED_DIAGNOSTIC_ONLY`, `BUDGET_STOPPED`, `REFUSED`, or `UNRESOLVED`.
+
+Reject missing, extra, duplicate, wrong-type, old/unknown policy, or cross-candidate/run/authority/process/artifact fields. If candidate V4 has no `run_id`, bind the run through its exact inner-authority reference; do not add a synthetic field.
+
+The new audit record and journal are each limited to 64 KiB and retain no source or raw control payload. Existing progress stdout cap (16000 bytes), candidate cap (64 MiB), and verifier managed-buffer cap (512 MiB) remain unchanged; the controller receives no additional same-sized buffer budget.
+
+### Status and evidence use
+
+- `COMPLETED_DIAGNOSTIC_ONLY`: all proof work finished before 270 seconds; candidate persistence/required bindings, reader exit, and owned cleanup were verified before 300 seconds. Only persistence of that fact snapshot may follow.
+- `BUDGET_STOPPED`: work/proof window expired; the stop cause is known and no candidate may be promoted.
+- `REFUSED`: reader was not started; admission rejected and recorded.
+- `UNRESOLVED`: ownership, timing, output submission, cleanup, or evidence chain has an unverified part.
+
+`ProcessExited=true`, exit code 0, a file's existence, a success marker, or the legacy `CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY` string cannot override expiry/unknowns.
+
+Each late observation, termination request, exit, join, or flush records its scheduled boundary, observed tick, and lateness. Calls crossing a boundary record their actual duration; they cannot claim the total ceiling was met or turn lateness into source-work permission.
+
+Absent, partial, or unconfirmed candidate output remains unchanged; do not delete, overwrite, or reuse that path. Cleanup and evidence availability are distinct: cleanup after timeout is not proof success.
+
+Future diagnostic preparation may jointly review and independently pin the unchanged V4 candidate plus this execution record. Candidate alone or a missing/non-complete execution record cannot be promoted. The audit is not a formal checkpoint, PASS, gate, or Cargo launch authority.
+
+### Required implementation validation and future L1
+
+One integrated synthetic L0 batch must use synthetic records, fake monotonic clocks, and bounded replay to cover:
+
+- 269999/270000/299999/300000 and 345000/360000 boundaries.
+- 270-second advisory without kill, 300-second expiry, and non-resetting reserve.
+- Startup/admission time consumption, child clock reset rejection, counter overflow/rollback.
+- Late in-flight reads, late finalization, partial candidate write.
+- Late exit 0, deadline/exit race, stderr/marker failure.
+- Kill/join/Job count/ownership/PID reuse and controller interruption.
+- Audit write failure/overshoot and primary-error preservation.
+- New authority/result producer → validator → JSON readback → consumer closure.
+- Missing companion, cross-run/pin, auto-retry, late-success, and formal-consumer rejection.
+
+L0 does not prove real Job/termination behavior. A changed controller launch boundary requires a separately authorized minimal L1 admission under the effective execution-efficiency policy. Do not use the first real source scan as a trial run; without a legal short, real, non-source-content validation path, remain NOT VERIFIED at admission.
+
+After the implementation batch and clean new candidate, the Coordinator may prepare a new independent execution authority, inner SourceProof authority, run/output/pins and explicit one-shot execution authorization. Existing preparations, old authorities, old census, and this ADR cannot launch the attempt. The existing candidate-bound census requirement is not reduced. One fixed source-proof attempt only: no automatic retry/resume/checkpoint concatenation or budget increase. Unverified cleanup blocks later related launch until a separately authorized exact cleanup check; read-only investigation remains possible.
+
+### Invariants retained and remaining UNKNOWN
+
+SC-D32-V1, formal commands/tests/gates, Profile V2, Trace V2, cache/source trust, GNU parsing semantics, and the 1800-second compiler diagnostic budget are unchanged. This ADR does not migrate census timing or authorize its execution.
+
+Archive-format support is not source closure. The 153 missing entries, Git/source graph, whether actual work fits within 270 seconds, and real controller cleanup remain UNKNOWN.
+
+D32 remains NOT FROZEN with Gate NONE. This decision itself authorizes no implementation/build/helper/native probe, archive/cache additional reads, Cargo/Git/source-proof/census/network or other launch. No D33 is established.
+
 ## ADR 模板
 
 ### ADR-XXXX — <标题>

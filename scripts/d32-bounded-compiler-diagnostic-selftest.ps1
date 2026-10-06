@@ -910,7 +910,7 @@ $stoppedSourceProofTimer = [Diagnostics.Stopwatch]::new()
 $deadlineStreamBytes = [byte[]]@(1, 2, 3, 4)
 $deadlineMemoryStream = [IO.MemoryStream]::new($deadlineStreamBytes, $false)
 $exactReadDeadlineRejected = $false
-try { $null = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $deadlineMemoryStream -Count 4 -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $exactReadDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+try { $null = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $deadlineMemoryStream -Count 4 -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $exactReadDeadlineRejected = $_.Exception.Message -like '*deadline reached*' -or $_.Exception.Message -like '*no active monotonic proof timer*' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'archive exact-read deadline is checked before a bounded stream read without sleeping' ($exactReadDeadlineRejected -and $deadlineMemoryStream.Position -eq 0)
 $deadlineMemoryStream.Dispose()
 
@@ -946,7 +946,7 @@ $lineEndingSemanticsExact = @($lockLfRows | ForEach-Object { [string]$_.package_
     (@($lockNoFinalRows | ForEach-Object { [string]$_.package_id }) -join "`n") -ceq (@($lockRows | ForEach-Object { [string]$_.package_id }) -join "`n")
 Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.lock line scanner preserves LF, CRLF, and no-final-newline package semantics' $lineEndingSemanticsExact
 $stoppedLockDeadlineRejected = $false
-try { $null = Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockText -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedLockDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+try { $null = Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockText -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedLockDeadlineRejected = $_.Exception.Message -like '*deadline reached*' -or $_.Exception.Message -like '*no active monotonic proof timer*' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.lock parser fails closed at an expired in-memory deadline' $stoppedLockDeadlineRejected
 $sourcePlan = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $lockText
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan V2 is explicitly non-authorizing and not verified' ($sourcePlan.record_type -ceq 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -and $sourcePlan.schema_version -eq 2 -and $sourcePlan.gate_authority -ceq 'NONE' -and $sourcePlan.verification_status -ceq 'NOT_RUN' -and $sourcePlan.source_proof_status -ceq 'NOT_VERIFIED' -and $sourcePlan.lock_dependency_edge_count -eq 0)
@@ -983,7 +983,7 @@ $manifestLineModels = @(
 $manifestLineSemanticsExact = @($manifestLineModels | Where-Object { $_.package_name -ceq 'streaming-fixture' -and $_.package_version -ceq '1.2.3' -and $_.dependencies.Count -eq 1 -and $_.dependencies[0].alias -ceq 'small' }).Count -eq 3
 Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.toml scanner preserves LF, CRLF, trailing LF, inline dependency, and no-final-newline semantics' $manifestLineSemanticsExact
 $stoppedManifestDeadlineRejected = $false
-try { $null = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixture -SourcePath 'fixture/Cargo.toml' -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedManifestDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+try { $null = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixture -SourcePath 'fixture/Cargo.toml' -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedManifestDeadlineRejected = $_.Exception.Message -like '*deadline reached*' -or $_.Exception.Message -like '*no active monotonic proof timer*' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.toml parser fails closed at an expired in-memory deadline' $stoppedManifestDeadlineRejected
 $nestedTomlDepth64 = [Text.StringBuilder]::new()
 [void]$nestedTomlDepth64.Append('{')
@@ -2076,7 +2076,8 @@ $sourceProofEntryTokens = $null; $sourceProofEntryParseErrors = $null
 $sourceProofEntryAst = [System.Management.Automation.Language.Parser]::ParseFile($sourceProofEntryPathReal, [ref]$sourceProofEntryTokens, [ref]$sourceProofEntryParseErrors)
 $sourceProofEntryText = [string]$sourceProofEntryAst.Extent.Text
 $sourceProofExpectedParameters = @('Repository', 'CandidateSha', 'HistoricalOriginCandidateSha', 'ToolchainProfilePath',
-    'ExpectedToolchainProfileSha256', 'SourceProofAuthorityPath', 'ExpectedSourceProofAuthoritySha256')
+    'ExpectedToolchainProfileSha256', 'SourceProofAuthorityPath', 'ExpectedSourceProofAuthoritySha256', 'ExecutionAuthorityPath',
+    'ExpectedExecutionAuthoritySha256', 'LifecycleT0Ticks', 'LifecycleCounterFrequency', 'LifecycleWorkDeadlineTicks', 'LifecycleProofExpiryTicks')
 $sourceProofActualParameters = @($sourceProofEntryAst.ParamBlock.Parameters | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
 $sourceProofEntryParametersExact = $sourceProofEntryAst.ParamBlock.Parameters.Count -eq $sourceProofExpectedParameters.Count
 for ($parameterIndex = 0; $parameterIndex -lt $sourceProofExpectedParameters.Count -and $sourceProofEntryParametersExact; $parameterIndex++) {
@@ -2086,8 +2087,9 @@ for ($parameterIndex = 0; $parameterIndex -lt $sourceProofExpectedParameters.Cou
         $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.FullName -ceq 'Parameter' -and
         @($_.NamedArguments | Where-Object { $_.ArgumentName -ceq 'Mandatory' -and $_.Argument.Extent.Text -ceq '$true' }).Count -eq 1
     }).Count -eq 1
+    $expectedParameterType = if ($parameterIndex -le 8) { 'String' } else { 'Int64' }
     if ($sourceProofActualParameters[$parameterIndex] -cne $sourceProofExpectedParameters[$parameterIndex] -or
-        $parameterType -cne 'String' -or -not $mandatoryAttribute) { $sourceProofEntryParametersExact = $false }
+        $parameterType -cne $expectedParameterType -or -not $mandatoryAttribute) { $sourceProofEntryParametersExact = $false }
 }
 $sourceProofInvocationCommands = @($sourceProofEntryAst.FindAll({ param($node)
     $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand
@@ -2095,7 +2097,10 @@ $sourceProofInvocationCommands = @($sourceProofEntryAst.FindAll({ param($node)
 $sourceProofExpectedInvocationElements = @('$runnerPath', '-SourceProofOnly', '-Repository', '$Repository', '-CandidateSha', '$CandidateSha',
     '-HistoricalOriginCandidateSha', '$HistoricalOriginCandidateSha', '-ToolchainProfilePath', '$ToolchainProfilePath',
     '-ExpectedToolchainProfileSha256', '$ExpectedToolchainProfileSha256', '-SourceProofEntryPath', '$PSCommandPath',
-    '-SourceProofAuthorityPath', '$SourceProofAuthorityPath', '-ExpectedSourceProofAuthoritySha256', '$ExpectedSourceProofAuthoritySha256')
+    '-SourceProofAuthorityPath', '$SourceProofAuthorityPath', '-ExpectedSourceProofAuthoritySha256', '$ExpectedSourceProofAuthoritySha256',
+    '-ExecutionAuthorityPath', '$ExecutionAuthorityPath', '-ExpectedExecutionAuthoritySha256', '$ExpectedExecutionAuthoritySha256',
+    '-LifecycleT0Ticks', '$LifecycleT0Ticks', '-LifecycleCounterFrequency', '$LifecycleCounterFrequency',
+    '-LifecycleWorkDeadlineTicks', '$LifecycleWorkDeadlineTicks', '-LifecycleProofExpiryTicks', '$LifecycleProofExpiryTicks')
 $sourceProofInvocationExact = $sourceProofInvocationCommands.Count -eq 1
 $sourceProofInvocationElements = @()
 if ($sourceProofInvocationExact) {
@@ -2943,6 +2948,343 @@ $formalConsumerSchemas = @(
     [PSCustomObject]@{ path = (Join-Path $PSScriptRoot 'd32-phase0-matrix.ps1'); schema = 'D32_PHASE0_MATRIX_RECORD_V8' },
     [PSCustomObject]@{ path = (Join-Path $PSScriptRoot 'd32-downstream-readiness.ps1'); schema = 'D32_POST_BUNDLE_AGGREGATE_RECORD_V8' }
 )
+# Shared SourceProof lifecycle V1 is exercised with synthetic QPC records only.
+# No lifecycle entry, native method, child process, cache object, or source file
+# is opened from these fixtures.
+$lifecycleControllerPath = Join-Path $testRepo 'scripts\d32-bounded-diagnostic-sourceproof-controller.ps1'
+$lifecycleCandidateSha = $sourceProofCurrentSha
+$lifecycleRunId = '8' * 32
+$lifecycleParent = 'C:\d32-diagnostic-policy-test\lifecycle-output'
+$lifecycleOutput = [PSCustomObject][ordered]@{
+    candidate_path = Join-Path $lifecycleParent 'source-proof-candidate.json'
+    execution_record_path = Join-Path $lifecycleParent 'source-proof-execution.json'
+    journal_path = Join-Path $lifecycleParent 'source-proof-journal.jsonl'
+    parent_path = $lifecycleParent
+    parent_volume_serial_hex = '1122334455667788'
+    parent_file_id_hex = '11223344556677881122334455667788'
+}
+$lifecyclePins = @((New-D32BoundedCompilerDiagnosticTestReference $lifecycleControllerPath)) + @($sourceProofPins)
+$lifecycleInnerAuthority = Copy-D32BoundedCompilerDiagnosticTestJson -Record $sourceProofAuthority
+$lifecycleInnerAuthority.run_id = $lifecycleRunId
+$lifecycleInnerAuthority.output_candidate.path = $lifecycleOutput.candidate_path
+$lifecycleInnerAuthority.output_candidate.parent_path = $lifecycleParent
+$lifecycleInnerAuthority.output_candidate.parent_volume_serial_hex = $lifecycleOutput.parent_volume_serial_hex
+$lifecycleInnerAuthority.output_candidate.parent_file_id_hex = $lifecycleOutput.parent_file_id_hex
+$lifecycleSourceAuthorityReference = New-D32BoundedCompilerDiagnosticTestReference 'C:\d32-diagnostic-policy-test\external\lifecycle-source-proof-authority.json'
+$lifecycleProfileReference = $lifecycleInnerAuthority.toolchain_profile
+$lifecycleRuntime = [PSCustomObject][ordered]@{
+    path = 'C:\Program Files\PowerShell\7\pwsh.exe'; bytes = 4096L; sha256 = 'd' * 64
+    volume_serial_hex = '2233445566778899'; file_id_hex = '22334455667788992233445566778899'
+    powershell_home = 'C:\Program Files\PowerShell\7'; system_root = 'C:\Windows'
+}
+$lifecycleFrequency = [Int64][Diagnostics.Stopwatch]::Frequency
+$lifecycleT0 = [Int64]1000000000
+$lifecycleClockInput = [PSCustomObject][ordered]@{ counter_origin = 'QueryPerformanceCounter'; frequency = $lifecycleFrequency }
+$lifecycleAuthority = New-D32BoundedDiagnosticSourceProofExecutionAuthorityCandidate `
+    -CandidateSha $lifecycleCandidateSha -Repository $testRepo `
+    -RepositoryIdentity $sourceProofAuthority.repository_identity -RunId $lifecycleRunId -OwnerId 'synthetic-lifecycle-test' `
+    -SourceProofAuthorityReference $lifecycleSourceAuthorityReference -ToolchainProfileReference $lifecycleProfileReference `
+    -PowerShellRuntime $lifecycleRuntime -SourcePins $lifecyclePins -Output $lifecycleOutput -Clock $lifecycleClockInput `
+    -IssuedAtUtc '2026-10-04T00:00:00.0000000+00:00'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'lifecycle authority candidate producer creates the frozen exact V1 authority shape' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthority -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution authority binds all six fixed source pins and the unchanged inner SourceProof V3 run/output/profile' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityBindings -ExecutionAuthority $lifecycleAuthority `
+        -SourceProofAuthority $lifecycleInnerAuthority -SourceProofAuthorityReference $lifecycleSourceAuthorityReference `
+        -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo)
+$lifecycleAuthorityJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $lifecycleAuthority
+$lifecycleAuthorityRoundTrip = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json $lifecycleAuthorityJson
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution authority producer survives duplicate-aware module-free JSON serialization/readback and strict revalidation' `
+    ((Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityRoundTrip -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo) -and
+     (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityBindings -ExecutionAuthority $lifecycleAuthorityRoundTrip `
+        -SourceProofAuthority $lifecycleInnerAuthority -SourceProofAuthorityReference $lifecycleSourceAuthorityReference `
+        -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+$lifecycleAuthorityBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleAuthority
+$lifecycleAuthorityBad.timing_policy = 'D32_SOURCEPROOF_LIFECYCLE_V0'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'old lifecycle timing policy cannot be substituted into a fresh execution authority' `
+    (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityBad -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+$lifecycleAuthorityBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleAuthority
+$lifecycleAuthorityBad.limits.cleanup_deadline_milliseconds = 360000L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'authority cannot expand cleanup or audit-only deadlines' `
+    (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityBad -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+$lifecycleAuthorityBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleAuthority
+$lifecycleAuthorityBad.clock | Add-Member -NotePropertyName child_t0_ticks -NotePropertyValue $lifecycleT0
+Assert-D32BoundedCompilerDiagnosticSelfTest 'authority clock rejects a reader-local reset field' `
+    (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityBad -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+$lifecycleAuthorityBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleAuthority
+$lifecycleAuthorityBad.source_pins[2] = $lifecycleAuthorityBad.source_pins[1]
+Assert-D32BoundedCompilerDiagnosticSelfTest 'authority fixed source closure rejects duplicate/reordered pin identity' `
+    (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityBad -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+$lifecycleAuthorityBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleAuthority
+$lifecycleAuthorityBad.limits.work_milliseconds = '270000'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution authority rejects numeric-looking string limits instead of coercing JSON types' `
+    (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $lifecycleAuthorityBad -ExpectedCandidateSha $lifecycleCandidateSha -Repository $testRepo))
+
+function New-D32LifecycleSelfTestClock {
+    param([long]$T0, [long]$Frequency, [AllowNull()][object]$Create = $null, [AllowNull()][object]$Resume = $null,
+        [AllowNull()][object]$Exit = $null, [AllowNull()][object]$Artifact = $null, [AllowNull()][object]$Cleanup = $null)
+    return [PSCustomObject][ordered]@{
+        counter_origin = 'QueryPerformanceCounter'; frequency = $Frequency; t0_ticks = $T0
+        work_deadline_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $T0 -Frequency $Frequency -DeadlineMilliseconds 270000L
+        proof_expiry_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $T0 -Frequency $Frequency -DeadlineMilliseconds 300000L
+        cleanup_deadline_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $T0 -Frequency $Frequency -DeadlineMilliseconds 345000L
+        terminal_audit_deadline_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $T0 -Frequency $Frequency -DeadlineMilliseconds 360000L
+        controller_entry_ticks = $T0 + 10L; reader_create_attempt_ticks = $Create; reader_resume_ticks = $Resume
+        reader_exit_ticks = $Exit; artifact_verified_ticks = $Artifact; cleanup_verified_ticks = $Cleanup
+        audit_persisted_ticks = $null; observed_ticks = $T0 + 20L
+    }
+}
+function New-D32LifecycleSelfTestEvent {
+    param([string]$Name, [long]$Observed, [AllowNull()][object]$Scheduled = $null)
+    return [PSCustomObject][ordered]@{
+        event = $Name; scheduled_ticks = if ($null -eq $Scheduled) { $null } else { [Int64]$Scheduled }
+        observed_ticks = $Observed
+        lateness_ticks = if ($null -eq $Scheduled) { $null } else { [Int64]($Observed - [Int64]$Scheduled) }
+    }
+}
+function New-D32LifecycleSelfTestRecord {
+    param([string]$Status, [object]$Clock, [object[]]$Events, [object]$Reader, [object]$Artifact,
+        [object]$Captures, [object]$Cleanup, [AllowNull()][string]$PrimaryError)
+    $authorityReference = New-D32BoundedCompilerDiagnosticTestReference 'C:\d32-diagnostic-policy-test\external\lifecycle-execution-authority.json'
+    $authorityReference.bytes = 4096L; $authorityReference.sha256 = 'f' * 64
+    $runtimeReference = [PSCustomObject][ordered]@{ path = $lifecycleRuntime.path; bytes = $lifecycleRuntime.bytes; sha256 = $lifecycleRuntime.sha256; volume_serial_hex = $lifecycleRuntime.volume_serial_hex; file_id_hex = $lifecycleRuntime.file_id_hex }
+    return New-D32BoundedDiagnosticSourceProofExecutionResultCandidate `
+        -CandidateSha $lifecycleCandidateSha -RunId $lifecycleRunId -AuthorityReference $authorityReference `
+        -SourcePins $lifecycleAuthority.source_pins -PowerShellRuntime $runtimeReference -Output $lifecycleAuthority.output `
+        -Status $Status -Clock $Clock -Controller ([PSCustomObject]@{ process_id = 100; creation_filetime_ticks = 1000L }) `
+        -Reader $Reader -Artifact $Artifact -Captures $Captures -Cleanup $Cleanup -Events $Events `
+        -PrimaryError $PrimaryError -StartedAtUtc '2026-10-04T00:00:00.0000000+00:00' -CompletedAtUtc '2026-10-04T00:00:02.0000000+00:00'
+}
+
+$lifecycleWork = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -DeadlineMilliseconds 270000L
+$lifecycleExpiry = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -DeadlineMilliseconds 300000L
+$lifecycleCleanup = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -DeadlineMilliseconds 345000L
+$lifecycleTerminal = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -DeadlineMilliseconds 360000L
+$lifecyclePhaseCases = @(
+    [PSCustomObject]@{ ticks = [Int64]($lifecycleWork - 1); phase = 'PROOF_WORK' },
+    [PSCustomObject]@{ ticks = $lifecycleWork; phase = 'FINALIZATION_ONLY' },
+    [PSCustomObject]@{ ticks = [Int64]($lifecycleExpiry - 1); phase = 'FINALIZATION_ONLY' },
+    [PSCustomObject]@{ ticks = $lifecycleExpiry; phase = 'CLEANUP_ONLY' },
+    [PSCustomObject]@{ ticks = [Int64]($lifecycleCleanup - 1); phase = 'CLEANUP_ONLY' },
+    [PSCustomObject]@{ ticks = $lifecycleCleanup; phase = 'AUDIT_ONLY' },
+    [PSCustomObject]@{ ticks = [Int64]($lifecycleTerminal - 1); phase = 'AUDIT_ONLY' },
+    [PSCustomObject]@{ ticks = $lifecycleTerminal; phase = 'EXPIRED' })
+$lifecyclePhaseValid = $true
+foreach ($case in $lifecyclePhaseCases) {
+    if ((Get-D32BoundedDiagnosticSourceProofLifecyclePhase -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -NowTicks $case.ticks) -cne $case.phase) { $lifecyclePhaseValid = $false; break }
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'shared monotonic phase boundaries are exact at 269999/270000, 299999/300000, 345000 and 360000' $lifecyclePhaseValid
+$lifecycleClockRollbackRejected = $false
+try { $null = Get-D32BoundedDiagnosticSourceProofElapsedMilliseconds -T0Ticks $lifecycleT0 -Frequency $lifecycleFrequency -NowTicks ($lifecycleT0 - 1) } catch { $lifecycleClockRollbackRejected = $true }
+$lifecycleClockOverflowRejected = $false
+try { $null = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks ([Int64]::MaxValue - 1) -Frequency $lifecycleFrequency -DeadlineMilliseconds 360000L } catch { $lifecycleClockOverflowRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'shared monotonic counter rollback and checked deadline overflow fail closed' ($lifecycleClockRollbackRejected -and $lifecycleClockOverflowRejected)
+
+$lifecycleClock = New-D32LifecycleSelfTestClock -T0 $lifecycleT0 -Frequency $lifecycleFrequency `
+    -Create ($lifecycleT0 + 100L) -Resume ($lifecycleT0 + 130L) -Exit ($lifecycleT0 + 200L) `
+    -Artifact ($lifecycleT0 + 250L) -Cleanup ($lifecycleT0 + 300L)
+$lifecycleEvents = @(
+    (New-D32LifecycleSelfTestEvent -Name 'AUTHORITY_ADMISSION' -Scheduled $lifecycleT0 -Observed ($lifecycleT0 + 50L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_CREATE_ATTEMPT' -Scheduled $lifecycleClock.reader_create_attempt_ticks -Observed ($lifecycleClock.reader_create_attempt_ticks + 1L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_ASSIGNED_TO_JOB' -Scheduled $lifecycleClock.reader_create_attempt_ticks -Observed ($lifecycleT0 + 110L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_RESUMED' -Observed $lifecycleClock.reader_resume_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_EXIT' -Observed $lifecycleClock.reader_exit_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'CLEANUP_VERIFIED' -Observed $lifecycleClock.cleanup_verified_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'TERMINAL_AUDIT' -Scheduled $lifecycleCleanup -Observed ($lifecycleCleanup + 10L)))
+$lifecycleReader = [PSCustomObject][ordered]@{ launch_attempt_count = 1L; process_id = 4242L; creation_filetime_ticks = 424200L; job_instance_id = 'a' * 32; job_assignment = 'ASSIGNED'; exit_code = 0 }
+$emptyCaptureSha = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+$lifecycleCaptures = [PSCustomObject][ordered]@{ stdout_bytes = 0L; stdout_sha256 = $emptyCaptureSha; stdout_truncated = $false; stderr_bytes = 0L; stderr_sha256 = $emptyCaptureSha; stderr_truncated = $false; allowlisted_marker_count = 0L; output_unavailable = $false }
+$lifecycleArtifact = [PSCustomObject][ordered]@{ state = 'VERIFIED'; path = $lifecycleOutput.candidate_path; bytes = 2048L; sha256 = 'b' * 64; volume_serial_hex = '1122334455667788'; file_id_hex = '33445566778899aa33445566778899aa'; inner_status = 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' }
+$lifecycleCleanupRecord = [PSCustomObject][ordered]@{ state = 'VERIFIED'; termination_requested = $false; join_verified = $true; job_active_process_count = 0L; job_closed = $true; kill_on_close_enabled = $true }
+$lifecycleResult = New-D32LifecycleSelfTestRecord -Status 'COMPLETED_DIAGNOSTIC_ONLY' -Clock $lifecycleClock -Events $lifecycleEvents `
+    -Reader $lifecycleReader -Artifact $lifecycleArtifact -Captures $lifecycleCaptures -Cleanup $lifecycleCleanupRecord -PrimaryError $null
+Assert-D32BoundedCompilerDiagnosticSelfTest 'complete lifecycle result producer emits a strictly valid non-gating completed record' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleResult)
+$lifecycleResultAuthorityReference = $lifecycleResult.authority
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution result binds the authority SHA, current six source pins, runtime, candidate output and deadlines' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultBindings -Record $lifecycleResult -ExecutionAuthority $lifecycleAuthority `
+        -ExecutionAuthorityReference $lifecycleResultAuthorityReference -ExpectedExecutionAuthoritySha256 ([string]$lifecycleResultAuthorityReference.sha256) `
+        -ExpectedExecutionAuthorityPath ([string]$lifecycleResultAuthorityReference.path))
+$lifecycleResultJson = ConvertTo-D32PowerShellAuthorityJsonText -Value $lifecycleResult
+$lifecycleResultRoundTrip = ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json $lifecycleResultJson
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution result producer survives duplicate-aware JSON readback and strict consumer bindings' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultBindings -Record $lifecycleResultRoundTrip -ExecutionAuthority $lifecycleAuthority `
+        -ExecutionAuthorityReference $lifecycleResultAuthorityReference -ExpectedExecutionAuthoritySha256 ([string]$lifecycleResultAuthorityReference.sha256) `
+        -ExpectedExecutionAuthorityPath ([string]$lifecycleResultAuthorityReference.path))
+Assert-D32BoundedCompilerDiagnosticSelfTest 'lifecycle execution result is rejected by formal candidate status gate' (Test-D32BoundedCompilerDiagnosticFormalReject $lifecycleResultRoundTrip)
+
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.gate_authority = 'PHASE0'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'lifecycle result cannot gain formal gate authority' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad | Add-Member -NotePropertyName unexpected_checkpoint -NotePropertyValue $true
+Assert-D32BoundedCompilerDiagnosticSelfTest 'lifecycle result rejects extra checkpoint fields' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.reader.creation_filetime_ticks = $null
+Assert-D32BoundedCompilerDiagnosticSelfTest 'completed status requires the retained process creation identity in addition to PID' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.clock.cleanup_verified_ticks = $lifecycleExpiry
+Assert-D32BoundedCompilerDiagnosticSelfTest 'late cleanup after 300 seconds rejects a completed-diagnostic claim even when exit is zero' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.clock.reader_exit_ticks = $lifecycleExpiry
+$lifecycleBad.events[4].observed_ticks = $lifecycleExpiry
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reader exit observed exactly at 300 seconds loses the exit/deadline race and cannot complete' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.captures.stdout_bytes = 16001L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'execution result rejects a stdout capture larger than its fixed 16000-byte retained prefix' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.events[1].scheduled_ticks = $lifecycleWork
+$lifecycleBad.events[1].observed_ticks = $lifecycleWork + 1L
+$lifecycleBad.events[1].lateness_ticks = 1L
+$lifecycleBad.clock.reader_create_attempt_ticks = $lifecycleWork
+Assert-D32BoundedCompilerDiagnosticSelfTest 'reader creation at the work cutoff is not admitted as a completed run' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.events[6].scheduled_ticks = $lifecycleCleanup + 1L
+$lifecycleBad.events[6].observed_ticks = $lifecycleCleanup + 2L
+$lifecycleBad.events[6].lateness_ticks = 1L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'terminal audit cannot be rebound to a later deadline' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleBad = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleBad.events[1].event = 'READER_RESUMED'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'duplicate event names and launch/resume event substitution are rejected' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBad))
+$lifecycleLateSuccess = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecycleLateSuccess.clock.reader_exit_ticks = $lifecycleExpiry + 1L
+$lifecycleLateSuccess.clock.cleanup_verified_ticks = $lifecycleExpiry + 2L
+$lifecycleLateSuccess.events[4].observed_ticks = $lifecycleExpiry + 1L
+$lifecycleLateSuccess.events[5].observed_ticks = $lifecycleExpiry + 2L
+$lifecycleLateSuccess.events[6].observed_ticks = $lifecycleCleanup + 10L
+Assert-D32BoundedCompilerDiagnosticSelfTest 'late exit zero and later cleanup cannot be promoted by status mutation to completed proof' (-not (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleLateSuccess))
+$lifecyclePartial = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleResult
+$lifecyclePartial.status = 'UNRESOLVED'
+$lifecyclePartial.primary_error = 'synthetic partial candidate must remain unresolved'
+$lifecyclePartial.artifact.state = 'PARTIAL_OR_UNCONFIRMED'
+$lifecyclePartial.artifact.bytes = $null; $lifecyclePartial.artifact.sha256 = $null
+$lifecyclePartial.artifact.volume_serial_hex = $null; $lifecyclePartial.artifact.file_id_hex = $null; $lifecyclePartial.artifact.inner_status = $null
+$lifecyclePartial.clock.artifact_verified_ticks = $null
+Assert-D32BoundedCompilerDiagnosticSelfTest 'partial candidate output cannot be upgraded by reader exit zero' (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecyclePartial)
+$duplicateLifecycleJson = $lifecycleResultJson.Replace('"gate_authority":"NONE"', '"gate_authority":"NONE","gate_authority":"PHASE0"')
+$duplicateLifecycleDocument = [System.Text.Json.JsonDocument]::Parse($duplicateLifecycleJson)
+try { $lifecycleDuplicateRejected = Test-D32PowerShellAuthorityJsonDuplicates -Element $duplicateLifecycleDocument.RootElement }
+finally { $duplicateLifecycleDocument.Dispose() }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'duplicate JSON properties in lifecycle results are rejected before schema projection' $lifecycleDuplicateRejected
+
+$lifecycleRefusedClock = New-D32LifecycleSelfTestClock -T0 $lifecycleT0 -Frequency $lifecycleFrequency
+$lifecycleRefusedEvents = @(
+    (New-D32LifecycleSelfTestEvent -Name 'AUTHORITY_ADMISSION' -Scheduled $lifecycleT0 -Observed ($lifecycleT0 + 50L)),
+    (New-D32LifecycleSelfTestEvent -Name 'TERMINAL_AUDIT' -Scheduled $lifecycleCleanup -Observed ($lifecycleCleanup + 10L)))
+$lifecycleRefusedReader = [PSCustomObject][ordered]@{ launch_attempt_count = 0L; process_id = $null; creation_filetime_ticks = $null; job_instance_id = $null; job_assignment = 'NOT_ATTEMPTED'; exit_code = $null }
+$lifecycleNotReadArtifact = [PSCustomObject][ordered]@{ state = 'NOT_READ'; path = $lifecycleOutput.candidate_path; bytes = $null; sha256 = $null; volume_serial_hex = $null; file_id_hex = $null; inner_status = $null }
+$lifecycleNotStartedCleanup = [PSCustomObject][ordered]@{ state = 'NOT_STARTED'; termination_requested = $false; join_verified = $false; job_active_process_count = $null; job_closed = $false; kill_on_close_enabled = $false }
+$lifecycleRefused = New-D32LifecycleSelfTestRecord -Status 'REFUSED' -Clock $lifecycleRefusedClock -Events $lifecycleRefusedEvents `
+    -Reader $lifecycleRefusedReader -Artifact $lifecycleNotReadArtifact -Captures $lifecycleCaptures -Cleanup $lifecycleNotStartedCleanup `
+    -PrimaryError 'synthetic strict prelaunch refusal'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'strict prelaunch refusal is a durable no-launch status, not a proof result' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleRefused)
+
+$lifecycleBudgetClock = New-D32LifecycleSelfTestClock -T0 $lifecycleT0 -Frequency $lifecycleFrequency `
+    -Create ($lifecycleT0 + 100L) -Resume ($lifecycleT0 + 130L) -Exit ($lifecycleExpiry + 3L) -Cleanup ($lifecycleExpiry + 100L)
+$lifecycleBudgetEvents = @(
+    (New-D32LifecycleSelfTestEvent -Name 'AUTHORITY_ADMISSION' -Scheduled $lifecycleT0 -Observed ($lifecycleT0 + 50L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_CREATE_ATTEMPT' -Scheduled $lifecycleBudgetClock.reader_create_attempt_ticks -Observed ($lifecycleBudgetClock.reader_create_attempt_ticks + 1L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_ASSIGNED_TO_JOB' -Scheduled $lifecycleBudgetClock.reader_create_attempt_ticks -Observed ($lifecycleT0 + 110L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_RESUMED' -Observed $lifecycleBudgetClock.reader_resume_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'WORK_CUTOFF' -Scheduled $lifecycleWork -Observed ($lifecycleWork + 1L)),
+    (New-D32LifecycleSelfTestEvent -Name 'PROOF_EXPIRY' -Scheduled $lifecycleExpiry -Observed ($lifecycleExpiry + 1L)),
+    (New-D32LifecycleSelfTestEvent -Name 'TERMINATION_REQUEST' -Scheduled $lifecycleExpiry -Observed ($lifecycleExpiry + 2L)),
+    (New-D32LifecycleSelfTestEvent -Name 'READER_EXIT' -Observed $lifecycleBudgetClock.reader_exit_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'CLEANUP_VERIFIED' -Observed $lifecycleBudgetClock.cleanup_verified_ticks),
+    (New-D32LifecycleSelfTestEvent -Name 'TERMINAL_AUDIT' -Scheduled $lifecycleCleanup -Observed ($lifecycleCleanup + 10L)))
+$lifecycleBudgetCleanup = [PSCustomObject][ordered]@{ state = 'VERIFIED'; termination_requested = $true; join_verified = $true; job_active_process_count = 0L; job_closed = $true; kill_on_close_enabled = $true }
+$lifecycleBudgetRecord = New-D32LifecycleSelfTestRecord -Status 'BUDGET_STOPPED' -Clock $lifecycleBudgetClock -Events $lifecycleBudgetEvents `
+    -Reader $lifecycleReader -Artifact $lifecycleNotReadArtifact -Captures $lifecycleCaptures -Cleanup $lifecycleBudgetCleanup `
+    -PrimaryError 'synthetic 270/300 second budget cutoff'
+Assert-D32BoundedCompilerDiagnosticSelfTest 'exit zero after expiry remains BUDGET_STOPPED and cannot be upgraded by later cleanup' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleBudgetRecord)
+$lifecycleUnknownCleanup = Copy-D32BoundedCompilerDiagnosticTestJson -Record $lifecycleBudgetRecord
+$lifecycleUnknownCleanup.status = 'UNRESOLVED'
+$lifecycleUnknownCleanup.primary_error = 'synthetic cleanup remains unknown'
+$lifecycleUnknownCleanup.cleanup.state = 'UNVERIFIED'
+$lifecycleUnknownCleanup.cleanup.join_verified = $false
+$lifecycleUnknownCleanup.cleanup.job_active_process_count = 1L
+$lifecycleUnknownCleanup.cleanup.job_closed = $true
+$lifecycleUnknownCleanup.clock.cleanup_verified_ticks = $null
+$lifecycleUnknownCleanup.captures.output_unavailable = $true
+$lifecycleUnknownCleanup.events = @($lifecycleUnknownCleanup.events | Where-Object { $_.event -cne 'CLEANUP_VERIFIED' -and $_.event -cne 'TERMINAL_AUDIT' }) + @(
+    (New-D32LifecycleSelfTestEvent -Name 'CLEANUP_UNVERIFIED' -Scheduled $lifecycleCleanup -Observed ($lifecycleCleanup + 1L)),
+    (New-D32LifecycleSelfTestEvent -Name 'TERMINAL_AUDIT' -Scheduled $lifecycleCleanup -Observed ($lifecycleCleanup + 10L)))
+Assert-D32BoundedCompilerDiagnosticSelfTest 'unknown cleanup remains UNRESOLVED even after kill-on-close intent and cannot claim joined ownership' `
+    (Test-D32BoundedDiagnosticSourceProofExecutionResultShape -Record $lifecycleUnknownCleanup)
+
+$controllerPath = Join-Path $PSScriptRoot 'd32-bounded-diagnostic-sourceproof-controller.ps1'
+$controllerTokens = $null; $controllerParseErrors = $null
+$controllerAst = [System.Management.Automation.Language.Parser]::ParseFile($controllerPath, [ref]$controllerTokens, [ref]$controllerParseErrors)
+$controllerText = [string]$controllerAst.Extent.Text
+$controllerForbiddenCommands = @($controllerAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    ([string]$node.GetCommandName() -match '^(?i:Start-Process|Start-Job|Invoke-Expression|Import-Module|Get-CimInstance|Get-Process|Stop-Process|cargo|git|rustc)$')
+}, $true))
+$controllerNativeCreationOrder = $controllerText.IndexOf('CreateProcessW(image,') -ge 0 -and
+    $controllerText.IndexOf('CreateProcessW(image,') -lt $controllerText.IndexOf('AssignProcessToJobObject(owned.Job, owned.Process)') -and
+    $controllerText.IndexOf('AssignProcessToJobObject(owned.Job, owned.Process)') -lt $controllerText.IndexOf('ResumeThread(owned.Thread)')
+$controllerSafetyAst = $controllerParseErrors.Count -eq 0 -and $controllerForbiddenCommands.Count -eq 0 -and
+    $controllerNativeCreationOrder -and $controllerText.Contains('CREATE_SUSPENDED') -and
+    $controllerText.Contains('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE') -and $controllerText.Contains('StartSuspendedAssignedAndResume') -and
+    $controllerText.Contains("'-NoLogo', '-NoProfile', '-NonInteractive', '-File'") -and
+    -not $controllerText.Contains('Process.GetProcesses') -and -not $controllerText.Contains('.Kill()') -and
+    $controllerText.Contains('cleanup_deadline_ticks') -and $controllerText.Contains('terminal_audit_deadline_ticks')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'durable controller AST has one fixed suspended CreateProcess→Job assignment→resume order and no free-form helper/commands' $controllerSafetyAst
+$controllerClockFunction = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32LifecycleNow'
+}, $true)
+$controllerReaderFunction = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-D32LifecycleReferenceBytes'
+}, $true)
+$controllerClockReaderText = if ($null -eq $controllerReaderFunction) { '' } else { [string]$controllerReaderFunction.Extent.Text }
+$controllerFakeClockWorked = $false
+if ($null -ne $controllerClockFunction) {
+    . ([ScriptBlock]::Create([string]$controllerClockFunction.Extent.Text))
+    try {
+        $script:D32LifecycleNow = { [Int64]424242 }
+        $clockBeforeBoundary = Get-D32LifecycleNow
+        $script:D32LifecycleNow = { [Int64]$lifecycleWork }
+        $clockAtWorkBoundary = Get-D32LifecycleNow
+        $controllerFakeClockWorked = ($clockBeforeBoundary -eq 424242L -and $clockAtWorkBoundary -eq $lifecycleWork -and
+            $controllerClockReaderText.Contains('(Get-D32LifecycleNow)') -and -not $controllerClockReaderText.Contains('Stopwatch]::GetTimestamp'))
+    } catch { $controllerFakeClockWorked = $false }
+    finally {
+        Remove-Item Function:\Get-D32LifecycleNow -ErrorAction SilentlyContinue
+        Remove-Variable -Scope Script -Name D32LifecycleNow -ErrorAction SilentlyContinue
+    }
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'controller bounded-input clock checks use the injectable shared monotonic source at both pre/post-read boundaries' $controllerFakeClockWorked
+$controllerPreservesPrimaryAst = $controllerText.Contains('if (-not $script:D32LifecyclePrimary) { $script:D32LifecyclePrimary = $caughtError }') -and
+    $controllerText.Contains('elseif ($script:D32LifecycleSecondary.Count -lt 8)') -and
+    $controllerText.Contains('The bounded terminal audit result was not persisted before expiry.')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'controller preserves the first primary cause, bounds secondary errors, and records terminal persistence failure' $controllerPreservesPrimaryAst
+$resultPersistCall = $controllerText.IndexOf('try { $recordWritten = Write-D32LifecycleFinalRecord }', [StringComparison]::Ordinal)
+$resultJournalCall = $controllerText.IndexOf('Add-D32LifecycleExecutionRecordPersistedFact', $resultPersistCall, [StringComparison]::Ordinal)
+$journalCloseCall = $controllerText.IndexOf('Close-D32LifecycleJournalStream', $resultJournalCall, [StringComparison]::Ordinal)
+$persistedJournalFunction = if ($null -eq ($controllerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Add-D32LifecycleExecutionRecordPersistedFact' }, $true))) { '' } else { [string]($controllerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Add-D32LifecycleExecutionRecordPersistedFact' }, $true).Extent.Text) }
+$controllerResultPersistClosure = $resultPersistCall -ge 0 -and $resultPersistCall -lt $resultJournalCall -and $resultJournalCall -lt $journalCloseCall -and
+    $persistedJournalFunction.Contains('execution_record_sha256') -and $persistedJournalFunction.Contains('execution_record_bytes') -and
+    $persistedJournalFunction.Contains('remaining_ticks') -and $persistedJournalFunction.Contains('65536') -and
+    $persistedJournalFunction.Contains("gate_authority = 'NONE'")
+Assert-D32BoundedCompilerDiagnosticSelfTest 'post-write journal fact binds exact result bytes/hash and observed timing before bounded journal close' $controllerResultPersistClosure
+$controllerNativeAssignment = $controllerAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text.EndsWith('nativeSource')
+}, $true)
+$controllerNativeSourceText = if ($null -eq $controllerNativeAssignment) { '' } else { [string]$controllerNativeAssignment.Right.Expression.Value }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'controller in-process native source itself has exactly one CreateProcess API and retained-handle-only cleanup' `
+    ($controllerNativeSourceText -match 'static extern bool CreateProcessW\(' -and
+     ([regex]::Matches($controllerNativeSourceText, 'if \(!CreateProcessW\(image,')).Count -eq 1 -and
+     $controllerNativeSourceText.Contains('TerminateExactProcess') -and
+     $controllerNativeSourceText.Contains('AssignProcessToJobObject(owned.Job, owned.Process)') -and
+     $controllerNativeSourceText.Contains('Close(ref process.Process)'))
+$controllerNativeCompilationCovered = $controllerNativeSourceText.Contains('using System;') -and
+    $controllerNativeSourceText.Contains('static extern bool CreateProcessW(')
+$controllerNativeCompilationSucceeded = $false
+try { Add-Type -TypeDefinition $controllerNativeSourceText -Language CSharp -ErrorAction Stop; $controllerNativeCompilationSucceeded = $true } catch { $controllerNativeCompilationSucceeded = $false }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'native supervisor surface compiles in-process without invoking P/Invoke or launching a native child' ($controllerNativeCompilationCovered -and $controllerNativeCompilationSucceeded)
+
 foreach ($consumer in $formalConsumerSchemas) {
     $consumerText = [IO.File]::ReadAllText($consumer.path, [Text.UTF8Encoding]::new($false, $true))
     Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema and rejects diagnostic V3/census V2: $([IO.Path]::GetFileName($consumer.path))" `
@@ -2950,5 +3292,5 @@ foreach ($consumer in $formalConsumerSchemas) {
          -not $consumerText.Contains('D32_BOUNDED_DIAGNOSTIC_ARCHIVE_FORMAT_CENSUS_V2'))
 }
 
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, 300s/270s supervisor advisory/total-deadline transition tests, bounded advisory stdout marker wiring and output cap, exact formal-consumer schema rejection for diagnostic V3 and census V2, historical BLOCKED/NONE replay and all four diagnostic non-PASS statuses. Pure synthetic fixtures only: no Cargo, native child, network, registry cache, or archive content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, source-proof execution authority/result V1 producer-validator-JSON-consumer closure and strict scalar/schema mutations, shared synthetic QPC phase boundaries at 269999/270000/299999/300000/345000/360000, clock rollback/overflow and reset rejection, exit/deadline race and late-zero/partial-result refusal, fake-clock controller read boundaries, retained-handle/job AST ordering and PID-creation identity requirements, bounded capture/journal/candidate limits, exact result-persisted journal bytes/hash/timing ordering, primary-error preservation and formal-consumer refusal. Pure synthetic fixtures only: no Cargo, native child/PInvoke invocation, network, registry cache, or archive content access.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

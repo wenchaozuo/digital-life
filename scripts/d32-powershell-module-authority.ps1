@@ -488,11 +488,14 @@ function Open-D32PowerShellAuthorityFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
-        [ValidateRange(1, 2147483647)][Int64]$MaximumBytes = [Int32]::MaxValue
+        [ValidateRange(1, 2147483647)][Int64]$MaximumBytes = [Int32]::MaxValue,
+        [long]$DeadlineTicks = 0
     )
+    if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: shared source-proof work deadline reached before bounded file open' }
     $full = [IO.Path]::GetFullPath($Path)
     if (-not (Test-D32PowerShellAuthorityPathNoReparse -Path $full)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: missing or reparse-backed file: $full" }
     Add-D32PowerShellAuthorityDirectoryChain -Directory ([IO.Path]::GetDirectoryName($full)) -Fences $DirectoryFences
+    if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: shared source-proof work deadline reached before bounded file open' }
     # File handles witness opened content/object identity; they are not locks or
     # namespace-freeze evidence. Keep normal OS/runtime servicing compatible.
     # Protected ACLs and the no-maintenance-during-run premise provide exclusion.
@@ -509,10 +512,13 @@ function Open-D32PowerShellAuthorityFile {
         $bytes = [byte[]]::new([int]$before.Bytes)
         $offset = 0
         while ($offset -lt $bytes.Length) {
+            if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: shared source-proof work deadline reached before bounded file read' }
             $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
             if ($read -le 0) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: file changed during opened read: $full" }
+            if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: late bounded file-read bytes discarded at the shared source-proof work deadline' }
             $offset += $read
         }
+        if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: late bounded file-read bytes discarded before source-proof hashing' }
         $after = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
         $security = Get-D32PowerShellAuthorityObjectSecurity -Path $full -IsDirectory:$false -Handle $stream.SafeFileHandle -Stream $stream
         if ((Test-D32PowerShellAuthorityPathWithin -Child $full -Parent ([string]$PSHOME)) -and
@@ -523,6 +529,7 @@ function Open-D32PowerShellAuthorityFile {
             -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $stream.SafeFileHandle), $full)) {
             throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: opened file identity changed while reading: $full"
         }
+        if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: late bounded file-read bytes discarded before source-proof hashing' }
         $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
         return [PSCustomObject]@{
             Record = [ordered]@{ path = $full; bytes = [Int64]$before.Bytes; sha256 = $sha; volume_serial_hex = $before.VolumeSerialHex; file_id_hex = $before.FileIdHex }

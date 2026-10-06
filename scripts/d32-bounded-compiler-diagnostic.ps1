@@ -35,7 +35,19 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
     [string]$SourceProofAuthorityPath,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
-    [string]$ExpectedSourceProofAuthoritySha256
+    [string]$ExpectedSourceProofAuthoritySha256,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [string]$ExecutionAuthorityPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [string]$ExpectedExecutionAuthoritySha256,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [long]$LifecycleT0Ticks,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [long]$LifecycleCounterFrequency,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [long]$LifecycleWorkDeadlineTicks,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')]
+    [long]$LifecycleProofExpiryTicks
 )
 
 $script:D32BoundedDiagnosticSourceProofProgressMarkerBytes = [long]0
@@ -43,6 +55,13 @@ $script:D32BoundedDiagnosticSourceProofProgressMarkerCount = 0
 $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $false
 $script:D32BoundedDiagnosticSourceProofWallTimer = if ($SourceProofOnly) { [Diagnostics.Stopwatch]::StartNew() } else { $null }
 if ($SourceProofOnly) {
+    $lifecycleNowTicks = [Diagnostics.Stopwatch]::GetTimestamp()
+    if ($LifecycleT0Ticks -le 0 -or $LifecycleCounterFrequency -ne [Diagnostics.Stopwatch]::Frequency -or
+        $LifecycleWorkDeadlineTicks -le $LifecycleT0Ticks -or $LifecycleProofExpiryTicks -le $LifecycleWorkDeadlineTicks -or
+        $lifecycleNowTicks -lt $LifecycleT0Ticks -or $lifecycleNowTicks -ge $LifecycleWorkDeadlineTicks -or
+        $ExpectedExecutionAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$') {
+        exit 86
+    }
     try { [Console]::Out.WriteLine('D32SP1 p=timer.start t=0 n=none') }
     catch { $script:D32BoundedDiagnosticSourceProofProgressMarkerOutputUnavailable = $true }
 }
@@ -149,10 +168,16 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
         $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $CandidateSha -ceq $HistoricalOriginCandidateSha) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: source-proof authority or current/historical candidate pin is invalid'
     }
+    if ((Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $script:D32BoundedDiagnosticSourceProofWallTimer) -ge 270000L) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: shared work deadline expired before SourceProof V3 admission'
+    }
     $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
     $authorityFile = $null
     try {
-        $authorityFile = Open-D32PowerShellAuthorityFile -Path $authorityFull -DirectoryFences $directoryFences -MaximumBytes 4194304
+        $authorityFile = Open-D32PowerShellAuthorityFile -Path $authorityFull -DirectoryFences $directoryFences -MaximumBytes 4194304 -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
+        if ((Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $script:D32BoundedDiagnosticSourceProofWallTimer) -ge 270000L) {
+            throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: late SourceProof V3 authority bytes discarded at work cutoff'
+        }
         if ([string]$authorityFile.Record.sha256 -cne $ExpectedSourceProofAuthoritySha256) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: independently supplied source-proof authority SHA differs from current opened bytes'
         }
@@ -188,6 +213,9 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
         }
         $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($reference in $bootstrap.source_pins) {
+            if ((Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $script:D32BoundedDiagnosticSourceProofWallTimer) -ge 270000L) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: shared work deadline expired before code-pin admission read'
+            }
             $referenceFields = @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')
             $referenceNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             foreach ($property in $reference.PSObject.Properties) { [void]$referenceNames.Add([string]$property.Name) }
@@ -210,8 +238,11 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
                 ([StringComparer]::OrdinalIgnoreCase.Equals($relative, 'scripts/d32-bounded-compiler-diagnostic.ps1') -and $path -cne [IO.Path]::GetFullPath($PSCommandPath))) {
                 throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: entry or runner source pin differs from the exact invoked scripts'
             }
-            $opened = Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $directoryFences -MaximumBytes 16777216
+            $opened = Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $directoryFences -MaximumBytes 16777216 -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
             try {
+                if ((Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $script:D32BoundedDiagnosticSourceProofWallTimer) -ge 270000L) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: late code-pin bytes discarded at shared work cutoff'
+                }
                 if ([int64]$opened.Record.bytes -ne [int64]$reference.bytes -or [string]$opened.Record.sha256 -cne [string]$reference.sha256 -or
                     [string]$opened.Record.volume_serial_hex -cne [string]$reference.volume_serial_hex -or
                     [string]$opened.Record.file_id_hex -cne [string]$reference.file_id_hex) {
@@ -221,6 +252,13 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
             finally { $opened.Stream.Dispose() }
         }
         foreach ($relative in $expectedRelative) { if (-not $seen.Contains($expectedPaths[$relative])) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: fixed source-proof code closure has a missing pin' } }
+        $script:D32BoundedDiagnosticSourceProofAuthorityReference = [PSCustomObject]@{
+            path = [string]$authorityFile.Record.path
+            bytes = [Int64]$authorityFile.Record.bytes
+            sha256 = [string]$authorityFile.Record.sha256
+            volume_serial_hex = [string]$authorityFile.Record.volume_serial_hex
+            file_id_hex = [string]$authorityFile.Record.file_id_hex
+        }
         return $bootstrap
     }
     finally {
@@ -229,16 +267,101 @@ function Assert-D32BoundedDiagnosticSourceProofBootstrap {
     }
 }
 
+function Assert-D32BoundedDiagnosticSourceProofExecutionBootstrap {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+    $authorityFull = [IO.Path]::GetFullPath($ExecutionAuthorityPath)
+    if (-not [IO.Path]::IsPathRooted($ExecutionAuthorityPath) -or $authorityFull -cne $ExecutionAuthorityPath -or
+        -not (Test-D32PowerShellAuthorityPathNoReparse -Path $authorityFull) -or
+        (Test-D32PowerShellAuthorityPathWithin -Child $authorityFull -Parent $Repo) -or
+        (Test-D32PowerShellAuthorityPathWithin -Child $authorityFull -Parent 'E:\d32\inv7\r\c') -or
+        $ExpectedExecutionAuthoritySha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'D32_SOURCEPROOF_LIFECYCLE_REFUSED: execution authority path or caller-supplied pin is invalid'
+    }
+    if ([Diagnostics.Stopwatch]::GetTimestamp() -ge $LifecycleWorkDeadlineTicks) {
+        throw 'D32_SOURCEPROOF_LIFECYCLE_BUDGET_STOPPED: work cutoff reached before authority read'
+    }
+    $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $authorityFile = $null
+    try {
+        $authorityFile = Open-D32PowerShellAuthorityFile -Path $authorityFull -DirectoryFences $directoryFences -MaximumBytes 1048576 -DeadlineTicks $LifecycleWorkDeadlineTicks
+        if ([Diagnostics.Stopwatch]::GetTimestamp() -ge $LifecycleWorkDeadlineTicks) {
+            throw 'D32_SOURCEPROOF_LIFECYCLE_BUDGET_STOPPED: late authority bytes discarded at shared work cutoff'
+        }
+        if ([string]$authorityFile.Record.sha256 -cne $ExpectedExecutionAuthoritySha256) {
+            throw 'D32_SOURCEPROOF_LIFECYCLE_REFUSED: caller-pinned execution authority SHA differs from opened bytes'
+        }
+        $jsonDocument = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$authorityFile.Bytes))
+        try {
+            if ($jsonDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
+                (Test-D32PowerShellAuthorityJsonDuplicates -Element $jsonDocument.RootElement)) {
+                throw 'D32_SOURCEPROOF_LIFECYCLE_REFUSED: execution authority root or duplicate-property validation failed'
+            }
+            Assert-D32PowerShellAuthorityExactJsonRecord -Element $jsonDocument.RootElement -Fields @('schema_version', 'record_type', 'timing_policy',
+                'gate_authority', 'candidate_sha', 'source_repo', 'repository_identity', 'run_id', 'owner_id', 'source_proof_authority',
+                'toolchain_profile', 'powershell_runtime', 'source_pins', 'invocation', 'output', 'clock', 'limits', 'issued_at_utc') `
+                -Name 'bounded source-proof execution authority V1'
+            $document = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $jsonDocument.RootElement
+        }
+        finally { $jsonDocument.Dispose() }
+        if (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityShape -Document $document -ExpectedCandidateSha $CandidateSha -Repository $Repo) -or
+            [string]$document.source_proof_authority.path -cne [IO.Path]::GetFullPath($SourceProofAuthorityPath) -or
+            [string]$document.source_proof_authority.sha256 -cne $ExpectedSourceProofAuthoritySha256 -or
+            [string]$document.toolchain_profile.path -cne [IO.Path]::GetFullPath($ToolchainProfilePath) -or
+            [string]$document.toolchain_profile.sha256 -cne $ExpectedToolchainProfileSha256 -or
+            [string]$document.invocation.entry_path -cne [IO.Path]::GetFullPath($SourceProofEntryPath) -or
+            [Int64]$document.clock.frequency -ne $LifecycleCounterFrequency -or
+            $LifecycleWorkDeadlineTicks -ne (ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $LifecycleT0Ticks -Frequency $LifecycleCounterFrequency -DeadlineMilliseconds 270000L) -or
+            $LifecycleProofExpiryTicks -ne (ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $LifecycleT0Ticks -Frequency $LifecycleCounterFrequency -DeadlineMilliseconds 300000L) -or
+            [string]$document.powershell_runtime.path -cne [IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)) {
+            throw 'D32_SOURCEPROOF_LIFECYCLE_REFUSED: execution authority does not bind the exact candidate, entry, inner authority, profile, runtime, or shared clock argv'
+        }
+        $reference = [PSCustomObject]@{
+            path = [string]$authorityFile.Record.path
+            bytes = [Int64]$authorityFile.Record.bytes
+            sha256 = [string]$authorityFile.Record.sha256
+            volume_serial_hex = [string]$authorityFile.Record.volume_serial_hex
+            file_id_hex = [string]$authorityFile.Record.file_id_hex
+        }
+        $script:D32BoundedDiagnosticSourceProofLifecycleAuthorityReference = $reference
+        $script:D32BoundedDiagnosticSourceProofLifecycleClock = [PSCustomObject]@{
+            counter_origin = 'QueryPerformanceCounter'
+            frequency = [Int64]$LifecycleCounterFrequency
+            t0_ticks = [Int64]$LifecycleT0Ticks
+            work_deadline_ticks = [Int64]$LifecycleWorkDeadlineTicks
+            proof_expiry_ticks = [Int64]$LifecycleProofExpiryTicks
+            cleanup_deadline_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $LifecycleT0Ticks -Frequency $LifecycleCounterFrequency -DeadlineMilliseconds 345000L
+            terminal_audit_deadline_ticks = ConvertTo-D32BoundedDiagnosticSourceProofDeadlineTicks -T0Ticks $LifecycleT0Ticks -Frequency $LifecycleCounterFrequency -DeadlineMilliseconds 360000L
+        }
+        if ((Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $script:D32BoundedDiagnosticSourceProofWallTimer) -ge 270000L) {
+            throw 'D32_SOURCEPROOF_LIFECYCLE_BUDGET_STOPPED: execution authority admission crossed the shared work cutoff'
+        }
+        return [PSCustomObject]@{ Document = $document; Reference = $reference }
+    }
+    finally {
+        if ($null -ne $authorityFile -and $null -ne $authorityFile.Stream -and -not $authorityFile.Stream.SafeFileHandle.IsClosed) { $authorityFile.Stream.Dispose() }
+        foreach ($directory in $directoryFences.Values) { if ($null -ne $directory.Handle -and -not $directory.Handle.IsClosed) { $directory.Handle.Dispose() } }
+    }
+}
+
+. (Join-Path $PSScriptRoot 'd32-bounded-compiler-diagnostic-policy.ps1')
+
 $repositoryFull = [IO.Path]::GetFullPath($Repository)
 if ($repositoryFull -cne $Repository -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$') { throw 'D32_BOUNDED_DIAGNOSTIC_REFUSED: repository or candidate pin is not exact' }
 if ($PSCmdlet.ParameterSetName -ceq 'SourceProofOnly') {
+    $script:D32BoundedDiagnosticSourceProofExecutionBootstrapContext = Assert-D32BoundedDiagnosticSourceProofExecutionBootstrap -Repo $repositoryFull
     $script:D32BoundedDiagnosticSourceProofBootstrapAuthority = Assert-D32BoundedDiagnosticSourceProofBootstrap -Repo $repositoryFull
+    if (-not (Test-D32BoundedDiagnosticSourceProofExecutionAuthorityBindings `
+        -ExecutionAuthority $script:D32BoundedDiagnosticSourceProofExecutionBootstrapContext.Document `
+        -SourceProofAuthority $script:D32BoundedDiagnosticSourceProofBootstrapAuthority `
+        -SourceProofAuthorityReference $script:D32BoundedDiagnosticSourceProofAuthorityReference `
+        -ExpectedCandidateSha $CandidateSha -Repository $repositoryFull)) {
+        throw 'D32_SOURCEPROOF_LIFECYCLE_REFUSED: execution authority and strict inner SourceProof V3 do not cross-bind'
+    }
 }
 else {
     $script:D32BoundedDiagnosticBootstrapAuthority = Assert-D32BoundedDiagnosticBootstrapPins -Repo $repositoryFull
 }
 
-. (Join-Path $PSScriptRoot 'd32-bounded-compiler-diagnostic-policy.ps1')
 . (Join-Path $PSScriptRoot 'd32-build-toolchain-profile.ps1')
 
 function Test-D32BoundedDiagnosticJsonDuplicates {
@@ -291,7 +414,9 @@ function Read-D32BoundedDiagnosticJson {
     $directoryFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
     $opened = $null
     try {
-        $opened = Open-D32PowerShellAuthorityFile -Path $full -DirectoryFences $directoryFences -MaximumBytes $MaximumBytes
+        $deadlineTicks = if ($null -ne $ProofTimer) { Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks } else { [Int64]0 }
+        $opened = Open-D32PowerShellAuthorityFile -Path $full -DirectoryFences $directoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $deadlineTicks
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_json.read_complete' -Progress 'late_input_discarded_before_parse' -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
         if ($null -ne $ExpectedReference -and
             ([string]$opened.Record.path -cne [string]$ExpectedReference.path -or [Int64]$opened.Record.bytes -ne [Int64]$ExpectedReference.bytes -or
                 [string]$opened.Record.sha256 -cne [string]$ExpectedReference.sha256 -or
@@ -383,7 +508,8 @@ function Assert-D32BoundedDiagnosticFileReference {
     if (-not (Test-D32ProfileNoReparsePath -Path $path)) {
         throw "D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: source file reference is missing or traverses a reparse point; $referenceContext"
     }
-    $snapshot = if ($MetadataOnly) { Get-D32ProfileFileMetadataSnapshot -Path $path } else { Get-D32ProfileFileSnapshot -Path $path -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds }
+    $deadlineTicks = if ($null -ne $ProofTimer) { Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks } else { [Int64]0 }
+    $snapshot = if ($MetadataOnly) { Get-D32ProfileFileMetadataSnapshot -Path $path } else { Get-D32ProfileFileSnapshot -Path $path -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks $deadlineTicks }
     if ($null -ne $ProofTimer) {
         Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $(if ($MetadataOnly) { 'file_reference.metadata_check' } else { 'file_reference.content_hash' }) -Progress ("caller={0};field={1}" -f $Caller, $ReferenceField) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED'
     }
@@ -616,7 +742,7 @@ function Assert-D32BoundedDiagnosticPriorInv7Provenance {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: retained inv7 record does not prove the exact blocked attempt; it is not a successful discovery record'
     }
     for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
-        if ($null -ne $ProofTimer -and (($index -band 3) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'origin.prior_argument_bindings' -Progress ("arguments={0}/{1}" -f $index, $expectedArguments.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'origin.prior_argument_bindings' -Progress ("arguments={0}/{1}" -f $index, $expectedArguments.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         if ($blocked.failing_fixed_command.arguments[$index] -isnot [string] -or
             [string]$blocked.failing_fixed_command.arguments[$index] -cne $expectedArguments[$index]) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: retained inv7 terminal command differs from the exact authorized test-list attempt'
@@ -661,7 +787,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
     $expected = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
     $archiveIndex = 0
     foreach ($entry in $ArchiveInventory.entries) {
-        if (($archiveIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_archive_map' -Progress ("members={0}/{1}" -f $archiveIndex, $ArchiveInventory.entries.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_archive_map' -Progress ("members={0}/{1}" -f $archiveIndex, $ArchiveInventory.entries.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $archiveIndex++
         if (-not $expected.TryAdd([string]$entry.path, $entry)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: archive inventory has a duplicate/case-colliding path' }
     }
@@ -676,7 +802,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
         Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_directory' -Progress ("entries={0};pending={1}" -f $count, $stack.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED'
         $directory = $stack.Pop()
         foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
-            if (($count -band 63) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory' -Progress ("entries={0}/{1}" -f $count, $MaximumEntries) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory' -Progress ("entries={0}/{1}" -f $count, $MaximumEntries) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
             $count++
             if ($count -gt $MaximumEntries) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: extracted registry source exceeds its fixed entry bound' }
             $attributes = [IO.File]::GetAttributes($item)
@@ -698,7 +824,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
             $generatedAuxiliary = Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile `
                 -RelativePath $relative -AtRoot $atSourceRoot -ArchiveMember $expectedArchiveMember
             if ($generatedAuxiliary -and $relative -ceq '.cargo-ok') {
-                $snapshot = Get-D32ProfileFileSnapshot -Path $item -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                $snapshot = Get-D32ProfileFileSnapshot -Path $item -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                 $sourceBytes += [Int64]$snapshot.Bytes
                 if (-not (Test-D32BoundedDiagnosticRegistryCargoOkMarkerSnapshot -Bytes ([Int64]$snapshot.Bytes) -Sha256 ([string]$snapshot.Sha256))) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated registry .cargo-ok marker is not the exact canonical 7-byte v1 record'
@@ -712,7 +838,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
                 continue
             }
             if ($generatedAuxiliary -and $relative -ceq '.cargo-checksum.json') {
-                $snapshot = Get-D32ProfileFileContentSnapshot -Path $item -MaximumBytes 16777216L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                $snapshot = Get-D32ProfileFileContentSnapshot -Path $item -MaximumBytes 16777216L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                 $sourceBytes += [Int64]$snapshot.Bytes
                 try { $metadataText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$snapshot.Content) }
                 catch { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: Cargo-generated checksum metadata is not strict UTF-8' }
@@ -725,7 +851,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
                 $metadata.Add([PSCustomObject]@{ path = $relative; bytes = [Int64]$snapshot.Bytes; sha256 = [string]$snapshot.Sha256; volume_serial_hex = [string]$snapshot.VolumeSerialHex; file_id_hex = [string]$snapshot.FileIdHex })
                 continue
             }
-            $snapshot = Get-D32ProfileFileSnapshot -Path $item -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+            $snapshot = Get-D32ProfileFileSnapshot -Path $item -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
             $sourceBytes += [Int64]$snapshot.Bytes
             $expectedEntry = $null
             if (-not $expected.TryGetValue($relative, [ref]$expectedEntry) -or [string]$expectedEntry.kind -cne 'file' -or
@@ -737,7 +863,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
     }
     $directoryIndex = 0
     foreach ($directoryRecord in $actualDirectories.Values) {
-        if (($directoryIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_directory_identity' -Progress ("directories={0}/{1}" -f $directoryIndex, $actualDirectories.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_directory_identity' -Progress ("directories={0}/{1}" -f $directoryIndex, $actualDirectories.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $directoryIndex++
         $directoryPath = Join-Path $SourceRoot ([string]$directoryRecord.path.Replace('/', '\'))
         $directoryAfter = Get-D32ProfileDirectoryIdentity -Path $directoryPath
@@ -748,7 +874,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
     }
     $archiveIndex = 0
     foreach ($entry in $ArchiveInventory.entries) {
-        if (($archiveIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_archive_closure' -Progress ("members={0}/{1}" -f $archiveIndex, $ArchiveInventory.entries.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_archive_closure' -Progress ("members={0}/{1}" -f $archiveIndex, $ArchiveInventory.entries.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $archiveIndex++
         if ([string]$entry.kind -ceq 'file' -and -not $actualFiles.ContainsKey([string]$entry.path)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: lock-checksummed archive file is missing from its extracted source directory'
@@ -770,14 +896,14 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
     $inventoryCanonical = [System.Collections.Generic.List[string]]::new()
     $canonicalIndex = 0
     foreach ($key in $fileKeys) {
-        if (($canonicalIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_file_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $fileKeys.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_file_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $fileKeys.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $file = $actualFiles[$key]
         $inventoryCanonical.Add(('file' + "`t" + $key + "`t" + [Int64]$file.Bytes + "`t" + [string]$file.Sha256 + "`t" + [string]$file.VolumeSerialHex + "`t" + [string]$file.FileIdHex))
         $canonicalIndex++
     }
     $canonicalIndex = 0
     foreach ($key in $directoryKeys) {
-        if (($canonicalIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_directory_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $directoryKeys.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_directory_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $directoryKeys.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $directory = $actualDirectories[$key]
         $inventoryCanonical.Add(('directory' + "`t" + $key + "`t" + [string]$directory.volume_serial_hex + "`t" + [string]$directory.file_id_hex))
         $canonicalIndex++
@@ -786,7 +912,7 @@ function Assert-D32BoundedDiagnosticArchiveMatchesExtractedSource {
     [Array]::Sort($metadataRows, [System.Comparison[object]]{ param($left, $right) [StringComparer]::Ordinal.Compare([string]$left.path, [string]$right.path) })
     $canonicalIndex = 0
     foreach ($metadataRow in $metadataRows) {
-        if (($canonicalIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_metadata_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $metadataRows.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.extracted_inventory_metadata_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $metadataRows.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $inventoryCanonical.Add(('metadata' + "`t" + [string]$metadataRow.path + "`t" + [Int64]$metadataRow.bytes + "`t" + [string]$metadataRow.sha256 + "`t" + [string]$metadataRow.volume_serial_hex + "`t" + [string]$metadataRow.file_id_hex))
         $canonicalIndex++
     }
@@ -864,7 +990,7 @@ function New-D32BoundedDiagnosticRegistrySourceContentProof {
         $totalCompressed += [Int64]$snapshot.Bytes
         if ($totalCompressed -gt 17179869184L) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: aggregate registry archive bytes exceed 16 GiB' }
         $archiveContent = Get-D32ProfileFileContentSnapshot -Path ([string]$archive.path) -MaximumBytes $script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes `
-            -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+            -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
         if ($archiveContent.Bytes -ne $snapshot.Bytes -or $archiveContent.Sha256 -cne [string]$package.checksum -or
             $archiveContent.VolumeSerialHex -cne $snapshot.VolumeSerialHex -or $archiveContent.FileIdHex -cne $snapshot.FileIdHex) {
             throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: opened registry archive content/identity differs from the lock-checksummed caller pin'
@@ -913,7 +1039,7 @@ function Get-D32BoundedDiagnosticGitCatalog {
     $rows = [System.Collections.Generic.List[object]]::new()
     $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($itemPath in [IO.Directory]::EnumerateFileSystemEntries($Path)) {
-        if ($null -ne $ProofTimer -and (($rows.Count -band 15) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.catalog' -Progress ("path={0};entries={1}" -f $Path, $rows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.catalog' -Progress ("path={0};entries={1}" -f $Path, $rows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
         if ($rows.Count -ge $MaximumEntries) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git catalog exceeds its fixed 64-entry bound' }
         $full = [IO.Path]::GetFullPath($itemPath)
         if (-not $full.StartsWith([IO.Path]::GetFullPath($Path).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or
@@ -984,7 +1110,7 @@ function Get-D32BoundedDiagnosticGitBlobOidFromFile {
     if ($ExpectedBytes -lt 0 -or $ExpectedBytes -gt 67108864L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout file exceeds the 64 MiB per-object bound' }
     if (-not (Test-D32ProfileNoReparsePath -Path $Path)) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout file is missing or traverses a reparse point' }
     Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_file' -Progress $Path -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED'
-    try { $snapshot = Get-D32ProfileGitBlobSnapshot -Path $Path -ExpectedBytes $ExpectedBytes -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds }
+    try { $snapshot = Get-D32ProfileGitBlobSnapshot -Path $Path -ExpectedBytes $ExpectedBytes -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks) }
     catch { throw ('D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: opened checkout blob verification failed; path={0}; reason={1}' -f (Format-D32BoundedCompilerDiagnosticPathForError $Path), [string]$_.Exception.Message) }
     return [PSCustomObject]@{ oid = [string]$snapshot.GitBlobOid; bytes = [Int64]$snapshot.Bytes; sha256 = [string]$snapshot.Sha256; volume_serial_hex = [string]$snapshot.VolumeSerialHex; file_id_hex = [string]$snapshot.FileIdHex }
 }
@@ -1030,11 +1156,11 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
             $treeParseEstimate = 12582912L + (3L * [Int64]$tree.Data.Length)
             $managedInventoryEstimate += $treeParseEstimate
             if ($managedInventoryEstimate -gt $managedInventoryLimit) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git tree parser exceeds the remaining 512 MiB managed-memory budget' }
-            $entries = [D32BoundedGitPackReaderV1]::ParseTree($tree.Data, [Int64]($DeadlineMilliseconds - $ProofTimer.ElapsedMilliseconds))
+            $entries = [D32BoundedGitPackReaderV1]::ParseTree($tree.Data, [Int64]($DeadlineMilliseconds - (Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $ProofTimer)))
             if ($entries.Count -eq 0) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: empty Git tree is unsupported for Cargo checkout closure' }
             $treeObjectCount++
             foreach ($entry in $entries) {
-                if (($expected.Count -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.tree_inventory' -Progress ("entries={0}" -f $expected.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+                if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.tree_inventory' -Progress ("entries={0}" -f $expected.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
                 $relative = if ([String]::IsNullOrEmpty([string]$frame.path)) { [string]$entry.Name } else { [string]$frame.path + '/' + [string]$entry.Name }
                 if (-not (Test-D32BoundedCompilerDiagnosticTarPath $relative) -or $relative.Length -gt 4096) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git tree path is unsafe or exceeds 4096 characters'
@@ -1081,7 +1207,7 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
         Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_walk' -Progress ("files={0};directories={1};pending={2}" -f $fileCount, $directoryCount, $walk.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED'
         $directory = $walk.Pop()
         foreach ($itemPath in [IO.Directory]::EnumerateFileSystemEntries([string]$directory.path)) {
-            if ((($fileCount + $directoryCount) -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_entries' -Progress ("files={0};directories={1}" -f $fileCount, $directoryCount) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_entries' -Progress ("files={0};directories={1}" -f $fileCount, $directoryCount) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
             $full = [IO.Path]::GetFullPath($itemPath)
             if (-not $full.StartsWith([IO.Path]::GetFullPath($CheckoutPath).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or
                 -not (Test-D32ProfileNoReparsePath -Path $full)) {
@@ -1097,10 +1223,10 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
             $isAtRoot = -not $relative.Contains('/')
             if ($relative -ceq '.git' -and -not $expected.ContainsKey($relative)) {
                 if ($isDirectory) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git indirection is a directory, not a bounded pointer file' }
-                $pointerBefore = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                $pointerBefore = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                 if ([Int64]$pointerBefore.Bytes -le 0 -or [Int64]$pointerBefore.Bytes -gt 4096) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer is empty or exceeds 4096 bytes' }
                 $pointerBytes = [byte[]]$pointerBefore.Content
-                $pointerAfter = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                $pointerAfter = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 4096 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                 if ($pointerBytes.Length -gt 4096 -or $pointerAfter.Bytes -ne $pointerBefore.Bytes -or $pointerAfter.Sha256 -cne $pointerBefore.Sha256 -or
                     $pointerAfter.VolumeSerialHex -cne $pointerBefore.VolumeSerialHex -or $pointerAfter.FileIdHex -cne $pointerBefore.FileIdHex) {
                     throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout .git pointer changed or exceeds its bounded read'
@@ -1119,7 +1245,7 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
             if ($relative -ceq '.cargo-ok' -and $isAtRoot -and
                 (Test-D32BoundedDiagnosticGeneratedRegistryAuxiliaryFile -RelativePath $relative -AtRoot $true -ArchiveMember $expectedGitArchiveMember)) {
                 if ($isDirectory) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Cargo .cargo-ok metadata is not a regular file' }
-                $marker = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 0 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                $marker = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 0 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                 Assert-D32BoundedDiagnosticGitCargoOkMarkerEmpty -Bytes ([Int64]$marker.Bytes)
                 $sourceMetadata.Add(('cargo-ok' + "`t" + $relative + "`t" + [string]$marker.Sha256 + "`t" + [string]$marker.VolumeSerialHex + "`t" + [string]$marker.FileIdHex))
                 $metadataCount++
@@ -1156,7 +1282,7 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
                     if ($manifestBytesTotal -gt 33554432L) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: verified Git manifest buffer total exceeds its 32 MiB bound' }
                     $manifestManagedEstimate = 4096L + (3L * [Int64]$blobProof.bytes)
                     if ($managedInventoryEstimate -gt ($managedInventoryLimit - $manifestManagedEstimate)) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: manifest candidates plus checkout inventory exceed the remaining 512 MiB managed-memory budget before read' }
-                    $manifestSnapshot = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 1048576L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+                    $manifestSnapshot = Get-D32ProfileFileContentSnapshot -Path $full -MaximumBytes 1048576L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
                     if ($manifestSnapshot.Bytes -ne [Int64]$blobProof.bytes -or $manifestSnapshot.Sha256 -cne [string]$blobProof.sha256 -or
                         $manifestSnapshot.VolumeSerialHex -cne [string]$blobProof.volume_serial_hex -or
                         $manifestSnapshot.FileIdHex -cne [string]$blobProof.file_id_hex) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: Git Cargo.toml changed while its bounded manifest bytes were captured' }
@@ -1180,13 +1306,13 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
     if ($actual.Count -ne $expected.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: current checkout file/directory inventory is incomplete for the locked commit tree' }
     $expectedIndex = 0
     foreach ($relative in $expected.Keys) {
-        if (($expectedIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_expected_coverage' -Progress ("paths={0}/{1}" -f $expectedIndex, $expected.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_expected_coverage' -Progress ("paths={0}/{1}" -f $expectedIndex, $expected.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
         if (-not $actual.Contains($relative)) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: a locked Git tree path is absent from the current Cargo checkout' }
         $expectedIndex++
     }
     $directoryIdentityIndex = 0
     foreach ($relative in $directoryIdentities.Keys) {
-        if (($directoryIdentityIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_directory_identity' -Progress ("directories={0}/{1}" -f $directoryIdentityIndex, $directoryIdentities.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_directory_identity' -Progress ("directories={0}/{1}" -f $directoryIdentityIndex, $directoryIdentities.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
         $path = if ([String]::IsNullOrEmpty([string]$relative)) { $CheckoutPath } else { Join-Path $CheckoutPath ([string]$relative.Replace('/', '\')) }
         $after = Get-D32ProfileDirectoryIdentity -Path $path
         $before = $directoryIdentities[$relative]
@@ -1201,7 +1327,7 @@ function Get-D32BoundedDiagnosticGitCheckoutContentProof {
     }
     $metadataIndex = 0
     foreach ($row in $sourceMetadata) {
-        if (($metadataIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_metadata_inventory' -Progress ("rows={0}/{1}" -f $metadataIndex, $sourceMetadata.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.checkout_metadata_inventory' -Progress ("rows={0}/{1}" -f $metadataIndex, $sourceMetadata.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
         $inventoryRows.Add($row); $managedInventoryEstimate += 1024L + (6L * $row.Length); $metadataIndex++
     }
     if ($managedInventoryEstimate -gt $managedInventoryLimit) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: checkout metadata inventory exceeds the remaining 512 MiB managed-memory budget' }
@@ -1369,13 +1495,13 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
             $indexBefore.VolumeSerialHex -cne [string]$gitReference.index_volume_serial_hex -or $indexBefore.FileIdHex -cne [string]$gitReference.index_file_id_hex) {
             throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: opened pack/index length or object identity differs from the bounded caller pin'
         }
-        $indexContent = Get-D32ProfileFileContentSnapshot -Path $indexReference.path -MaximumBytes 67108864L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+        $indexContent = Get-D32ProfileFileContentSnapshot -Path $indexReference.path -MaximumBytes 67108864L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
         if ($indexContent.Bytes -ne $indexBefore.Bytes -or $indexContent.VolumeSerialHex -cne $indexBefore.VolumeSerialHex -or
             $indexContent.FileIdHex -cne $indexBefore.FileIdHex) {
             throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: opened Git pack index identity changed during its bounded read'
         }
         $indexBytes = [byte[]]$indexContent.Content
-        $remainingMilliseconds = [Int64]$DeadlineMilliseconds - [Int64]$ProofTimer.ElapsedMilliseconds
+        $remainingMilliseconds = [Int64]$DeadlineMilliseconds - [Int64](Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $ProofTimer)
         if ($remainingMilliseconds -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: no aggregate source-proof time remains for the Git pack closure' }
         Initialize-D32BoundedCompilerDiagnosticGitPackType
         $packStream = $null
@@ -1395,7 +1521,7 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
             if ([string]$commitObject.Type -cne 'commit' -or [string]$commitObject.Oid -cne [string]$source.commit) {
                 throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: locked commit did not resolve to an exact SHA-1 Git commit object'
             }
-            $remainingTreeMilliseconds = [Int64]$DeadlineMilliseconds - [Int64]$ProofTimer.ElapsedMilliseconds
+            $remainingTreeMilliseconds = [Int64]$DeadlineMilliseconds - [Int64](Get-D32BoundedDiagnosticSourceProofCurrentElapsedMilliseconds -ProofTimer $ProofTimer)
             if ($remainingTreeMilliseconds -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED: no aggregate source-proof time remains for commit-tree parsing' }
             $treeOid = [D32BoundedGitPackReaderV1]::CommitTreeOid($commitObject.Data, $remainingTreeMilliseconds)
             $reader.Release($commitObject)
@@ -1407,7 +1533,7 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
                 -MaximumManifestBytes $remainingManifestContentBytes
             $manifestIndex = 0
             foreach ($manifestText in $checkoutProof.manifest_texts) {
-                if (($manifestIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.manifest_candidates' -Progress ("source={0};manifests={1}/{2}" -f $source.commit, $manifestIndex, $checkoutProof.manifest_texts.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+                if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.manifest_candidates' -Progress ("source={0};manifests={1}/{2}" -f $source.commit, $manifestIndex, $checkoutProof.manifest_texts.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
                 if ($manifestCandidates.Count -ge $MaximumManifestCandidates) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: verified Git Cargo.toml candidates exceed the remaining exact 4096-entry manifest-catalog capacity' }
                 $manifestCandidates.Add([PSCustomObject]@{ source_kind = 'git'; source = [string]$source.source; source_path = [string]$manifestText.relative_path; content = [string]$manifestText.text; content_sha256 = [string]$manifestText.content_sha256; package_id = '' })
                 $manifestIndex++
@@ -1493,7 +1619,7 @@ function New-D32BoundedDiagnosticGitSourceContentProof {
     $canonicalRows = [System.Collections.Generic.List[string]]::new()
     $canonicalIndex = 0
     foreach ($row in $tupleRows) {
-        if (($canonicalIndex -band 15) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.proof_digest_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $tupleRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'git.proof_digest_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $tupleRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GIT_SOURCE_BLOCKED' -NoProgress }
         $canonicalRows.Add(([string]$row.source + "`t" + [string]$row.commit + "`t" + [string]$row.tree_oid + "`t" + [string]$row.pack_content_sha1 + "`t" +
             [string]$row.pack_sha256 + "`t" + [string]$row.index_sha256 + "`t" + [string]$row.checkout_inventory_sha256))
         $canonicalIndex++
@@ -1610,7 +1736,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         if ([string]$reference.sha256 -cne [string]$lock.LockSha256) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: Profile V2 and dependency origin disagree on a locked manifest digest' }
     }
     $vitaLockReference = $manifestByPath['vita-agent/Cargo.lock']
-    $vitaLockContent = Get-D32ProfileFileContentSnapshot -Path ([string]$vitaLockReference.path) -MaximumBytes 8388608L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+    $vitaLockContent = Get-D32ProfileFileContentSnapshot -Path ([string]$vitaLockReference.path) -MaximumBytes 8388608L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
     if ($vitaLockContent.Bytes -ne [Int64]$vitaLockReference.bytes -or $vitaLockContent.Sha256 -cne [string]$vitaLockReference.sha256 -or
         $vitaLockContent.VolumeSerialHex -cne [string]$vitaLockReference.volume_serial_hex -or $vitaLockContent.FileIdHex -cne [string]$vitaLockReference.file_id_hex) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: opened current vita-agent Cargo.lock content differs from its caller pin'
@@ -1643,7 +1769,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         if (-not $lockedRegistryByKey.TryAdd($key, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_BLOCKED: duplicate locked registry name/version key' }
     }
     foreach ($archive in $Origin.registry_archives) {
-        if (($archiveByKey.Count -band 63) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'origin.registry_refs' -Progress ("archives={0}/{1}" -f $archiveByKey.Count, $Origin.registry_archives.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'origin.registry_refs' -Progress ("archives={0}/{1}" -f $archiveByKey.Count, $Origin.registry_archives.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' -NoProgress }
         $fields = @('source', 'name', 'version', 'checksum', 'path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties -Object $archive -Expected $fields) -or
             [string]$archive.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
@@ -1680,7 +1806,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
     $workspaceManifestContentBytes = [Int64]0
     $workspaceManifestReferenceIndex = 0
     foreach ($reference in $Origin.manifest_refs) {
-        if (($workspaceManifestReferenceIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.workspace_manifest_capacity' -Progress ("references={0}/{1}" -f $workspaceManifestReferenceIndex, $Origin.manifest_refs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.workspace_manifest_capacity' -Progress ("references={0}/{1}" -f $workspaceManifestReferenceIndex, $Origin.manifest_refs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' -NoProgress }
         if ([IO.Path]::GetFileName([string]$reference.path) -ceq 'Cargo.toml') {
             if ([Int64]$reference.bytes -le 0 -or [Int64]$reference.bytes -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: pinned current workspace Cargo.toml exceeds the fixed 1 MiB manifest bound before Git traversal' }
             $workspaceManifestReferenceCount++
@@ -1696,7 +1822,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
     $registryManifestRetainedBytesEstimate = [Int64]0
     $registryCandidateIndex = 0
     foreach ($candidate in $registryContentResult.manifest_candidates) {
-        if (($registryCandidateIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.registry_manifest_memory_estimate' -Progress ("candidates={0}/{1}" -f $registryCandidateIndex, $registryContentResult.manifest_candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.registry_manifest_memory_estimate' -Progress ("candidates={0}/{1}" -f $registryCandidateIndex, $registryContentResult.manifest_candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' -NoProgress }
         $candidateBytes = [Int64][Text.UTF8Encoding]::new($false).GetByteCount([string]$candidate.content)
         $registryManifestRetainedBytesEstimate += 4096L + (3L * $candidateBytes)
         if ($registryManifestRetainedBytesEstimate -gt [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: retained registry manifest candidates exceed the fixed 512 MiB managed-memory budget' }
@@ -1708,7 +1834,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
     $retainedManifestCandidateBytes = [Int64]$registryManifestRetainedBytesEstimate
     $gitCandidateIndex = 0
     foreach ($candidate in $gitContentResult.manifest_candidates) {
-        if (($gitCandidateIndex -band 127) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.git_manifest_memory_estimate' -Progress ("candidates={0}/{1}" -f $gitCandidateIndex, $gitContentResult.manifest_candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'graph.git_manifest_memory_estimate' -Progress ("candidates={0}/{1}" -f $gitCandidateIndex, $gitContentResult.manifest_candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' -NoProgress }
         $candidateBytes = [Int64][Text.UTF8Encoding]::new($false).GetByteCount([string]$candidate.content)
         $retainedManifestCandidateBytes += 4096L + (3L * $candidateBytes)
         if ($retainedManifestCandidateBytes -gt [Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: retained registry and Git manifest candidates exceed the fixed 512 MiB managed-memory budget' }
@@ -1724,7 +1850,7 @@ function Assert-D32BoundedDiagnosticInv7Origin {
         if ([Int64]$reference.bytes -le 0 -or [Int64]$reference.bytes -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: pinned current workspace Cargo.toml exceeds the fixed 1 MiB manifest bound' }
         $workspaceManifestManagedEstimate = 4096L + (3L * [Int64]$reference.bytes)
         if ($retainedManifestCandidateBytes -gt ([Int64]$script:D32BoundedCompilerDiagnosticSourceWorkingBufferLimitBytes - $workspaceManifestManagedEstimate)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: retained registry, Git, and current workspace manifests exceed the fixed 512 MiB managed-memory budget' }
-        $manifestContent = Get-D32ProfileFileContentSnapshot -Path ([string]$reference.path) -MaximumBytes 1048576L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+        $manifestContent = Get-D32ProfileFileContentSnapshot -Path ([string]$reference.path) -MaximumBytes 1048576L -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
         if ([Int64]$manifestContent.Bytes -ne [Int64]$reference.bytes -or [string]$manifestContent.Sha256 -cne [string]$reference.sha256 -or
             [string]$manifestContent.VolumeSerialHex -cne [string]$reference.volume_serial_hex -or [string]$manifestContent.FileIdHex -cne [string]$reference.file_id_hex) {
             throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: caller-pinned current workspace manifest changed during the bounded graph input read'
@@ -1870,7 +1996,7 @@ function Write-D32BoundedDiagnosticCreateNewJson {
         if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.flush_complete' -Progress ("bytes={0}" -f $bytes.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
     }
     finally { $stream.Dispose() }
-    return Get-D32ProfileFileSnapshot -Path $Path -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+    return Get-D32ProfileFileSnapshot -Path $Path -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks)
 }
 
 function Write-D32BoundedDiagnosticSidecarLine {
@@ -2466,7 +2592,7 @@ function Get-D32BoundedDiagnosticSourceProofProfile {
         $null -ne $profileDocument.fetch_git) {
         throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: caller-pinned Profile V2 does not contain the exact three current lock bindings or has fetch_git enabled'
     }
-    $lockInputs = @(Get-D32BuildToolchainLockInputs -Repository $Repo -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds)
+    $lockInputs = @(Get-D32BuildToolchainLockInputs -Repository $Repo -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -DeadlineTicks (Get-D32BoundedDiagnosticSourceProofWorkDeadlineTicks))
     Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'profile.lock_bindings' -Progress ("locks={0}" -f $lockInputs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED'
     if ($lockInputs.Count -ne 3) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: current manifest/lock input set is not the exact three-file D32 profile inventory' }
     for ($index = 0; $index -lt $lockInputs.Count; $index++) {

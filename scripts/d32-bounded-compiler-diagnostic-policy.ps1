@@ -23,6 +23,187 @@ $script:D32BoundedCompilerDiagnosticSampleSidecarLimitBytes = 67108864
 $script:D32BoundedCompilerDiagnosticGitQueryTimeoutMilliseconds = 5000
 $script:D32BoundedCompilerDiagnosticGitJoinGraceMilliseconds = 5000
 $script:D32BoundedCompilerDiagnosticGitPipeJoinMilliseconds = 5000
+$script:D32BoundedDiagnosticSourceProofCombinedMilliseconds = 300000L
+$script:D32BoundedDiagnosticSourceProofPersistReserveMilliseconds = 30000L
+$script:D32BoundedDiagnosticSourceProofMaximumOutputBytes = 67108864L
+$script:D32BoundedDiagnosticManifestValueNodeLimit = 100000L
+$script:D32BoundedDiagnosticGraphCandidateComparisonLimit = 1000000L
+$script:D32BoundedDiagnosticSourceProofPhase = 'bootstrap'
+$script:D32BoundedDiagnosticSourceProofProgress = 'not_started'
+$script:D32BoundedDiagnosticSourceProofTimer = $null
+$script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds = 270000L
+
+function Set-D32BoundedDiagnosticSourceProofProgress {
+    param([Parameter(Mandatory = $true)][string]$Phase, [Parameter(Mandatory = $true)][string]$Progress)
+    $script:D32BoundedDiagnosticSourceProofPhase = [regex]::Replace($Phase, '[^A-Za-z0-9_.#-]', '_')
+    $script:D32BoundedDiagnosticSourceProofProgress = [regex]::Replace($Progress, '[^A-Za-z0-9_.#=/-]', '_')
+}
+
+function Get-D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds {
+    param([long]$CombinedMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [long]$PersistReserveMilliseconds = $script:D32BoundedDiagnosticSourceProofPersistReserveMilliseconds)
+    if ($CombinedMilliseconds -ne $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds -or
+        $PersistReserveMilliseconds -le 0 -or $PersistReserveMilliseconds -ge $CombinedMilliseconds) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED: invalid in-budget persistence reserve'
+    }
+    return [Int64]($CombinedMilliseconds - $PersistReserveMilliseconds)
+}
+
+function Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline {
+    param([long]$ElapsedMilliseconds, [long]$DeadlineMilliseconds)
+    return ($ElapsedMilliseconds -ge 0 -and $DeadlineMilliseconds -gt 0 -and $ElapsedMilliseconds -lt $DeadlineMilliseconds)
+}
+
+function Assert-D32BoundedDiagnosticSourceProofDeadline {
+    param([Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer,
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [string]$Progress = 'not_available',
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [string]$ErrorPrefix = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED')
+    Set-D32BoundedDiagnosticSourceProofProgress -Phase $Phase -Progress $Progress
+    if (-not $ProofTimer.IsRunning -or
+        -not (Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline -ElapsedMilliseconds ([Int64]$ProofTimer.ElapsedMilliseconds) -DeadlineMilliseconds $DeadlineMilliseconds)) {
+        $phaseValue = [regex]::Replace($Phase, '[^A-Za-z0-9_.#-]', '_')
+        $progressValue = [regex]::Replace($Progress, '[^A-Za-z0-9_.#=/-]', '_')
+        throw ("{0}: combined source-proof deadline reached; phase={1}; progress={2}; elapsed_ms={3}; work_deadline_ms={4}" -f
+            $ErrorPrefix, $phaseValue, $progressValue, [Int64]$ProofTimer.ElapsedMilliseconds, $DeadlineMilliseconds)
+    }
+}
+
+function Get-D32BoundedDiagnosticSha256FromBytes {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [string]$Phase = 'sha256-bytes')
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        for ($offset = 0; $offset -lt $Bytes.Length; $offset += 65536) {
+            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("offset={0}/{1}" -f $offset, $Bytes.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $take = [int][Math]::Min(65536, $Bytes.Length - $offset)
+            $hash.AppendData($Bytes, $offset, $take)
+        }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("offset={0}/{1}" -f $Bytes.Length, $Bytes.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hash.Dispose() }
+}
+
+function Get-D32BoundedDiagnosticSha256FromLines {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [string]$Phase = 'sha256-lines')
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    try {
+        for ($index = 0; $index -lt $Lines.Length; $index++) {
+            if ($null -ne $ProofTimer -and (($index -band 255) -eq 0)) {
+                Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("row={0}/{1}" -f $index, $Lines.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED'
+            }
+            $rowBytes = $utf8.GetBytes([string]$Lines[$index] + "`n")
+            $hash.AppendData($rowBytes)
+        }
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("row={0}/{1}" -f $Lines.Length, $Lines.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hash.Dispose() }
+}
+
+function Get-D32BoundedDiagnosticGraphTupleKey {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Values)
+    $builder = [Text.StringBuilder]::new()
+    foreach ($value in $Values) { [void]$builder.Append($value.Length).Append(':').Append($value) }
+    return $builder.ToString()
+}
+
+function Get-D32BoundedDiagnosticSourceGraphDigest {
+    param([Parameter(Mandatory = $true)][string]$LockSha256,
+        [Parameter(Mandatory = $true)][string]$LockDependencyEdgesSha256,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$RootIds,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$EdgeRows,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$DecisionRows,
+        [Parameter(Mandatory = $true)][string]$ClosedSetSha256,
+        [Parameter(Mandatory = $true)][string]$ManifestSetSha256,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $newline = [byte[]]@([byte]10)
+    try {
+        $prefix = [string]$LockSha256 + "`n" + [string]$LockDependencyEdgesSha256 + "`n" + [string]::Join("`n", $RootIds) + "`n"
+        $hash.AppendData($utf8.GetBytes($prefix))
+        $sections = [System.Collections.Generic.List[string[]]]::new()
+        $sections.Add($EdgeRows); $sections.Add($DecisionRows)
+        foreach ($rows in $sections) {
+            for ($index = 0; $index -lt $rows.Count; $index++) {
+                if ($null -ne $ProofTimer -and (($index -band 255) -eq 0)) {
+                    Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.digest' -Progress ("section_rows={0}" -f $index) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED'
+                }
+                if ($index -gt 0) { $hash.AppendData($newline) }
+                $hash.AppendData($utf8.GetBytes([string]$rows[$index]))
+            }
+            $hash.AppendData($newline)
+        }
+        $hash.AppendData($utf8.GetBytes([string]$ClosedSetSha256 + "`n" + [string]$ManifestSetSha256 + "`n"))
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.digest_complete' -Progress ("edge_rows={0};decision_rows={1}" -f $EdgeRows.Count, $DecisionRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $hash.Dispose() }
+}
+
+function Get-D32BoundedDiagnosticEstimatedJsonUpperBound {
+    param([Parameter(Mandatory = $true)][object]$Document,
+        [Parameter(Mandatory = $true)][Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [long]$MaximumBytes = $script:D32BoundedDiagnosticSourceProofMaximumOutputBytes)
+    $pending = [System.Collections.Generic.Stack[object]]::new()
+    $pending.Push($Document)
+    $estimate = [Int64]2
+    $visited = [Int64]0
+    while ($pending.Count -gt 0) {
+        if (($visited -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.estimate_output' -Progress ("nodes={0};pending={1};estimated_bytes={2}" -f $visited, $pending.Count, $estimate) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $visited++
+        $value = $pending.Pop()
+        if ($null -eq $value) { $estimate += 4; continue }
+        if ($value -is [string]) { $estimate += (6L * [Int64]$value.Length) + 2L; continue }
+        if ($value -is [bool] -or $value -is [ValueType]) { $estimate += 32L; continue }
+        if ($value -is [System.Collections.IDictionary]) {
+            $estimate += 2L + (2L * [Int64]$value.Count)
+            $childIndex = 0
+            foreach ($key in $value.Keys) {
+                if (($childIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.estimate_dictionary' -Progress ("nodes={0};children={1}/{2};estimated_bytes={3}" -f $visited, $childIndex, $value.Count, $estimate) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+                $estimate += (6L * [Int64]([string]$key).Length) + 3L
+                $pending.Push($value[$key])
+                $childIndex++
+                if ($estimate -gt $MaximumBytes) { throw ('D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: proof result exceeds its fixed {0}-byte serialization ceiling before JSON conversion' -f $MaximumBytes) }
+            }
+        }
+        elseif ($value -is [Array] -or $value -is [System.Collections.IList]) {
+            $estimate += 2L + (2L * [Int64]$value.Count)
+            $childIndex = 0
+            foreach ($item in $value) {
+                if (($childIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.estimate_array' -Progress ("nodes={0};children={1}/{2};estimated_bytes={3}" -f $visited, $childIndex, $value.Count, $estimate) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+                $pending.Push($item)
+                $childIndex++
+            }
+        }
+        else {
+            $properties = @($value.PSObject.Properties)
+            $estimate += 2L + (2L * [Int64]$properties.Count)
+            $childIndex = 0
+            foreach ($property in $properties) {
+                if (($childIndex -band 255) -eq 0) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.estimate_object' -Progress ("nodes={0};children={1}/{2};estimated_bytes={3}" -f $visited, $childIndex, $properties.Count, $estimate) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+                $estimate += (6L * [Int64]$property.Name.Length) + 3L
+                $pending.Push($property.Value)
+                $childIndex++
+                if ($estimate -gt $MaximumBytes) { throw ('D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: proof result exceeds its fixed {0}-byte serialization ceiling before JSON conversion' -f $MaximumBytes) }
+            }
+        }
+        if ($estimate -gt $MaximumBytes) { throw ('D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED: proof result exceeds its fixed {0}-byte serialization ceiling before JSON conversion' -f $MaximumBytes) }
+    }
+    Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'result.estimate_output_complete' -Progress ("nodes={0};estimated_bytes={1}" -f $visited, $estimate) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED'
+    return $estimate
+}
 
 function Initialize-D32BoundedCompilerDiagnosticGitPackType {
     if ('D32BoundedGitPackReaderV1' -as [type]) { return }
@@ -83,12 +264,14 @@ public sealed class D32BoundedGitPackReaderV1
     private long _expandedBytes;
     private int _resolvedCount;
     private bool _disposed;
+    private string _packSha256;
     private static readonly uint[] CrcTable = MakeCrcTable();
 
     public int ObjectCount { get { return _objectCount; } }
     public long PackBytes { get { return _packLength; } }
     public long PeakWorkingBytes { get { return _peakWorkingBytes; } }
     public long ExpandedBytes { get { return _expandedBytes; } }
+    public string PackSha256 { get { EnsureLive(); return _packSha256; } }
 
     public D32BoundedGitPackReaderV1(Stream pack, byte[] indexBytes, string expectedPackId)
         : this(pack, indexBytes, expectedPackId, MaxElapsedMilliseconds, MaxWorkingBytes)
@@ -114,7 +297,7 @@ public sealed class D32BoundedGitPackReaderV1
         _timer = Stopwatch.StartNew();
         if (_packLength < 32 || _packLength > MaxPackBytes || _index.Length < 1072 || _index.Length > 64 * 1024 * 1024) throw new InvalidDataException("Git pack/index exceeds fixed size bounds");
         if (ReadU32(_index, 0) != 0xff744f63U || ReadU32(_index, 4) != 2U) throw new InvalidDataException("Only SHA-1 Git index v2 is supported");
-        byte[] indexDigest = Sha1(_index, 0, _index.Length - 20);
+        byte[] indexDigest = HashBytes(_index, 0, _index.Length - 20, HashAlgorithmName.SHA1);
         if (!FixedTimeEqual(indexDigest, Slice(_index, _index.Length - 20, 20))) throw new InvalidDataException("Git index checksum mismatch");
         byte[] indexPackDigest = Slice(_index, _index.Length - 40, 20);
         uint count = ReadU32(_index, 8 + 255 * 4);
@@ -138,6 +321,7 @@ public sealed class D32BoundedGitPackReaderV1
         _peakWorkingBytes = _workingBytes;
         uint priorFanout = 0;
         for (int i = 0; i < 256; i++) {
+            if ((i & 63) == 0) CheckDeadline();
             uint current = ReadU32(_index, 8 + i * 4);
             if (current < priorFanout) throw new InvalidDataException("Git index fanout is not monotonic");
             priorFanout = current;
@@ -146,6 +330,7 @@ public sealed class D32BoundedGitPackReaderV1
         uint[] firstByteCounts = new uint[256];
         byte[] priorOid = null;
         for (int i = 0; i < _objectCount; i++) {
+            if ((i & 1023) == 0) CheckDeadline();
             int dest = i * 20;
             Buffer.BlockCopy(_index, checked((int)(oidStart + (long)i * 20L)), _oids, dest, 20);
             byte[] oid = Slice(_oids, dest, 20);
@@ -156,11 +341,13 @@ public sealed class D32BoundedGitPackReaderV1
         }
         uint cumulative = 0;
         for (int i = 0; i < 256; i++) {
+            if ((i & 63) == 0) CheckDeadline();
             cumulative += firstByteCounts[i];
             if (ReadU32(_index, 8 + i * 4) != cumulative) throw new InvalidDataException("Git index fanout does not match the object ID table");
         }
         bool[] largeSlots = new bool[largeOffsetCount];
         for (int i = 0; i < _objectCount; i++) {
+            if ((i & 1023) == 0) CheckDeadline();
             uint raw = ReadU32(_index, checked((int)(offsetStart + (long)i * 4L)));
             long offset;
             if ((raw & 0x80000000U) != 0) {
@@ -174,11 +361,14 @@ public sealed class D32BoundedGitPackReaderV1
             if (offset < 12 || offset >= _packLength - 20 || !_indexByOffset.TryAdd(offset, i)) throw new InvalidDataException("Git index contains an invalid or duplicate pack offset");
             _offsets[i] = offset;
         }
-        for (int i = 0; i < largeSlots.Length; i++) if (!largeSlots[i]) throw new InvalidDataException("Git index has an unreferenced large-offset slot");
+        for (int i = 0; i < largeSlots.Length; i++) { if ((i & 1023) == 0) CheckDeadline(); if (!largeSlots[i]) throw new InvalidDataException("Git index has an unreferenced large-offset slot"); }
         _sortedOffsets = (long[])_offsets.Clone();
+        CheckDeadline();
         Array.Sort(_sortedOffsets);
+        CheckDeadline();
         if (_sortedOffsets.Length == 0 || _sortedOffsets[0] != 12L) throw new InvalidDataException("Git pack does not begin with its first indexed object at byte 12");
         for (int i = 0; i < _sortedOffsets.Length; i++) {
+            if ((i & 1023) == 0) CheckDeadline();
             long next = i + 1 < _sortedOffsets.Length ? _sortedOffsets[i + 1] : _packLength - 20L;
             long recordLength = next - _sortedOffsets[i];
             if (recordLength <= 0 || recordLength > MaxObjectBytes) throw new InvalidDataException("Git packed object record boundary exceeds the fixed 64 MiB cap");
@@ -206,15 +396,25 @@ public sealed class D32BoundedGitPackReaderV1
 
     public static string CommitTreeOid(byte[] body)
     {
+        return CommitTreeOid(body, MaxElapsedMilliseconds);
+    }
+
+    public static string CommitTreeOid(byte[] body, long maximumElapsedMilliseconds)
+    {
+        if (maximumElapsedMilliseconds <= 0) throw new InvalidDataException("Git commit parse has no remaining source-proof time");
+        Stopwatch timer = Stopwatch.StartNew();
         if (body == null || body.Length == 0 || body.Length > 1024 * 1024) throw new InvalidDataException("Git commit body is empty or exceeds 1 MiB");
         int end = Array.IndexOf(body, (byte)10);
+        CheckTreeDeadline(timer, maximumElapsedMilliseconds);
         if (end <= 5) throw new InvalidDataException("Git commit has no first tree line");
         string first = Encoding.ASCII.GetString(body, 0, end);
         if (!first.StartsWith("tree ", StringComparison.Ordinal) || first.Length != 45 || !IsLowerHex(first.Substring(5))) throw new InvalidDataException("Git commit first header is not a SHA-1 tree reference");
         int cursor = end + 1;
         bool blank = false;
         while (cursor < body.Length) {
+            CheckTreeDeadline(timer, maximumElapsedMilliseconds);
             int lineEnd = Array.IndexOf(body, (byte)10, cursor);
+            CheckTreeDeadline(timer, maximumElapsedMilliseconds);
             if (lineEnd < 0) throw new InvalidDataException("Git commit header is not LF-terminated");
             if (lineEnd == cursor) { blank = true; break; }
             string line = Encoding.ASCII.GetString(body, cursor, lineEnd - cursor);
@@ -223,11 +423,19 @@ public sealed class D32BoundedGitPackReaderV1
             cursor = lineEnd + 1;
         }
         if (!blank) throw new InvalidDataException("Git commit has no header/body separator");
+        CheckTreeDeadline(timer, maximumElapsedMilliseconds);
         return first.Substring(5);
     }
 
     public static D32BoundedGitTreeEntryV1[] ParseTree(byte[] body)
     {
+        return ParseTree(body, MaxElapsedMilliseconds);
+    }
+
+    public static D32BoundedGitTreeEntryV1[] ParseTree(byte[] body, long maximumElapsedMilliseconds)
+    {
+        if (maximumElapsedMilliseconds <= 0) throw new InvalidDataException("Git tree parse has no remaining source-proof time");
+        Stopwatch timer = Stopwatch.StartNew();
         if (body == null || body.Length > MaxObjectBytes) throw new InvalidDataException("Git tree body exceeds the fixed object bound");
         List<D32BoundedGitTreeEntryV1> result = new List<D32BoundedGitTreeEntryV1>();
         HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -236,16 +444,18 @@ public sealed class D32BoundedGitPackReaderV1
         int cursor = 0;
         UTF8Encoding strictUtf8 = new UTF8Encoding(false, true);
         while (cursor < body.Length) {
+            if ((result.Count & 255) == 0) CheckTreeDeadline(timer, maximumElapsedMilliseconds);
             if (result.Count >= 100000) throw new InvalidDataException("Git tree entry count exceeds the fixed 100000 limit");
             int modeStart = cursor;
-            while (cursor < body.Length && body[cursor] != 32) cursor++;
+            while (cursor < body.Length && body[cursor] != 32) { if ((cursor & 65535) == 0) CheckTreeDeadline(timer, maximumElapsedMilliseconds); cursor++; }
             if (cursor == modeStart || cursor >= body.Length) throw new InvalidDataException("Git tree mode separator is malformed");
             string mode = Encoding.ASCII.GetString(body, modeStart, cursor - modeStart);
             for (int i = 0; i < mode.Length; i++) if (mode[i] < '0' || mode[i] > '7') throw new InvalidDataException("Git tree mode is not octal");
             cursor++;
             int nameStart = cursor;
-            while (cursor < body.Length && body[cursor] != 0) cursor++;
+            while (cursor < body.Length && body[cursor] != 0) { if ((cursor & 65535) == 0) CheckTreeDeadline(timer, maximumElapsedMilliseconds); cursor++; }
             if (cursor == nameStart || cursor >= body.Length) throw new InvalidDataException("Git tree name is empty or unterminated");
+            if (cursor - nameStart > 4096) throw new InvalidDataException("Git tree name exceeds the fixed Windows component bound");
             byte[] nameBytes = Slice(body, nameStart, cursor - nameStart);
             string name;
             try { name = strictUtf8.GetString(nameBytes); } catch { throw new InvalidDataException("Git tree name is not strict UTF-8"); }
@@ -298,8 +508,8 @@ public sealed class D32BoundedGitPackReaderV1
             entryBudget = entryLength;
             entryBytes = new byte[entryLength];
             _pack.Position = start;
-            ReadExactly(_pack, entryBytes, 0, entryLength);
-            if (ComputeCrc32(entryBytes, 0, entryLength) != _crcs[index]) throw new InvalidDataException("Git pack entry CRC differs from its v2 index record");
+            ReadPackExactly(entryBytes, 0, entryLength);
+            if (ComputeCrc32Bounded(entryBytes, 0, entryLength) != _crcs[index]) throw new InvalidDataException("Git pack entry CRC differs from its v2 index record");
             int cursor = 0;
             int first = entryBytes[cursor++];
             int type = (first >> 4) & 7;
@@ -403,6 +613,7 @@ public sealed class D32BoundedGitPackReaderV1
         byte[] result = new byte[resultLength];
         int written = 0;
         while (cursor < delta.Length) {
+            if ((cursor & 4095) == 0) CheckDeadline();
             int instruction = delta[cursor++];
             if ((instruction & 128) != 0) {
                 long offset = 0;
@@ -462,10 +673,12 @@ public sealed class D32BoundedGitPackReaderV1
             using (MemoryStream input = new MemoryStream(source, offset, length, false, true))
             using (ZLibStream inflater = new ZLibStream(input, CompressionMode.Decompress, true)) {
                 int cursor = 0;
+                byte[] buffer = new byte[HashBufferSize];
                 while (cursor < output.Length) {
                     CheckDeadline();
-                    int read = inflater.Read(output, cursor, output.Length - cursor);
+                    int read = inflater.Read(buffer, 0, (int)Math.Min((long)buffer.Length, output.Length - cursor));
                     if (read <= 0) throw new InvalidDataException("Git zlib stream is truncated before its declared object size");
+                    Buffer.BlockCopy(buffer, 0, output, cursor, read);
                     cursor += read;
                 }
                 if (inflater.ReadByte() != -1) throw new InvalidDataException("Git zlib stream exceeds its declared object size");
@@ -503,18 +716,19 @@ public sealed class D32BoundedGitPackReaderV1
         byte[] trailer = new byte[20];
         _pack.Position = _packLength - 20L;
         ReadExactly(_pack, trailer, 0, 20);
-        byte[] digest = HashStreamPrefix(_pack, _packLength - 20L);
+        byte[] digest = HashStreamPrefix(_pack, _packLength - 20L, out _packSha256);
         if (!FixedTimeEqual(digest, trailer) || !FixedTimeEqual(indexPackDigest, trailer) || BytesToHex(trailer, 0, 20) != expectedPackId) throw new InvalidDataException("Git pack trailer, index pack checksum, or filename SHA-1 mismatch");
         _pack.Position = 0;
     }
 
-    private byte[] HashStreamPrefix(Stream stream, long count)
+    private byte[] HashStreamPrefix(Stream stream, long count, out string sha256Hex)
     {
         byte[] buffer = new byte[HashBufferSize];
         long original = stream.Position;
         try {
             stream.Position = 0;
             using (SHA1 sha = SHA1.Create()) {
+                using (IncrementalHash sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)) {
                 long remaining = count;
                 while (remaining > 0) {
                     CheckDeadline();
@@ -522,10 +736,13 @@ public sealed class D32BoundedGitPackReaderV1
                     int read = stream.Read(buffer, 0, take);
                     if (read <= 0) throw new InvalidDataException("Git pack ended during streaming checksum");
                     sha.TransformBlock(buffer, 0, read, buffer, 0);
+                    sha256.AppendData(buffer, 0, read);
                     remaining -= read;
                 }
                 sha.TransformFinalBlock(new byte[0], 0, 0);
+                sha256Hex = BytesToHex(sha256.GetHashAndReset(), 0, 32);
                 return sha.Hash;
+                }
             }
         } finally { stream.Position = original; }
     }
@@ -535,7 +752,11 @@ public sealed class D32BoundedGitPackReaderV1
         byte[] prefix = Encoding.ASCII.GetBytes(type + " " + body.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\0");
         using (SHA1 sha = SHA1.Create()) {
             sha.TransformBlock(prefix, 0, prefix.Length, prefix, 0);
-            sha.TransformBlock(body, 0, body.Length, body, 0);
+            for (int offset = 0; offset < body.Length; offset += HashBufferSize) {
+                CheckDeadline();
+                int take = Math.Min(HashBufferSize, body.Length - offset);
+                sha.TransformBlock(body, offset, take, body, offset);
+            }
             sha.TransformFinalBlock(new byte[0], 0, 0);
             return sha.Hash;
         }
@@ -556,7 +777,31 @@ public sealed class D32BoundedGitPackReaderV1
 
     private void CheckDeadline()
     {
-        if (_timer.ElapsedMilliseconds > _maxElapsedMilliseconds) throw new InvalidDataException("Git source proof exceeded its remaining 300-second budget");
+        if (_timer.ElapsedMilliseconds >= _maxElapsedMilliseconds) throw new InvalidDataException("Git source proof exceeded its remaining source-proof deadline");
+    }
+
+    private void ReadPackExactly(byte[] buffer, int offset, int count)
+    {
+        while (count > 0) {
+            CheckDeadline();
+            int take = Math.Min(HashBufferSize, count);
+            int read = _pack.Read(buffer, offset, take);
+            if (read <= 0) throw new InvalidDataException("Git pack entry ended during its bounded read");
+            offset += read;
+            count -= read;
+        }
+    }
+
+    private uint ComputeCrc32Bounded(byte[] bytes, int offset, int count)
+    {
+        if (bytes == null || offset < 0 || count < 0 || offset > bytes.Length - count) throw new InvalidDataException("CRC input bounds are invalid");
+        uint crc = 0xffffffffU;
+        int end = offset + count;
+        for (int i = offset; i < end; i++) {
+            if (((i - offset) & 65535) == 0) CheckDeadline();
+            crc = CrcTable[(crc ^ bytes[i]) & 0xffU] ^ (crc >> 8);
+        }
+        return crc ^ 0xffffffffU;
     }
 
     private void EnsureLive() { if (_disposed) throw new ObjectDisposedException("D32BoundedGitPackReaderV1"); CheckDeadline(); }
@@ -584,9 +829,23 @@ public sealed class D32BoundedGitPackReaderV1
         return table;
     }
 
-    private static byte[] Sha1(byte[] bytes, int offset, int count)
+    private byte[] HashBytes(byte[] bytes, int offset, int count, HashAlgorithmName algorithm)
     {
-        using (SHA1 sha = SHA1.Create()) return sha.ComputeHash(bytes, offset, count);
+        if (bytes == null || offset < 0 || count < 0 || offset > bytes.Length - count) throw new InvalidDataException("Hash input bounds are invalid");
+        using (IncrementalHash hash = IncrementalHash.CreateHash(algorithm)) {
+            int end = offset + count;
+            for (int cursor = offset; cursor < end; cursor += HashBufferSize) {
+                CheckDeadline();
+                int take = Math.Min(HashBufferSize, end - cursor);
+                hash.AppendData(bytes, cursor, take);
+            }
+            return hash.GetHashAndReset();
+        }
+    }
+
+    private static void CheckTreeDeadline(Stopwatch timer, long maximumElapsedMilliseconds)
+    {
+        if (timer.ElapsedMilliseconds >= maximumElapsedMilliseconds) throw new InvalidDataException("Git tree parse exceeded the remaining source-proof deadline");
     }
 
     private static uint ReadU32(byte[] bytes, int offset)
@@ -878,7 +1137,8 @@ function Test-D32BoundedCompilerDiagnosticFormalReject {
 }
 
 function Test-D32BoundedDiagnosticSourceGraphProof {
-    param([AllowNull()][object]$Graph)
+    param([AllowNull()][object]$Graph, [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     $fields = @('schema_version', 'record_type', 'gate_authority', 'formal_gate_usable', 'status', 'semantic_scope', 'lock_sha256',
         'lock_dependency_edges_sha256', 'graph_sha256', 'root_manifest_path', 'selected_root_ids', 'root_selection_rule', 'host_triple',
         'target_triple', 'target_resolution_scope', 'locked_package_count', 'included_package_ids', 'included_package_count',
@@ -917,12 +1177,20 @@ function Test-D32BoundedDiagnosticSourceGraphProof {
     $rootId = [string]$Graph.selected_root_ids[0]
     if ($rootId -notmatch '^digital-life-vita-agent@[^|]+\|workspace\|workspace$') { return $false }
     $included = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($id in $Graph.included_package_ids) { if ($id -isnot [string] -or -not $included.Add([string]$id)) { return $false } }
+    $validationIndex = 0
+    foreach ($id in $Graph.included_package_ids) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.included_ids' -Progress ("packages={0}/{1}" -f $validationIndex, $Graph.included_package_ids.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if ($id -isnot [string] -or -not $included.Add([string]$id)) { return $false }
+        $validationIndex++
+    }
     if (-not $included.Contains($rootId)) { return $false }
     $classified = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $includedClassifications = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $excludedClassifications = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $validationIndex = 0
     foreach ($class in $Graph.classifications) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.classifications' -Progress ("rows={0}/{1}" -f $validationIndex, $Graph.classifications.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $validationIndex++
         if ([string]$class.classification -ceq 'INCLUDED') {
             $classFields = @('package_id', 'classification', 'source_kind', 'source_identity', 'manifest_path', 'manifest_sha256', 'witness_kind', 'witness_root_path', 'closed_reachability_sha256')
             if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $class $classFields) -or
@@ -961,70 +1229,114 @@ function Test-D32BoundedDiagnosticSourceGraphProof {
     }
     if ($classified.Count -ne [Int64]$Graph.locked_package_count -or $includedClassifications.Count -ne [Int64]$Graph.included_package_count -or
         $excludedClassifications.Count -ne [Int64]$Graph.excluded_package_count) { return $false }
+    $edgeKeyCounts = [System.Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $edgePairs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $includedEdgeTargets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $validationIndex = 0
     foreach ($edge in $Graph.included_edges) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.edges' -Progress ("rows={0}/{1}" -f $validationIndex, $Graph.included_edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $validationIndex++
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $edge @('parent_package_id', 'target_package_id', 'lock_spec', 'dependency_alias', 'kind', 'target_predicate', 'predicate_proven', 'predicate_witness', 'optional_included')) -or
-            -not $included.Contains([string]$edge.parent_package_id) -or -not $included.Contains([string]$edge.target_package_id)) { return $false }
-        if (@($Graph.dependency_decisions | Where-Object {
-            [string]$_.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG') -and
-            [string]$_.parent_package_id -ceq [string]$edge.parent_package_id -and
-            [string]$_.target_package_id -ceq [string]$edge.target_package_id -and
-            [string]$_.lock_specs[0] -ceq [string]$edge.lock_spec -and
-            [string]$_.alias -ceq [string]$edge.dependency_alias -and
-            [string]$_.kind -ceq [string]$edge.kind -and
-            [string]$_.target -ceq [string]$edge.target_predicate -and
-            [bool]$_.predicate_proven -eq [bool]$edge.predicate_proven -and
-            [string]$_.predicate_witness -ceq [string]$edge.predicate_witness -and
-            [bool]$_.optional_included -eq [bool]$edge.optional_included
-        }).Count -ne 1) { return $false }
+            -not $included.Contains([string]$edge.parent_package_id) -or -not $included.Contains([string]$edge.target_package_id) -or
+            $edge.predicate_proven -isnot [bool] -or $edge.optional_included -isnot [bool]) { return $false }
+        $edgeKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@(
+            [string]$edge.parent_package_id, [string]$edge.target_package_id, [string]$edge.lock_spec, [string]$edge.dependency_alias,
+            [string]$edge.kind, [string]$edge.target_predicate, [string]$edge.predicate_proven, [string]$edge.predicate_witness,
+            [string]$edge.optional_included))
+        if ($edgeKeyCounts.ContainsKey($edgeKey)) { $edgeKeyCounts[$edgeKey] = [int]$edgeKeyCounts[$edgeKey] + 1 }
+        else { $edgeKeyCounts.Add($edgeKey, 1) }
+        $pairKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$edge.parent_package_id, [string]$edge.target_package_id))
+        [void]$edgePairs.Add($pairKey)
+        [void]$includedEdgeTargets.Add([string]$edge.target_package_id)
     }
+    $includedDecisionKeyCounts = [System.Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $includedDecisionTargets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $validationIndex = 0
     foreach ($decision in $Graph.dependency_decisions) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.decisions' -Progress ("rows={0}/{1}" -f $validationIndex, $Graph.dependency_decisions.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $validationIndex++
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $decision @('parent_package_id', 'alias', 'kind', 'target', 'disposition', 'predicate_proven', 'predicate_witness', 'target_package_id', 'lock_specs', 'optional_included')) -or
-            -not $included.Contains([string]$decision.parent_package_id) -or $decision.lock_specs -isnot [Array]) { return $false }
+            -not $included.Contains([string]$decision.parent_package_id) -or $decision.lock_specs -isnot [Array] -or
+            $decision.predicate_proven -isnot [bool] -or $decision.optional_included -isnot [bool]) { return $false }
         if ([string]$decision.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG')) {
             if (-not $included.Contains([string]$decision.target_package_id) -or $decision.lock_specs.Count -ne 1 -or
-                @($Graph.included_edges | Where-Object {
-                    [string]$_.parent_package_id -ceq [string]$decision.parent_package_id -and
-                    [string]$_.target_package_id -ceq [string]$decision.target_package_id -and
-                    [string]$_.lock_spec -ceq [string]$decision.lock_specs[0] -and
-                    [string]$_.dependency_alias -ceq [string]$decision.alias -and
-                    [string]$_.kind -ceq [string]$decision.kind -and
-                    [string]$_.target_predicate -ceq [string]$decision.target -and
-                    [bool]$_.predicate_proven -eq [bool]$decision.predicate_proven -and
-                    [string]$_.predicate_witness -ceq [string]$decision.predicate_witness -and
-                    [bool]$_.optional_included -eq [bool]$decision.optional_included
-                }).Count -ne 1) { return $false }
+                $decision.lock_specs[0] -isnot [string]) { return $false }
+            $decisionKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@(
+                [string]$decision.parent_package_id, [string]$decision.target_package_id, [string]$decision.lock_specs[0], [string]$decision.alias,
+                [string]$decision.kind, [string]$decision.target, [string]$decision.predicate_proven, [string]$decision.predicate_witness,
+                [string]$decision.optional_included))
+            if (-not $edgeKeyCounts.ContainsKey($decisionKey)) { return $false }
+            if ($includedDecisionKeyCounts.ContainsKey($decisionKey)) { $includedDecisionKeyCounts[$decisionKey] = [int]$includedDecisionKeyCounts[$decisionKey] + 1 }
+            else { $includedDecisionKeyCounts.Add($decisionKey, 1) }
+            [void]$includedDecisionTargets.Add([string]$decision.target_package_id)
         }
     }
+    if ($includedDecisionKeyCounts.Count -ne $edgeKeyCounts.Count) { return $false }
+    $validationIndex = 0
+    foreach ($edgeKey in $edgeKeyCounts.Keys) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.edge_keys' -Progress ("keys={0}/{1}" -f $validationIndex, $edgeKeyCounts.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if ($edgeKeyCounts[$edgeKey] -ne 1 -or -not $includedDecisionKeyCounts.ContainsKey($edgeKey) -or $includedDecisionKeyCounts[$edgeKey] -ne 1) { return $false }
+        $validationIndex++
+    }
+    $validationIndex = 0
     foreach ($id in $Graph.included_package_ids) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.witnesses' -Progress ("packages={0}/{1}" -f $validationIndex, $Graph.included_package_ids.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $validationIndex++
         $class = $includedClassifications[[string]$id]
         $path = [string[]]$class.witness_root_path
         for ($i = 1; $i -lt $path.Length; $i++) {
-            if (-not @($Graph.included_edges | Where-Object { [string]$_.parent_package_id -ceq $path[$i - 1] -and [string]$_.target_package_id -ceq $path[$i] }).Count) { return $false }
+            if ($null -ne $ProofTimer -and (($i -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.witness_edges' -Progress ("package={0};edges={1}/{2}" -f $id, $i, $path.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+            $pairKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@($path[$i - 1], $path[$i]))
+            if (-not $edgePairs.Contains($pairKey)) { return $false }
         }
     }
+    $validationIndex = 0
     foreach ($id in $excludedClassifications.Keys) {
-        if (@($Graph.included_edges | Where-Object { [string]$_.target_package_id -ceq $id }).Count -gt 0 -or
-            @($Graph.dependency_decisions | Where-Object { [string]$_.disposition -cin @('INCLUDED', 'INCLUDED_UNKNOWN_CFG') -and [string]$_.target_package_id -ceq $id }).Count -gt 0) { return $false }
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.exclusions' -Progress ("packages={0}/{1}" -f $validationIndex, $excludedClassifications.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $validationIndex++
+        if ($includedEdgeTargets.Contains([string]$id) -or $includedDecisionTargets.Contains([string]$id)) { return $false }
     }
-    $includedIds = [string[]]@($Graph.included_package_ids); [Array]::Sort($includedIds, [StringComparer]::Ordinal)
-    $expectedClosedSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($includedIds -join "`n") + "`n"))).ToLowerInvariant()
+    $includedIds = [string[]]@($Graph.included_package_ids)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_closed_set' -Progress ("packages={0}" -f $includedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    [Array]::Sort($includedIds, [StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_closed_set_complete' -Progress ("packages={0}" -f $includedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $expectedClosedSha = Get-D32BoundedDiagnosticSha256FromLines -Lines $includedIds -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_graph.validate_closed_digest'
     if ($expectedClosedSha -cne [string]$Graph.closed_reachability_set_sha256) { return $false }
     $manifestCanon = [System.Collections.Generic.List[string]]::new()
+    $validationIndex = 0
     foreach ($id in $includedIds) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.manifest_rows' -Progress ("rows={0}/{1}" -f $validationIndex, $includedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
         $class = $includedClassifications[$id]
         $manifestCanon.Add($id + "`t" + [string]$class.source_kind + "`t" + [string]$class.source_identity + "`t" + [string]$class.manifest_path + "`t" + [string]$class.manifest_sha256)
+        $validationIndex++
     }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_manifests' -Progress ("rows={0}" -f $manifestCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $manifestCanon.Sort([StringComparer]::Ordinal)
-    $expectedManifestSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($manifestCanon -join "`n") + "`n"))).ToLowerInvariant()
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_manifests_complete' -Progress ("rows={0}" -f $manifestCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $expectedManifestSha = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$manifestCanon.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_graph.validate_manifest_digest'
     if ($expectedManifestSha -cne [string]$Graph.included_manifest_set_sha256) { return $false }
     $edgeCanon = [System.Collections.Generic.List[string]]::new()
-    foreach ($edge in $Graph.included_edges) { $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)) }
+    $validationIndex = 0
+    foreach ($edge in $Graph.included_edges) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.edge_rows' -Progress ("rows={0}/{1}" -f $validationIndex, $Graph.included_edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)); $validationIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_edges' -Progress ("rows={0}" -f $edgeCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $edgeCanon.Sort([StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_edges_complete' -Progress ("rows={0}" -f $edgeCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $decisionCanon = [System.Collections.Generic.List[string]]::new()
-    foreach ($decision in $Graph.dependency_decisions) { $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)) }
+    $validationIndex = 0
+    foreach ($decision in $Graph.dependency_decisions) {
+        if ($null -ne $ProofTimer -and (($validationIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.decision_rows' -Progress ("rows={0}/{1}" -f $validationIndex, $Graph.dependency_decisions.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)); $validationIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_decisions' -Progress ("rows={0}" -f $decisionCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $decisionCanon.Sort([StringComparer]::Ordinal)
-    $rootCanonical = [string]::Join("`n", [string[]]$Graph.selected_root_ids)
-    $expectedGraphSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(([string]$Graph.lock_sha256 + "`n" + [string]$Graph.lock_dependency_edges_sha256 + "`n" + $rootCanonical + "`n" + ($edgeCanon -join "`n") + "`n" + ($decisionCanon -join "`n") + "`n" + $expectedClosedSha + "`n" + $expectedManifestSha + "`n")))).ToLowerInvariant()
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.result_validation.sort_decisions_complete' -Progress ("rows={0}" -f $decisionCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $expectedGraphSha = Get-D32BoundedDiagnosticSourceGraphDigest -LockSha256 ([string]$Graph.lock_sha256) `
+        -LockDependencyEdgesSha256 ([string]$Graph.lock_dependency_edges_sha256) -RootIds ([string[]]$Graph.selected_root_ids) `
+        -EdgeRows ([string[]]$edgeCanon.ToArray()) -DecisionRows ([string[]]$decisionCanon.ToArray()) `
+        -ClosedSetSha256 $expectedClosedSha -ManifestSetSha256 $expectedManifestSha -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
     if ($expectedGraphSha -cne [string]$Graph.graph_sha256) { return $false }
     return $true
 }
@@ -1085,9 +1397,13 @@ function New-D32BoundedDiagnosticSourceProofCandidateDocument {
 }
 
 function Get-D32BoundedDiagnosticRegistrySourceProofDigest {
-    param([Parameter(Mandatory = $true)][object[]]$Packages)
+    param([Parameter(Mandatory = $true)][object[]]$Packages,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $canonicalRows = [System.Collections.Generic.List[string]]::new()
+    $packageIndex = 0
     foreach ($package in $Packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.result_digest' -Progress ("packages={0}/{1}" -f $packageIndex, $Packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
         $counts = $package.format_counts
         $parts = [string[]]@(
             [string]$package.package_id, [string]$package.name, [string]$package.version, [string]$package.checksum,
@@ -1112,10 +1428,10 @@ function Get-D32BoundedDiagnosticRegistrySourceProofDigest {
             ([Int64]$package.source_bytes).ToString([Globalization.CultureInfo]::InvariantCulture),
             [string]$package.source_inventory_sha256)
         $canonicalRows.Add([string]::Join("`t", $parts))
+        $packageIndex++
     }
     $canonicalRows.Sort([StringComparer]::Ordinal)
-    $canonical = ($canonicalRows -join "`n") + "`n"
-    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($canonical))).ToLowerInvariant()
+    return Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$canonicalRows.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.result_digest_hash'
 }
 
 function New-D32BoundedDiagnosticRegistrySourceProofPackage {
@@ -1201,7 +1517,8 @@ function New-D32BoundedDiagnosticRegistrySourceContentProofDocument {
 }
 
 function Test-D32BoundedDiagnosticRegistrySourceContentProof {
-    param([AllowNull()][object]$Proof)
+    param([AllowNull()][object]$Proof, [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $fields = @('schema_version', 'record_type', 'registry_archive_policy', 'gate_authority', 'status', 'formal_gate_usable',
         'semantic_scope', 'source_proof_sha256', 'verifier_managed_buffer_cap_bytes', 'maximum_buffered_registry_archive_bytes',
         'concurrent_buffered_registry_archives', 'lock_sha256', 'registry_tuple_sha256', 'package_count', 'locked_registry_catalog_count',
@@ -1239,6 +1556,7 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
     $countsFields = @('ustar_regular', 'ustar_directory', 'gnu_regular', 'gnu_directory', 'gnu_longname_extension')
     $index = 0
     foreach ($package in $Proof.packages) {
+        if ($null -ne $ProofTimer -and (($index -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.result_validation' -Progress ("packages={0}/{1}" -f $index, $Proof.packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $package $archiveFields) -or
             $package.package_id -isnot [string] -or [string]$package.package_id -notmatch '^[A-Za-z0-9_-]+@[0-9A-Za-z.+_-]+\|registry\|registry\+https://github\.com/rust-lang/crates\.io-index$' -or
             -not $packageIds.Add([string]$package.package_id) -or $Proof.verified_package_ids[$index] -isnot [string] -or
@@ -1290,12 +1608,14 @@ function Test-D32BoundedDiagnosticRegistrySourceContentProof {
             [Int64]$package.header_count -gt 10000) { return $false }
         $index++
     }
-    try { return ((Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages @($Proof.packages)) -ceq [string]$Proof.source_proof_sha256) }
+    try { return ((Get-D32BoundedDiagnosticRegistrySourceProofDigest -Packages @($Proof.packages) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds) -ceq [string]$Proof.source_proof_sha256) }
     catch { return $false }
 }
 
 function Test-D32BoundedDiagnosticSourceProofCandidate {
-    param([AllowNull()][object]$Record, [AllowNull()][System.Collections.Generic.List[string]]$FailureReasons)
+    param([AllowNull()][object]$Record, [AllowNull()][System.Collections.Generic.List[string]]$FailureReasons,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     $fields = @('schema_version', 'record_type', 'source_plan_semantics_version', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
         'registry_archive_policy', 'source_repo', 'status', 'formal_phase1_allowed', 'formal_aggregate_allowed', 'diagnostic_invocation_authority',
         'historical_origin', 'proof_authority', 'proof_entry', 'proof_started_at_utc', 'proof_completed_at_utc',
@@ -1344,7 +1664,7 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
         return $false
     }
     if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -and $null -ne $Record.current_source_closure -and
-        -not (Test-D32BoundedDiagnosticSourceGraphProof $Record.current_source_closure.SourceGraphProof)) {
+        -not (Test-D32BoundedDiagnosticSourceGraphProof $Record.current_source_closure.SourceGraphProof -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds)) {
         Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'source-graph-proof-shape-or-witness'
         return $false
     }
@@ -1383,7 +1703,7 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
         }
         if ([string]$Record.current_source_closure.RegistryContentProof.status -cne 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY' -or
             [bool]$Record.current_source_closure.RegistryContentProof.formal_gate_usable -or
-            -not (Test-D32BoundedDiagnosticRegistrySourceContentProof $Record.current_source_closure.RegistryContentProof) -or
+            -not (Test-D32BoundedDiagnosticRegistrySourceContentProof $Record.current_source_closure.RegistryContentProof -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds) -or
             [string]$Record.current_source_closure.RegistryContentProof.lock_sha256 -cne [string]$Record.current_source_closure.SourceGraphProof.lock_sha256 -or
             $Record.current_source_closure.RegistryContentProof.verified_package_ids -isnot [Array]) {
             Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'registry-proof-status-lock-or-package-set'
@@ -1400,21 +1720,29 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
     }
     if ([string]$Record.status -ceq 'CURRENT_SOURCE_CONTENT_VERIFIED_FOR_DIAGNOSTIC_ONLY') {
         $registryIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $closureIndex = 0
         foreach ($id in $Record.current_source_closure.RegistryContentProof.verified_package_ids) {
+            if ($null -ne $ProofTimer -and (($closureIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_registry_ids' -Progress ("packages={0}/{1}" -f $closureIndex, $Record.current_source_closure.RegistryContentProof.verified_package_ids.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
             if ($id -isnot [string] -or -not $registryIds.Add([string]$id)) {
                 Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'registry-proof-package-id-set'
                 return $false
             }
+            $closureIndex++
         }
         $gitIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $closureIndex = 0
         foreach ($id in $Record.current_source_closure.GitContentProof.verified_package_ids) {
+            if ($null -ne $ProofTimer -and (($closureIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_git_ids' -Progress ("packages={0}/{1}" -f $closureIndex, $Record.current_source_closure.GitContentProof.verified_package_ids.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
             if ($id -isnot [string] -or -not $gitIds.Add([string]$id)) {
                 Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'git-proof-package-id-set'
                 return $false
             }
+            $closureIndex++
         }
         $workspaceManifests = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $closureIndex = 0
         foreach ($manifest in $Record.current_source_closure.CurrentManifestProof) {
+            if ($null -ne $ProofTimer -and (($closureIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_current_manifests' -Progress ("manifests={0}/{1}" -f $closureIndex, $Record.current_source_closure.CurrentManifestProof.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
             if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $manifest @('manifest_path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
                 [string]$manifest.manifest_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$' -or
                 -not (Test-D32BoundedCompilerDiagnosticInteger $manifest.bytes -Positive) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
@@ -1423,18 +1751,33 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
                 Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'workspace-manifest-proof-shape-or-duplicate'
                 return $false
             }
+            $closureIndex++
         }
         if ($workspaceManifests.Count -ne $Record.current_profile_lock_bindings.Count) {
             Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'workspace-manifest-to-profile-binding-count'
             return $false
         }
+        $closureIndex = 0
         foreach ($binding in $Record.current_profile_lock_bindings) {
+            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_profile_bindings' -Progress ("bindings={0}/{1}" -f $closureIndex, $Record.current_profile_lock_bindings.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
             if (-not $workspaceManifests.ContainsKey([string]$binding.manifest_path)) {
                 Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'profile-binding-manifest-unmatched'
                 return $false
             }
+            $closureIndex++
         }
+        $gitSourceCounts = [System.Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+        $closureIndex = 0
+        foreach ($gitSource in $Record.current_source_closure.GitContentProof.sources) {
+            if ($null -ne $ProofTimer -and (($closureIndex -band 15) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_git_sources' -Progress ("sources={0}/{1}" -f $closureIndex, $Record.current_source_closure.GitContentProof.sources.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $sourceName = [string]$gitSource.source
+            if ($gitSourceCounts.ContainsKey($sourceName)) { $gitSourceCounts[$sourceName] = [int]$gitSourceCounts[$sourceName] + 1 } else { $gitSourceCounts.Add($sourceName, 1) }
+            $closureIndex++
+        }
+        $closureIndex = 0
         foreach ($class in $Record.current_source_closure.SourceGraphProof.classifications) {
+            if ($null -ne $ProofTimer -and (($closureIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_proof.result_classifications' -Progress ("classifications={0}/{1}" -f $closureIndex, $Record.current_source_closure.SourceGraphProof.classifications.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $closureIndex++
             if ([string]$class.classification -cne 'INCLUDED') { continue }
             switch ([string]$class.source_kind) {
                 'workspace' {
@@ -1451,7 +1794,7 @@ function Test-D32BoundedDiagnosticSourceProofCandidate {
                 }
                 'git' {
                     if (-not $gitIds.Contains([string]$class.package_id) -or
-                        @($Record.current_source_closure.GitContentProof.sources | Where-Object { [string]$_.source -ceq [string]$class.source_identity }).Count -ne 1) {
+                        -not $gitSourceCounts.ContainsKey([string]$class.source_identity) -or $gitSourceCounts[[string]$class.source_identity] -ne 1) {
                         Add-D32BoundedDiagnosticSourceProofCandidateFailureReason -FailureReasons $FailureReasons -Reason 'included-git-package-crossbind'
                         return $false
                     }
@@ -1484,7 +1827,9 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
         [Parameter(Mandatory = $true)][string]$EntryScriptPath,
         [Parameter(Mandatory = $true)][string]$RunnerPath,
         [Parameter(Mandatory = $true)][string]$ToolchainProfilePath,
-        [Parameter(Mandatory = $true)][string]$ToolchainProfileSha256
+        [Parameter(Mandatory = $true)][string]$ToolchainProfileSha256,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds
     )
     $top = @('schema_version', 'record_type', 'registry_archive_policy', 'gate_authority', 'candidate_sha', 'historical_origin_candidate_sha',
         'source_repo', 'repository_identity', 'toolchain_profile', 'source_pins', 'dependency_origin', 'proof_budget',
@@ -1528,8 +1873,11 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.owner_record.path, 'E:\d32\inv7\D32-PHASE0-OWNER.json') -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $origin.blocked_diagnostic) -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$origin.blocked_diagnostic.path, 'E:\d32\inv7\D32-PHASE0-BLOCKED-DIAGNOSTIC.json')) { return $false }
+    $referenceIndex = 0
     foreach ($reference in @($origin.fetch_records) + @($origin.manifest_refs)) {
+        if ($null -ne $ProofTimer -and (($referenceIndex -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'authority_shape.origin_refs' -Progress ("references={0}" -f $referenceIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' }
         if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $reference)) { return $false }
+        $referenceIndex++
     }
     $rootPaths = @(
         [PSCustomObject]@{ Name = 'registry_archive_root'; Path = 'E:\d32\inv7\r\c\registry\cache\index.crates.io-1949cf8c6b5b557f' },
@@ -1542,7 +1890,9 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
             -not (Test-D32BoundedCompilerDiagnosticIdentityPair $reference) -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$reference.path, [string]$rootPin.Path)) { return $false }
     }
+    $archiveIndex = 0
     foreach ($archive in $origin.registry_archives) {
+        if ($null -ne $ProofTimer -and (($archiveIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'authority_shape.registry_archives' -Progress ("archives={0}/{1}" -f $archiveIndex, $origin.registry_archives.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' }
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $archive @('source', 'name', 'version', 'checksum', 'path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) -or
             [string]$archive.source -cne 'registry+https://github.com/rust-lang/crates.io-index' -or
             [string]$archive.name -notmatch '^[A-Za-z0-9_-]+$' -or [string]$archive.version -notmatch '^[0-9A-Za-z.+_-]+$' -or
@@ -1550,11 +1900,15 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
             -not (Test-D32BoundedCompilerDiagnosticInteger $archive.bytes -Positive) -or [Int64]$archive.bytes -gt 268435456 -or
             [string]$archive.volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$archive.file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$archive.path, (Join-Path ([string]$origin.registry_archive_root.path) ([string]$archive.name + '-' + [string]$archive.version + '.crate')))) { return $false }
+        $archiveIndex++
     }
     if ($origin.git_content_refs -isnot [Array] -or $origin.git_content_refs.Count -eq 0 -or $origin.git_content_refs.Count -gt 16) { return $false }
     $gitSourcesSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $gitIndex = 0
     foreach ($reference in $origin.git_content_refs) {
+        if ($null -ne $ProofTimer -and (($gitIndex -band 15) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'authority_shape.git_refs' -Progress ("references={0}/{1}" -f $gitIndex, $origin.git_content_refs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' }
         if (-not (Test-D32BoundedCompilerDiagnosticGitContentReferenceShape $reference) -or -not $gitSourcesSeen.Add([string]$reference.source)) { return $false }
+        $gitIndex++
     }
 
     $pins = $Document.source_pins
@@ -1566,9 +1920,12 @@ function Test-D32BoundedDiagnosticSourceProofAuthorityShape {
         'scripts/d32-powershell-module-authority.ps1')
     if ($pins -isnot [Array] -or $pins.Count -ne $expectedPins.Count) { return $false }
     $pinPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $sourcePinIndex = 0
     foreach ($pin in $pins) {
+        if ($null -ne $ProofTimer -and (($sourcePinIndex -band 15) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'authority_shape.source_pins' -Progress ("pins={0}/{1}" -f $sourcePinIndex, $pins.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PROOF_BLOCKED' }
         if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $pin) -or
             -not (Test-D32BoundedCompilerDiagnosticWithin $pin.path $Repository) -or -not $pinPaths.Add([string]$pin.path)) { return $false }
+        $sourcePinIndex++
     }
     foreach ($relative in $expectedPins) {
         $expectedPath = [IO.Path]::GetFullPath((Join-Path $Repository ($relative.Replace('/', '\'))))
@@ -2095,17 +2452,26 @@ function Test-D32BoundedCompilerDiagnosticTestBinaryNotStarted {
 }
 
 function ConvertFrom-D32BoundedDiagnosticLockStringArray {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Body)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Body,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [int]$MaximumItems = 65536)
+    if ($MaximumItems -lt 0 -or $MaximumItems -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency-array item budget is outside its fixed 65536-edge ceiling' }
     $items = [System.Collections.Generic.List[string]]::new()
     $index = 0
     while ($index -lt $Body.Length) {
-        while ($index -lt $Body.Length -and ($Body[$index] -eq ',' -or [char]::IsWhiteSpace($Body[$index]))) { $index++ }
+        if ($null -ne $ProofTimer -and (($index -band 65535) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.dependency_array_parse' -Progress ("offset={0}/{1}" -f $index, $Body.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        while ($index -lt $Body.Length -and ($Body[$index] -eq ',' -or [char]::IsWhiteSpace($Body[$index]))) {
+            if ($null -ne $ProofTimer -and (($index -band 65535) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.dependency_array_whitespace' -Progress ("offset={0}/{1}" -f $index, $Body.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $index++
+        }
         if ($index -ge $Body.Length) { break }
         if ($Body[$index] -cne '"') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array has an unsupported TOML token' }
         $index++
         $value = [Text.StringBuilder]::new()
         $closed = $false
         while ($index -lt $Body.Length) {
+            if ($null -ne $ProofTimer -and (($index -band 65535) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.dependency_string_parse' -Progress ("offset={0}/{1}" -f $index, $Body.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
             $character = $Body[$index++]
             if ($character -ceq '"') { $closed = $true; break }
             if ($character -ceq '\') {
@@ -2117,6 +2483,7 @@ function ConvertFrom-D32BoundedDiagnosticLockStringArray {
             [void]$value.Append($character)
         }
         if (-not $closed) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unterminated dependency string' }
+        if ($items.Count -ge $MaximumItems) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock dependency edges exceed their fixed aggregate 65536-entry limit' }
         $items.Add($value.ToString())
         while ($index -lt $Body.Length -and [char]::IsWhiteSpace($Body[$index])) { $index++ }
         if ($index -lt $Body.Length -and $Body[$index] -cne ',') { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array separator is unsupported' }
@@ -2137,19 +2504,32 @@ function ConvertFrom-D32BoundedDiagnosticLockDependencySpec {
 }
 
 function Get-D32BoundedCompilerDiagnosticLockSources {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$LockText)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$LockText,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     if ($LockText.Length -le 0 -or $LockText.Length -gt 8388608) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: finite Cargo.lock input is empty or exceeds 8 MiB' }
     $packages = [System.Collections.Generic.List[object]]::new()
     $current = $null
     $collectingEdges = $false
     $lockVersion = $null
     $totalEdgeTextCount = 0
-    foreach ($line in ($LockText -split '\r?\n')) {
+    $lineIndex = 0
+    $lineStart = 0
+    while ($lineStart -le $LockText.Length) {
+        if ($null -ne $ProofTimer -and (($lineIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.line_parse' -Progress ("lines={0}" -f $lineIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $lineEnd = $LockText.IndexOf("`n", $lineStart)
+        $hasLineFeed = ($lineEnd -ge 0)
+        if (-not $hasLineFeed) { $lineEnd = $LockText.Length }
+        $rawLength = $lineEnd - $lineStart
+        if ($hasLineFeed -and $rawLength -gt 0 -and $LockText[$lineEnd - 1] -ceq "`r") { $rawLength-- }
+        $line = $LockText.Substring($lineStart, $rawLength)
+        $lineStart = if ($hasLineFeed) { $lineEnd + 1 } else { $LockText.Length + 1 }
+        $lineIndex++
         if ($line -cmatch '^\[\[package\]\]$') {
             if ($collectingEdges) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: truncated Cargo.lock dependency array before the next package' }
             if ($null -ne $current) { $packages.Add($current) }
             if ($packages.Count -gt 2048) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock package count exceeds its fixed 2048-entry limit' }
-            $current = [ordered]@{ name = $null; version = $null; source = $null; checksum = $null; dependency_text = $null; dependencies = @() }
+            $current = [ordered]@{ name = $null; version = $null; source = $null; checksum = $null; dependency_text = $null; dependency_lines = $null; dependencies = @() }
             continue
         }
         if ($null -eq $current) {
@@ -2163,15 +2543,18 @@ function Get-D32BoundedCompilerDiagnosticLockSources {
             throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: unsupported Cargo.lock root statement or table before package catalog'
         }
         if ($collectingEdges) {
-            $current.dependency_text += "`n" + $line
+            if ($current.dependency_lines.Count -ge 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: one multiline dependency array exceeds the fixed 65536-line parser bound' }
+            $current.dependency_lines.Add([string]$line)
             if ($line -match '\]') {
-                $close = $current.dependency_text.LastIndexOf(']')
-                if ($close -lt 0 -or -not [String]::IsNullOrWhiteSpace($current.dependency_text.Substring($close + 1))) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array tail is unsupported' }
-                $body = $current.dependency_text.Substring(0, $close)
-                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $body)
+                $dependencyText = [string]::Join("`n", [string[]]$current.dependency_lines.ToArray())
+                $close = $dependencyText.LastIndexOf(']')
+                if ($close -lt 0 -or -not [String]::IsNullOrWhiteSpace($dependencyText.Substring($close + 1))) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array tail is unsupported' }
+                $body = $dependencyText.Substring(0, $close)
+                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $body -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -MaximumItems ([Math]::Max(0, 65536 - $totalEdgeTextCount)))
                 $totalEdgeTextCount += $current.dependencies.Count
                 if ($totalEdgeTextCount -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock dependency edge count exceeds its fixed 65536-entry limit' }
                 $collectingEdges = $false
+                $current.dependency_lines = $null
             }
             continue
         }
@@ -2186,11 +2569,11 @@ function Get-D32BoundedCompilerDiagnosticLockSources {
             if ($current.dependency_text -match '\]') {
                 $close = $current.dependency_text.LastIndexOf(']')
                 if (-not [String]::IsNullOrWhiteSpace($current.dependency_text.Substring($close + 1))) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: dependency array tail is unsupported' }
-                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $current.dependency_text.Substring(0, $close))
+                $current.dependencies = @(ConvertFrom-D32BoundedDiagnosticLockStringArray -Body $current.dependency_text.Substring(0, $close) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -MaximumItems ([Math]::Max(0, 65536 - $totalEdgeTextCount)))
                 $totalEdgeTextCount += $current.dependencies.Count
                 if ($totalEdgeTextCount -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock dependency edge count exceeds its fixed 65536-entry limit' }
             }
-            else { $collectingEdges = $true }
+            else { $current.dependency_lines = [System.Collections.Generic.List[string]]::new(); $current.dependency_lines.Add([string]$current.dependency_text); $collectingEdges = $true }
             continue
         }
         throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: package record contains an unsupported or malformed Cargo.lock field/table'
@@ -2199,7 +2582,10 @@ function Get-D32BoundedCompilerDiagnosticLockSources {
     if ($null -ne $current) { $packages.Add($current) }
     if ($null -eq $lockVersion -or $packages.Count -eq 0 -or $packages.Count -gt 2048) { throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: finite Cargo.lock requires one supported version and a bounded nonempty package catalog' }
     $output = [System.Collections.Generic.List[object]]::new()
+    $packageIndex = 0
     foreach ($package in $packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.package_normalize' -Progress ("packages={0}/{1}" -f $packageIndex, $packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $packageIndex++
         if ([String]::IsNullOrWhiteSpace([string]$package.name) -or [string]$package.name -notmatch '^[A-Za-z0-9_-]+$' -or
             [String]::IsNullOrWhiteSpace([string]$package.version) -or [string]$package.version -notmatch '^[0-9A-Za-z.+_-]+$') {
             throw 'D32_BOUNDED_DIAGNOSTIC_LOCK_BLOCKED: Cargo.lock package identity is malformed'
@@ -2221,7 +2607,12 @@ function Get-D32BoundedCompilerDiagnosticLockSources {
         $sourceIdentity = if ($null -eq $package.source) { 'workspace' } else { [string]$package.source }
         $id = [string]$package.name + '@' + [string]$package.version + '|' + $sourceKind + '|' + $sourceIdentity
         $edgeSpecs = [System.Collections.Generic.List[object]]::new()
-        foreach ($dependencyText in $package.dependencies) { $edgeSpecs.Add((ConvertFrom-D32BoundedDiagnosticLockDependencySpec -Value ([string]$dependencyText))) }
+        $dependencyIndex = 0
+        foreach ($dependencyText in $package.dependencies) {
+            if ($null -ne $ProofTimer -and (($dependencyIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'lock.dependency_specs' -Progress ("package={0};dependencies={1}" -f $package.name, $dependencyIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $dependencyIndex++
+            $edgeSpecs.Add((ConvertFrom-D32BoundedDiagnosticLockDependencySpec -Value ([string]$dependencyText)))
+        }
         $output.Add([PSCustomObject][ordered]@{
             package_id = $id; name = [string]$package.name; version = [string]$package.version; source = $package.source
             source_kind = $sourceKind; checksum = $package.checksum; commit = $commit; dependency_specs = @($edgeSpecs.ToArray()); dependency_ids = @()
@@ -2231,32 +2622,80 @@ function Get-D32BoundedCompilerDiagnosticLockSources {
 }
 
 function Get-D32BoundedCompilerDiagnosticSourcePlan {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$LockText)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$LockText,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     $maxLockCharacters = 8388608
     $maxLockedPackages = 2048
     $maxRegistryPackages = 1536
     $maxGitSources = 16
     if ($LockText.Length -le 0 -or $LockText.Length -gt $maxLockCharacters) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock input is empty or exceeds its fixed 8 MiB text bound' }
-    $packages = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $LockText)
+    $packages = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $LockText -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds)
     if ($packages.Count -eq 0 -or $packages.Count -gt $maxLockedPackages) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: locked package inventory is empty or exceeds its fixed 2048-entry bound' }
     $catalog = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
-    foreach ($package in $packages) { if (-not $catalog.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate full Cargo.lock package identity' } }
-    $edges = [System.Collections.Generic.List[object]]::new()
+    $packagesByName = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $packagesByNameVersion = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $packagesByNameSource = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $packagesByExactDependencyIdentity = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $packageIndex = 0
     foreach ($package in $packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.index_packages' -Progress ("packages={0}/{1}" -f $packageIndex, $packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $packageIndex++
+        if (-not $catalog.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate full Cargo.lock package identity' }
+        if (-not $packagesByName.ContainsKey([string]$package.name)) { $packagesByName.Add([string]$package.name, [System.Collections.Generic.List[object]]::new()) }
+        $packagesByName[[string]$package.name].Add($package)
+        $nameVersionKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$package.name, [string]$package.version))
+        if (-not $packagesByNameVersion.ContainsKey($nameVersionKey)) { $packagesByNameVersion.Add($nameVersionKey, [System.Collections.Generic.List[object]]::new()) }
+        $packagesByNameVersion[$nameVersionKey].Add($package)
+        $nameSourceKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$package.name, [string]$package.source))
+        if (-not $packagesByNameSource.ContainsKey($nameSourceKey)) { $packagesByNameSource.Add($nameSourceKey, [System.Collections.Generic.List[object]]::new()) }
+        $packagesByNameSource[$nameSourceKey].Add($package)
+        $exactKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$package.name, [string]$package.version, [string]$package.source))
+        if (-not $packagesByExactDependencyIdentity.TryAdd($exactKey, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate exact dependency name/version/source identity' }
+    }
+    $edges = [System.Collections.Generic.List[object]]::new()
+    $packageIndex = 0
+    foreach ($package in $packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.resolve_dependencies' -Progress ("packages={0}/{1};edges={2}" -f $packageIndex, $packages.Count, $edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $packageIndex++
         $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $dependencyIndex = 0
         foreach ($spec in $package.dependency_specs) {
-            $matches = @($packages | Where-Object {
-                [string]$_.name -ceq [string]$spec.name -and
-                ($null -eq $spec.version -or [string]$_.version -ceq [string]$spec.version) -and
-                ($null -eq $spec.source -or [string]$_.source -ceq [string]$spec.source)
-            })
-            if ($matches.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Cargo.lock dependency edge does not resolve to exactly one audited package ID' }
-            $target = $matches[0]
+            if ($null -ne $ProofTimer -and (($dependencyIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.resolve_edge' -Progress ("package={0};dependencies={1}" -f $package.package_id, $dependencyIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+            $dependencyIndex++
+            $candidates = $null
+            if ($null -ne $spec.version -and $null -ne $spec.source) {
+                $exactKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$spec.name, [string]$spec.version, [string]$spec.source))
+                $exactPackage = $null
+                if (-not $packagesByExactDependencyIdentity.TryGetValue($exactKey, [ref]$exactPackage)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: exact Cargo.lock dependency edge does not resolve to an audited package identity' }
+                $candidates = [System.Collections.Generic.List[object]]::new(1)
+                $candidates.Add($exactPackage)
+            }
+            elseif ($null -ne $spec.version) {
+                $nameVersionKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$spec.name, [string]$spec.version))
+                if (-not $packagesByNameVersion.TryGetValue($nameVersionKey, [ref]$candidates)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: versioned Cargo.lock dependency edge does not resolve to an audited package identity' }
+            }
+            elseif ($null -ne $spec.source) {
+                $nameSourceKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$spec.name, [string]$spec.source))
+                if (-not $packagesByNameSource.TryGetValue($nameSourceKey, [ref]$candidates)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: sourced Cargo.lock dependency edge does not resolve to an audited package identity' }
+            }
+            elseif (-not $packagesByName.TryGetValue([string]$spec.name, [ref]$candidates)) {
+                throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Cargo.lock dependency edge does not resolve to exactly one audited package ID'
+            }
+            $target = $null
+            $matchCount = 0
+            foreach ($candidate in $candidates) {
+                if (($null -eq $spec.version -or [string]$candidate.version -ceq [string]$spec.version) -and
+                    ($null -eq $spec.source -or [string]$candidate.source -ceq [string]$spec.source)) { $target = $candidate; $matchCount++ }
+            }
+            if ($matchCount -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: Cargo.lock dependency edge does not resolve to exactly one audited package ID' }
             if (-not $targets.Add([string]$target.package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: duplicate dependency edge target is unsupported' }
             $edges.Add([PSCustomObject][ordered]@{ parent_package_id = [string]$package.package_id; target_package_id = [string]$target.package_id; lock_spec = [string]$spec.raw })
         }
         $targetIds = [string[]]@($targets)
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_target_ids' -Progress ("package={0};targets={1}" -f $package.package_id, $targetIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
         [Array]::Sort($targetIds, [StringComparer]::Ordinal)
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_target_ids_complete' -Progress ("package={0};targets={1}" -f $package.package_id, $targetIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
         $package.dependency_ids = @($targetIds)
     }
     $cargoHome = 'E:\d32\inv7\r\c'
@@ -2267,7 +2706,10 @@ function Get-D32BoundedCompilerDiagnosticSourcePlan {
     $gitBySource = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $packageKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $pathKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $packageIndex = 0
     foreach ($package in $packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.map_source_rows' -Progress ("packages={0}/{1}" -f $packageIndex, $packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $packageIndex++
         if ($package.source_kind -ceq 'registry') {
             if ([string]$package.source -cne 'registry+https://github.com/rust-lang/crates.io-index') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: non-crates.io registry source is outside the approved finite origin' }
             $key = [string]$package.name + [char]0 + [string]$package.version
@@ -2293,21 +2735,38 @@ function Get-D32BoundedCompilerDiagnosticSourcePlan {
         elseif ($package.source_kind -cne 'workspace') { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: lock contains an unapproved source kind' }
     }
     if ($registryRows.Count -gt $maxRegistryPackages -or $gitBySource.Count -gt $maxGitSources) { throw 'D32_BOUNDED_DIAGNOSTIC_SOURCE_PLAN_BLOCKED: registry or Git tuple count exceeds its fixed finite bound' }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_registry_rows' -Progress ("rows={0}" -f $registryRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
     $registryRows.Sort([System.Comparison[object]]{ param($a, $b) [StringComparer]::Ordinal.Compare(([string]$a.name + [char]0 + [string]$a.version), ([string]$b.name + [char]0 + [string]$b.version)) })
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_registry_rows_complete' -Progress ("rows={0}" -f $registryRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
     $gitRows = [System.Collections.Generic.List[object]]::new()
     foreach ($source in @($gitBySource.Keys | Sort-Object -CaseSensitive)) { $gitRows.Add($gitBySource[$source]) }
     $registryCanonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($row in $registryRows) { $registryCanonical.Add(('registry' + [char]9 + $row.name + [char]9 + $row.version + [char]9 + $row.checksum)) }
+    $canonicalIndex = 0
+    foreach ($row in $registryRows) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.registry_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $registryRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $registryCanonical.Add(('registry' + [char]9 + $row.name + [char]9 + $row.version + [char]9 + $row.checksum)); $canonicalIndex++
+    }
     $gitCanonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($row in $gitRows) { $gitCanonical.Add(('git' + [char]9 + $row.url + [char]9 + $row.commit)) }
+    $canonicalIndex = 0
+    foreach ($row in $gitRows) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 15) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.git_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $gitRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $gitCanonical.Add(('git' + [char]9 + $row.url + [char]9 + $row.commit)); $canonicalIndex++
+    }
     $edgeCanonical = [System.Collections.Generic.List[string]]::new()
-    foreach ($edge in $edges) { $edgeCanonical.Add(([string]$edge.parent_package_id + [char]9 + [string]$edge.target_package_id + [char]9 + [string]$edge.lock_spec)) }
+    $canonicalIndex = 0
+    foreach ($edge in $edges) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.edge_rows' -Progress ("rows={0}/{1}" -f $canonicalIndex, $edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+        $edgeCanonical.Add(([string]$edge.parent_package_id + [char]9 + [string]$edge.target_package_id + [char]9 + [string]$edge.lock_spec)); $canonicalIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_edges' -Progress ("rows={0}" -f $edgeCanonical.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
     $edgeCanonical.Sort([StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.sort_edges_complete' -Progress ("rows={0}" -f $edgeCanonical.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
     $utf8 = [Text.UTF8Encoding]::new($false)
-    $registryDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $registryCanonical.ToArray())) + [char]10))).ToLowerInvariant()
-    $gitDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $gitCanonical.ToArray())) + [char]10))).ToLowerInvariant()
-    $edgeDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]::Join([char]10, $edgeCanonical.ToArray())) + [char]10))).ToLowerInvariant()
-    $lockDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes($LockText))).ToLowerInvariant()
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_plan.digests' -Progress ("packages={0};edges={1}" -f $packages.Count, $edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_SOURCE_CONTENT_BLOCKED' }
+    $registryDigest = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$registryCanonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_plan.registry_digest'
+    $gitDigest = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$gitCanonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_plan.git_digest'
+    $edgeDigest = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$edgeCanonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_plan.edge_digest'
+    $lockDigest = Get-D32BoundedDiagnosticSha256FromBytes -Bytes ($utf8.GetBytes($LockText)) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_plan.lock_digest'
     return [PSCustomObject][ordered]@{
         schema_version = 2; record_type = 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2'; gate_authority = 'NONE'; verification_status = 'NOT_RUN'
         semantic_scope = 'FULL_LOCK_AUDIT_CATALOG_PLUS_SELECTED_REACHABLE_CONSERVATIVE_SUPERSET'
@@ -2324,10 +2783,15 @@ function Get-D32BoundedCompilerDiagnosticSourcePlan {
 }
 
 function Split-D32BoundedDiagnosticTopLevel {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [char]$Separator = ',')
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [char]$Separator = ',',
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds,
+        [int]$MaximumParts = 65536)
+    if ($MaximumParts -le 0 -or $MaximumParts -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML split part bound is invalid' }
     $parts = [System.Collections.Generic.List[string]]::new()
     $start = 0; $depthSquare = 0; $depthCurly = 0; $depthParen = 0; $quote = [char]0; $escaped = $false
     for ($i = 0; $i -lt $Text.Length; $i++) {
+        if ($null -ne $ProofTimer -and (($i -band 4095) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.split_top_level' -Progress ("offset={0}/{1}" -f $i, $Text.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
         $ch = $Text[$i]
         if ($quote -ne [char]0) {
             if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
@@ -2343,18 +2807,25 @@ function Split-D32BoundedDiagnosticTopLevel {
         if ($ch -ceq '(') { $depthParen++; continue }
         if ($ch -ceq ')') { $depthParen--; if ($depthParen -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unbalanced cfg parenthesis' }; continue }
         if ($ch -ceq $Separator -and $depthSquare -eq 0 -and $depthCurly -eq 0 -and $depthParen -eq 0) {
+            if ($parts.Count -ge $MaximumParts) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML split exceeds the fixed per-value part bound' }
             $parts.Add($Text.Substring($start, $i - $start).Trim()); $start = $i + 1
         }
     }
     if ($quote -ne [char]0 -or $depthSquare -ne 0 -or $depthCurly -ne 0 -or $depthParen -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML value has unbalanced string/container delimiters' }
-    if ($start -lt $Text.Length -or $Text.Length -eq 0) { $parts.Add($Text.Substring($start).Trim()) }
+    if ($start -lt $Text.Length -or $Text.Length -eq 0) {
+        if ($parts.Count -ge $MaximumParts) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML split exceeds the fixed per-value part bound' }
+        $parts.Add($Text.Substring($start).Trim())
+    }
     return $parts.ToArray()
 }
 
 function Remove-D32BoundedDiagnosticTomlComment {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $quote = [char]0; $escaped = $false
     for ($i = 0; $i -lt $Line.Length; $i++) {
+        if ($null -ne $ProofTimer -and (($i -band 4095) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.strip_comment' -Progress ("offset={0}/{1}" -f $i, $Line.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
         $ch = $Line[$i]
         if ($quote -ne [char]0) {
             if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
@@ -2369,13 +2840,16 @@ function Remove-D32BoundedDiagnosticTomlComment {
 }
 
 function ConvertFrom-D32BoundedDiagnosticTomlString {
-    param([Parameter(Mandatory = $true)][string]$Text)
+    param([Parameter(Mandatory = $true)][string]$Text,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $value = $Text.Trim()
     if ($value.Length -lt 2 -or ($value[0] -cne '"' -and $value[0] -cne "'") -or $value[$value.Length - 1] -cne $value[0]) {
         throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: expected a bounded TOML string'
     }
     $quote = $value[0]; $result = [Text.StringBuilder]::new()
     for ($i = 1; $i -lt ($value.Length - 1); $i++) {
+        if ($null -ne $ProofTimer -and (($i -band 4095) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.decode_string' -Progress ("offset={0}/{1}" -f $i, $value.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
         $ch = $value[$i]
         if ($quote -ceq '"' -and $ch -ceq '\\') {
             $i++; if ($i -ge ($value.Length - 1)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: truncated TOML string escape' }
@@ -2392,18 +2866,33 @@ function ConvertFrom-D32BoundedDiagnosticTomlString {
 }
 
 function ConvertFrom-D32BoundedDiagnosticCargoValue {
-    param([Parameter(Mandatory = $true)][string]$Text)
+    param([Parameter(Mandatory = $true)][string]$Text,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds,
+        [int]$Depth = 0,
+        [System.Collections.IDictionary]$ValueNodeBudget)
+    if ($Depth -lt 0 -or $Depth -gt 64) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML value nesting exceeds the fixed 64-level parser stack bound' }
+    if ($null -eq $ValueNodeBudget) { $ValueNodeBudget = [ordered]@{ nodes = 0L; maximum = [Int64]$script:D32BoundedDiagnosticManifestValueNodeLimit } }
+    if (-not $ValueNodeBudget.Contains('nodes') -or -not $ValueNodeBudget.Contains('maximum') -or
+        [Int64]$ValueNodeBudget.maximum -le 0 -or [Int64]$ValueNodeBudget.maximum -gt [Int64]$script:D32BoundedDiagnosticManifestValueNodeLimit) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: aggregate TOML value-node budget is invalid'
+    }
+    if ([Int64]$ValueNodeBudget.nodes -ge [Int64]$ValueNodeBudget.maximum) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: aggregate TOML value-node budget reached its fixed in-memory cap'
+    }
+    $ValueNodeBudget.nodes = [Int64]$ValueNodeBudget.nodes + 1L
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.value_depth' -Progress ("depth={0}" -f $Depth) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
     $value = $Text.Trim()
     if ($value.Length -ge 2 -and (($value[0] -ceq '"' -and $value[$value.Length - 1] -ceq '"') -or ($value[0] -ceq "'" -and $value[$value.Length - 1] -ceq "'"))) {
-        return [PSCustomObject]@{ kind = 'string'; value = (ConvertFrom-D32BoundedDiagnosticTomlString -Text $value) }
+        return [PSCustomObject]@{ kind = 'string'; value = (ConvertFrom-D32BoundedDiagnosticTomlString -Text $value -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds) }
     }
     if ($value -ceq 'true' -or $value -ceq 'false') { return [PSCustomObject]@{ kind = 'bool'; value = ($value -ceq 'true') } }
     if ($value.StartsWith('[') -and $value.EndsWith(']')) {
         $items = [System.Collections.Generic.List[string]]::new()
         $inner = $value.Substring(1, $value.Length - 2)
-        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner)) {
+        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -MaximumParts 65536)) {
             if ([String]::IsNullOrWhiteSpace($part)) { continue }
-            $parsed = ConvertFrom-D32BoundedDiagnosticCargoValue -Text $part
+            $parsed = ConvertFrom-D32BoundedDiagnosticCargoValue -Text $part -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Depth ($Depth + 1) -ValueNodeBudget $ValueNodeBudget
             if ([string]$parsed.kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: only bounded string arrays are supported in dependency metadata' }
             $items.Add([string]$parsed.value)
         }
@@ -2412,13 +2901,13 @@ function ConvertFrom-D32BoundedDiagnosticCargoValue {
     if ($value.StartsWith('{') -and $value.EndsWith('}')) {
         $map = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
         $inner = $value.Substring(1, $value.Length - 2)
-        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner)) {
+        foreach ($part in (Split-D32BoundedDiagnosticTopLevel -Text $inner -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -MaximumParts 65536)) {
             if ([String]::IsNullOrWhiteSpace($part)) { continue }
             $assignment = [regex]::Match($part, '^\s*(?<key>[A-Za-z0-9_-]+)\s*=\s*(?<value>.+?)\s*$')
             if (-not $assignment.Success) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported inline-table field syntax' }
             $key = [string]$assignment.Groups['key'].Value
             if ($map.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate inline-table field' }
-            $map.Add($key, (ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value)))
+            $map.Add($key, (ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Depth ($Depth + 1) -ValueNodeBudget $ValueNodeBudget))
         }
         return [PSCustomObject]@{ kind = 'table'; value = $map }
     }
@@ -2426,9 +2915,12 @@ function ConvertFrom-D32BoundedDiagnosticCargoValue {
 }
 
 function Test-D32BoundedDiagnosticTomlStatementComplete {
-    param([Parameter(Mandatory = $true)][string]$Text)
+    param([Parameter(Mandatory = $true)][string]$Text,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $square = 0; $curly = 0; $quote = [char]0; $escaped = $false
     for ($i = 0; $i -lt $Text.Length; $i++) {
+        if ($null -ne $ProofTimer -and (($i -band 4095) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.statement_check' -Progress ("offset={0}/{1}" -f $i, $Text.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
         $ch = $Text[$i]
         if ($quote -ne [char]0) {
             if ($quote -ceq '"' -and $escaped) { $escaped = $false; continue }
@@ -2443,24 +2935,64 @@ function Test-D32BoundedDiagnosticTomlStatementComplete {
     return ($quote -eq [char]0 -and $square -eq 0 -and $curly -eq 0)
 }
 
+function Update-D32BoundedDiagnosticTomlStatementState {
+    param([Parameter(Mandatory = $true)][string]$Line,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$State,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
+    for ($i = 0; $i -lt $Line.Length; $i++) {
+        if ($null -ne $ProofTimer -and (($i -band 4095) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.statement_incremental' -Progress ("offset={0}/{1}" -f $i, $Line.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
+        $ch = $Line[$i]
+        if ([char]$State.quote -ne [char]0) {
+            if ([char]$State.quote -ceq '"' -and [bool]$State.escaped) { $State.escaped = $false; continue }
+            if ([char]$State.quote -ceq '"' -and $ch -ceq '\\') { $State.escaped = $true; continue }
+            if ($ch -ceq [char]$State.quote) { $State.quote = [char]0 }
+            continue
+        }
+        if ($ch -ceq '"' -or $ch -ceq "'") { $State.quote = $ch; continue }
+        if ($ch -ceq '[') { $State.square = [int]$State.square + 1 }
+        elseif ($ch -ceq ']') { $State.square = [int]$State.square - 1 }
+        elseif ($ch -ceq '{') { $State.curly = [int]$State.curly + 1 }
+        elseif ($ch -ceq '}') { $State.curly = [int]$State.curly - 1 }
+        if ([int]$State.square -lt 0 -or [int]$State.curly -lt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: TOML statement has unbalanced delimiters' }
+    }
+    return ([char]$State.quote -eq [char]0 -and [int]$State.square -eq 0 -and [int]$State.curly -eq 0)
+}
+
 function ConvertFrom-D32BoundedDiagnosticCargoManifest {
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [string]$SourcePath = '')
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text, [string]$SourcePath = '',
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds,
+        [System.Collections.IDictionary]$ValueNodeBudget)
     if ($Text.Length -le 0 -or [Text.Encoding]::UTF8.GetByteCount($Text) -gt 1048576 -or $Text.Contains("`0")) {
         throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: manifest is empty or exceeds the 1 MiB finite input bound'
     }
-    $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKind = 'dependencies'; $nestedKey = ''; $pending = ''
+    $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKind = 'dependencies'; $nestedKey = ''
+    $pendingBuilder = [Text.StringBuilder]::new(); $pendingActive = $false
+    $statementState = [ordered]@{ square = 0; curly = 0; quote = [char]0; escaped = $false }
     $package = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $workspace = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $workspacePackage = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $dependencies = [System.Collections.Generic.List[object]]::new(); $workspaceDependencies = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $features = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $patches = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $nestedDeps = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    if ($null -eq $ValueNodeBudget) { $ValueNodeBudget = [ordered]@{ nodes = 0L; maximum = [Int64]$script:D32BoundedDiagnosticManifestValueNodeLimit } }
     $workspaceRootSeen = $false
-    $lineNumber = 0
-    foreach ($rawLine in ($Text -split '\r?\n')) {
-        $lineNumber++; $line = (Remove-D32BoundedDiagnosticTomlComment -Line $rawLine).Trim()
+    $lineNumber = 0; $sourceOffset = 0L; $lineStart = 0
+    while ($lineStart -le $Text.Length) {
+        if ($null -ne $ProofTimer -and (($lineNumber -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.lines' -Progress ("line={0};offset={1}/{2}" -f $lineNumber, $sourceOffset, $Text.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
+        $lineEnd = $Text.IndexOf("`n", $lineStart)
+        $hasLineFeed = ($lineEnd -ge 0)
+        if (-not $hasLineFeed) { $lineEnd = $Text.Length }
+        $rawLength = $lineEnd - $lineStart
+        if ($rawLength -gt 0 -and $Text[$lineEnd - 1] -ceq "`r") { $rawLength-- }
+        $rawLine = $Text.Substring($lineStart, $rawLength)
+        $sourceOffset = [Int64]$lineEnd + [Int64][int]$hasLineFeed
+        $lineNumber++
+        if ($hasLineFeed) { $lineStart = $lineEnd + 1 } else { $lineStart = $Text.Length + 1 }
+        $line = (Remove-D32BoundedDiagnosticTomlComment -Line $rawLine -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds).Trim()
         if ([String]::IsNullOrWhiteSpace($line)) { continue }
-        if ([String]::IsNullOrEmpty($pending) -and $line.StartsWith('[')) {
+        if (-not $pendingActive -and $line.StartsWith('[')) {
             if ($line -match '^\[\[.*\]\]$') { $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKey = ''; continue }
             if ($line -notmatch '^\[(?<body>[^\[\]]+)\]$') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported TOML table header' }
             $body = [string]$Matches['body']; $section = 'other'; $targetCondition = ''; $nestedAlias = ''; $nestedKey = ''; $nestedKind = 'dependencies'
@@ -2487,11 +3019,13 @@ function ConvertFrom-D32BoundedDiagnosticCargoManifest {
             }
             continue
         }
-        if (-not [String]::IsNullOrEmpty($pending)) { $pending += ' ' + $line } else { $pending = $line }
-        if (-not (Test-D32BoundedDiagnosticTomlStatementComplete -Text $pending)) { continue }
+        if ($pendingActive) { [void]$pendingBuilder.Append(' ') } else { $pendingActive = $true }
+        [void]$pendingBuilder.Append($line)
+        if (-not (Update-D32BoundedDiagnosticTomlStatementState -Line $line -State $statementState -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds)) { continue }
+        $pending = $pendingBuilder.ToString()
         $assignment = [regex]::Match($pending, '^\s*(?<key>[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)\s*=\s*(?<value>.+?)\s*$')
-        if (-not $assignment.Success) { if ($section -ne 'other') { throw ('D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported assignment at ' + $SourcePath + ':' + $lineNumber) }; $pending = ''; continue }
-        $key = [string]$assignment.Groups['key'].Value; $value = ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value)
+        if (-not $assignment.Success) { if ($section -ne 'other') { throw ('D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: unsupported assignment at ' + $SourcePath + ':' + $lineNumber) }; $pendingBuilder.Clear() | Out-Null; $pendingActive = $false; $statementState = [ordered]@{ square = 0; curly = 0; quote = [char]0; escaped = $false }; continue }
+        $key = [string]$assignment.Groups['key'].Value; $value = ConvertFrom-D32BoundedDiagnosticCargoValue -Text ([string]$assignment.Groups['value'].Value) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -ValueNodeBudget $ValueNodeBudget
         switch -Regex ($section) {
             '^package$' { if ($package.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate package field' }; $package.Add($key, $value); break }
             '^workspace$' { if ($workspace.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: duplicate workspace field' }; $workspace.Add($key, $value); break }
@@ -2528,12 +3062,15 @@ function ConvertFrom-D32BoundedDiagnosticCargoManifest {
             }
             default { }
         }
-        $pending = ''
+        $pendingBuilder.Clear() | Out-Null; $pendingActive = $false; $statementState = [ordered]@{ square = 0; curly = 0; quote = [char]0; escaped = $false }
     }
-    if (-not [String]::IsNullOrEmpty($pending)) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: manifest ends with an incomplete TOML statement' }
+    if ($pendingActive) { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: manifest ends with an incomplete TOML statement' }
+    $nestedIndex = 0
     foreach ($nestedKeyValue in $nestedDeps.Keys) {
+        if ($null -ne $ProofTimer -and (($nestedIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest.nested_dependency_finalize' -Progress ("dependencies={0}/{1}" -f $nestedIndex, $nestedDeps.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED' }
         $nested = $nestedDeps[$nestedKeyValue]
         $dependencies.Add([PSCustomObject]@{ alias = [string]$nested.alias; kind = [string]$nested.kind; target = [string]$nested.target; fields = $nested.fields })
+        $nestedIndex++
     }
     foreach ($key in @('name', 'version')) {
         if ($package.ContainsKey($key) -and $package[$key].kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_MANIFEST_BLOCKED: package name/version must be literal strings unless workspace inheritance is explicit' }
@@ -2557,15 +3094,28 @@ function ConvertFrom-D32BoundedDiagnosticCargoManifest {
 }
 
 function Get-D32BoundedDiagnosticTargetPredicate {
-    param([Parameter(Mandatory = $true)][string]$Expression, [Parameter(Mandatory = $true)][string]$TargetTriple)
+    param([Parameter(Mandatory = $true)][string]$Expression, [Parameter(Mandatory = $true)][string]$TargetTriple,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds,
+        [int]$Depth = 0,
+        [System.Collections.IDictionary]$ParseBudget)
+    if ($Depth -lt 0 -or $Depth -gt 64) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: cfg predicate recursion exceeds the fixed 64-level parser stack bound' }
+    if ($null -eq $ParseBudget) { $ParseBudget = [ordered]@{ scanned_chars = 0L; maximum = 8388608L } }
+    if (-not $ParseBudget.Contains('scanned_chars') -or -not $ParseBudget.Contains('maximum') -or
+        [Int64]$ParseBudget.maximum -le 0 -or [Int64]$ParseBudget.maximum -gt 8388608L -or
+        [Int64]$Expression.Length -gt ([Int64]$ParseBudget.maximum - [Int64]$ParseBudget.scanned_chars)) {
+        throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: cumulative cfg predicate parsing exceeds its fixed 8 Mi-character work bound'
+    }
+    $ParseBudget.scanned_chars = [Int64]$ParseBudget.scanned_chars + [Int64]$Expression.Length
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.cfg_predicate' -Progress ("depth={0};scanned_chars={1}" -f $Depth, $ParseBudget.scanned_chars) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     if ($Expression -ceq $TargetTriple) { return [PSCustomObject]@{ value = $true; proven = $true; witness = 'exact target triple' } }
     if ($Expression -match '^cfg\((?<inner>.*)\)$') { $inner = [string]$Matches['inner'] } else { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown target selector conservatively included' } }
     $inner = $inner.Trim()
     foreach ($operator in @('all', 'any', 'not')) {
         if ($inner.StartsWith($operator + '(') -and $inner.EndsWith(')')) {
-            $parts = @(Split-D32BoundedDiagnosticTopLevel -Text $inner.Substring($operator.Length + 1, $inner.Length - $operator.Length - 2))
-            if ($operator -ceq 'not') { if ($parts.Count -ne 1) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'malformed unknown cfg conservatively included' } }; $child = Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $parts[0] + ')') -TargetTriple $TargetTriple; if (-not $child.proven) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'not of unknown cfg conservatively included' } }; return [PSCustomObject]@{ value = -not [bool]$child.value; proven = $true; witness = 'not(' + [string]$child.witness + ')' } }
-            $children = @($parts | ForEach-Object { Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $_ + ')') -TargetTriple $TargetTriple })
+            $parts = @(Split-D32BoundedDiagnosticTopLevel -Text $inner.Substring($operator.Length + 1, $inner.Length - $operator.Length - 2) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds)
+            if ($operator -ceq 'not') { if ($parts.Count -ne 1) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'malformed unknown cfg conservatively included' } }; $child = Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $parts[0] + ')') -TargetTriple $TargetTriple -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Depth ($Depth + 1) -ParseBudget $ParseBudget; if (-not $child.proven) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'not of unknown cfg conservatively included' } }; return [PSCustomObject]@{ value = -not [bool]$child.value; proven = $true; witness = 'not(' + [string]$child.witness + ')' } }
+            $children = @($parts | ForEach-Object { Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $_ + ')') -TargetTriple $TargetTriple -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Depth ($Depth + 1) -ParseBudget $ParseBudget })
             if ($operator -ceq 'all') { if (@($children | Where-Object { $_.proven -and -not $_.value }).Count -gt 0) { return [PSCustomObject]@{ value = $false; proven = $true; witness = 'all contains proven-false target predicate' } }; if (@($children | Where-Object { -not $_.proven }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown member of all conservatively included' } }; return [PSCustomObject]@{ value = $true; proven = $true; witness = 'all target predicates proven true' } }
             if (@($children | Where-Object { $_.proven -and $_.value }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $true; witness = 'any contains proven-true target predicate' } }; if (@($children | Where-Object { -not $_.proven }).Count -gt 0) { return [PSCustomObject]@{ value = $true; proven = $false; witness = 'unknown member of any conservatively included' } }; return [PSCustomObject]@{ value = $false; proven = $true; witness = 'all any-target predicates proven false' }
         }
@@ -2584,6 +3134,7 @@ function Get-D32BoundedDiagnosticTargetPredicate {
 
 function Test-D32BoundedDiagnosticVersionRequirement {
     param([Parameter(Mandatory = $true)][string]$Requirement, [Parameter(Mandatory = $true)][string]$LockedVersion)
+    if ($Requirement.Length -gt 4096) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: semver dependency requirement exceeds its fixed 4096-character parser work bound' }
     if ($Requirement -ceq '*') { return $true }
     if ($Requirement -match '^=(?<exact>[0-9A-Za-z.+_-]+)$') { return [string]$Matches['exact'] -ceq $LockedVersion }
     if ($Requirement.Contains('-') -and $Requirement -ceq $LockedVersion) { return $true }
@@ -2669,7 +3220,8 @@ function Assert-D32BoundedDiagnosticDependencyFields {
 
 function Get-D32BoundedDiagnosticDependencyExpectedSource {
     param([Parameter(Mandatory = $true)][object]$Dependency, [Parameter(Mandatory = $true)][object]$RootManifest,
-        [Parameter(Mandatory = $true)][object]$ParentPackage)
+        [Parameter(Mandatory = $true)][object]$ParentPackage,
+        [AllowNull()][System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]$RootPatchIndex)
     $fields = $Dependency.fields; Assert-D32BoundedDiagnosticDependencyFields -Fields $fields
     $packageName = if ($fields.ContainsKey('package')) { [string]$fields['package'].value } else { [string]$Dependency.alias }
     if ($fields.ContainsKey('path')) {
@@ -2686,10 +3238,19 @@ function Get-D32BoundedDiagnosticDependencyExpectedSource {
     }
     if ($fields.ContainsKey('registry') -and [string]$fields['registry'].value -cne 'crates-io') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: non-crates.io registry dependency is outside the fixed source domain' }
     $patch = $null
-    foreach ($patchAlias in $RootManifest.patches.Keys) {
-        $patchFields = $RootManifest.patches[$patchAlias]
-        $patchedName = if ($patchFields.ContainsKey('package')) { [string]$patchFields['package'].value } else { [string]$patchAlias }
-        if ($patchedName -ceq $packageName) { if ($null -ne $patch) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: ambiguous root crates.io patch target' }; $patch = $patchFields }
+    $patchMatches = $null
+    if ($null -ne $RootPatchIndex) { [void]$RootPatchIndex.TryGetValue($packageName, [ref]$patchMatches) }
+    else {
+        $patchMatches = [System.Collections.Generic.List[object]]::new()
+        foreach ($patchAlias in $RootManifest.patches.Keys) {
+            $patchFields = $RootManifest.patches[$patchAlias]
+            $patchedName = if ($patchFields.ContainsKey('package')) { [string]$patchFields['package'].value } else { [string]$patchAlias }
+            if ($patchedName -ceq $packageName) { $patchMatches.Add($patchFields) }
+        }
+    }
+    if ($null -ne $patchMatches) {
+        if ($patchMatches.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: ambiguous root crates.io patch target' }
+        if ($patchMatches.Count -eq 1) { $patch = $patchMatches[0] }
     }
     if ($null -ne $patch) {
         Assert-D32BoundedDiagnosticDependencyFields -Fields $patch
@@ -2727,18 +3288,30 @@ function Test-D32BoundedDiagnosticPathDependencyBinding {
 }
 
 function Complete-D32BoundedDiagnosticManifestCatalog {
-    param([Parameter(Mandatory = $true)][object]$Plan, [Parameter(Mandatory = $true)][object[]]$Candidates)
+    param([Parameter(Mandatory = $true)][object]$Plan, [Parameter(Mandatory = $true)][object[]]$Candidates,
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     if ($Candidates.Count -gt 4096) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: candidate manifest count exceeds its fixed 4096-entry bound' }
     $lockedPackageById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $lockedPackageIndex = 0
     foreach ($lockedPackage in $Plan.locked_packages) {
+        if ($null -ne $ProofTimer -and (($lockedPackageIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.lock_index' -Progress ("packages={0}/{1}" -f $lockedPackageIndex, $Plan.locked_packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
         if (-not $lockedPackageById.TryAdd([string]$lockedPackage.package_id, $lockedPackage)) {
             throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-plan package identity is duplicated before manifest mapping'
         }
+        $lockedPackageIndex++
     }
+    $gitSourceSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($gitSource in $Plan.git_sources) { [void]$gitSourceSet.Add([string]$gitSource.source) }
     $parsed = [System.Collections.Generic.List[object]]::new()
     $bySourcePath = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $manifestValueNodeBudget = [ordered]@{ nodes = 0L; maximum = [Int64]$script:D32BoundedDiagnosticManifestValueNodeLimit }
     $candidateBytes = [Int64]0
+    $candidateIndex = 0
     foreach ($candidate in $Candidates) {
+        if ($null -ne $ProofTimer) {
+            Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.parse' -Progress ("candidates={0}/{1}" -f $candidateIndex, $Candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED'
+        }
         if ([string]$candidate.source_kind -cnotin @('workspace', 'registry', 'git') -or
             [string]$candidate.source_path -notmatch '^[A-Za-z0-9_./-]+/Cargo\.toml$|^Cargo\.toml$' -or
             [string]$candidate.content_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$candidate.content -isnot [string]) {
@@ -2751,7 +3324,10 @@ function Complete-D32BoundedDiagnosticManifestCatalog {
         if ($candidateSize -gt 1048576) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source manifest exceeds the 1 MiB content ceiling' }
         $candidateBytes += $candidateSize
         if ($candidateBytes -gt 67108864L) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: combined source-manifest candidate bytes exceed the 64 MiB managed buffer bound' }
-        $actualSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$candidate.content))).ToLowerInvariant()
+        $candidateContentBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$candidate.content)
+        $actualSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($candidateContentBytes)).ToLowerInvariant()
+        $candidateContentBytes = $null
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.content_digest' -Progress ("candidate={0}/{1}" -f $candidateIndex, $Candidates.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
         if ($actualSha -cne [string]$candidate.content_sha256) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: manifest bytes differ from their archive/tree/file content digest' }
         if (-not [String]::IsNullOrEmpty([string]$candidate.package_id)) {
             if (-not $lockedPackageById.ContainsKey([string]$candidate.package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: manifest candidate package ID is absent from the exact lock catalog' }
@@ -2768,15 +3344,21 @@ function Complete-D32BoundedDiagnosticManifestCatalog {
         }
         $groupSource = if ($candidate.source_kind -ceq 'workspace') { 'workspace' } else { [string]$candidate.source }
         if ($candidate.source_kind -ceq 'registry' -and ($groupSource -cne 'registry+https://github.com/rust-lang/crates.io-index' -or [String]::IsNullOrEmpty([string]$candidate.package_id))) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: registry manifest candidate has a non-approved source or lacks its exact lock package binding' }
-        if ($candidate.source_kind -ceq 'git' -and -not ($Plan.git_sources | Where-Object { [string]$_.source -ceq $groupSource })) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: Git manifest candidate is not from an exact lock-derived Git source' }
+        if ($candidate.source_kind -ceq 'git' -and -not $gitSourceSet.Contains($groupSource)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: Git manifest candidate is not from an exact lock-derived Git source' }
         $groupIdentity = if ($candidate.source_kind -ceq 'registry') { $groupSource + [char]0 + [string]$candidate.package_id } else { $groupSource }
         $key = $candidate.source_kind + [char]0 + $groupIdentity + [char]0 + [string]$candidate.source_path
         if ($bySourcePath.ContainsKey($key)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: duplicate manifest path within one verified source identity' }
-        $model = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text ([string]$candidate.content) -SourcePath ([string]$candidate.source_path)
+        $model = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text ([string]$candidate.content) -SourcePath ([string]$candidate.source_path) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -ValueNodeBudget $manifestValueNodeBudget
         $entry = [PSCustomObject]@{ source_kind = [string]$candidate.source_kind; source = $groupSource; group_identity = $groupIdentity; source_path = [string]$candidate.source_path; content_sha256 = [string]$candidate.content_sha256; explicit_package_id = [string]$candidate.package_id; model = $model }
         $parsed.Add($entry); $bySourcePath.Add($key, $entry)
+        $candidateIndex++
     }
+    $workspaceIndex = 0
     foreach ($entry in $parsed) {
+        if ($null -ne $ProofTimer -and (($workspaceIndex -band 63) -eq 0)) {
+            Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.workspace_resolution' -Progress ("candidates={0}/{1}" -f $workspaceIndex, $parsed.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED'
+        }
+        $workspaceIndex++
         $model = $entry.model
         if ([String]::IsNullOrEmpty([string]$model.package_name)) { continue }
         $manifestDirectory = [IO.Path]::GetDirectoryName([string]$entry.source_path.Replace('/', '\'))
@@ -2794,11 +3376,14 @@ function Complete-D32BoundedDiagnosticManifestCatalog {
         else {
             if ([bool]$model.is_workspace_root) { $workspaceManifest = $model }
             $ancestor = $manifestDirectory
+            $ancestorIndex = 0
             while ($null -eq $workspaceManifest -and -not [String]::IsNullOrEmpty($ancestor)) {
+                if ($null -ne $ProofTimer -and (($ancestorIndex -band 31) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.workspace_ancestor' -Progress ("candidate={0}/{1};depth={2}" -f $workspaceIndex, $parsed.Count, $ancestorIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
                 $workspacePath = $ancestor.Replace('\', '/') + '/Cargo.toml'
                 $workspaceKey = $entry.source_kind + [char]0 + [string]$entry.group_identity + [char]0 + $workspacePath
                 if ($bySourcePath.ContainsKey($workspaceKey) -and [bool]$bySourcePath[$workspaceKey].model.is_workspace_root) { $workspaceManifest = $bySourcePath[$workspaceKey].model; break }
                 $separator = $ancestor.LastIndexOf('\'); if ($separator -lt 0) { $ancestor = '' } elseif ($separator -eq 0) { $ancestor = '' } else { $ancestor = $ancestor.Substring(0, $separator) }
+                $ancestorIndex++
             }
         }
         if ($model.package_version_workspace) {
@@ -2807,16 +3392,36 @@ function Complete-D32BoundedDiagnosticManifestCatalog {
         }
         if ($null -ne $workspaceManifest) { $model | Add-Member -NotePropertyName workspace_manifest -NotePropertyValue $workspaceManifest -Force }
     }
+    $explicitByPackageIdentity = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $unboundBySourceIdentity = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $identityIndex = 0
+    foreach ($entry in $parsed) {
+        if ($null -ne $ProofTimer -and (($identityIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.index_identities' -Progress ("candidates={0}/{1}" -f $identityIndex, $parsed.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $identityIndex++
+        if ([String]::IsNullOrEmpty([string]$entry.model.package_name) -or [String]::IsNullOrEmpty([string]$entry.model.package_version)) { continue }
+        if (-not [String]::IsNullOrEmpty([string]$entry.explicit_package_id)) {
+            $key = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$entry.model.package_name, [string]$entry.model.package_version, [string]$entry.explicit_package_id))
+            if (-not $explicitByPackageIdentity.ContainsKey($key)) { $explicitByPackageIdentity.Add($key, [System.Collections.Generic.List[object]]::new()) }
+            $explicitByPackageIdentity[$key].Add($entry)
+            continue
+        }
+        $key = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$entry.model.package_name, [string]$entry.model.package_version, [string]$entry.source_kind, [string]$entry.source))
+        if (-not $unboundBySourceIdentity.ContainsKey($key)) { $unboundBySourceIdentity.Add($key, [System.Collections.Generic.List[object]]::new()) }
+        $unboundBySourceIdentity[$key].Add($entry)
+    }
     $catalog = [System.Collections.Generic.List[object]]::new()
+    $packageIndex = 0
     foreach ($package in $Plan.locked_packages) {
-        $matches = @($parsed | Where-Object {
-            $entry = $_
-            if ([string]$entry.model.package_name -cne [string]$package.name -or [string]$entry.model.package_version -cne [string]$package.version) { return $false }
-            if (-not [String]::IsNullOrEmpty([string]$entry.explicit_package_id)) { return [string]$entry.explicit_package_id -ceq [string]$package.package_id }
-            if ([string]$package.source_kind -cne [string]$entry.source_kind) { return $false }
-            if ([string]$package.source_kind -ceq 'workspace') { return $true }
-            return [string]$package.source -ceq [string]$entry.source
-        })
+        if ($null -ne $ProofTimer -and (($packageIndex -band 63) -eq 0)) {
+            Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'manifest_catalog.map_locked_packages' -Progress ("packages={0}/{1}" -f $packageIndex, $Plan.locked_packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED'
+        }
+        $packageIndex++
+        $matches = [System.Collections.Generic.List[object]]::new()
+        $explicitKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$package.name, [string]$package.version, [string]$package.package_id))
+        if ($explicitByPackageIdentity.ContainsKey($explicitKey)) { foreach ($entry in $explicitByPackageIdentity[$explicitKey]) { $matches.Add($entry) } }
+        $sourceIdentity = if ([string]$package.source_kind -ceq 'workspace') { 'workspace' } else { [string]$package.source }
+        $unboundKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$package.name, [string]$package.version, [string]$package.source_kind, $sourceIdentity))
+        if ($unboundBySourceIdentity.ContainsKey($unboundKey)) { foreach ($entry in $unboundBySourceIdentity[$unboundKey]) { $matches.Add($entry) } }
         if ($matches.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: multiple verified current manifests match one locked package identity' }
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
@@ -2828,7 +3433,9 @@ function Complete-D32BoundedDiagnosticManifestCatalog {
 
 function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
     param([Parameter(Mandatory = $true)][object]$Plan, [Parameter(Mandatory = $true)][object[]]$ManifestCatalog,
-        [string]$RootManifestPath = 'vita-agent/Cargo.toml')
+        [string]$RootManifestPath = 'vita-agent/Cargo.toml',
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds)
     if ([string]$Plan.record_type -cne 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -or [int]$Plan.schema_version -ne 2 -or
         [string]$Plan.semantic_scope -cne 'FULL_LOCK_AUDIT_CATALOG_PLUS_SELECTED_REACHABLE_CONSERVATIVE_SUPERSET' -or
         [string]$Plan.host_triple -cne 'x86_64-pc-windows-msvc' -or [string]$Plan.target_triple -cne 'x86_64-pc-windows-msvc' -or
@@ -2837,18 +3444,33 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
         $Plan.lock_dependency_edges.Count -gt 65536 -or [string]$Plan.lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [string]$Plan.lock_dependency_edges_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-plan version, fixed target, root selection, or manifest catalog is invalid' }
     $packageById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
-    foreach ($package in $Plan.locked_packages) { if (-not $packageById.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: lock catalog package identity is duplicated' } }
+    $packageIndex = 0
+    foreach ($package in $Plan.locked_packages) {
+        if ($null -ne $ProofTimer -and (($packageIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.index_packages' -Progress ("packages={0}/{1}" -f $packageIndex, $Plan.locked_packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $packageIndex++
+        if (-not $packageById.TryAdd([string]$package.package_id, $package)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: lock catalog package identity is duplicated' }
+    }
     $edgeByParent = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    $edgeByParentAndTargetName = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
     $edgeIdentitySet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $edgeIndex = 0
     foreach ($edge in $Plan.lock_dependency_edges) {
+        if ($null -ne $ProofTimer -and (($edgeIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.index_edges' -Progress ("edges={0}/{1}" -f $edgeIndex, $Plan.lock_dependency_edges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $edgeIndex++
         if (-not $packageById.ContainsKey([string]$edge.parent_package_id) -or -not $packageById.ContainsKey([string]$edge.target_package_id)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: lock edge references an unknown catalog package' }
         if ([String]::IsNullOrWhiteSpace([string]$edge.lock_spec) -or -not $edgeIdentitySet.Add(([string]$edge.parent_package_id + [char]0 + [string]$edge.lock_spec))) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: duplicate or empty lock edge identity cannot support exhaustive reconciliation' }
         if (-not $edgeByParent.ContainsKey([string]$edge.parent_package_id)) { $edgeByParent.Add([string]$edge.parent_package_id, [System.Collections.Generic.List[object]]::new()) }
         $edgeByParent[[string]$edge.parent_package_id].Add($edge)
+        $targetName = [string]$packageById[[string]$edge.target_package_id].name
+        $targetKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$edge.parent_package_id, $targetName))
+        if (-not $edgeByParentAndTargetName.ContainsKey($targetKey)) { $edgeByParentAndTargetName.Add($targetKey, [System.Collections.Generic.List[object]]::new()) }
+        $edgeByParentAndTargetName[$targetKey].Add($edge)
     }
     $manifestById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     $manifestRecordById = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $manifestIndex = 0
     foreach ($manifest in $ManifestCatalog) {
+        if ($null -ne $ProofTimer -and (($manifestIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.index_manifests' -Progress ("manifests={0}/{1}" -f $manifestIndex, $ManifestCatalog.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
         $manifestPackage = $null
         if ($null -ne $manifest -and $packageById.ContainsKey([string]$manifest.package_id)) { $manifestPackage = $packageById[[string]$manifest.package_id] }
         $expectedSourceIdentity = if ($null -eq $manifestPackage -or $null -eq $manifestPackage.source) { 'workspace' } else { [string]$manifestPackage.source }
@@ -2857,7 +3479,9 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
             [string]$manifest.source_identity -cne $expectedSourceIdentity -or
             -not $manifestById.TryAdd([string]$manifest.package_id, $manifest.model)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: source-verified manifest record is malformed or duplicated' }
         $manifestRecordById.Add([string]$manifest.package_id, $manifest)
+        $manifestIndex++
     }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.select_root' -Progress ("manifests={0}" -f $ManifestCatalog.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $rootModels = @($ManifestCatalog | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.source_path, $RootManifestPath) })
     if ($rootModels.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: selected manifest path does not identify exactly one caller-pinned current root' }
     $rootModel = $rootModels[0].model
@@ -2867,13 +3491,33 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
     if ($rootIds.Count -ne 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: current selected package does not resolve to exactly one local lock package' }
     if (-not $manifestById.ContainsKey($rootIds[0])) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: selected root package lacks its exact current source-manifest pin' }
     $selectedRootWorkspace = if ($null -ne $rootModel.PSObject.Properties['workspace_manifest']) { $rootModel.workspace_manifest } else { $rootModel }
+    $rootPatchByName = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]]::new([StringComparer]::Ordinal)
+    if ($null -ne $rootModel.patches) {
+        $patchIndex = 0
+        foreach ($patchAlias in $rootModel.patches.Keys) {
+            if ($null -ne $ProofTimer -and (($patchIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.root_patches' -Progress ("patches={0}/{1}" -f $patchIndex, $rootModel.patches.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+            $patchFields = $rootModel.patches[$patchAlias]
+            $patchedName = if ($patchFields.ContainsKey('package')) { [string]$patchFields['package'].value } else { [string]$patchAlias }
+            if (-not $rootPatchByName.ContainsKey($patchedName)) { $rootPatchByName.Add($patchedName, [System.Collections.Generic.List[object]]::new()) }
+            $rootPatchByName[$patchedName].Add($patchFields)
+            $patchIndex++
+        }
+    }
 
     $queue = [System.Collections.Generic.Queue[string]]::new(); $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $parentPath = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
-    foreach ($rootId in $rootIds) { $queue.Enqueue($rootId); $parentPath[$rootId] = $rootId }
+    $depthById = [System.Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $visitOrder = [System.Collections.Generic.List[string]]::new()
+    foreach ($rootId in $rootIds) { $queue.Enqueue($rootId); $parentPath[$rootId] = $rootId; $depthById[$rootId] = 0 }
     $graphEdges = [System.Collections.Generic.List[object]]::new(); $dependencyDecisions = [System.Collections.Generic.List[object]]::new(); $unknownCfgCount = 0L; $inactiveCfgCount = 0L
+    $visitedParentCount = 0L
+    $candidateComparisonCount = [Int64]0
+    $candidateComparisonCharacterWork = [Int64]0
     while ($queue.Count -gt 0) {
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.parents' -Progress ("visited={0};pending={1};edges={2};decisions={3}" -f $visitedParentCount, $queue.Count, $graphEdges.Count, $dependencyDecisions.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
         $parentId = $queue.Dequeue(); if (-not $visited.Add($parentId)) { continue }
+        $visitOrder.Add($parentId)
+        $visitedParentCount++
         if (-not $manifestById.ContainsKey($parentId)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: reachable locked package lacks a verified current source manifest; absence cannot prove exclusion' }
         $parentPackage = $packageById[$parentId]; $manifestModel = $manifestById[$parentId]
         if ([string]$manifestModel.package_name -cne [string]$parentPackage.name -or [string]$manifestModel.package_version -cne [string]$parentPackage.version) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: verified package manifest identity differs from its exact Cargo.lock package record' }
@@ -2881,22 +3525,36 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
         $lockEdges = if ($edgeByParent.ContainsKey($parentId)) { @($edgeByParent[$parentId].ToArray()) } else { @() }
         $matchedLockEdges = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $dependencyRows = [System.Collections.Generic.List[object]]::new()
+        $dependencyIndex = 0
         foreach ($rawDependency in $manifestModel.dependencies) {
+            if ($null -ne $ProofTimer -and (($dependencyIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.dependencies' -Progress ("parent={0};dependencies={1};edges={2}" -f $parentId, $dependencyIndex, $graphEdges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+            $dependencyIndex++
             $dependency = Resolve-D32BoundedDiagnosticWorkspaceDependency -Dependency $rawDependency -WorkspaceManifest $workspaceModel
             Assert-D32BoundedDiagnosticDependencyFields -Fields $dependency.fields
             $nonRootDev = ([string]$dependency.kind -ceq 'dev-dependencies' -and $parentId -cne $rootIds[0])
-            $condition = if ([String]::IsNullOrEmpty([string]$dependency.target)) { [PSCustomObject]@{ value = $true; proven = $true; witness = 'unconditional dependency' } } else { Get-D32BoundedDiagnosticTargetPredicate -Expression ([string]$dependency.target) -TargetTriple ([string]$Plan.target_triple) }
+            $condition = if ([String]::IsNullOrEmpty([string]$dependency.target)) { [PSCustomObject]@{ value = $true; proven = $true; witness = 'unconditional dependency' } } else { Get-D32BoundedDiagnosticTargetPredicate -Expression ([string]$dependency.target) -TargetTriple ([string]$Plan.target_triple) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds }
             $resolvedTargets = [System.Collections.Generic.List[object]]::new()
-            foreach ($edge in $lockEdges) {
+            $declarationFields = $dependency.fields
+            $targetName = if ($declarationFields.ContainsKey('package')) { [string]$declarationFields['package'].value } else { [string]$dependency.alias }
+            $targetNameKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@([string]$parentId, $targetName))
+            $candidateLockEdges = if ($edgeByParentAndTargetName.ContainsKey($targetNameKey)) { $edgeByParentAndTargetName[$targetNameKey] } else { $null }
+            $expectedSource = Get-D32BoundedDiagnosticDependencyExpectedSource -Dependency $dependency -RootManifest $selectedRootWorkspace -ParentPackage $parentPackage -RootPatchIndex $rootPatchByName
+            $versionField = if ($declarationFields.ContainsKey('version')) { $declarationFields['version'] } else { $null }
+            if ($null -ne $versionField -and [string]$versionField.kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency version is not a supported string' }
+            $requirement = if ($null -eq $versionField) { '*' } else { [string]$versionField.value }
+            $edgeCandidateIndex = 0
+            foreach ($edge in $candidateLockEdges) {
+                if ($null -ne $ProofTimer -and (($edgeCandidateIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.edge_candidates' -Progress ("parent={0};name={1};candidates={2}" -f $parentId, $targetName, $edgeCandidateIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+                $edgeCandidateIndex++
+                $candidateComparisonCount++
+                $candidateComparisonCharacters = [Int64]$requirement.Length + [Int64]$targetPackage.version.Length
+                $candidateComparisonCharacterWork += [Math]::Max(1L, $candidateComparisonCharacters)
+                if ($candidateComparisonCount -gt [Int64]$script:D32BoundedDiagnosticGraphCandidateComparisonLimit -or $candidateComparisonCharacterWork -gt 16777216L) {
+                    throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency-to-lock candidate comparisons exceed the fixed graph work bound'
+                }
                 $targetPackage = $packageById[[string]$edge.target_package_id]
-                $declarationFields = $dependency.fields
-                $targetName = if ($declarationFields.ContainsKey('package')) { [string]$declarationFields['package'].value } else { [string]$dependency.alias }
                 if ([string]$targetPackage.name -cne $targetName) { continue }
-                $versionField = if ($declarationFields.ContainsKey('version')) { $declarationFields['version'] } else { $null }
-                if ($null -ne $versionField -and [string]$versionField.kind -cne 'string') { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency version is not a supported string' }
-                $requirement = if ($null -eq $versionField) { '*' } else { [string]$versionField.value }
                 if (-not (Test-D32BoundedDiagnosticVersionRequirement -Requirement $requirement -LockedVersion ([string]$targetPackage.version))) { continue }
-                $expectedSource = Get-D32BoundedDiagnosticDependencyExpectedSource -Dependency $dependency -RootManifest $selectedRootWorkspace -ParentPackage $parentPackage
                 if ([string]$targetPackage.source_kind -cne [string]$expectedSource.source_kind -or
                     (($null -eq $expectedSource.source) -ne ($null -eq $targetPackage.source)) -or
                     ($null -ne $expectedSource.source -and [string]$targetPackage.source -cne [string]$expectedSource.source)) { continue }
@@ -2907,6 +3565,7 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
                     if (-not (Test-D32BoundedDiagnosticPathDependencyBinding -ParentPackage $pathParentPackage -ParentManifest $pathParentManifest -TargetPackage $targetPackage -TargetManifest $manifestById[[string]$targetPackage.package_id] -Path ([string]$expectedSource.path))) { continue }
                 }
                 $resolvedTargets.Add($edge)
+                if ($resolvedTargets.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: dependency declaration resolves ambiguously to multiple exact lock edges' }
             }
             if ($nonRootDev) {
                 if ($resolvedTargets.Count -gt 1) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: non-root development dependency maps ambiguously to lock edges' }
@@ -2927,41 +3586,113 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
             $isOptional = ($dependency.fields.ContainsKey('optional') -and [bool]$dependency.fields['optional'].value)
             $graphEdges.Add([PSCustomObject]@{ parent_package_id = $parentId; target_package_id = [string]$edge.target_package_id; lock_spec = [string]$edge.lock_spec; dependency_alias = [string]$dependency.alias; kind = [string]$dependency.kind; target_predicate = [string]$dependency.target; predicate_proven = [bool]$condition.proven; predicate_witness = [string]$condition.witness; optional_included = $isOptional })
             $dependencyRows.Add([PSCustomObject]@{ parent_package_id = $parentId; alias = [string]$dependency.alias; kind = [string]$dependency.kind; target = [string]$dependency.target; disposition = if ($condition.proven) { 'INCLUDED' } else { 'INCLUDED_UNKNOWN_CFG' }; predicate_proven = [bool]$condition.proven; predicate_witness = [string]$condition.witness; target_package_id = [string]$edge.target_package_id; lock_specs = @([string]$edge.lock_spec); optional_included = $isOptional })
-            if (-not $visited.Contains([string]$edge.target_package_id)) { $queue.Enqueue([string]$edge.target_package_id); if (-not $parentPath.ContainsKey([string]$edge.target_package_id)) { $parentPath[[string]$edge.target_package_id] = $parentId } }
+            if (-not $visited.Contains([string]$edge.target_package_id)) {
+                $queue.Enqueue([string]$edge.target_package_id)
+                if (-not $parentPath.ContainsKey([string]$edge.target_package_id)) {
+                    $parentPath[[string]$edge.target_package_id] = $parentId
+                    $depthById[[string]$edge.target_package_id] = [int]$depthById[$parentId] + 1
+                }
+            }
         }
+        $lockEdgeIndex = 0
         foreach ($edge in $lockEdges) {
+            if ($null -ne $ProofTimer -and (($lockEdgeIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.reconcile_parent_edges' -Progress ("parent={0};edges={1}/{2}" -f $parentId, $lockEdgeIndex, $lockEdges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
             if (-not $matchedLockEdges.Contains(([string]$parentId + [char]0 + [string]$edge.lock_spec))) {
                 throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: reachable parent has an unexplained lock dependency edge not reconciled with its complete manifest declarations'
             }
+            $lockEdgeIndex++
         }
-        foreach ($decision in $dependencyRows) { $dependencyDecisions.Add($decision) }
+        $decisionIndex = 0
+        foreach ($decision in $dependencyRows) {
+            if ($null -ne $ProofTimer -and (($decisionIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.append_parent_decisions' -Progress ("parent={0};decisions={1}/{2}" -f $parentId, $decisionIndex, $dependencyRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+            $dependencyDecisions.Add($decision); $decisionIndex++
+        }
     }
     $rootSetCanonical = [string]::Join("`n", [string[]]$rootIds)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_included_ids' -Progress ("packages={0}" -f $visited.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
     $includedIds = [string[]]@($visited); [Array]::Sort($includedIds, [StringComparer]::Ordinal)
-    $excludedIds = [string[]]@(@($Plan.locked_packages | Where-Object { -not $visited.Contains([string]$_.package_id) } | ForEach-Object { [string]$_.package_id })); [Array]::Sort($excludedIds, [StringComparer]::Ordinal)
-    $edgeCanon = [System.Collections.Generic.List[string]]::new(); $manifestCanon = [System.Collections.Generic.List[string]]::new()
-    foreach ($id in $includedIds) { $row = $manifestRecordById[$id]; $manifestCanon.Add($id + "`t" + [string]$row.source_kind + "`t" + [string]$row.source_identity + "`t" + [string]$row.source_path + "`t" + [string]$row.content_sha256) }
-    $manifestCanon.Sort([StringComparer]::Ordinal)
-    foreach ($edge in $graphEdges) { $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)) }
-    $edgeCanon.Sort([StringComparer]::Ordinal); $utf8 = [Text.UTF8Encoding]::new($false)
-    $decisionCanon = [System.Collections.Generic.List[string]]::new()
-    foreach ($decision in $dependencyDecisions) { $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)) }
-    $decisionCanon.Sort([StringComparer]::Ordinal)
-    $closedSetSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($includedIds -join "`n") + "`n"))).ToLowerInvariant()
-    $manifestSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(($manifestCanon -join "`n") + "`n"))).ToLowerInvariant()
-    $graphSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($utf8.GetBytes(([string]$Plan.lock_sha256 + "`n" + [string]$Plan.lock_dependency_edges_sha256 + "`n" + $rootSetCanonical + "`n" + ($edgeCanon -join "`n") + "`n" + ($decisionCanon -join "`n") + "`n" + $closedSetSha + "`n" + $manifestSha + "`n")))).ToLowerInvariant()
-    $classifications = [System.Collections.Generic.List[object]]::new()
-    foreach ($id in $includedIds) {
-        $row = $manifestRecordById[$id]
-        $path = [System.Collections.Generic.List[string]]::new(); $cursor = $id; $guard = 0
-        while ($cursor -cne $rootIds[0]) {
-            if (-not $parentPath.ContainsKey($cursor) -or $guard -ge $includedIds.Count) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: included package lacks a bounded root reachability witness path' }
-            $cursor = [string]$parentPath[$cursor]; $path.Add($cursor); $guard++
-        }
-        $path.Reverse(); $path.Add($id)
-        $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'INCLUDED'; source_kind = [string]$packageById[$id].source_kind; source_identity = [string]$row.source_identity; manifest_path = [string]$row.source_path; manifest_sha256 = [string]$row.content_sha256; witness_kind = 'ROOT_PATH_IN_VERIFIED_DECLARATION_GRAPH'; witness_root_path = @($path.ToArray()); closed_reachability_sha256 = $closedSetSha })
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_included_ids_complete' -Progress ("packages={0}" -f $includedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $excludedList = [System.Collections.Generic.List[string]]::new()
+    $excludedScanIndex = 0
+    foreach ($package in $Plan.locked_packages) {
+        if ($null -ne $ProofTimer -and (($excludedScanIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.excluded_id_scan' -Progress ("packages={0}/{1}" -f $excludedScanIndex, $Plan.locked_packages.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        if (-not $visited.Contains([string]$package.package_id)) { $excludedList.Add([string]$package.package_id) }
+        $excludedScanIndex++
     }
-    foreach ($id in $excludedIds) { $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'EXCLUDED_WITH_WITNESS'; source_kind = [string]$packageById[$id].source_kind; source_identity = if ($null -eq $packageById[$id].source) { 'workspace' } else { [string]$packageById[$id].source }; witness_kind = 'CLOSED_REACHABILITY_CUT'; unreachable_from_roots = @($rootIds); complete_reachable_parent_count = [Int64]$visited.Count; complete_reachable_dependency_decision_count = [Int64]$dependencyDecisions.Count; no_active_incoming_edge_from_included = $true; closed_reachability_sha256 = $closedSetSha }) }
+    $excludedIds = [string[]]$excludedList.ToArray()
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_excluded_ids' -Progress ("packages={0}" -f $excludedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    [Array]::Sort($excludedIds, [StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_excluded_ids_complete' -Progress ("packages={0}" -f $excludedIds.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $edgeCanon = [System.Collections.Generic.List[string]]::new(); $manifestCanon = [System.Collections.Generic.List[string]]::new()
+    $canonicalIndex = 0
+    foreach ($id in $includedIds) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.canonical_manifests' -Progress ("rows={0}/{1}" -f $canonicalIndex, $includedIds.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $row = $manifestRecordById[$id]; $manifestCanon.Add($id + "`t" + [string]$row.source_kind + "`t" + [string]$row.source_identity + "`t" + [string]$row.source_path + "`t" + [string]$row.content_sha256); $canonicalIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_manifest_rows' -Progress ("rows={0}" -f $manifestCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $manifestCanon.Sort([StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_manifest_rows_complete' -Progress ("rows={0}" -f $manifestCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $canonicalIndex = 0
+    foreach ($edge in $graphEdges) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.canonical_edges' -Progress ("rows={0}/{1}" -f $canonicalIndex, $graphEdges.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $edgeCanon.Add(([string]$edge.parent_package_id + "`t" + [string]$edge.target_package_id + "`t" + [string]$edge.dependency_alias + "`t" + [string]$edge.kind + "`t" + [string]$edge.target_predicate + "`t" + [string]$edge.predicate_witness + "`t" + [string]$edge.lock_spec)); $canonicalIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_edge_rows' -Progress ("rows={0}" -f $edgeCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $edgeCanon.Sort([StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_edge_rows_complete' -Progress ("rows={0}" -f $edgeCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $decisionCanon = [System.Collections.Generic.List[string]]::new()
+    $canonicalIndex = 0
+    foreach ($decision in $dependencyDecisions) {
+        if ($null -ne $ProofTimer -and (($canonicalIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.canonical_decisions' -Progress ("rows={0}/{1}" -f $canonicalIndex, $dependencyDecisions.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $decisionCanon.Add(([string]$decision.parent_package_id + "`t" + [string]$decision.alias + "`t" + [string]$decision.kind + "`t" + [string]$decision.target + "`t" + [string]$decision.disposition + "`t" + [string]$decision.predicate_witness + "`t" + [string]$decision.target_package_id + "`t" + [string]::Join(',', [string[]]$decision.lock_specs) + "`t" + [string]$decision.predicate_proven + "`t" + [string]$decision.optional_included)); $canonicalIndex++
+    }
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_decision_rows' -Progress ("rows={0}" -f $decisionCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $decisionCanon.Sort([StringComparer]::Ordinal)
+    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.sort_decision_rows_complete' -Progress ("rows={0}" -f $decisionCanon.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+    $closedSetSha = Get-D32BoundedDiagnosticSha256FromLines -Lines $includedIds -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_graph.closed_set_digest'
+    $manifestSha = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$manifestCanon.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'source_graph.manifest_digest'
+    $graphSha = Get-D32BoundedDiagnosticSourceGraphDigest -LockSha256 ([string]$Plan.lock_sha256) `
+        -LockDependencyEdgesSha256 ([string]$Plan.lock_dependency_edges_sha256) -RootIds ([string[]]$rootIds) `
+        -EdgeRows ([string[]]$edgeCanon.ToArray()) -DecisionRows ([string[]]$decisionCanon.ToArray()) `
+        -ClosedSetSha256 $closedSetSha -ManifestSetSha256 $manifestSha -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+    $pathUtf8BytesById = [System.Collections.Generic.Dictionary[string,Int64]]::new([StringComparer]::Ordinal)
+    $witnessArrayLowerBound = [Int64]0; $witnessBudgetIndex = 0
+    foreach ($id in $visitOrder) {
+        if ($null -ne $ProofTimer -and (($witnessBudgetIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.witness_budget' -Progress ("packages={0}/{1};lower_bound_bytes={2}" -f $witnessBudgetIndex, $visitOrder.Count, $witnessArrayLowerBound) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $pathBytes = if ($parentPath[$id] -ceq $id) { [Int64]$id.Length } else { [Int64]$pathUtf8BytesById[[string]$parentPath[$id]] + [Int64]$id.Length }
+        $pathUtf8BytesById.Add($id, $pathBytes)
+        $pathCount = [Int64]$depthById[$id] + 1L
+        $arrayLowerBound = $pathBytes + (3L * $pathCount) + 1L
+        if ($witnessArrayLowerBound -gt ([Int64]::MaxValue - $arrayLowerBound)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: included root-path witnesses exceed checked arithmetic bounds' }
+        $witnessArrayLowerBound += $arrayLowerBound
+        $witnessBudgetIndex++
+    }
+    if ($witnessArrayLowerBound -gt $script:D32BoundedDiagnosticSourceProofMaximumOutputBytes) {
+        throw ('D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: exhaustive included-root path witnesses alone exceed the fixed {0}-byte output ceiling; witness_array_lower_bound_bytes={1}' -f $script:D32BoundedDiagnosticSourceProofMaximumOutputBytes, $witnessArrayLowerBound)
+    }
+    $classifications = [System.Collections.Generic.List[object]]::new()
+    $classificationIndex = 0
+    foreach ($id in $includedIds) {
+        if ($null -ne $ProofTimer -and (($classificationIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.witness_materialize' -Progress ("packages={0}/{1}" -f $classificationIndex, $includedIds.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $row = $manifestRecordById[$id]
+        $pathLength = [int]$depthById[$id] + 1
+        $path = [string[]]::new($pathLength); $cursor = $id; $pathIndex = $pathLength - 1
+        while ($pathIndex -gt 0) {
+            if ($null -ne $ProofTimer -and (($pathIndex -band 255) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.witness_path' -Progress ("package={0};remaining={1}" -f $id, $pathIndex) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+            if (-not $parentPath.ContainsKey($cursor)) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: included package lacks a bounded root reachability witness path' }
+            $path[$pathIndex] = $cursor
+            $cursor = [string]$parentPath[$cursor]
+            $pathIndex--
+        }
+        if ($pathLength -eq 1) { $path[0] = $id } else { $path[0] = $cursor }
+        if ([string]$path[0] -cne [string]$rootIds[0]) { throw 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED: computed witness root differs from the selected root' }
+        $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'INCLUDED'; source_kind = [string]$packageById[$id].source_kind; source_identity = [string]$row.source_identity; manifest_path = [string]$row.source_path; manifest_sha256 = [string]$row.content_sha256; witness_kind = 'ROOT_PATH_IN_VERIFIED_DECLARATION_GRAPH'; witness_root_path = $path; closed_reachability_sha256 = $closedSetSha })
+        $classificationIndex++
+    }
+    foreach ($id in $excludedIds) {
+        if ($null -ne $ProofTimer -and (($classificationIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'source_graph.exclusion_materialize' -Progress ("classifications={0}/{1}" -f $classificationIndex, $packageById.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_GRAPH_BLOCKED' }
+        $classifications.Add([PSCustomObject]@{ package_id = $id; classification = 'EXCLUDED_WITH_WITNESS'; source_kind = [string]$packageById[$id].source_kind; source_identity = if ($null -eq $packageById[$id].source) { 'workspace' } else { [string]$packageById[$id].source }; witness_kind = 'CLOSED_REACHABILITY_CUT'; unreachable_from_roots = @($rootIds); complete_reachable_parent_count = [Int64]$visited.Count; complete_reachable_dependency_decision_count = [Int64]$dependencyDecisions.Count; no_active_incoming_edge_from_included = $true; closed_reachability_sha256 = $closedSetSha }); $classificationIndex++
+    }
     return [PSCustomObject][ordered]@{
         schema_version = 2; record_type = 'D32_BOUNDED_DIAGNOSTIC_SOURCE_GRAPH_PROOF_V2'; gate_authority = 'NONE'; formal_gate_usable = $false
         status = 'CURRENT_LOCKED_SOURCE_GRAPH_VERIFIED_FOR_DIAGNOSTIC_ONLY'; semantic_scope = [string]$Plan.semantic_scope
@@ -2979,12 +3710,18 @@ function Resolve-D32BoundedDiagnosticLockedDependencyGraph {
 }
 
 function Read-D32BoundedCompilerDiagnosticStreamExact {
-    param([Parameter(Mandatory = $true)][IO.Stream]$Stream, [Parameter(Mandatory = $true)][int]$Count)
+    param([Parameter(Mandatory = $true)][IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds,
+        [string]$Phase = 'registry.archive_stream_read')
     if ($Count -lt 0 -or $Count -gt 65536) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: invalid bounded read length' }
     $buffer = [byte[]]::new($Count)
     $offset = 0
     while ($offset -lt $Count) {
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("bytes={0}/{1}" -f $offset, $Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
         $read = $Stream.Read($buffer, $offset, $Count - $offset)
+        if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase $Phase -Progress ("bytes={0}/{1}" -f ($offset + $read), $Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
         if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated tar stream' }
         $offset += $read
     }
@@ -3316,9 +4053,13 @@ function New-D32BoundedCompilerDiagnosticGnuLongNamePair {
 }
 
 function Get-D32BoundedCompilerDiagnosticLongNamePairDigest {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $canonical = [System.Collections.Generic.List[string]]::new()
+    $pairIndex = 0
     foreach ($pair in $Pairs) {
+        if ($null -ne $ProofTimer -and (($pairIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.pair_inventory_digest' -Progress ("pairs={0}/{1}" -f $pairIndex, $Pairs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
         $canonical.Add([string]::Join("`t", [string[]]@(
             ([Int64]$pair.longname_offset).ToString([Globalization.CultureInfo]::InvariantCulture),
             [string]$pair.longname_header_sha256,
@@ -3333,22 +4074,26 @@ function Get-D32BoundedCompilerDiagnosticLongNamePairDigest {
             [string]$pair.raw_prefix_field_sha256,
             [string]$pair.effective_path,
             [string]$pair.fallback_kind)))
+        $pairIndex++
     }
-    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-        [Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + $(if ($canonical.Count -gt 0) { "`n" } else { '' })))).ToLowerInvariant()
+    return Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$canonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.pair_inventory_digest_hash'
 }
 
 function Get-D32BoundedCompilerDiagnosticLongNameControlDigest {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Pairs,
+        [Diagnostics.Stopwatch]$ProofTimer = $script:D32BoundedDiagnosticSourceProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds)
     $canonical = [System.Collections.Generic.List[string]]::new()
+    $pairIndex = 0
     foreach ($pair in $Pairs) {
+        if ($null -ne $ProofTimer -and (($pairIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.control_metadata_digest' -Progress ("pairs={0}/{1}" -f $pairIndex, $Pairs.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
         $offset = if ($null -ne $pair.PSObject.Properties['longname_offset']) { [Int64]$pair.longname_offset } else { [Int64]$pair.offset }
         $size = if ($null -ne $pair.PSObject.Properties['longname_size']) { [Int64]$pair.longname_size } else { [Int64]$pair.size }
         $canonical.Add($offset.ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
             $size.ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + [string]$pair.control_payload_sha256)
+        $pairIndex++
     }
-    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-        [Text.UTF8Encoding]::new($false).GetBytes(($canonical -join "`n") + $(if ($canonical.Count -gt 0) { "`n" } else { '' })))).ToLowerInvariant()
+    return Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$canonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.control_metadata_digest_hash'
 }
 
 function Test-D32BoundedCompilerDiagnosticTarPath {
@@ -3373,9 +4118,11 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         [long]$MaximumExpandedBytes = 1073741824L,
         [long]$MaximumMemberBytes = 134217728L,
         [int]$MaximumMembers = 10000,
-        [Diagnostics.Stopwatch]$ProofTimer
+        [Diagnostics.Stopwatch]$ProofTimer,
+        [long]$DeadlineMilliseconds = $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds,
+        [AllowNull()][string]$OpenedHandleSha256
     )
-    if ($null -ne $ProofTimer -and (-not $ProofTimer.IsRunning -or $ProofTimer.ElapsedMilliseconds -ge 300000)) {
+    if ($null -ne $ProofTimer -and (-not $ProofTimer.IsRunning -or $ProofTimer.ElapsedMilliseconds -ge $DeadlineMilliseconds)) {
         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer is absent, stopped, or expired before archive parsing'
     }
     if ($CompressedBytes.Length -le 0 -or [Int64]$CompressedBytes.Length -gt $MaximumCompressedBytes -or
@@ -3384,10 +4131,10 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $MaximumExpandedBytes -le 0 -or $MaximumMemberBytes -le 0 -or $MaximumMembers -le 0 -or $MaximumMembers -gt 10000) {
         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive bytes, expected package identity, or finite parser bound is invalid'
     }
-    $archiveSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($CompressedBytes)).ToLowerInvariant()
-    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while hashing the compressed archive'
-    }
+    $archiveSha = if ([String]::IsNullOrEmpty($OpenedHandleSha256)) {
+        Get-D32BoundedDiagnosticSha256FromBytes -Bytes $CompressedBytes -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_hash'
+    } else { [string]$OpenedHandleSha256 }
+    if ($archiveSha -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: opened-handle archive digest is malformed' }
     if ($archiveSha -cne $ExpectedArchiveSha256) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: compressed registry archive SHA-256 differs from Cargo.lock checksum' }
     $compressed = [IO.MemoryStream]::new($CompressedBytes, $false)
     $gzip = $null
@@ -3395,6 +4142,7 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $gzip = [IO.Compression.GZipStream]::new($compressed, [IO.Compression.CompressionMode]::Decompress, $true)
         $expected = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
         $rawNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $pathTrieRoot = [PSCustomObject]@{ segment = ''; path = ''; kind = 'directory'; explicit = $true; children = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase) }
         $rawMemberCount = 0
         $expandedBytes = [Int64]0
         $rootPrefix = $ExpectedPackageRoot + '/'
@@ -3409,24 +4157,20 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         $pendingLongName = $null
         $ended = $false
         while (-not $ended) {
-            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired during USTAR inventory'
-            }
+            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_headers' -Progress ("headers={0};expanded={1}" -f $rawMemberCount, $expandedBytes) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
             $headerOffset = [Int64]$expandedBytes
-            $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
+            $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_header_read'
             $expandedBytes += 512
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
             $allZero = $true
             for ($index = 0; $index -lt 512; $index++) { if ($header[$index] -ne 0) { $allZero = $false; break } }
             if ($allZero) {
                 if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname pending at tar terminator without its adjacent ordinary header' }
-                $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
+                $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_end_marker_read'
                 $expandedBytes += 512
                 for ($index = 0; $index -lt 512; $index++) { if ($second[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar terminator is not two complete zero blocks' } }
                 while (($read = $gzip.Read($header, 0, 512)) -gt 0) {
-                    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while consuming trailing archive data'
-                    }
+                    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_trailing_data' -Progress ("expanded={0}" -f $expandedBytes) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
                     $expandedBytes += $read
                     if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: trailing archive data exceeds its fixed byte ceiling' }
                     for ($index = 0; $index -lt $read; $index++) { if ($header[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: nonzero data follows the tar terminator' } }
@@ -3443,13 +4187,13 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
             if ($size -lt 0 -or $size -gt $MaximumMemberBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: tar member exceeds its fixed byte ceiling' }
             if ([string]$headerRecord.kind -ceq 'longname') {
                 if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: chained GNU longname controls are unsupported' }
-                $payload = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count ([int]$size)
+                $payload = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count ([int]$size) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_longname_read'
                 $expandedBytes += [Int64]$size
                 if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling while reading GNU longname metadata' }
                 $payloadSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payload)).ToLowerInvariant()
                 $padding = [int]((512 - ($size % 512)) % 512)
                 if ($padding -gt 0) {
-                    $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding
+                    $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_longname_padding'
                     if (-not (Test-D32BoundedCompilerDiagnosticTarZeroBytes -Bytes $pad -Offset 0 -Length $pad.Length)) {
                         throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: GNU longname control padding is nonzero'
                     }
@@ -3497,25 +4241,38 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 $relative = $fullName.Substring($rootPrefix.Length)
                 if ($isDirectory) { $relative = $relative.TrimEnd('/') }
                 if ([String]::IsNullOrEmpty($relative)) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: empty non-root member path is invalid' }
-                $segments = $relative.Split('/')
-                $parentPath = ''
-                for ($segmentIndex = 0; $segmentIndex -lt ($segments.Count - 1); $segmentIndex++) {
-                    $parentPath = if ([String]::IsNullOrEmpty($parentPath)) { $segments[$segmentIndex] } else { $parentPath + '/' + $segments[$segmentIndex] }
-                    if ($expected.ContainsKey($parentPath)) {
-                        if ([string]$expected[$parentPath].kind -cne 'directory' -or [string]$expected[$parentPath].path -cne $parentPath) {
-                            throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member has a case collision or a file used as a directory'
+                $segments = $relative.Split('/'); $trieNode = $pathTrieRoot
+                for ($segmentIndex = 0; $segmentIndex -lt $segments.Count; $segmentIndex++) {
+                    if ($null -ne $ProofTimer -and (($segmentIndex -band 63) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_path_trie' -Progress ("member={0};segments={1}/{2};entries={3}" -f $rawMemberCount, $segmentIndex, $segments.Count, $expected.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
+                    if ([string]$trieNode.kind -ceq 'file') { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member uses a file as a parent directory' }
+                    $segment = [string]$segments[$segmentIndex]; $childNode = $null
+                    if ($trieNode.children.TryGetValue($segment, [ref]$childNode)) {
+                        if ([string]$childNode.segment -cne $segment) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive path collides by Windows case-insensitive segment identity' }
+                    }
+                    else {
+                        $nodePath = if ([String]::IsNullOrEmpty([string]$trieNode.path)) { $segment } else { [string]$trieNode.path + '/' + $segment }
+                        $childNode = [PSCustomObject]@{ segment = $segment; path = $nodePath; kind = 'directory'; explicit = $false; children = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase) }
+                        $trieNode.children.Add($segment, $childNode)
+                        if ($segmentIndex -lt ($segments.Count - 1) -or $isDirectory) {
+                            $expected.Add($nodePath, [PSCustomObject]@{ path = $nodePath; kind = 'directory'; bytes = 0L; sha256 = $null })
+                            if ($expected.Count -gt 10000) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: inferred source inventory exceeds the matching extracted-tree 10000-entry bound' }
                         }
                     }
-                    else { $expected.Add($parentPath, [PSCustomObject]@{ path = $parentPath; kind = 'directory'; bytes = 0L; sha256 = $null }) }
-                }
-                if ($expected.ContainsKey($relative)) {
-                    if (-not $isDirectory -or [string]$expected[$relative].kind -cne 'directory' -or [string]$expected[$relative].path -cne $relative) {
-                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive contains a duplicate member or case/type collision'
+                    $isFinalSegment = ($segmentIndex -eq ($segments.Count - 1))
+                    if (-not $isFinalSegment) {
+                        if ([string]$childNode.kind -cne 'directory') { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive member uses a non-directory node as a parent' }
                     }
-                    # A previously inferred parent directory may receive its one explicit USTAR directory record.
+                    elseif ($isDirectory) {
+                        if ([string]$childNode.kind -cne 'directory' -or [bool]$childNode.explicit) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive contains a duplicate directory or case/type collision' }
+                        $childNode.explicit = $true
+                    }
+                    else {
+                        if ([bool]$childNode.explicit -or [string]$childNode.kind -cne 'directory' -or $childNode.children.Count -gt 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: archive contains a duplicate file or file/directory collision' }
+                        $childNode.kind = 'file'; $childNode.explicit = $true
+                    }
+                    $trieNode = $childNode
                 }
-                elseif ($isDirectory) { $expected.Add($relative, [PSCustomObject]@{ path = $relative; kind = 'directory'; bytes = 0L; sha256 = $null }) }
-                else {
+                if (-not $isDirectory) {
                     $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
                     $captureManifest = ($relative -ceq 'Cargo.toml')
                     if ($captureManifest -and $size -gt 1048576L) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: crate Cargo.toml exceeds its 1 MiB dependency-graph parser bound' }
@@ -3524,11 +4281,10 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                         $remaining = [Int64]$size
                         $buffer = [byte[]]::new(65536)
                         while ($remaining -gt 0) {
-                            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-                                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while hashing a USTAR member'
-                            }
+                            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_member_hash' -Progress ("path={0};remaining={1}" -f $relative, $remaining) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
                             $take = [int][Math]::Min([Int64]$buffer.Length, $remaining)
                             $read = $gzip.Read($buffer, 0, $take)
+                            if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_member_hash' -Progress ("path={0};remaining={1}" -f $relative, $remaining) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
                             if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated file member data' }
                             $hash.AppendData($buffer, 0, $read)
                             if ($captureManifest) { $manifestBuffer.Write($buffer, 0, $read) }
@@ -3547,11 +4303,12 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                     if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: expanded archive exceeded its fixed byte ceiling' }
                     $padding = [int]((512 - ($size % 512)) % 512)
                     if ($padding -gt 0) {
-                        $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding
+                        $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $padding -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_file_padding'
                         for ($index = 0; $index -lt $pad.Length; $index++) { if ($pad[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: nonzero file padding is unsupported' } }
                         $expandedBytes += $padding
                     }
                     $expected.Add($relative, [PSCustomObject]@{ path = $relative; kind = 'file'; bytes = [Int64]$size; sha256 = $fileSha })
+                    if ($expected.Count -gt 10000) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: source inventory exceeds the matching extracted-tree 10000-entry bound' }
                     $headerRows.Add([PSCustomObject][ordered]@{ offset = $headerOffset; format = [string]$headerRecord.format; path = $fullName; kind = 'file'; size = $size; type_flag = $typeFlag; header_sha256 = [string]$headerRecord.header_sha256; name_field_sha256 = [string]$headerRecord.name_field_sha256; prefix_field_sha256 = [string]$headerRecord.prefix_field_sha256; fallback_kind = $fallbackKind })
                     $countKey = ([string]$headerRecord.format).ToLowerInvariant() + '_regular'
                     $formatCounts[$countKey] = [Int64]$formatCounts[$countKey] + 1L
@@ -3571,17 +4328,16 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
                 $discard = [byte[]]::new(65536)
                 $remaining = [Int64]$size
                 while ($remaining -gt 0) {
-                    if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-                        throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while consuming unsupported USTAR member data'
-                    }
+                    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_member_discard' -Progress ("path={0};remaining={1}" -f $fullName, $remaining) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
                     $read = $gzip.Read($discard, 0, [int][Math]::Min([Int64]$discard.Length, $remaining))
+                    if ($null -ne $ProofTimer) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_member_discard' -Progress ("path={0};remaining={1}" -f $fullName, $remaining) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
                     if ($read -le 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: truncated unsupported member data' }
                     $remaining -= $read
                 }
                 $expandedBytes += [Int64]$size
             }
             if ($paddingSize -gt 0) {
-                $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $paddingSize
+                $pad = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count $paddingSize -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_member_padding'
                 for ($index = 0; $index -lt $pad.Length; $index++) { if ($pad[$index] -ne 0) { throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: nonzero tar padding is unsupported' } }
                 $expandedBytes += $paddingSize
             }
@@ -3600,33 +4356,40 @@ function Get-D32BoundedCompilerDiagnosticCrateArchiveInventory {
         [Array]::Sort($paths, [StringComparer]::Ordinal)
         $rows = [System.Collections.Generic.List[object]]::new()
         $canonical = [System.Collections.Generic.List[string]]::new()
+        $inventoryIndex = 0
         foreach ($path in $paths) {
-            if ($null -ne $ProofTimer -and $ProofTimer.ElapsedMilliseconds -ge 300000) {
-                throw 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED: aggregate source-proof timer expired while finalizing the USTAR inventory'
-            }
+            if ($null -ne $ProofTimer -and (($inventoryIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_inventory_rows' -Progress ("rows={0}/{1}" -f $inventoryIndex, $paths.Length) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
             $entry = $expected[$path]
             $rows.Add($entry)
             $canonical.Add(([string]$entry.kind + "`t" + [string]$entry.path + "`t" + [Int64]$entry.bytes + "`t" + [string]$entry.sha256))
+            $inventoryIndex++
         }
         $headerCanonical = [System.Collections.Generic.List[string]]::new()
+        $headerIndex = 0
         foreach ($headerRow in $headerRows) {
+        if ($null -ne $ProofTimer -and (($headerIndex -band 127) -eq 0)) { Assert-D32BoundedDiagnosticSourceProofDeadline -ProofTimer $ProofTimer -Phase 'registry.archive_header_digest_rows' -Progress ("rows={0}/{1}" -f $headerIndex, $headerRows.Count) -DeadlineMilliseconds $DeadlineMilliseconds -ErrorPrefix 'D32_BOUNDED_DIAGNOSTIC_ARCHIVE_BLOCKED' }
         $headerCanonical.Add(([Int64]$headerRow.offset).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
             [string]$headerRow.format + "`t" + [string]$headerRow.path + "`t" + [string]$headerRow.kind + "`t" +
             ([Int64]$headerRow.type_flag).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" +
             ([Int64]$headerRow.size).ToString([Globalization.CultureInfo]::InvariantCulture) + "`t" + [string]$headerRow.header_sha256 + "`t" +
             [string]$headerRow.name_field_sha256 + "`t" + [string]$headerRow.prefix_field_sha256 + "`t" + [string]$headerRow.fallback_kind)
+            $headerIndex++
         }
-        $headerInventorySha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(($headerCanonical -join "`n") + "`n"))).ToLowerInvariant()
-        $pairInventorySha = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @($pairRows.ToArray())
-        $controlMetadataSha = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @($controlMetadataRows.ToArray())
+        $headerInventorySha = Get-D32BoundedDiagnosticSha256FromLines -Lines ([string[]]$headerCanonical.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_header_inventory_digest'
+        $pairInventorySha = Get-D32BoundedCompilerDiagnosticLongNamePairDigest -Pairs @($pairRows.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
+        $controlMetadataSha = Get-D32BoundedCompilerDiagnosticLongNameControlDigest -Pairs @($controlMetadataRows.ToArray()) -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds
         $formatCanonical = [string]::Join("`t", [string[]]@($script:D32BoundedDiagnosticRegistryArchivePolicy,
             ([Int64]$formatCounts.ustar_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.ustar_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.gnu_regular).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.gnu_directory).ToString([Globalization.CultureInfo]::InvariantCulture),
             ([Int64]$formatCounts.gnu_longname_extension).ToString([Globalization.CultureInfo]::InvariantCulture)))
-        $inventorySha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes(
-            ($canonical -join "`n") + "`n" + $headerInventorySha + "`n" + $pairInventorySha + "`n" + $formatCanonical + "`n"))).ToLowerInvariant()
+        $inventoryDigestRows = [string[]]::new($canonical.Count + 3)
+        $canonical.CopyTo($inventoryDigestRows, 0)
+        $inventoryDigestRows[$canonical.Count] = $headerInventorySha
+        $inventoryDigestRows[$canonical.Count + 1] = $pairInventorySha
+        $inventoryDigestRows[$canonical.Count + 2] = $formatCanonical
+        $inventorySha = Get-D32BoundedDiagnosticSha256FromLines -Lines $inventoryDigestRows -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_inventory_digest'
         return [PSCustomObject][ordered]@{
             archive_sha256 = $archiveSha
             archive_policy_id = $script:D32BoundedDiagnosticRegistryArchivePolicy
@@ -3738,7 +4501,7 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
             $currentHeaderSize = $null
             $currentHeaderNameFieldSha = $null
             $currentHeaderPrefixFieldSha = $null
-            $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
+            $header = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_header_read'
             $currentHeaderSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($header)).ToLowerInvariant()
             $expandedBytes += 512L
             if ($expandedBytes -gt $MaximumExpandedBytes) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BUDGET_STOPPED: expanded archive limit reached' }
@@ -3747,7 +4510,7 @@ function Get-D32BoundedDiagnosticArchiveFormatCensusInventory {
             if ($allZero) {
                 if ($null -ne $pendingLongName) { throw 'D32_BOUNDED_DIAGNOSTIC_CENSUS_BLOCKED: GNU longname pending at tar terminator without adjacent ordinary header' }
                 $secondOffset = [Int64]$expandedBytes
-                $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512
+                $second = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $gzip -Count 512 -ProofTimer $ProofTimer -DeadlineMilliseconds $DeadlineMilliseconds -Phase 'registry.archive_end_marker_read'
                 $expandedBytes += 512L
                 if ($expandedBytes -gt $MaximumExpandedBytes -or -not (Test-D32BoundedCompilerDiagnosticTarZeroBytes -Bytes $second -Offset 0 -Length 512)) {
                     $currentOffset = $secondOffset

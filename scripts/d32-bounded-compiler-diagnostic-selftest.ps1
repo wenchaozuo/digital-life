@@ -755,9 +755,10 @@ catch { $badArchiveTupleRejected = $_.Exception.Message -like 'D32_BOUNDED_DIAGN
 Assert-D32BoundedCompilerDiagnosticSelfTest 'archive projection rejects a regular-file reference or arbitrary extra-field object instead of silently dropping unknown properties' $badArchiveTupleRejected
 $archiveProjectionConsumersExact = $registryContentProofAst.Extent.Text.Contains('New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive') -and
     $registryContentProofAst.Extent.Text.Contains('-Reference $archiveFileReference') -and
-    $inv7OriginAst.Extent.Text.Contains('New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection -Reference $archive') -and
-    $inv7OriginAst.Extent.Text.Contains('-Reference $archiveReference')
-Assert-D32BoundedCompilerDiagnosticSelfTest 'both registry archive file-reference consumers project the validated catalog tuple before strict exact-shape validation' $archiveProjectionConsumersExact
+    -not $inv7OriginAst.Extent.Text.Contains('New-D32BoundedDiagnosticRegistryArchiveFileReferenceProjection') -and
+    $inv7OriginAst.Extent.Text.Contains('registry archive source pin has an invalid exact schema') -and
+    $inv7OriginAst.Extent.Text.Contains('registry archive checksum differs from Cargo.lock')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'origin validator keeps the exact nine-field lock/root tuple while the sole content reader projects it before file IO' $archiveProjectionConsumersExact
 $capturedStreamOptInCalls = @($runnerAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -ceq 'Assert-D32BoundedDiagnosticFileReference' -and $node.Extent.Text.Contains('-ReferenceKind CapturedStream') }, $true)).Count
 Assert-D32BoundedCompilerDiagnosticSelfTest 'zero-byte allowance is explicit and limited to the historical ordered capture consumer' ($capturedStreamOptInCalls -eq 1)
@@ -874,6 +875,20 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'unreliable sample stops' (Test-D32B
 Assert-D32BoundedCompilerDiagnosticSelfTest 'capture ceiling stops' (Test-D32BoundedCompilerDiagnosticResourceStop -Sample $highSample -MetricsReliable $true -AdmissionSucceeded $true -CaptureLimitReached $true -DeadlineReached $false)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'deadline stops' (Test-D32BoundedCompilerDiagnosticResourceStop -Sample $highSample -MetricsReliable $true -AdmissionSucceeded $true -CaptureLimitReached $false -DeadlineReached $true)
 
+$sourceProofWorkDeadline = Get-D32BoundedDiagnosticSourceProofWorkDeadlineMilliseconds
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof keeps its fixed 300-second combined budget and 30-second result reserve' `
+    ($script:D32BoundedDiagnosticSourceProofCombinedMilliseconds -eq 300000L -and $sourceProofWorkDeadline -eq 270000L)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source-proof deadline comparison is strictly below the pinned ceiling' `
+    ((Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline -ElapsedMilliseconds 269999L -DeadlineMilliseconds 270000L) -and
+     -not (Test-D32BoundedDiagnosticSourceProofElapsedWithinDeadline -ElapsedMilliseconds 270000L -DeadlineMilliseconds 270000L))
+$stoppedSourceProofTimer = [Diagnostics.Stopwatch]::new()
+$deadlineStreamBytes = [byte[]]@(1, 2, 3, 4)
+$deadlineMemoryStream = [IO.MemoryStream]::new($deadlineStreamBytes, $false)
+$exactReadDeadlineRejected = $false
+try { $null = Read-D32BoundedCompilerDiagnosticStreamExact -Stream $deadlineMemoryStream -Count 4 -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $exactReadDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'archive exact-read deadline is checked before a bounded stream read without sleeping' ($exactReadDeadlineRejected -and $deadlineMemoryStream.Position -eq 0)
+$deadlineMemoryStream.Dispose()
+
 $lockText = @'
 version = 4
 
@@ -895,6 +910,19 @@ version = "0.1.0"
 '@
 $lockRows = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockText)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'registry archive and immutable Git source parsed' ($lockRows.Count -eq 3 -and $lockRows[0].source_kind -ceq 'registry' -and $lockRows[1].source_kind -ceq 'git' -and $lockRows[1].commit -ceq ('b' * 40) -and $lockRows[2].source_kind -ceq 'workspace')
+$lockLf = $lockText.Replace("`r`n", "`n")
+$lockCrLf = [regex]::Replace($lockText, '\r?\n', "`r`n")
+$lockNoFinalNewline = $lockText.TrimEnd("`r", "`n")
+$lockLfRows = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockLf)
+$lockCrLfRows = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockCrLf)
+$lockNoFinalRows = @(Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockNoFinalNewline)
+$lineEndingSemanticsExact = @($lockLfRows | ForEach-Object { [string]$_.package_id }) -join "`n" -ceq (@($lockRows | ForEach-Object { [string]$_.package_id }) -join "`n") -and
+    (@($lockCrLfRows | ForEach-Object { [string]$_.package_id }) -join "`n") -ceq (@($lockRows | ForEach-Object { [string]$_.package_id }) -join "`n") -and
+    (@($lockNoFinalRows | ForEach-Object { [string]$_.package_id }) -join "`n") -ceq (@($lockRows | ForEach-Object { [string]$_.package_id }) -join "`n")
+Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.lock line scanner preserves LF, CRLF, and no-final-newline package semantics' $lineEndingSemanticsExact
+$stoppedLockDeadlineRejected = $false
+try { $null = Get-D32BoundedCompilerDiagnosticLockSources -LockText $lockText -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedLockDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.lock parser fails closed at an expired in-memory deadline' $stoppedLockDeadlineRejected
 $sourcePlan = Get-D32BoundedCompilerDiagnosticSourcePlan -LockText $lockText
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan V2 is explicitly non-authorizing and not verified' ($sourcePlan.record_type -ceq 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V2' -and $sourcePlan.schema_version -eq 2 -and $sourcePlan.gate_authority -ceq 'NONE' -and $sourcePlan.verification_status -ceq 'NOT_RUN' -and $sourcePlan.source_proof_status -ceq 'NOT_VERIFIED' -and $sourcePlan.lock_dependency_edge_count -eq 0)
 Assert-D32BoundedCompilerDiagnosticSelfTest 'source plan declares the verifier-wide 512 MiB cap and single buffered-archive ceiling' ($sourcePlan.verifier_managed_buffer_cap_bytes -eq 536870912L -and $script:D32BoundedCompilerDiagnosticRegistryArchiveLimitBytes -eq 268435456L)
@@ -920,6 +948,44 @@ function New-D32BoundedCompilerDiagnosticGraphFixtureEntry {
     $sourceIdentity = if ($null -eq $package[0].source) { 'workspace' } else { [string]$package[0].source }
     return [PSCustomObject]@{ package_id = [string]$package[0].package_id; source_kind = $sourceKind; source_identity = $sourceIdentity; source_path = $SourcePath; content_sha256 = $sha; content = $Text; model = $model }
 }
+$manifestLineFixture = "[package]`nname = `"streaming-fixture`"`nversion = `"1.2.3`"`n[dependencies]`nsmall = { version = `"1`", optional = true }`n"
+$manifestLineFixtureCrLf = [regex]::Replace($manifestLineFixture, '\r?\n', "`r`n")
+$manifestLineFixtureNoFinalNewline = $manifestLineFixture.TrimEnd("`r", "`n")
+$manifestLineModels = @(
+    (ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixture -SourcePath 'fixture/Cargo.toml'),
+    (ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixtureCrLf -SourcePath 'fixture/Cargo.toml'),
+    (ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixtureNoFinalNewline -SourcePath 'fixture/Cargo.toml'))
+$manifestLineSemanticsExact = @($manifestLineModels | Where-Object { $_.package_name -ceq 'streaming-fixture' -and $_.package_version -ceq '1.2.3' -and $_.dependencies.Count -eq 1 -and $_.dependencies[0].alias -ceq 'small' }).Count -eq 3
+Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.toml scanner preserves LF, CRLF, trailing LF, inline dependency, and no-final-newline semantics' $manifestLineSemanticsExact
+$stoppedManifestDeadlineRejected = $false
+try { $null = ConvertFrom-D32BoundedDiagnosticCargoManifest -Text $manifestLineFixture -SourcePath 'fixture/Cargo.toml' -ProofTimer $stoppedSourceProofTimer -DeadlineMilliseconds 270000L } catch { $stoppedManifestDeadlineRejected = $_.Exception.Message -like '*deadline reached*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'streaming Cargo.toml parser fails closed at an expired in-memory deadline' $stoppedManifestDeadlineRejected
+$nestedTomlDepth64 = [Text.StringBuilder]::new()
+[void]$nestedTomlDepth64.Append('{')
+for ($index = 0; $index -lt 63; $index++) { [void]$nestedTomlDepth64.Append('k={') }
+[void]$nestedTomlDepth64.Append('leaf="v"')
+for ($index = 0; $index -lt 64; $index++) { [void]$nestedTomlDepth64.Append('}') }
+$nestedToml64Accepted = $false
+try { $nestedToml64Accepted = (ConvertFrom-D32BoundedDiagnosticCargoValue -Text $nestedTomlDepth64.ToString()).kind -ceq 'table' } catch { $nestedToml64Accepted = $false }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'finite TOML inline-table nesting depth 64 remains accepted' $nestedToml64Accepted
+$nestedTomlDepth65 = [Text.StringBuilder]::new()
+[void]$nestedTomlDepth65.Append('{')
+for ($index = 0; $index -lt 64; $index++) { [void]$nestedTomlDepth65.Append('k={') }
+[void]$nestedTomlDepth65.Append('leaf="v"')
+for ($index = 0; $index -lt 65; $index++) { [void]$nestedTomlDepth65.Append('}') }
+$nestedToml65Rejected = $false
+try { $null = ConvertFrom-D32BoundedDiagnosticCargoValue -Text $nestedTomlDepth65.ToString() } catch { $nestedToml65Rejected = $_.Exception.Message -like '*nesting exceeds the fixed 64-level parser stack bound*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'TOML inline-table nesting beyond the fixed depth 64 fails closed' $nestedToml65Rejected
+$boundedSplitRejected = $false
+try { $null = Split-D32BoundedDiagnosticTopLevel -Text 'a,b,c' -MaximumParts 2 } catch { $boundedSplitRejected = $_.Exception.Message -like '*fixed per-value part bound*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'TOML top-level split stops before materializing beyond its finite part bound' $boundedSplitRejected
+$smallValueNodeBudget = [ordered]@{ nodes = 0L; maximum = 2L }
+$boundedValueNodesRejected = $false
+try { $null = ConvertFrom-D32BoundedDiagnosticCargoValue -Text '["a","b"]' -ValueNodeBudget $smallValueNodeBudget } catch { $boundedValueNodesRejected = $_.Exception.Message -like '*aggregate TOML value-node budget reached*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'TOML value materialization fails closed at its aggregate node budget' ($boundedValueNodesRejected -and $smallValueNodeBudget.nodes -eq 2L)
+$emptyTupleComponentKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@('workspace', ''))
+$nonemptyTupleComponentKey = Get-D32BoundedDiagnosticGraphTupleKey -Values ([string[]]@('workspace'))
+Assert-D32BoundedCompilerDiagnosticSelfTest 'length-prefixed graph tuple keys preserve intentional empty source components without colliding' ($emptyTupleComponentKey -ceq '9:workspace0:' -and $emptyTupleComponentKey -cne $nonemptyTupleComponentKey)
 $graphRegistrySource = 'registry+https://github.com/rust-lang/crates.io-index'
 $graphLines = [System.Collections.Generic.List[string]]::new(); $graphLines.Add('version = 4')
 $rootEdgeSpecs = [System.Collections.Generic.List[string]]::new(); $rootEdgeSpecs.Add('local-protocol 1.0.0')
@@ -944,12 +1010,31 @@ $graphProof.selected_crate_kinds = [string]::Join(',', [string[]]$graphCrateKind
 Assert-D32BoundedCompilerDiagnosticSelfTest 'graph proof selected crate-kind list must remain an exact typed array' (-not (Test-D32BoundedDiagnosticSourceGraphProof $graphProof))
 $graphProof.selected_crate_kinds = $graphCrateKinds
 Assert-D32BoundedCompilerDiagnosticSelfTest 'graph proof exact selected crate kinds and all-targets package scope validate' (Test-D32BoundedDiagnosticSourceGraphProof $graphProof)
+$priorGraphCandidateComparisonLimit = [Int64]$script:D32BoundedDiagnosticGraphCandidateComparisonLimit
+$script:D32BoundedDiagnosticGraphCandidateComparisonLimit = 1L
+$graphCandidateComparisonBudgetRejected = $false
+try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray()) } catch { $graphCandidateComparisonBudgetRejected = $_.Exception.Message -like '*fixed graph work bound*' }
+finally { $script:D32BoundedDiagnosticGraphCandidateComparisonLimit = $priorGraphCandidateComparisonLimit }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'actual dependency graph producer stops after its explicit aggregate candidate-comparison budget' $graphCandidateComparisonBudgetRejected
 $graphManifestCandidates = [System.Collections.Generic.List[object]]::new()
 foreach ($entry in $graphCatalog) {
     $kind = if ([string]$entry.package_id -like '*|workspace|*') { 'workspace' } else { 'registry' }
     $source = if ($kind -ceq 'registry') { $graphRegistrySource } else { $null }
     $graphManifestCandidates.Add([PSCustomObject]@{ source_kind = $kind; source = $source; source_path = [string]$entry.source_path; content = [string]$entry.content; content_sha256 = [string]$entry.content_sha256; package_id = [string]$entry.package_id })
 }
+$rootLockPackage = @($graphPlan.locked_packages | Where-Object { [string]$_.name -ceq 'digital-life-vita-agent' })[0]
+$protocolLockPackage = @($graphPlan.locked_packages | Where-Object { [string]$_.name -ceq 'local-protocol' })[0]
+$catalogBudgetFixtureCandidates = @(
+    [PSCustomObject]@{ source_kind = 'workspace'; source = $null; source_path = 'vita-agent/Cargo.toml'; content = "[package]`nname = `"digital-life-vita-agent`"`nversion = `"1.0.0`"`n"; content_sha256 = ''; package_id = [string]$rootLockPackage.package_id },
+    [PSCustomObject]@{ source_kind = 'workspace'; source = $null; source_path = 'vita-agent-protocol/Cargo.toml'; content = "[package]`nname = `"local-protocol`"`nversion = `"1.0.0`"`n"; content_sha256 = ''; package_id = [string]$protocolLockPackage.package_id }
+)
+foreach ($candidate in $catalogBudgetFixtureCandidates) { $candidate.content_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes([string]$candidate.content))).ToLowerInvariant() }
+$priorManifestValueNodeLimit = [Int64]$script:D32BoundedDiagnosticManifestValueNodeLimit
+$script:D32BoundedDiagnosticManifestValueNodeLimit = 3L
+$aggregateCatalogNodeBudgetRejected = $false
+try { $null = Complete-D32BoundedDiagnosticManifestCatalog -Plan $graphPlan -Candidates $catalogBudgetFixtureCandidates } catch { $aggregateCatalogNodeBudgetRejected = $_.Exception.Message -like '*aggregate TOML value-node budget reached*' }
+finally { $script:D32BoundedDiagnosticManifestValueNodeLimit = $priorManifestValueNodeLimit }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'actual manifest-catalog producer shares one aggregate TOML node budget across candidate manifests' $aggregateCatalogNodeBudgetRejected
 $completedGraphCatalog = Complete-D32BoundedDiagnosticManifestCatalog -Plan $graphPlan -Candidates @($graphManifestCandidates.ToArray())
 $completedGraphProof = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $completedGraphCatalog.entries
 Assert-D32BoundedCompilerDiagnosticSelfTest 'verified archive/tree/current-manifest catalog closes into the same graph proof without retaining raw source authority' ($completedGraphProof.graph_sha256 -ceq $graphProof.graph_sha256 -and $completedGraphCatalog.verified_candidate_manifest_count -eq $graphCatalog.Count)
@@ -985,6 +1070,21 @@ $ambiguousSourceCatalog = @($ambiguousSourceRoot) + @($graphCatalog | Where-Obje
 try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog $ambiguousSourceCatalog; $ambiguousSourceRejected = $false } catch { $ambiguousSourceRejected = $true }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'conflicting path and Git source selectors rejected' $ambiguousSourceRejected
 Assert-D32BoundedCompilerDiagnosticSelfTest 'bounded semver wildcard uses exact major/minor range rather than broad caret range' (-not (Test-D32BoundedDiagnosticVersionRequirement -Requirement '1.2.*' -LockedVersion '1.3.0') -and (Test-D32BoundedDiagnosticVersionRequirement -Requirement '1.2.*' -LockedVersion '1.2.9'))
+$oversizedSemverRejected = $false
+try { $null = Test-D32BoundedDiagnosticVersionRequirement -Requirement ('1' * 4097) -LockedVersion '1.0.0' } catch { $oversizedSemverRejected = $_.Exception.Message -like '*4096-character parser work bound*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'semver requirement scanning rejects input beyond its finite per-value work bound' $oversizedSemverRejected
+$cfgDepth64Body = 'windows'
+for ($index = 0; $index -lt 64; $index++) { $cfgDepth64Body = 'not(' + $cfgDepth64Body + ')' }
+$cfgDepth64 = Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $cfgDepth64Body + ')') -TargetTriple 'x86_64-pc-windows-msvc'
+$cfgDepth65Body = 'windows'
+for ($index = 0; $index -lt 65; $index++) { $cfgDepth65Body = 'not(' + $cfgDepth65Body + ')' }
+$cfgDepth65Rejected = $false
+try { $null = Get-D32BoundedDiagnosticTargetPredicate -Expression ('cfg(' + $cfgDepth65Body + ')') -TargetTriple 'x86_64-pc-windows-msvc' } catch { $cfgDepth65Rejected = $_.Exception.Message -like '*cfg predicate recursion exceeds the fixed 64-level parser stack bound*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'cfg predicate recursion stays within its finite stack bound and preserves all accepted nested result semantics' ($cfgDepth64.proven -and $cfgDepth65Rejected)
+$smallCfgBudget = [ordered]@{ scanned_chars = 0L; maximum = 4L }
+$cfgCharacterBudgetRejected = $false
+try { $null = Get-D32BoundedDiagnosticTargetPredicate -Expression 'cfg(windows)' -TargetTriple 'x86_64-pc-windows-msvc' -ParseBudget $smallCfgBudget } catch { $cfgCharacterBudgetRejected = $_.Exception.Message -like '*fixed 8 Mi-character work bound*' }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'cfg parser shares an explicit aggregate scanned-character budget across recursive calls' $cfgCharacterBudgetRejected
 $oldPlanType = $graphPlan.record_type; $graphPlan.record_type = 'D32_BOUNDED_DIAGNOSTIC_LOCK_SOURCE_PLAN_V1'
 try { $null = Resolve-D32BoundedDiagnosticLockedDependencyGraph -Plan $graphPlan -ManifestCatalog @($graphCatalog.ToArray()); $oldPlanRejected = $false } catch { $oldPlanRejected = $true }
 $graphPlan.record_type = $oldPlanType
@@ -1989,6 +2089,19 @@ $sourceProofEntrySafetyExact = $sourceProofEntryParametersExact -and $sourceProo
 $sourceProofRunnerAst = $runnerAst
 $sourceProofInvokerAst = $sourceProofRunnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-D32BoundedDiagnosticSourceProofRun' }, $true)
 $sourceProofInvokerText = if ($null -eq $sourceProofInvokerAst) { '' } else { [string]$sourceProofInvokerAst.Extent.Text }
+$sourceProofResultWriterAst = $sourceProofRunnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Write-D32BoundedDiagnosticCreateNewJson' }, $true)
+$sourceProofResultWriterText = if ($null -eq $sourceProofResultWriterAst) { '' } else { [string]$sourceProofResultWriterAst.Extent.Text }
+$sourceProofResultWriterDeadlineExact = $null -ne $sourceProofResultWriterAst -and
+    $sourceProofResultWriterText.Contains("Phase 'result.write'") -and
+    $sourceProofResultWriterText.Contains("Phase 'result.write_complete'") -and
+    $sourceProofResultWriterText.Contains("Phase 'result.flush_complete'") -and
+    $sourceProofResultWriterText.Contains('MaximumBytes') -and $sourceProofResultWriterText.Contains('CreateNew')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'create-new proof-result persistence remains byte-capped and checks the single combined deadline before and after writes and flush' $sourceProofResultWriterDeadlineExact
+$sourceProofDeadlinePartitionExact = $sourceProofInvokerText.Contains('$resultValidationDeadlineMilliseconds = [Int64]$workDeadlineMilliseconds') -and
+    $sourceProofInvokerText.Contains('$blockedFallbackValidationDeadlineMilliseconds = [Int64]($script:D32BoundedDiagnosticSourceProofCombinedMilliseconds - 15000L)') -and
+    $sourceProofInvokerText.Contains('-DeadlineMilliseconds $blockedFallbackValidationDeadlineMilliseconds') -and
+    -not $sourceProofInvokerText.Contains('-DeadlineMilliseconds $script:D32BoundedDiagnosticSourceProofCombinedMilliseconds))')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'source proof result validation and blocked fallback leave the fixed final persistence interval inside the unchanged combined deadline' $sourceProofDeadlinePartitionExact
 $sourceOriginAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticInv7Origin' }, $true)
 $sourceOriginText = if ($null -eq $sourceOriginAst) { '' } else { [string]$sourceOriginAst.Extent.Text }
 $sourceProofBootstrapAst = $runnerAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-D32BoundedDiagnosticSourceProofBootstrap' }, $true)
@@ -2013,7 +2126,9 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'both diagnostic and proof-only orig
 $sourceProofDispatchExact = $runnerParseErrors.Count -eq 0 -and $sourceProofEntryParseErrors.Count -eq 0 -and
     $sourceProofEntryText.Contains('-SourceProofOnly') -and $sourceProofEntryText.Contains('& $runnerPath') -and
     -not $sourceProofEntryText.Contains('. $runnerPath') -and $null -ne $sourceProofInvokerAst -and
-    $sourceProofInvokerText.Contains('StartNew()') -and $sourceProofInvokerText.Contains('Assert-D32BoundedDiagnosticInv7Origin') -and
+    $runnerAst.Extent.Text.Contains('$script:D32BoundedDiagnosticSourceProofWallTimer = if ($SourceProofOnly) { [Diagnostics.Stopwatch]::StartNew() } else { $null }') -and
+    $sourceProofInvokerText.Contains('$script:D32BoundedDiagnosticSourceProofWallTimer') -and
+    -not $sourceProofInvokerText.Contains('StartNew()') -and $sourceProofInvokerText.Contains('Assert-D32BoundedDiagnosticInv7Origin') -and
     -not $sourceProofInvokerText.Contains('Invoke-D32BoundedCompilerDiagnosticRun') -and
     -not $sourceProofInvokerText.Contains('Initialize-D32PowerShellModuleAuthority') -and
     -not $sourceProofInvokerText.Contains('Start-Process') -and -not $sourceProofInvokerText.Contains('Import-Module') -and

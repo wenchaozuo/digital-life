@@ -70,6 +70,11 @@ $script:D32NonSourceL1FailSafeTerminations = [long]0
 $script:D32NonSourceL1OwnedBuffers = [long]0
 $script:D32NonSourceL1Status = 'REFUSED'
 $script:D32NonSourceL1BatchDeadline = [long]0
+# Operational invocations always leave this null. The module-free self-test
+# binds a synthetic provider in-process so the actual case state machine can be
+# exercised without calling CreateProcessW, Job APIs, or reader processes.
+$script:D32NonSourceL1NativeAdapter = $null
+$script:D32NonSourceL1FileAdapter = $null
 
 # The caller captures T0 before invoking this entry. Parameter binding, this
 # script's admission, native type initialization, and child creation all spend
@@ -336,6 +341,34 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
 
     static string HashEnvironmentBlock(string block) { return BitConverter.ToString(SHA256.HashData(Encoding.Unicode.GetBytes(block))).Replace("-", "").ToLowerInvariant(); }
 
+    // Pure in-process preparation shared by the real launcher and L0's
+    // synthetic native adapter. It constructs the exact CreateProcessW inputs
+    // before any handle/job/process API is touched.
+    public static string PrepareInvocation(D32LifecycleInvocationV1 invocation, string image, string[] arguments,
+        string workingDirectory, string[] environmentEntries, string caseId, string caseNonce,
+        long batchT0Ticks, long caseT0Ticks, long counterFrequency, long activeDeadlineTicks) {
+        if (invocation == null) throw new ArgumentNullException("invocation");
+        invocation.ImagePath = image; invocation.Arguments = arguments == null ? null : (string[])arguments.Clone(); invocation.WorkingDirectory = workingDirectory;
+        invocation.EnvironmentEntries = environmentEntries == null ? null : (string[])environmentEntries.Clone();
+        invocation.CaseId = caseId; invocation.CaseNonce = caseNonce; invocation.BatchT0Ticks = batchT0Ticks; invocation.CaseT0Ticks = caseT0Ticks;
+        invocation.CounterFrequency = counterFrequency; invocation.ActiveDeadlineTicks = activeDeadlineTicks;
+        invocation.HandleRoles = new string[] { "stdin:NUL", "stdout:PIPE_WRITE", "stderr:PIPE_WRITE" };
+        invocation.CreationFlags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+        invocation.InheritHandles = true;
+        if (String.IsNullOrWhiteSpace(image) || arguments == null || arguments.Length != 26 || String.IsNullOrWhiteSpace(workingDirectory) ||
+            String.IsNullOrWhiteSpace(caseId) || caseNonce == null || caseNonce.Length != 32 || batchT0Ticks <= 0 || caseT0Ticks <= 0 || counterFrequency <= 0 || activeDeadlineTicks <= 0)
+            throw new InvalidDataException("fixed reader invocation context is incomplete");
+        string[] sortedEnvironmentEntries = (string[])environmentEntries.Clone(); Array.Sort(sortedEnvironmentEntries, StringComparer.OrdinalIgnoreCase);
+        string environmentBlock = BuildEnvironmentBlock(sortedEnvironmentEntries);
+        invocation.EnvironmentEntries = sortedEnvironmentEntries;
+        invocation.EnvironmentBlockSha256 = HashEnvironmentBlock(environmentBlock);
+        StringBuilder command = new StringBuilder(); command.Append(QuoteArgument(image));
+        foreach (string argument in arguments) { command.Append(' '); command.Append(QuoteArgument(argument)); }
+        invocation.CommandLine = command.ToString();
+        if (invocation.CommandLine.Length >= 32767) throw new InvalidDataException("fixed reader command line exceeds the Windows limit");
+        return environmentBlock;
+    }
+
     public static D32LifecycleOwnedProcessV1 StartSuspendedAssignedAndResume(string image, string[] arguments, string workingDirectory, string[] environmentEntries,
         string caseId, string caseNonce, long batchT0Ticks, long caseT0Ticks, long counterFrequency, long activeDeadlineTicks, long workDeadlineTicks) {
         D32LifecycleOwnedProcessV1 owned = new D32LifecycleOwnedProcessV1();
@@ -344,24 +377,8 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
         ProcessInformation pi = new ProcessInformation();
         try {
             D32LifecycleInvocationV1 invocation = owned.Invocation;
-            invocation.ImagePath = image; invocation.Arguments = arguments == null ? null : (string[])arguments.Clone(); invocation.WorkingDirectory = workingDirectory;
-            invocation.EnvironmentEntries = environmentEntries == null ? null : (string[])environmentEntries.Clone();
-            invocation.CaseId = caseId; invocation.CaseNonce = caseNonce; invocation.BatchT0Ticks = batchT0Ticks; invocation.CaseT0Ticks = caseT0Ticks;
-            invocation.CounterFrequency = counterFrequency; invocation.ActiveDeadlineTicks = activeDeadlineTicks;
-            invocation.HandleRoles = new string[] { "stdin:NUL", "stdout:PIPE_WRITE", "stderr:PIPE_WRITE" };
-            invocation.CreationFlags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
-            invocation.InheritHandles = true;
-            if (String.IsNullOrWhiteSpace(image) || arguments == null || arguments.Length != 26 || String.IsNullOrWhiteSpace(workingDirectory) ||
-                String.IsNullOrWhiteSpace(caseId) || caseNonce == null || caseNonce.Length != 32 || batchT0Ticks <= 0 || caseT0Ticks <= 0 || counterFrequency <= 0 || activeDeadlineTicks <= 0)
-                throw new InvalidDataException("fixed reader invocation context is incomplete");
-            string[] sortedEnvironmentEntries = (string[])environmentEntries.Clone(); Array.Sort(sortedEnvironmentEntries, StringComparer.OrdinalIgnoreCase);
-            string environmentBlock = BuildEnvironmentBlock(sortedEnvironmentEntries);
-            invocation.EnvironmentEntries = sortedEnvironmentEntries;
-            invocation.EnvironmentBlockSha256 = HashEnvironmentBlock(environmentBlock);
-            StringBuilder command = new StringBuilder(); command.Append(QuoteArgument(image));
-            foreach (string argument in arguments) { command.Append(' '); command.Append(QuoteArgument(argument)); }
-            invocation.CommandLine = command.ToString();
-            if (invocation.CommandLine.Length >= 32767) throw new InvalidDataException("fixed reader command line exceeds the Windows limit");
+            string environmentBlock = PrepareInvocation(invocation, image, arguments, workingDirectory, environmentEntries,
+                caseId, caseNonce, batchT0Ticks, caseT0Ticks, counterFrequency, activeDeadlineTicks);
             owned.Job = CreateJobObjectW(IntPtr.Zero, null); if (owned.Job == IntPtr.Zero) throw LastError("CreateJobObjectW failed");
             ExtendedLimitInformation limits = new ExtendedLimitInformation();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
@@ -891,8 +908,8 @@ function Get-D32NonSourceL1DeadlineTicks {
 
 function Add-D32NonSourceL1JournalFact {
     param([Parameter(Mandatory = $true)][string]$Event, [string]$CaseId = '',
-        [AllowNull()][long]$ScheduledTicks = $null, [Parameter(Mandatory = $true)][long]$ObservedTicks,
-        [AllowNull()][object]$ResultReference = $null, [AllowNull()][string]$CaseEvidenceSha256 = $null)
+        [AllowNull()][Nullable[long]]$ScheduledTicks = $null, [Parameter(Mandatory = $true)][long]$ObservedTicks,
+        [AllowNull()][object]$ResultReference = $null, [AllowNull()][object]$CaseEvidenceSha256 = $null)
     if ($null -eq $script:D32NonSourceL1JournalStream) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result journal is unavailable' }
     $fact = [PSCustomObject][ordered]@{
         event = $Event; case_id = $CaseId; scheduled_ticks = $ScheduledTicks; observed_ticks = $ObservedTicks
@@ -911,6 +928,27 @@ function Add-D32NonSourceL1JournalFact {
     }
     $script:D32NonSourceL1JournalStream.Write($bytes, 0, $bytes.Length); $script:D32NonSourceL1JournalStream.Flush($true)
     $script:D32NonSourceL1JournalBytes += $bytes.Length
+}
+
+function ConvertTo-D32NonSourceL1ResultBytes {
+    param([Parameter(Mandatory = $true)][object]$Record)
+    if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $Record)) {
+        throw 'D32_NON_SOURCE_L1_UNRESOLVED: exact result schema rejected producer record'
+    }
+    $json = ConvertTo-Json -InputObject $Record -Depth 32 -Compress -ErrorAction Stop
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    if ($bytes.Length -gt 65536) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: result exceeds the fixed 65536-byte output ceiling' }
+    return ,$bytes
+}
+
+function New-D32NonSourceL1ResultPersistedFact {
+    param([Parameter(Mandatory = $true)][object]$ResultReference, [Parameter(Mandatory = $true)][long]$ObservedTicks)
+    return [PSCustomObject][ordered]@{
+        event = 'L1_RESULT_PERSISTED'; case_id = ''; scheduled_ticks = $null; observed_ticks = $ObservedTicks; lateness_ticks = $null
+        result_path = [string]$ResultReference.path; result_bytes = [Int64]$ResultReference.bytes
+        result_sha256 = [string]$ResultReference.sha256; result_volume_serial_hex = [string]$ResultReference.volume_serial_hex
+        result_file_id_hex = [string]$ResultReference.file_id_hex; case_evidence_sha256 = $null; gate_authority = 'NONE'
+    }
 }
 
 function Get-D32NonSourceL1ErrorText {
@@ -997,6 +1035,7 @@ function Get-D32NonSourceL1ReferenceFromOpened {
 function Open-D32NonSourceL1PinnedFile {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][object]$Pin)
     if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed code/runtime pin read crossed the batch deadline' }
+    if ($null -ne $script:D32NonSourceL1FileAdapter) { return & $script:D32NonSourceL1FileAdapter $Path $Pin }
     $opened = Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $script:D32LifecycleFences -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
     $script:D32NonSourceL1OwnedBuffers += [Int64]$opened.Record.bytes
     if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { if ($null -ne $opened.Stream) { $opened.Stream.Dispose() }; throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: probe-owned input buffers exceed 16 MiB' }
@@ -1076,12 +1115,95 @@ function Get-D32NonSourceL1RemainingWaitMilliseconds {
     return [uint32][Math]::Max(1, [Math]::Min(50, [Math]::Ceiling($remaining)))
 }
 
+# The native-operation seam is private to the controller process. Operational
+# invocation leaves the adapter null and therefore calls only the fixed native
+# implementation below. The policy self-test installs a synthetic in-process
+# provider to exercise the same case state machine without any P/Invoke child.
+function Start-D32NonSourceL1NativeChild {
+    param([string]$Image, [string[]]$Arguments, [string]$WorkingDirectory, [string[]]$EnvironmentEntries,
+        [string]$CaseId, [string]$CaseNonce, [long]$BatchT0Ticks, [long]$CaseT0Ticks,
+        [long]$CounterFrequency, [long]$ActiveDeadlineTicks, [long]$WorkDeadlineTicks)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) {
+        return & $script:D32NonSourceL1NativeAdapter.Start -Image $Image -Arguments $Arguments -WorkingDirectory $WorkingDirectory `
+            -EnvironmentEntries $EnvironmentEntries -CaseId $CaseId -CaseNonce $CaseNonce -BatchT0Ticks $BatchT0Ticks `
+            -CaseT0Ticks $CaseT0Ticks -CounterFrequency $CounterFrequency -ActiveDeadlineTicks $ActiveDeadlineTicks -WorkDeadlineTicks $WorkDeadlineTicks
+    }
+    return [D32BoundedSourceProofLifecycleNativeV1]::StartSuspendedAssignedAndResume($Image, $Arguments, $WorkingDirectory,
+        $EnvironmentEntries, $CaseId, $CaseNonce, $BatchT0Ticks, $CaseT0Ticks, $CounterFrequency, $ActiveDeadlineTicks, $WorkDeadlineTicks)
+}
+
+function Test-D32NonSourceL1NativeSignaled {
+    param([IntPtr]$Process)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.IsSignaled -Process $Process) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($Process)
+}
+
+function Get-D32NonSourceL1NativeCaptureText {
+    param([object]$Capture)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [string](& $script:D32NonSourceL1NativeAdapter.CaptureText -Capture $Capture) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($Capture)
+}
+
+function Stop-D32NonSourceL1NativeJob {
+    param([IntPtr]$Job, [object]$ExitCode)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.TerminateJob -Job $Job -ExitCode $ExitCode) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($Job, $ExitCode)
+}
+
+function Stop-D32NonSourceL1NativeProcess {
+    param([IntPtr]$Process, [object]$ExitCode)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.TerminateExactProcess -Process $Process -ExitCode $ExitCode) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::TerminateExactProcess($Process, $ExitCode)
+}
+
+function Wait-D32NonSourceL1NativeProcess {
+    param([IntPtr]$Process, [uint32]$Milliseconds)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [uint32](& $script:D32NonSourceL1NativeAdapter.Wait -Process $Process -Milliseconds $Milliseconds) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::Wait($Process, $Milliseconds)
+}
+
+function Get-D32NonSourceL1NativeExitCode {
+    param([IntPtr]$Process)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return & $script:D32NonSourceL1NativeAdapter.ExitCode -Process $Process }
+    return [D32BoundedSourceProofLifecycleNativeV1]::ExitCode($Process)
+}
+
+function Get-D32NonSourceL1NativeActiveProcessCount {
+    param([IntPtr]$Job)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return & $script:D32NonSourceL1NativeAdapter.ActiveProcesses -Job $Job }
+    return [D32BoundedSourceProofLifecycleNativeV1]::ActiveProcesses($Job)
+}
+
+function Get-D32NonSourceL1NativeTotalProcessCount {
+    param([IntPtr]$Job)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return & $script:D32NonSourceL1NativeAdapter.TotalProcesses -Job $Job }
+    return [D32BoundedSourceProofLifecycleNativeV1]::TotalProcesses($Job)
+}
+
+function Join-D32NonSourceL1NativeCaptures {
+    param([object]$Native, [int]$Milliseconds)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.JoinCaptures -Native $Native -Milliseconds $Milliseconds) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, $Milliseconds)
+}
+
+function Close-D32NonSourceL1NativeJob {
+    param([object]$Native)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.CloseJob -Native $Native) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($Native)
+}
+
+function Close-D32NonSourceL1NativeHandles {
+    param([object]$Native)
+    if ($null -ne $script:D32NonSourceL1NativeAdapter) { return [bool](& $script:D32NonSourceL1NativeAdapter.CloseAll -Native $Native) }
+    return [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($Native)
+}
+
 function Join-D32NonSourceL1CapturesUntilDeadline {
     param([Parameter(Mandatory = $true)][object]$Native, [Parameter(Mandatory = $true)][long]$DeadlineTicks)
     while ((Get-D32NonSourceL1Now) -lt $DeadlineTicks) {
-        if ([D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, 20)) { return $true }
+        if (Join-D32NonSourceL1NativeCaptures -Native $Native -Milliseconds 20) { return $true }
     }
-    return [D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, 0)
+    return Join-D32NonSourceL1NativeCaptures -Native $Native -Milliseconds 0
 }
 
 function New-D32NonSourceL1ActualInvocationRecord {
@@ -1134,10 +1256,10 @@ function Invoke-D32NonSourceL1Case {
             $row.state = 'EXPECTED_REFUSAL_VERIFIED'; $row.primary_error = 'fixed reader entry SHA mismatch was rejected by common opened-handle pre-create binding'; return $row
         }
         if (-not [bool]$plan.admitted -or (Get-D32NonSourceL1Now) -ge $active) { throw 'fixed pre-create admission did not complete before active deadline' }
-        $native = [D32BoundedSourceProofLifecycleNativeV1]::StartSuspendedAssignedAndResume(
-            [string]$plan.image, [string[]]$plan.arguments, [string]$plan.working_directory, [string[]]$plan.environment_entries,
-            [string]$caseId, $caseNonce, [Int64]$L1T0Ticks, [Int64]$caseT0, [Int64][Diagnostics.Stopwatch]::Frequency,
-            [Int64]$active, [Int64]$active)
+        $native = Start-D32NonSourceL1NativeChild -Image ([string]$plan.image) -Arguments ([string[]]$plan.arguments) `
+            -WorkingDirectory ([string]$plan.working_directory) -EnvironmentEntries ([string[]]$plan.environment_entries) `
+            -CaseId ([string]$caseId) -CaseNonce ([string]$caseNonce) -BatchT0Ticks ([Int64]$L1T0Ticks) -CaseT0Ticks ([Int64]$caseT0) `
+            -CounterFrequency ([Int64][Diagnostics.Stopwatch]::Frequency) -ActiveDeadlineTicks ([Int64]$active) -WorkDeadlineTicks ([Int64]$active)
         $row.actual_invocation = New-D32NonSourceL1ActualInvocationRecord -Native $native -Plan $plan -CaseId $caseId -CaseNonce $caseNonce -CaseT0Ticks $caseT0 -ActiveDeadlineTicks $active
         if ($native.CreateProcessAttempted) { $script:D32NonSourceL1CreateAttempts++; $row.create_attempt_count = 1L; $row.create_attempt_ticks = [Int64]$native.CreateProcessAttemptTicks }
         $row.job_instance_id = if ([string]$native.JobInstanceId -match '^[0-9a-f]{32}$') { [string]$native.JobInstanceId } else { $null }
@@ -1163,13 +1285,13 @@ function Invoke-D32NonSourceL1Case {
         $ready = 'D32NSL1|' + $caseId + '|' + [string]$caseAuthority.nonce + '|READY'
         $plannedTerminationObserved = $false
         while ((Get-D32NonSourceL1Now) -lt $active) {
-            if ([D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $processExited = $true; break }
+            if (Test-D32NonSourceL1NativeSignaled -Process $native.Process) { $processExited = $true; break }
             if ($caseId -ceq 'NORMAL_EXIT') { }
             else {
-                $captureText = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stdout)
-                if ($captureText.Contains($ready) -and -not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) {
+                $captureText = Get-D32NonSourceL1NativeCaptureText -Capture $native.Stdout
+                if ($captureText.Contains($ready) -and -not (Test-D32NonSourceL1NativeSignaled -Process $native.Process)) {
                     $terminationTicks = Get-D32NonSourceL1Now
-                    if ($terminationTicks -lt $active -and [D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210002)) {
+                    if ($terminationTicks -lt $active -and (Stop-D32NonSourceL1NativeJob -Job $native.Job -ExitCode 0xD3210002)) {
                         $plannedTerminationObserved = $true; $script:D32NonSourceL1PlannedTerminations++
                         $row.planned_termination_count = 1L; $row.planned_termination_ticks = $terminationTicks
                     } else { $row.primary_error = 'planned termination was not accepted while the retained child remained active' }
@@ -1178,31 +1300,31 @@ function Invoke-D32NonSourceL1Case {
             }
             $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $active
             if ($waitMs -eq 0) { break }
-            $waitState = [D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs)
+            $waitState = Wait-D32NonSourceL1NativeProcess -Process $native.Process -Milliseconds $waitMs
             if ($waitState -eq [uint32]0) { $processExited = $true; break }
             if ($waitState -ne [uint32]258) { throw 'retained process wait failed inside active window' }
         }
-        if ([D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $processExited = $true }
+        if (Test-D32NonSourceL1NativeSignaled -Process $native.Process) { $processExited = $true }
         if (-not $processExited -and -not $plannedTerminationObserved) {
             $row.primary_error = if ($row.primary_error) { [string]$row.primary_error } else { 'fixed child did not complete or become ready within the active deadline' }
             $failSafeTicks = Get-D32NonSourceL1Now
-            if ($failSafeTicks -lt $cleanup -and [D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210003)) {
+            if ($failSafeTicks -lt $cleanup -and (Stop-D32NonSourceL1NativeJob -Job $native.Job -ExitCode 0xD3210003)) {
                 $script:D32NonSourceL1FailSafeTerminations++; $row.fail_safe_termination_count = 1L; $row.fail_safe_termination_ticks = $failSafeTicks
             }
         }
-        while (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+        while (-not (Test-D32NonSourceL1NativeSignaled -Process $native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
             $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $cleanup
             if ($waitMs -eq 0) { break }
-            $waitState = [D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs)
+            $waitState = Wait-D32NonSourceL1NativeProcess -Process $native.Process -Milliseconds $waitMs
             if ($waitState -eq [uint32]0) { break }
             if ($waitState -ne [uint32]258) { throw 'retained process wait failed inside cleanup window' }
         }
-        $processExited = [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)
+        $processExited = Test-D32NonSourceL1NativeSignaled -Process $native.Process
         if (-not $processExited) { $cleanupKnown = $false; throw 'owned reader exit remained unknown at cleanup deadline' }
         $row.exit_ticks = Get-D32NonSourceL1Now
-        $row.exit_code = [D32BoundedSourceProofLifecycleNativeV1]::ExitCode($native.Process)
-        $activeCount = [D32BoundedSourceProofLifecycleNativeV1]::ActiveProcesses($native.Job)
-        $totalCount = [D32BoundedSourceProofLifecycleNativeV1]::TotalProcesses($native.Job)
+        $row.exit_code = Get-D32NonSourceL1NativeExitCode -Process $native.Process
+        $activeCount = Get-D32NonSourceL1NativeActiveProcessCount -Job $native.Job
+        $totalCount = Get-D32NonSourceL1NativeTotalProcessCount -Job $native.Job
         $row.job_active_process_count = $activeCount; $row.job_total_process_count = $totalCount
         $joined = Join-D32NonSourceL1CapturesUntilDeadline -Native $native -DeadlineTicks $cleanup
         $row.capture_join_verified = [bool]$joined
@@ -1215,17 +1337,17 @@ function Invoke-D32NonSourceL1Case {
         }
         $expectedStdout = 'D32NSL1|' + $caseId + '|' + [string]$caseAuthority.nonce + '|READY'
         $expectedStderr = if ($caseId -ceq 'NORMAL_EXIT') { 'D32NSL1|FIXED|NORMAL' } else { 'D32NSL1|FIXED|FORCED' }
-        $actualStdout = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stdout).TrimEnd([char[]]@("`r", "`n"))
-        $actualStderr = [D32BoundedSourceProofLifecycleNativeV1]::CaptureText($native.Stderr).TrimEnd([char[]]@("`r", "`n"))
+        $actualStdout = (Get-D32NonSourceL1NativeCaptureText -Capture $native.Stdout).TrimEnd([char[]]@("`r", "`n"))
+        $actualStderr = (Get-D32NonSourceL1NativeCaptureText -Capture $native.Stderr).TrimEnd([char[]]@("`r", "`n"))
         $row.stdout_token_verified = ($joined -and -not $row.stdout_truncated -and $row.stdout_bytes -le 1024 -and $actualStdout -ceq $expectedStdout)
         $row.stderr_token_verified = ($joined -and -not $row.stderr_truncated -and $row.stderr_bytes -le 1024 -and $actualStderr -ceq $expectedStderr)
         if ($actualStdout -cne $expectedStdout -or $actualStderr -cne $expectedStderr) {
             $readerRefusalError = Get-D32NonSourceL1ReaderRefusalError -StderrCapture $actualStderr
             $row.primary_error = if ($readerRefusalError) { [string]$readerRefusalError } else { 'fixed fixture behavior token/capture did not match the exact case' }
         }
-        if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($native)) { $cleanupKnown = $false; throw 'owned kill-on-close Job handle did not close' }
+        if (-not (Close-D32NonSourceL1NativeJob -Native $native)) { $cleanupKnown = $false; throw 'owned kill-on-close Job handle did not close' }
         $row.job_closed = $true
-        if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($native) -or -not $native.TemporaryHandlesClosed) { $cleanupKnown = $false; throw 'retained native process/thread/pipe cleanup did not verify' }
+        if (-not (Close-D32NonSourceL1NativeHandles -Native $native) -or -not $native.TemporaryHandlesClosed) { $cleanupKnown = $false; throw 'retained native process/thread/pipe cleanup did not verify' }
         $row.cleanup_observed_ticks = Get-D32NonSourceL1Now
         if (-not $cleanupKnown) { $row.state = 'UNRESOLVED' }
         elseif ($caseId -ceq 'NORMAL_EXIT' -and $row.exit_code -eq 0 -and $row.stdout_bytes -le 1024 -and $row.stderr_bytes -le 1024 -and -not $row.stdout_truncated -and -not $row.stderr_truncated -and $row.capture_join_verified -and $row.job_active_process_count -eq 0 -and $row.job_total_process_count -eq 1 -and $row.job_closed -and $row.kill_on_close_enabled) { $row.state = 'NATIVE_BOUNDARY_VERIFIED' }
@@ -1236,27 +1358,27 @@ function Invoke-D32NonSourceL1Case {
         else { if ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += (Get-D32NonSourceL1ErrorText -Exception $_.Exception) } }
         if ($null -ne $native -and $native.Process -ne [IntPtr]::Zero) {
             try {
-                if (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+                if (-not (Test-D32NonSourceL1NativeSignaled -Process $native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
                     $script:D32NonSourceL1FailSafeTerminations++
                     $row.fail_safe_termination_count = 1L; $row.fail_safe_termination_ticks = Get-D32NonSourceL1Now
-                    if ($native.Job -ne [IntPtr]::Zero -and $native.Assigned) { [void][D32BoundedSourceProofLifecycleNativeV1]::TerminateJob($native.Job, 0xD3210003) }
-                    else { [void][D32BoundedSourceProofLifecycleNativeV1]::TerminateExactProcess($native.Process, 0xD3210003) }
-                    while (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
+                    if ($native.Job -ne [IntPtr]::Zero -and $native.Assigned) { [void](Stop-D32NonSourceL1NativeJob -Job $native.Job -ExitCode 0xD3210003) }
+                    else { [void](Stop-D32NonSourceL1NativeProcess -Process $native.Process -ExitCode 0xD3210003) }
+                    while (-not (Test-D32NonSourceL1NativeSignaled -Process $native.Process) -and (Get-D32NonSourceL1Now) -lt $cleanup) {
                         $waitMs = Get-D32NonSourceL1RemainingWaitMilliseconds -DeadlineTicks $cleanup
                         if ($waitMs -eq 0) { break }
-                        if ([D32BoundedSourceProofLifecycleNativeV1]::Wait($native.Process, $waitMs) -eq [uint32]0) { break }
+                        if ((Wait-D32NonSourceL1NativeProcess -Process $native.Process -Milliseconds $waitMs) -eq [uint32]0) { break }
                     }
                 }
-                if (-not [D32BoundedSourceProofLifecycleNativeV1]::IsSignaled($native.Process)) { $cleanupKnown = $false }
+                if (-not (Test-D32NonSourceL1NativeSignaled -Process $native.Process)) { $cleanupKnown = $false }
                 else {
-                    $row.exit_ticks = Get-D32NonSourceL1Now; $row.exit_code = [D32BoundedSourceProofLifecycleNativeV1]::ExitCode($native.Process)
-                    $row.job_active_process_count = if ($native.Job -ne [IntPtr]::Zero) { [D32BoundedSourceProofLifecycleNativeV1]::ActiveProcesses($native.Job) } else { $null }
-                    $row.job_total_process_count = if ($native.Job -ne [IntPtr]::Zero) { [D32BoundedSourceProofLifecycleNativeV1]::TotalProcesses($native.Job) } else { $null }
+                    $row.exit_ticks = Get-D32NonSourceL1Now; $row.exit_code = Get-D32NonSourceL1NativeExitCode -Process $native.Process
+                    $row.job_active_process_count = if ($native.Job -ne [IntPtr]::Zero) { Get-D32NonSourceL1NativeActiveProcessCount -Job $native.Job } else { $null }
+                    $row.job_total_process_count = if ($native.Job -ne [IntPtr]::Zero) { Get-D32NonSourceL1NativeTotalProcessCount -Job $native.Job } else { $null }
                     $row.capture_join_verified = Join-D32NonSourceL1CapturesUntilDeadline -Native $native -DeadlineTicks $cleanup
                     if ($null -ne $native.Stdout) { $row.stdout_bytes = [Int64]$native.Stdout.Bytes; $row.stdout_sha256 = [string]$native.Stdout.Sha256; $row.stdout_truncated = [bool]$native.Stdout.Truncated }
                     if ($null -ne $native.Stderr) { $row.stderr_bytes = [Int64]$native.Stderr.Bytes; $row.stderr_sha256 = [string]$native.Stderr.Sha256; $row.stderr_truncated = [bool]$native.Stderr.Truncated }
-                    if ($native.Job -ne [IntPtr]::Zero) { $row.job_closed = [D32BoundedSourceProofLifecycleNativeV1]::CloseJob($native) }
-                    if (-not [D32BoundedSourceProofLifecycleNativeV1]::CloseAll($native)) { $cleanupKnown = $false }
+                    if ($native.Job -ne [IntPtr]::Zero) { $row.job_closed = Close-D32NonSourceL1NativeJob -Native $native }
+                    if (-not (Close-D32NonSourceL1NativeHandles -Native $native)) { $cleanupKnown = $false }
                     $row.cleanup_observed_ticks = Get-D32NonSourceL1Now
                 }
             } catch { $cleanupKnown = $false; if ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += (Get-D32NonSourceL1ErrorText -Exception $_.Exception) } }
@@ -1267,6 +1389,37 @@ function Invoke-D32NonSourceL1Case {
         $row.state = if ($cleanupKnown) { if ((Get-D32NonSourceL1Now) -ge $active) { 'BUDGET_STOPPED' } else { 'BLOCKED' } } else { 'UNRESOLVED' }
     }
     return $row
+}
+
+function Invoke-D32NonSourceL1CaseBatch {
+    for ($index = 0; $index -lt 3; $index++) {
+        if ($script:D32NonSourceL1CaseStop -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { break }
+        $row = Invoke-D32NonSourceL1Case -Index $index
+        $row.case_completed_ticks = Get-D32NonSourceL1Now
+        if ($row.state -cne 'UNRESOLVED' -and [Int64]$row.case_completed_ticks -ge [Int64]$row.audit_deadline_ticks) {
+            $row.state = 'BUDGET_STOPPED'
+            $auditError = 'case audit/completion returned at or beyond its fixed 15-second/batch-bounded deadline'
+            if (-not $row.primary_error) { $row.primary_error = $auditError }
+            elseif ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += $auditError }
+        }
+        $row.case_evidence_sha256 = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseEvidenceSha256 -CaseNonce $row.case_nonce `
+            -PrecreateAdmission $row.precreate_admission -ActualInvocation $row.actual_invocation
+        $null = $script:D32NonSourceL1Cases.Add($row)
+        Add-D32NonSourceL1JournalFact -Event ('CASE_' + [string]$row.state) -CaseId ([string]$row.case_id) `
+            -ObservedTicks ([Int64]$row.case_completed_ticks) -CaseEvidenceSha256 ([string]$row.case_evidence_sha256)
+        if ([string]$row.state -ceq 'UNRESOLVED') { $script:D32NonSourceL1CaseStop = $true }
+    }
+    while ($script:D32NonSourceL1Cases.Count -lt 3) {
+        $nextCase = [string]$script:D32NonSourceL1Authority.cases[$script:D32NonSourceL1Cases.Count].case_id
+        $null = $script:D32NonSourceL1Cases.Add((New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $nextCase))
+    }
+    $batchOutcome = Resolve-D32BoundedDiagnosticSourceProofNonSourceL1BatchOutcome -Cases @($script:D32NonSourceL1Cases.ToArray()) `
+        -CreateProcessAttemptCount $script:D32NonSourceL1CreateAttempts -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations `
+        -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
+        -BatchDeadlineReached:((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline)
+    $script:D32NonSourceL1Status = [string]$batchOutcome.status
+    if (-not $script:D32NonSourceL1Primary -and $null -ne $batchOutcome.primary_error) { $script:D32NonSourceL1Primary = [string]$batchOutcome.primary_error }
+    return $batchOutcome
 }
 
 function Invoke-D32NonSourceL1 {
@@ -1394,33 +1547,7 @@ function Invoke-D32NonSourceL1 {
         })
         $script:D32NonSourceL1Opened.Add($runtimeOpened)
 
-        for ($index = 0; $index -lt 3; $index++) {
-            if ($script:D32NonSourceL1CaseStop -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { break }
-            $row = Invoke-D32NonSourceL1Case -Index $index
-            $row.case_completed_ticks = Get-D32NonSourceL1Now
-            if ($row.state -cne 'UNRESOLVED' -and [Int64]$row.case_completed_ticks -ge [Int64]$row.audit_deadline_ticks) {
-                $row.state = 'BUDGET_STOPPED'
-                $auditError = 'case audit/completion returned at or beyond its fixed 15-second/batch-bounded deadline'
-                if (-not $row.primary_error) { $row.primary_error = $auditError }
-                elseif ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += $auditError }
-            }
-            $row.case_evidence_sha256 = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseEvidenceSha256 -CaseNonce $row.case_nonce `
-                -PrecreateAdmission $row.precreate_admission -ActualInvocation $row.actual_invocation
-            $script:D32NonSourceL1Cases.Add($row)
-            Add-D32NonSourceL1JournalFact -Event ('CASE_' + [string]$row.state) -CaseId ([string]$row.case_id) `
-                -ObservedTicks ([Int64]$row.case_completed_ticks) -CaseEvidenceSha256 ([string]$row.case_evidence_sha256)
-            if ([string]$row.state -ceq 'UNRESOLVED') { $script:D32NonSourceL1CaseStop = $true }
-        }
-        while ($script:D32NonSourceL1Cases.Count -lt 3) {
-            $nextCase = [string]$script:D32NonSourceL1Authority.cases[$script:D32NonSourceL1Cases.Count].case_id
-            $script:D32NonSourceL1Cases.Add((New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $nextCase))
-        }
-        $batchOutcome = Resolve-D32BoundedDiagnosticSourceProofNonSourceL1BatchOutcome -Cases @($script:D32NonSourceL1Cases.ToArray()) `
-            -CreateProcessAttemptCount $script:D32NonSourceL1CreateAttempts -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations `
-            -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
-            -BatchDeadlineReached:((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline)
-        $script:D32NonSourceL1Status = [string]$batchOutcome.status
-        if (-not $script:D32NonSourceL1Primary -and $null -ne $batchOutcome.primary_error) { $script:D32NonSourceL1Primary = [string]$batchOutcome.primary_error }
+        $null = Invoke-D32NonSourceL1CaseBatch
     } catch {
         $caughtError = Get-D32NonSourceL1ErrorText -Exception $_.Exception
         $null = Add-D32NonSourceL1Error -Exception $_.Exception -Message $caughtError
@@ -1463,10 +1590,8 @@ function Invoke-D32NonSourceL1 {
             -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
             -Status $script:D32NonSourceL1Status -PrimaryError $script:D32NonSourceL1Primary -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) `
             -StartedAtUtc $script:D32NonSourceL1StartedAtUtc -CompletedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
-        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $record)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: exact result schema rejected producer record' }
-        $json = ConvertTo-Json -InputObject $record -Depth 32 -Compress -ErrorAction Stop
-        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
-        if ($bytes.Length -gt 65536 -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: result size or batch persistence deadline exceeded' }
+        $bytes = ConvertTo-D32NonSourceL1ResultBytes -Record $record
+        if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: result size or batch persistence deadline exceeded' }
         $resultStream = [IO.File]::Open([string]$script:D32NonSourceL1Authority.output.result_path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $resultStream.Write($bytes, 0, $bytes.Length); $resultStream.Flush($true) } finally { $resultStream.Dispose() }
         if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result flush returned after batch deadline' }
@@ -1477,12 +1602,7 @@ function Invoke-D32NonSourceL1 {
             $readback = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $resultDocument.RootElement
         } finally { $resultDocument.Dispose(); if ($null -ne $resultOpened.Stream) { $resultOpened.Stream.Dispose() } }
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $readback)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: persisted L1 result failed strict readback' }
-        $persistedFact = [PSCustomObject][ordered]@{
-            event = 'L1_RESULT_PERSISTED'; case_id = ''; scheduled_ticks = $null; observed_ticks = Get-D32NonSourceL1Now; lateness_ticks = $null
-            result_path = [string]$resultOpened.Record.path; result_bytes = [Int64]$resultOpened.Record.bytes
-            result_sha256 = [string]$resultOpened.Record.sha256; result_volume_serial_hex = [string]$resultOpened.Record.volume_serial_hex
-            result_file_id_hex = [string]$resultOpened.Record.file_id_hex; case_evidence_sha256 = $null; gate_authority = 'NONE'
-        }
+        $persistedFact = New-D32NonSourceL1ResultPersistedFact -ResultReference $resultOpened.Record -ObservedTicks (Get-D32NonSourceL1Now)
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings -Record $readback -Authority $script:D32NonSourceL1Authority `
             -AuthorityReference $script:D32NonSourceL1AuthorityReference -ExpectedAuthorityPath $L1AuthorityPath -ExpectedAuthoritySha256 $ExpectedL1AuthoritySha256 `
             -PersistedFact $persistedFact -ResultReference $resultOpened.Record)) {

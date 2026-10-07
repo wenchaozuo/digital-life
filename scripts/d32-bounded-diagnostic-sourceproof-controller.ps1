@@ -112,6 +112,7 @@ public sealed class D32LifecycleOwnedProcessV1 {
     public bool PrelaunchHandlesClosed;
     public bool CreateProcessAttempted;
     public long CreateProcessAttemptTicks;
+    public D32LifecycleInvocationV1 Invocation;
     public long ReaderResumeTicks;
     public long JobAssignmentTicks;
     public bool Assigned;
@@ -121,6 +122,38 @@ public sealed class D32LifecycleOwnedProcessV1 {
     public D32LifecycleCaptureV1 Stderr;
     internal Thread StdoutThread;
     internal Thread StderrThread;
+}
+
+public sealed class D32LifecycleInvocationV1 {
+    public string ImagePath;
+    public string[] Arguments;
+    public string CommandLine;
+    public string WorkingDirectory;
+    public string[] EnvironmentEntries;
+    public string EnvironmentBlockSha256;
+    public string CaseId;
+    public string CaseNonce;
+    public long BatchT0Ticks;
+    public long CaseT0Ticks;
+    public long CounterFrequency;
+    public long ActiveDeadlineTicks;
+    public bool InheritHandles;
+    public bool HandleListApplied;
+    public string[] HandleRoles;
+    public bool? StdinInheritable;
+    public bool? StdoutWriteInheritable;
+    public bool? StderrWriteInheritable;
+    public bool? StdoutReadInheritable;
+    public bool? StderrReadInheritable;
+    public uint CreationFlags;
+    public bool ApiAttempted;
+    public long? ApiAttemptTicks;
+    public bool? ApiReturned;
+    public int? ApiErrorCode;
+    public uint? ProcessId;
+    public long? CreationFileTimeTicks;
+    public string ProcessImagePath;
+    public bool ProcessImageBindingVerified;
 }
 
 public static class D32BoundedSourceProofLifecycleNativeV1 {
@@ -184,7 +217,9 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool CreatePipe(out IntPtr readPipe, out IntPtr writePipe, ref SecurityAttributes attributes, uint size);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode, EntryPoint="CreateFileW")] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode, EntryPoint="CreateFileW", ExactSpelling=true)] static extern IntPtr CreateFileWInheritable(string name, uint access, uint share, ref SecurityAttributes security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetHandleInformation(IntPtr handle, out uint flags);
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessW(string app, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string currentDirectory, ref StartupInfoEx startup, out ProcessInformation processInformation);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
@@ -279,11 +314,54 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
         return true;
     }
 
-    public static D32LifecycleOwnedProcessV1 StartSuspendedAssignedAndResume(string image, string commandLine, string workingDirectory, string environmentBlock, long workDeadlineTicks) {
+    static bool HandleInheritable(IntPtr handle, string role) {
+        uint flags; if (!GetHandleInformation(handle, out flags)) throw LastError("GetHandleInformation(" + role + ") failed");
+        return (flags & HANDLE_FLAG_INHERIT) != 0;
+    }
+
+    static string BuildEnvironmentBlock(string[] entries) {
+        if (entries == null || entries.Length != 15) throw new InvalidDataException("fixed child environment must have exactly 15 entries");
+        string[] sorted = (string[])entries.Clone(); Array.Sort(sorted, StringComparer.OrdinalIgnoreCase);
+        HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string entry in sorted) {
+            int separator = entry == null ? -1 : entry.IndexOf('=');
+            if (separator <= 0 || !names.Add(entry.Substring(0, separator))) throw new InvalidDataException("fixed child environment contains a malformed or duplicate entry");
+        }
+        string[] expected = new string[] { "APPDATA", "DOTNET_CLI_TELEMETRY_OPTOUT", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PSHOME", "PSModuleAutoLoadingPreference", "PSModulePath", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "WINDIR", "POWERSHELL_TELEMETRY_OPTOUT" };
+        Array.Sort(expected, StringComparer.OrdinalIgnoreCase);
+        if (sorted.Length != expected.Length) throw new InvalidDataException("fixed child environment names differ from the allowlist");
+        for (int i = 0; i < expected.Length; i++) if (!StringComparer.OrdinalIgnoreCase.Equals(sorted[i].Substring(0, sorted[i].IndexOf('=')), expected[i])) throw new InvalidDataException("fixed child environment names differ from the allowlist");
+        return String.Join("\0", sorted) + "\0\0";
+    }
+
+    static string HashEnvironmentBlock(string block) { return BitConverter.ToString(SHA256.HashData(Encoding.Unicode.GetBytes(block))).Replace("-", "").ToLowerInvariant(); }
+
+    public static D32LifecycleOwnedProcessV1 StartSuspendedAssignedAndResume(string image, string[] arguments, string workingDirectory, string[] environmentEntries,
+        string caseId, string caseNonce, long batchT0Ticks, long caseT0Ticks, long counterFrequency, long activeDeadlineTicks, long workDeadlineTicks) {
         D32LifecycleOwnedProcessV1 owned = new D32LifecycleOwnedProcessV1();
+        owned.Invocation = new D32LifecycleInvocationV1();
         IntPtr stdin = IntPtr.Zero, stdoutWrite = IntPtr.Zero, stderrWrite = IntPtr.Zero, attr = IntPtr.Zero, attrValue = IntPtr.Zero, env = IntPtr.Zero;
         ProcessInformation pi = new ProcessInformation();
         try {
+            D32LifecycleInvocationV1 invocation = owned.Invocation;
+            invocation.ImagePath = image; invocation.Arguments = arguments == null ? null : (string[])arguments.Clone(); invocation.WorkingDirectory = workingDirectory;
+            invocation.EnvironmentEntries = environmentEntries == null ? null : (string[])environmentEntries.Clone();
+            invocation.CaseId = caseId; invocation.CaseNonce = caseNonce; invocation.BatchT0Ticks = batchT0Ticks; invocation.CaseT0Ticks = caseT0Ticks;
+            invocation.CounterFrequency = counterFrequency; invocation.ActiveDeadlineTicks = activeDeadlineTicks;
+            invocation.HandleRoles = new string[] { "stdin:NUL", "stdout:PIPE_WRITE", "stderr:PIPE_WRITE" };
+            invocation.CreationFlags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+            invocation.InheritHandles = true;
+            if (String.IsNullOrWhiteSpace(image) || arguments == null || arguments.Length != 26 || String.IsNullOrWhiteSpace(workingDirectory) ||
+                String.IsNullOrWhiteSpace(caseId) || caseNonce == null || caseNonce.Length != 32 || batchT0Ticks <= 0 || caseT0Ticks <= 0 || counterFrequency <= 0 || activeDeadlineTicks <= 0)
+                throw new InvalidDataException("fixed reader invocation context is incomplete");
+            string[] sortedEnvironmentEntries = (string[])environmentEntries.Clone(); Array.Sort(sortedEnvironmentEntries, StringComparer.OrdinalIgnoreCase);
+            string environmentBlock = BuildEnvironmentBlock(sortedEnvironmentEntries);
+            invocation.EnvironmentEntries = sortedEnvironmentEntries;
+            invocation.EnvironmentBlockSha256 = HashEnvironmentBlock(environmentBlock);
+            StringBuilder command = new StringBuilder(); command.Append(QuoteArgument(image));
+            foreach (string argument in arguments) { command.Append(' '); command.Append(QuoteArgument(argument)); }
+            invocation.CommandLine = command.ToString();
+            if (invocation.CommandLine.Length >= 32767) throw new InvalidDataException("fixed reader command line exceeds the Windows limit");
             owned.Job = CreateJobObjectW(IntPtr.Zero, null); if (owned.Job == IntPtr.Zero) throw LastError("CreateJobObjectW failed");
             ExtendedLimitInformation limits = new ExtendedLimitInformation();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
@@ -291,13 +369,21 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
             if (!SetInformationJobObject(owned.Job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf<ExtendedLimitInformation>())) throw LastError("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed");
             owned.JobKillOnClose = true; owned.JobActiveProcessLimitOne = true; owned.JobInstanceId = Guid.NewGuid().ToString("N");
             SecurityAttributes sa = new SecurityAttributes(); sa.nLength = Marshal.SizeOf<SecurityAttributes>(); sa.bInheritHandle = 1;
-            stdin = CreateFileW("NUL", 0x80000000, 3, IntPtr.Zero, 3, 0x80, IntPtr.Zero); if (stdin == new IntPtr(-1)) throw LastError("open NUL stdin failed");
+            stdin = CreateFileWInheritable("NUL", 0x80000000, 3, ref sa, 3, 0x80, IntPtr.Zero); if (stdin == new IntPtr(-1)) throw LastError("open inheritable NUL stdin failed");
             InitPipe(out owned.StdoutRead, out stdoutWrite); InitPipe(out owned.StderrRead, out stderrWrite);
+            invocation.StdinInheritable = HandleInheritable(stdin, "stdin");
+            invocation.StdoutWriteInheritable = HandleInheritable(stdoutWrite, "stdout_write");
+            invocation.StderrWriteInheritable = HandleInheritable(stderrWrite, "stderr_write");
+            invocation.StdoutReadInheritable = HandleInheritable(owned.StdoutRead, "stdout_read");
+            invocation.StderrReadInheritable = HandleInheritable(owned.StderrRead, "stderr_read");
+            if (invocation.StdinInheritable != true || invocation.StdoutWriteInheritable != true || invocation.StderrWriteInheritable != true ||
+                invocation.StdoutReadInheritable != false || invocation.StderrReadInheritable != false) throw new InvalidDataException("observed standard-handle inheritance differs from the fixed allowlist");
             IntPtr size = IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
             attr = Marshal.AllocHGlobal(size); if (!InitializeProcThreadAttributeList(attr, 1, 0, ref size)) throw LastError("InitializeProcThreadAttributeList failed");
             attrValue = Marshal.AllocHGlobal(IntPtr.Size * 3);
             Marshal.WriteIntPtr(attrValue, 0, stdin); Marshal.WriteIntPtr(attrValue, IntPtr.Size, stdoutWrite); Marshal.WriteIntPtr(attrValue, IntPtr.Size * 2, stderrWrite);
             if (!UpdateProcThreadAttribute(attr, 0, new IntPtr(PROC_THREAD_ATTRIBUTE_HANDLE_LIST), attrValue, new IntPtr(IntPtr.Size * 3), IntPtr.Zero, IntPtr.Zero)) throw LastError("UpdateProcThreadAttribute(handle list) failed");
+            invocation.HandleListApplied = true;
             env = Marshal.StringToHGlobalUni(environmentBlock);
             StartupInfoEx startup = new StartupInfoEx(); startup.StartupInfo.cb = Marshal.SizeOf<StartupInfoEx>(); startup.StartupInfo.dwFlags = 0x00000100;
             startup.StartupInfo.hStdInput = stdin; startup.StartupInfo.hStdOutput = stdoutWrite; startup.StartupInfo.hStdError = stderrWrite; startup.lpAttributeList = attr;
@@ -305,9 +391,14 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
             owned.Failure = null; // the sole CreateProcess attempt begins here
             owned.CreateProcessAttemptTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             owned.CreateProcessAttempted = true;
-            if (!CreateProcessW(image, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
-                env, workingDirectory, ref startup, out pi)) { owned.Failure = LastError("CreateProcessW failed").Message; return owned; }
+            invocation.ApiAttempted = true;
+            invocation.ApiAttemptTicks = owned.CreateProcessAttemptTicks;
+            if (!CreateProcessW(image, new StringBuilder(invocation.CommandLine), IntPtr.Zero, IntPtr.Zero, invocation.InheritHandles,
+                invocation.CreationFlags, env, workingDirectory, ref startup, out pi)) {
+                invocation.ApiReturned = false; invocation.ApiErrorCode = Marshal.GetLastWin32Error();
+                owned.Failure = new Win32Exception(invocation.ApiErrorCode.Value, "CreateProcessW failed").Message; return owned;
+            }
+            invocation.ApiReturned = true; invocation.ProcessId = pi.dwProcessId;
             owned.Process = pi.hProcess; owned.Thread = pi.hThread; owned.ProcessId = pi.dwProcessId;
             if (!AssignProcessToJobObject(owned.Job, owned.Process)) { owned.Failure = LastError("AssignProcessToJobObject failed").Message; TerminateProcess(owned.Process, 0xD3203002); return owned; }
             owned.Assigned = true;
@@ -315,8 +406,11 @@ public static class D32BoundedSourceProofLifecycleNativeV1 {
             FileTime created, exited, kernel, user;
             if (!GetProcessTimes(owned.Process, out created, out exited, out kernel, out user)) { owned.Failure = LastError("GetProcessTimes(reader) failed").Message; TerminateJobObject(owned.Job, 0xD3203001); return owned; }
             owned.CreationFileTime = created.Value;
+            invocation.CreationFileTimeTicks = created.Value;
             owned.ImagePath = GetProcessImagePath(owned.Process);
-            if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(owned.ImagePath), Path.GetFullPath(image))) {
+            invocation.ProcessImagePath = owned.ImagePath;
+            invocation.ProcessImageBindingVerified = StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(owned.ImagePath), Path.GetFullPath(image));
+            if (!invocation.ProcessImageBindingVerified) {
                 owned.Failure = "actual process image differs from the fixed caller-pinned runtime"; TerminateJobObject(owned.Job, 0xD3203007); return owned;
             }
             if (System.Diagnostics.Stopwatch.GetTimestamp() >= workDeadlineTicks) { owned.Failure = "proof-work cutoff reached before reader resume"; TerminateJobObject(owned.Job, 0xD3203006); return owned; }
@@ -798,7 +892,7 @@ function Get-D32NonSourceL1DeadlineTicks {
 function Add-D32NonSourceL1JournalFact {
     param([Parameter(Mandatory = $true)][string]$Event, [string]$CaseId = '',
         [AllowNull()][long]$ScheduledTicks = $null, [Parameter(Mandatory = $true)][long]$ObservedTicks,
-        [AllowNull()][object]$ResultReference = $null)
+        [AllowNull()][object]$ResultReference = $null, [AllowNull()][string]$CaseEvidenceSha256 = $null)
     if ($null -eq $script:D32NonSourceL1JournalStream) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result journal is unavailable' }
     $fact = [PSCustomObject][ordered]@{
         event = $Event; case_id = $CaseId; scheduled_ticks = $ScheduledTicks; observed_ticks = $ObservedTicks
@@ -808,6 +902,7 @@ function Add-D32NonSourceL1JournalFact {
         result_sha256 = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.sha256 }
         result_volume_serial_hex = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.volume_serial_hex }
         result_file_id_hex = if ($null -eq $ResultReference) { $null } else { [string]$ResultReference.file_id_hex }
+        case_evidence_sha256 = $CaseEvidenceSha256
         gate_authority = 'NONE'
     }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $fact -Depth 8 -Compress) + "`n")
@@ -917,9 +1012,7 @@ function Open-D32NonSourceL1PinnedFile {
 
 function Get-D32NonSourceL1MutatedSha256 {
     param([Parameter(Mandatory = $true)][string]$Sha256)
-    if ($Sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_NON_SOURCE_L1_REFUSED: fixed entry pin is malformed' }
-    $replacement = if ($Sha256[0] -ceq '0') { '1' } else { '0' }
-    return $replacement + $Sha256.Substring(1)
+    return Get-D32BoundedDiagnosticSourceProofNonSourceL1DerivedEntryMismatchSha256 -Sha256 $Sha256
 }
 
 function New-D32NonSourceL1PreCreatePlan {
@@ -938,7 +1031,15 @@ function New-D32NonSourceL1PreCreatePlan {
     # pre-create binding check. The negative differs only in one derived SHA bit.
     if ([string]$entryOpened.Record.sha256 -cne $expectedEntrySha) {
         if ($DeriveEntryPinMismatch -and [string]$entryOpened.Record.sha256 -ceq [string]$entryPin.sha256 -and $expectedEntrySha -cne [string]$entryPin.sha256) {
-            return [PSCustomObject]@{ admitted = $false; refusal = 'ENTRY_PIN_BINDING_REFUSAL' }
+            $admission = [PSCustomObject][ordered]@{
+                decision = 'ENTRY_PIN_BINDING_REFUSAL'; observed_ticks = Get-D32NonSourceL1Now
+                entry_reference = [PSCustomObject][ordered]@{ path = $entryOpened.Record.path; bytes = [Int64]$entryOpened.Record.bytes; sha256 = [string]$entryOpened.Record.sha256; volume_serial_hex = [string]$entryOpened.Record.volume_serial_hex; file_id_hex = [string]$entryOpened.Record.file_id_hex }
+                entry_expected_sha256 = $expectedEntrySha; entry_observed_sha256 = [string]$entryOpened.Record.sha256
+                runtime_reference = [PSCustomObject][ordered]@{ path = $runtimeOpened.Record.path; bytes = [Int64]$runtimeOpened.Record.bytes; sha256 = [string]$runtimeOpened.Record.sha256; volume_serial_hex = [string]$runtimeOpened.Record.volume_serial_hex; file_id_hex = [string]$runtimeOpened.Record.file_id_hex }
+                runtime_expected_sha256 = [string]$runtimePin.sha256; runtime_observed_sha256 = [string]$runtimeOpened.Record.sha256
+                refusal_reason = 'ENTRY_SHA_MISMATCH'
+            }
+            return [PSCustomObject][ordered]@{ admitted = $false; refusal = 'ENTRY_PIN_BINDING_REFUSAL'; admission = $admission }
         }
         throw 'D32_NON_SOURCE_L1_REFUSED: common pre-create entry binding did not match its caller-pinned code reference'
     }
@@ -952,16 +1053,19 @@ function New-D32NonSourceL1PreCreatePlan {
         '-L1CaseId', $CaseId, '-L1Nonce', $Nonce, '-L1T0Ticks', [string]$L1T0Ticks,
         '-L1CounterFrequency', [string][Diagnostics.Stopwatch]::Frequency, '-L1CaseT0Ticks', [string]$CaseT0Ticks,
         '-L1ActiveDeadlineTicks', [string]$ActiveDeadlineTicks)
-    $commandLine = [D32BoundedSourceProofLifecycleNativeV1]::QuoteArgument([string]$runtimePin.path) + ' ' +
-        [string]::Join(' ', @($args | ForEach-Object { [D32BoundedSourceProofLifecycleNativeV1]::QuoteArgument([string]$_) }))
     $env = $script:D32NonSourceL1Authority.invocation.child_environment
-    $names = @('SystemRoot', 'WINDIR', 'PATH', 'PSHOME', 'PSModulePath', 'PSModuleAutoLoadingPreference',
-        'POWERSHELL_TELEMETRY_OPTOUT', 'DOTNET_CLI_TELEMETRY_OPTOUT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH')
-    $items = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in $names) { $items.Add(('{0}={1}' -f $name, [string]$env.$name)) }
-    $array = $items.ToArray(); [Array]::Sort($array, [StringComparer]::OrdinalIgnoreCase)
-    return [PSCustomObject]@{ admitted = $true; image = [string]$runtimePin.path; command_line = $commandLine
-        environment_block = ([string]::Join("`0", $array) + "`0`0"); working_directory = [string]$script:D32NonSourceL1Authority.output.root_path }
+    $admission = [PSCustomObject][ordered]@{
+        decision = 'ADMITTED'; observed_ticks = Get-D32NonSourceL1Now
+        entry_reference = [PSCustomObject][ordered]@{ path = $entryOpened.Record.path; bytes = [Int64]$entryOpened.Record.bytes; sha256 = [string]$entryOpened.Record.sha256; volume_serial_hex = [string]$entryOpened.Record.volume_serial_hex; file_id_hex = [string]$entryOpened.Record.file_id_hex }
+        entry_expected_sha256 = [string]$entryPin.sha256; entry_observed_sha256 = [string]$entryOpened.Record.sha256
+        runtime_reference = [PSCustomObject][ordered]@{ path = $runtimeOpened.Record.path; bytes = [Int64]$runtimeOpened.Record.bytes; sha256 = [string]$runtimeOpened.Record.sha256; volume_serial_hex = [string]$runtimeOpened.Record.volume_serial_hex; file_id_hex = [string]$runtimeOpened.Record.file_id_hex }
+        runtime_expected_sha256 = [string]$runtimePin.sha256; runtime_observed_sha256 = [string]$runtimeOpened.Record.sha256
+        refusal_reason = $null
+    }
+    $environmentEntries = Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentEntries -Environment $env
+    return [PSCustomObject][ordered]@{ admitted = $true; admission = $admission; image = [string]$runtimePin.path
+        arguments = [string[]]$args; environment_entries = [string[]]$environmentEntries
+        working_directory = [string]$script:D32NonSourceL1Authority.output.root_path }
 }
 
 function Get-D32NonSourceL1RemainingWaitMilliseconds {
@@ -980,26 +1084,61 @@ function Join-D32NonSourceL1CapturesUntilDeadline {
     return [D32BoundedSourceProofLifecycleNativeV1]::JoinCaptures($Native, 0)
 }
 
+function New-D32NonSourceL1ActualInvocationRecord {
+    param([Parameter(Mandatory = $true)][object]$Native, [Parameter(Mandatory = $true)][object]$Plan,
+        [Parameter(Mandatory = $true)][string]$CaseId, [Parameter(Mandatory = $true)][string]$CaseNonce,
+        [Parameter(Mandatory = $true)][long]$CaseT0Ticks, [Parameter(Mandatory = $true)][long]$ActiveDeadlineTicks)
+    $evidence = $Native.Invocation
+    if ($null -eq $evidence) { return $null }
+    return [PSCustomObject][ordered]@{
+        case_id = $CaseId; case_nonce = $CaseNonce; batch_t0_ticks = [Int64]$L1T0Ticks; case_t0_ticks = $CaseT0Ticks
+        counter_frequency = [Int64][Diagnostics.Stopwatch]::Frequency; active_deadline_ticks = $ActiveDeadlineTicks
+        entry_reference = $Plan.admission.entry_reference; executable_reference = $Plan.admission.runtime_reference
+        admission_observed_ticks = [Int64]$Plan.admission.observed_ticks
+        image_path = [string]$evidence.ImagePath; arguments = @($evidence.Arguments); raw_command_line = [string]$evidence.CommandLine
+        working_directory = [string]$evidence.WorkingDirectory; environment_entries = @($evidence.EnvironmentEntries)
+        environment_block_sha256 = [string]$evidence.EnvironmentBlockSha256
+        inherit_handles = [bool]$evidence.InheritHandles; handle_list_applied = [bool]$evidence.HandleListApplied
+        handle_roles = @($evidence.HandleRoles)
+        handle_observations = [PSCustomObject][ordered]@{
+            stdin_inheritable = $evidence.StdinInheritable; stdout_write_inheritable = $evidence.StdoutWriteInheritable
+            stderr_write_inheritable = $evidence.StderrWriteInheritable; stdout_read_inheritable = $evidence.StdoutReadInheritable
+            stderr_read_inheritable = $evidence.StderrReadInheritable
+        }
+        creation_flags = [UInt32]$evidence.CreationFlags
+        api_attempted = [bool]$evidence.ApiAttempted; api_attempt_ticks = $evidence.ApiAttemptTicks
+        api_returned = $evidence.ApiReturned; api_error_code = $evidence.ApiErrorCode
+        process_id = if ($null -eq $evidence.ProcessId) { $null } else { [Int64]$evidence.ProcessId }
+        creation_filetime_ticks = $evidence.CreationFileTimeTicks; process_image_path = $evidence.ProcessImagePath
+        process_image_binding_verified = [bool]$evidence.ProcessImageBindingVerified
+    }
+}
+
 function Invoke-D32NonSourceL1Case {
     param([Parameter(Mandatory = $true)][int]$Index)
     $caseAuthority = $script:D32NonSourceL1Authority.cases[$Index]
     $caseId = [string]$caseAuthority.case_id
+    $caseNonce = [string]$caseAuthority.nonce
     $caseT0 = Get-D32NonSourceL1Now
     $caseDeadlines = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseDeadlines -CaseT0Ticks $caseT0 -Frequency ([Diagnostics.Stopwatch]::Frequency) -BatchDeadlineTicks $script:D32NonSourceL1BatchDeadline
     $active = [Int64]$caseDeadlines.active_deadline_ticks; $cleanup = [Int64]$caseDeadlines.cleanup_deadline_ticks; $audit = [Int64]$caseDeadlines.audit_deadline_ticks
-    $row = New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $caseId -CaseT0Ticks $caseT0 `
+    $row = New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $caseId -CaseNonce $caseNonce -CaseT0Ticks $caseT0 `
         -ActiveDeadlineTicks $active -CleanupDeadlineTicks $cleanup -AuditDeadlineTicks $audit -AdmissionObservedTicks (Get-D32NonSourceL1Now)
     if ((Get-D32NonSourceL1Now) -ge $active) { $row.state = 'BUDGET_STOPPED'; $row.primary_error = 'case admission reached active deadline'; return $row }
     $native = $null; $cleanupKnown = $true; $processExited = $false; $activeCount = $null; $totalCount = $null
     try {
         $plan = New-D32NonSourceL1PreCreatePlan -CaseId $caseId -Nonce ([string]$caseAuthority.nonce) -CaseT0Ticks $caseT0 -ActiveDeadlineTicks $active -DeriveEntryPinMismatch:($caseId -ceq 'ENTRY_PIN_BINDING_REFUSAL')
+        $row.precreate_admission = $plan.admission
         if ($caseId -ceq 'ENTRY_PIN_BINDING_REFUSAL') {
             if ([bool]$plan.admitted -or [string]$plan.refusal -cne 'ENTRY_PIN_BINDING_REFUSAL') { throw 'expected pre-create entry-pin refusal was not observed' }
             $row.state = 'EXPECTED_REFUSAL_VERIFIED'; $row.primary_error = 'fixed reader entry SHA mismatch was rejected by common opened-handle pre-create binding'; return $row
         }
         if (-not [bool]$plan.admitted -or (Get-D32NonSourceL1Now) -ge $active) { throw 'fixed pre-create admission did not complete before active deadline' }
         $native = [D32BoundedSourceProofLifecycleNativeV1]::StartSuspendedAssignedAndResume(
-            [string]$plan.image, [string]$plan.command_line, [string]$plan.working_directory, [string]$plan.environment_block, [Int64]$active)
+            [string]$plan.image, [string[]]$plan.arguments, [string]$plan.working_directory, [string[]]$plan.environment_entries,
+            [string]$caseId, $caseNonce, [Int64]$L1T0Ticks, [Int64]$caseT0, [Int64][Diagnostics.Stopwatch]::Frequency,
+            [Int64]$active, [Int64]$active)
+        $row.actual_invocation = New-D32NonSourceL1ActualInvocationRecord -Native $native -Plan $plan -CaseId $caseId -CaseNonce $caseNonce -CaseT0Ticks $caseT0 -ActiveDeadlineTicks $active
         if ($native.CreateProcessAttempted) { $script:D32NonSourceL1CreateAttempts++; $row.create_attempt_count = 1L; $row.create_attempt_ticks = [Int64]$native.CreateProcessAttemptTicks }
         $row.job_instance_id = if ([string]$native.JobInstanceId -match '^[0-9a-f]{32}$') { [string]$native.JobInstanceId } else { $null }
         $row.job_assigned = [bool]$native.Assigned; $row.resume_ticks = if ($native.Resumed) { [Int64]$native.ReaderResumeTicks } else { $null }
@@ -1227,6 +1366,10 @@ function Invoke-D32NonSourceL1 {
         foreach ($pair in @(@('root_volume_serial_hex', 'root_file_id_hex', $rootIdentity), @('parent_volume_serial_hex', 'parent_file_id_hex', $parentIdentity))) {
             if ([string]$script:D32NonSourceL1Authority.output.($pair[0]) -cne [string]$pair[2].VolumeSerialHex -or [string]$script:D32NonSourceL1Authority.output.($pair[1]) -cne [string]$pair[2].FileIdHex) { throw 'D32_NON_SOURCE_L1_REFUSED: external root/parent opened identity drift' }
         }
+        $rootSecurity = [System.IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new([string]$script:D32NonSourceL1Authority.output.root_path))
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RootSecurity -Security $rootSecurity -OwnerSid ([string]$script:D32NonSourceL1Authority.owner_id))) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: fresh external root owner-bound DACL is not protected by the fixed trusted-writer allowlist'
+        }
         if ((Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent $Repository) -or
             (Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent 'E:\d32\inv7\r\c')) { throw 'D32_NON_SOURCE_L1_REFUSED: external L1 root violates fixed containment' }
         foreach ($path in @([string]$script:D32NonSourceL1Authority.output.result_path, [string]$script:D32NonSourceL1Authority.output.journal_path)) {
@@ -1261,9 +1404,11 @@ function Invoke-D32NonSourceL1 {
                 if (-not $row.primary_error) { $row.primary_error = $auditError }
                 elseif ($row.secondary_errors.Count -lt 8) { $row.secondary_errors += $auditError }
             }
+            $row.case_evidence_sha256 = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseEvidenceSha256 -CaseNonce $row.case_nonce `
+                -PrecreateAdmission $row.precreate_admission -ActualInvocation $row.actual_invocation
             $script:D32NonSourceL1Cases.Add($row)
             Add-D32NonSourceL1JournalFact -Event ('CASE_' + [string]$row.state) -CaseId ([string]$row.case_id) `
-                -ObservedTicks ([Int64]$row.case_completed_ticks)
+                -ObservedTicks ([Int64]$row.case_completed_ticks) -CaseEvidenceSha256 ([string]$row.case_evidence_sha256)
             if ([string]$row.state -ceq 'UNRESOLVED') { $script:D32NonSourceL1CaseStop = $true }
         }
         while ($script:D32NonSourceL1Cases.Count -lt 3) {
@@ -1336,7 +1481,7 @@ function Invoke-D32NonSourceL1 {
             event = 'L1_RESULT_PERSISTED'; case_id = ''; scheduled_ticks = $null; observed_ticks = Get-D32NonSourceL1Now; lateness_ticks = $null
             result_path = [string]$resultOpened.Record.path; result_bytes = [Int64]$resultOpened.Record.bytes
             result_sha256 = [string]$resultOpened.Record.sha256; result_volume_serial_hex = [string]$resultOpened.Record.volume_serial_hex
-            result_file_id_hex = [string]$resultOpened.Record.file_id_hex; gate_authority = 'NONE'
+            result_file_id_hex = [string]$resultOpened.Record.file_id_hex; case_evidence_sha256 = $null; gate_authority = 'NONE'
         }
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings -Record $readback -Authority $script:D32NonSourceL1Authority `
             -AuthorityReference $script:D32NonSourceL1AuthorityReference -ExpectedAuthorityPath $L1AuthorityPath -ExpectedAuthoritySha256 $ExpectedL1AuthoritySha256 `

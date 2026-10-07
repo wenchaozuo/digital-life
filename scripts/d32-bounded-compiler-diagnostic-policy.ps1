@@ -45,6 +45,12 @@ $script:D32BoundedDiagnosticSourceProofNonSourceL1Limits = [PSCustomObject][orde
     owned_buffer_max_bytes = 16777216L; result_max_bytes = 65536L; journal_max_bytes = 65536L
     max_create_process_attempts = 2L; fixed_case_count = 3L
 }
+$script:D32BoundedDiagnosticSourceProofNonSourceL1CreateFlags = 0x08080404L
+$script:D32BoundedDiagnosticSourceProofNonSourceL1HandleRoles = @('stdin:NUL', 'stdout:PIPE_WRITE', 'stderr:PIPE_WRITE')
+$script:D32BoundedDiagnosticSourceProofNonSourceL1ObservedHandleFlags = [PSCustomObject][ordered]@{
+    stdin_inheritable = $true; stdout_write_inheritable = $true; stderr_write_inheritable = $true
+    stdout_read_inheritable = $false; stderr_read_inheritable = $false
+}
 $script:D32BoundedDiagnosticSourceProofLifecycleClock = $null
 $script:D32BoundedDiagnosticSourceProofMaximumOutputBytes = 67108864L
 $script:D32BoundedDiagnosticManifestValueNodeLimit = 100000L
@@ -793,6 +799,128 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1Environment {
         [string]$Environment.HOMEPATH -ceq $homePath)
 }
 
+function New-D32BoundedDiagnosticSourceProofNonSourceL1RootSecurity {
+    param([Parameter(Mandatory = $true)][string]$OwnerSid)
+    if ($OwnerSid -cnotmatch '^S-1-[0-9-]{5,80}$') { throw 'D32_NON_SOURCE_L1_ROOT_BLOCKED: owner SID is malformed' }
+    $owner = [Security.Principal.SecurityIdentifier]::new($OwnerSid)
+    $trustedWriterSids = @(
+        'S-1-5-18',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',
+        'S-1-5-32-544')
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($owner)
+    $security.SetAccessRuleProtection($true, $false)
+    $principals = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [void]$principals.Add($OwnerSid)
+    foreach ($sid in $trustedWriterSids) { [void]$principals.Add($sid) }
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($sid in $principals) {
+        $identity = [Security.Principal.SecurityIdentifier]::new($sid)
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    return $security
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1RootSecurity {
+    param([AllowNull()][object]$Security, [Parameter(Mandatory = $true)][string]$OwnerSid)
+    if ($null -eq $Security -or $Security -isnot [Security.AccessControl.DirectorySecurity] -or
+        $OwnerSid -cnotmatch '^S-1-[0-9-]{5,80}$' -or -not $Security.AreAccessRulesProtected -or -not $Security.AreAccessRulesCanonical) { return $false }
+    try { if ([string]$Security.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $OwnerSid) { return $false } }
+    catch { return $false }
+    $expectedSids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [void]$expectedSids.Add($OwnerSid)
+    foreach ($sid in @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')) { [void]$expectedSids.Add($sid) }
+    $rules = @($Security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne $expectedSids.Count) { return $false }
+    $observedSids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $expectedInheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($rule in $rules) {
+        $sid = [string]$rule.IdentityReference.Value
+        if (-not $expectedSids.Contains($sid) -or -not $observedSids.Add($sid) -or $rule.IsInherited -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            [Int64]$rule.FileSystemRights -ne [Int64][Security.AccessControl.FileSystemRights]::FullControl -or
+            $rule.InheritanceFlags -ne $expectedInheritance -or
+            $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) { return $false }
+    }
+    return ($observedSids.Count -eq $expectedSids.Count)
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1DerivedEntryMismatchSha256 {
+    param([Parameter(Mandatory = $true)][string]$Sha256)
+    if ($Sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_NON_SOURCE_L1_REFUSED: fixed entry pin is malformed' }
+    $firstNibble = [Convert]::ToInt32($Sha256.Substring(0, 1), 16) -bxor 1
+    return $firstNibble.ToString('x1', [Globalization.CultureInfo]::InvariantCulture) + $Sha256.Substring(1)
+}
+
+function ConvertTo-D32BoundedDiagnosticSourceProofNonSourceL1WindowsArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value.IndexOfAny([char[]]@(' ', "`t", "`n", [char]11, '"')) -lt 0) { return $Value }
+    $builder = [Text.StringBuilder]::new(); [void]$builder.Append('"'); $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) { $slashes++; continue }
+        if ($character -eq [char]34) {
+            for ($index = 0; $index -lt (($slashes * 2) + 1); $index++) { [void]$builder.Append([char]92) }
+            [void]$builder.Append([char]34); $slashes = 0; continue
+        }
+        for ($index = 0; $index -lt $slashes; $index++) { [void]$builder.Append([char]92) }
+        $slashes = 0; [void]$builder.Append($character)
+    }
+    for ($index = 0; $index -lt ($slashes * 2); $index++) { [void]$builder.Append([char]92) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1ExpectedReaderArguments {
+    param([Parameter(Mandatory = $true)][object]$Record, [Parameter(Mandatory = $true)][object]$Case)
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    return @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', [string]$Record.source_pins[1].path,
+        '-NonSourceL1', '-L1AuthorityPath', [string]$Record.authority.path,
+        '-ExpectedL1AuthoritySha256', [string]$Record.authority.sha256,
+        '-L1CandidateSha', [string]$Record.candidate_sha, '-L1BatchId', [string]$Record.batch_id,
+        '-L1CaseId', [string]$Case.case_id, '-L1Nonce', [string]$Case.case_nonce,
+        '-L1T0Ticks', ([Int64]$Record.clock.batch_t0_ticks).ToString($culture),
+        '-L1CounterFrequency', ([Int64]$Record.clock.frequency).ToString($culture),
+        '-L1CaseT0Ticks', ([Int64]$Case.case_t0_ticks).ToString($culture),
+        '-L1ActiveDeadlineTicks', ([Int64]$Case.active_deadline_ticks).ToString($culture))
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentEntries {
+    param([Parameter(Mandatory = $true)][object]$Environment)
+    $names = @('SystemRoot', 'WINDIR', 'PATH', 'PSHOME', 'PSModulePath', 'PSModuleAutoLoadingPreference',
+        'POWERSHELL_TELEMETRY_OPTOUT', 'DOTNET_CLI_TELEMETRY_OPTOUT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH')
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $names) { $entries.Add(('{0}={1}' -f $name, [string]$Environment.$name)) }
+    $array = $entries.ToArray(); [Array]::Sort($array, [StringComparer]::OrdinalIgnoreCase)
+    return ,$array
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentBlockSha256 {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Entries)
+    $block = [string]::Join("`0", $Entries) + "`0`0"
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::Unicode.GetBytes($block))).ToLowerInvariant()
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseEvidenceSha256 {
+    param([AllowNull()][object]$CaseNonce, [AllowNull()][object]$PrecreateAdmission, [AllowNull()][object]$ActualInvocation)
+    $evidence = [PSCustomObject][ordered]@{
+        case_nonce = $CaseNonce
+        precreate_admission = $PrecreateAdmission
+        actual_invocation = $ActualInvocation
+    }
+    $json = ConvertTo-Json -InputObject $evidence -Depth 32 -Compress -ErrorAction Stop
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($json))).ToLowerInvariant()
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1ExpectedCommandLine {
+    param([Parameter(Mandatory = $true)][string]$Image, [Parameter(Mandatory = $true)][string[]]$Arguments)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add((ConvertTo-D32BoundedDiagnosticSourceProofNonSourceL1WindowsArgument -Value $Image))
+    foreach ($argument in $Arguments) { $parts.Add((ConvertTo-D32BoundedDiagnosticSourceProofNonSourceL1WindowsArgument -Value ([string]$argument))) }
+    return [string]::Join(' ', $parts.ToArray())
+}
+
 function Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseDeadlines {
     param([Parameter(Mandatory = $true)][long]$CaseT0Ticks, [Parameter(Mandatory = $true)][long]$Frequency,
         [Parameter(Mandatory = $true)][long]$BatchDeadlineTicks)
@@ -959,6 +1087,113 @@ function Resolve-D32BoundedDiagnosticSourceProofNonSourceL1BatchOutcome {
     return [PSCustomObject][ordered]@{ status = 'BLOCKED'; primary_error = $primary }
 }
 
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1PrecreateAdmission {
+    param([AllowNull()][object]$Admission, [Parameter(Mandatory = $true)][object]$Record)
+    if ($null -eq $Admission) { return $false }
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Admission @('decision', 'observed_ticks', 'entry_reference', 'entry_expected_sha256', 'entry_observed_sha256', 'runtime_reference', 'runtime_expected_sha256', 'runtime_observed_sha256', 'refusal_reason')) -or
+        [string]$Admission.decision -cnotin @('ADMITTED', 'ENTRY_PIN_BINDING_REFUSAL') -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Admission.observed_ticks -Positive) -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Admission.entry_reference) -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Admission.runtime_reference) -or
+        [string]$Admission.entry_expected_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$Admission.entry_observed_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Admission.runtime_expected_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$Admission.runtime_observed_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Admission.entry_reference.path -cne [string]$Record.source_pins[1].path -or
+        [string]$Admission.runtime_reference.path -cne [string]$Record.powershell_runtime.path -or
+        [string]$Admission.runtime_reference.sha256 -cne [string]$Admission.runtime_observed_sha256 -or
+        [string]$Admission.runtime_expected_sha256 -cne [string]$Admission.runtime_observed_sha256) { return $false }
+    if ([string]$Admission.decision -ceq 'ADMITTED') {
+        return ([string]$Admission.entry_expected_sha256 -ceq [string]$Admission.entry_observed_sha256 -and $null -eq $Admission.refusal_reason -and
+            [string]$Admission.entry_reference.sha256 -ceq [string]$Admission.entry_observed_sha256)
+    }
+    return ([string]$Admission.refusal_reason -ceq 'ENTRY_SHA_MISMATCH' -and
+        [string]$Admission.entry_expected_sha256 -cne [string]$Admission.entry_observed_sha256 -and
+        [string]$Admission.entry_reference.sha256 -ceq [string]$Admission.entry_observed_sha256)
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1ActualInvocation {
+    param([AllowNull()][object]$Invocation, [Parameter(Mandatory = $true)][object]$Record,
+        [Parameter(Mandatory = $true)][object]$Case, [Parameter(Mandatory = $true)][object]$Admission)
+    if ($null -eq $Invocation -or $null -eq $Admission -or [string]$Admission.decision -cne 'ADMITTED') { return $false }
+    $fields = @('case_id', 'case_nonce', 'batch_t0_ticks', 'case_t0_ticks', 'counter_frequency', 'active_deadline_ticks',
+        'entry_reference', 'executable_reference', 'admission_observed_ticks', 'image_path', 'arguments', 'raw_command_line', 'working_directory',
+        'environment_entries', 'environment_block_sha256', 'inherit_handles', 'handle_list_applied', 'handle_roles', 'handle_observations',
+        'creation_flags', 'api_attempted', 'api_attempt_ticks', 'api_returned', 'api_error_code', 'process_id', 'creation_filetime_ticks',
+        'process_image_path', 'process_image_binding_verified')
+    $observationFields = @('stdin_inheritable', 'stdout_write_inheritable', 'stderr_write_inheritable', 'stdout_read_inheritable', 'stderr_read_inheritable')
+    if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Invocation $fields) -or
+        [string]$Invocation.case_id -cne [string]$Case.case_id -or [string]$Invocation.case_nonce -cne [string]$Case.case_nonce -or
+        [Int64]$Invocation.batch_t0_ticks -ne [Int64]$Record.clock.batch_t0_ticks -or
+        [Int64]$Invocation.case_t0_ticks -ne [Int64]$Case.case_t0_ticks -or
+        [Int64]$Invocation.counter_frequency -ne [Int64]$Record.clock.frequency -or
+        [Int64]$Invocation.active_deadline_ticks -ne [Int64]$Case.active_deadline_ticks -or
+        [Int64]$Invocation.admission_observed_ticks -ne [Int64]$Admission.observed_ticks -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Invocation.entry_reference) -or
+        -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $Invocation.executable_reference) -or
+        [string]$Invocation.entry_reference.path -cne [string]$Admission.entry_reference.path -or
+        [string]$Invocation.entry_reference.sha256 -cne [string]$Admission.entry_reference.sha256 -or
+        [string]$Invocation.executable_reference.path -cne [string]$Admission.runtime_reference.path -or
+        [string]$Invocation.executable_reference.sha256 -cne [string]$Admission.runtime_reference.sha256 -or
+        [string]$Invocation.image_path -cne [string]$Record.powershell_runtime.path -or
+        [string]$Invocation.working_directory -cne [string]$Record.output.root_path -or
+        [string]$Invocation.raw_command_line -isnot [string] -or ([string]$Invocation.raw_command_line).Length -ge 32767 -or
+        [string]$Invocation.environment_block_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $Invocation.arguments -isnot [Array] -or $Invocation.environment_entries -isnot [Array] -or $Invocation.handle_roles -isnot [Array] -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $Invocation.creation_flags -Positive) -or
+        [UInt32]$Invocation.creation_flags -ne [UInt32]$script:D32BoundedDiagnosticSourceProofNonSourceL1CreateFlags -or
+        $Invocation.inherit_handles -isnot [bool] -or $Invocation.handle_list_applied -isnot [bool] -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Invocation.handle_observations $observationFields) -or
+        $Invocation.api_attempted -isnot [bool] -or
+        -not (Test-D32BoundedDiagnosticNonSourceL1NullablePositiveInteger $Invocation.api_attempt_ticks) -or
+        ($null -ne $Invocation.api_returned -and $Invocation.api_returned -isnot [bool]) -or
+        ($null -ne $Invocation.api_error_code -and (-not (Test-D32BoundedCompilerDiagnosticInteger $Invocation.api_error_code) -or [Int64]$Invocation.api_error_code -gt [Int64][Int32]::MaxValue)) -or
+        -not (Test-D32BoundedDiagnosticNonSourceL1NullablePositiveInteger $Invocation.process_id) -or
+        -not (Test-D32BoundedDiagnosticNonSourceL1NullablePositiveInteger $Invocation.creation_filetime_ticks) -or
+        (($null -ne $Invocation.process_image_path) -and -not (Test-D32BoundedCompilerDiagnosticCanonicalPath $Invocation.process_image_path)) -or
+        $Invocation.process_image_binding_verified -isnot [bool]) { return $false }
+    $expectedArguments = Get-D32BoundedDiagnosticSourceProofNonSourceL1ExpectedReaderArguments -Record $Record -Case $Case
+    if ($Invocation.arguments.Count -ne $expectedArguments.Count) { return $false }
+    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+        if ($Invocation.arguments[$index] -isnot [string] -or [string]$Invocation.arguments[$index] -cne [string]$expectedArguments[$index]) { return $false }
+    }
+    if ([string]$Invocation.raw_command_line -cne (Get-D32BoundedDiagnosticSourceProofNonSourceL1ExpectedCommandLine -Image ([string]$Record.powershell_runtime.path) -Arguments $expectedArguments)) { return $false }
+    $environmentNames = @('APPDATA', 'DOTNET_CLI_TELEMETRY_OPTOUT', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'PATH', 'PSHOME',
+        'PSModuleAutoLoadingPreference', 'PSModulePath', 'SystemRoot', 'TEMP', 'TMP', 'USERPROFILE', 'WINDIR', 'POWERSHELL_TELEMETRY_OPTOUT')
+    $actualEnvironmentNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $Invocation.environment_entries) {
+        if ($entry -isnot [string]) { return $false }
+        $separator = ([string]$entry).IndexOf('=')
+        if ($separator -le 0) { return $false }
+        $actualEnvironmentNames.Add(([string]$entry).Substring(0, $separator))
+    }
+    $sortedEnvironmentNames = $actualEnvironmentNames.ToArray(); [Array]::Sort($sortedEnvironmentNames, [StringComparer]::OrdinalIgnoreCase)
+    [Array]::Sort($environmentNames, [StringComparer]::OrdinalIgnoreCase)
+    if ($sortedEnvironmentNames.Count -ne $environmentNames.Count) { return $false }
+    for ($index = 0; $index -lt $environmentNames.Count; $index++) {
+        if ([string]$sortedEnvironmentNames[$index] -cne [string]$environmentNames[$index]) { return $false }
+    }
+    if ([string]$Invocation.environment_block_sha256 -cne (Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentBlockSha256 -Entries ([string[]]$Invocation.environment_entries))) { return $false }
+    if ($Invocation.handle_roles.Count -ne $script:D32BoundedDiagnosticSourceProofNonSourceL1HandleRoles.Count) { return $false }
+    for ($index = 0; $index -lt $script:D32BoundedDiagnosticSourceProofNonSourceL1HandleRoles.Count; $index++) {
+        if ([string]$Invocation.handle_roles[$index] -cne [string]$script:D32BoundedDiagnosticSourceProofNonSourceL1HandleRoles[$index]) { return $false }
+    }
+    foreach ($name in $observationFields) { if ($null -ne $Invocation.handle_observations.$name -and $Invocation.handle_observations.$name -isnot [bool]) { return $false } }
+    if ($Invocation.api_attempted) {
+        if ($null -eq $Invocation.api_attempt_ticks -or $null -eq $Invocation.api_returned -or
+            $Invocation.inherit_handles -ne $true -or -not $Invocation.handle_list_applied -or
+            $Invocation.handle_observations.stdin_inheritable -ne $true -or $Invocation.handle_observations.stdout_write_inheritable -ne $true -or
+            $Invocation.handle_observations.stderr_write_inheritable -ne $true -or $Invocation.handle_observations.stdout_read_inheritable -ne $false -or
+            $Invocation.handle_observations.stderr_read_inheritable -ne $false) { return $false }
+        if ($Invocation.api_returned) {
+            if ($null -ne $Invocation.api_error_code -or $null -eq $Invocation.process_id) { return $false }
+        } elseif ($null -eq $Invocation.api_error_code -or $null -ne $Invocation.process_id -or
+            $null -ne $Invocation.creation_filetime_ticks -or $null -ne $Invocation.process_image_path -or $Invocation.process_image_binding_verified) { return $false }
+    } elseif ($null -ne $Invocation.api_attempt_ticks -or $null -ne $Invocation.api_returned -or $null -ne $Invocation.api_error_code -or
+        $null -ne $Invocation.process_id -or $null -ne $Invocation.creation_filetime_ticks -or $null -ne $Invocation.process_image_path -or
+        $Invocation.process_image_binding_verified) { return $false }
+    if ($null -eq $Invocation.process_image_path) { return (-not $Invocation.process_image_binding_verified) }
+    return ($Invocation.process_image_binding_verified -eq [StringComparer]::OrdinalIgnoreCase.Equals([string]$Invocation.process_image_path, [string]$Record.powershell_runtime.path))
+}
+
 function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
     param([AllowNull()][object]$Record)
     $fields = @('schema_version', 'record_type', 'purpose', 'policy', 'gate_authority', 'candidate_sha', 'batch_id', 'run_id', 'authority',
@@ -1023,7 +1258,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
     $emptyCaptureSha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
     for ($index = 0; $index -lt 3; $index++) {
         $case = $Record.cases[$index]
-        $caseFields = @('case_id', 'state', 'case_t0_ticks', 'active_deadline_ticks', 'cleanup_deadline_ticks', 'audit_deadline_ticks', 'admission_observed_ticks',
+        $caseFields = @('case_id', 'case_nonce', 'precreate_admission', 'actual_invocation', 'case_evidence_sha256', 'state', 'case_t0_ticks', 'active_deadline_ticks', 'cleanup_deadline_ticks', 'audit_deadline_ticks', 'admission_observed_ticks',
             'create_attempt_count', 'create_attempt_ticks', 'process_id', 'creation_filetime_ticks', 'process_image_path', 'process_image_binding_verified', 'job_instance_id', 'job_assigned', 'resume_ticks',
             'planned_termination_count', 'planned_termination_ticks', 'fail_safe_termination_count', 'fail_safe_termination_ticks',
             'exit_ticks', 'exit_code', 'job_active_process_count', 'job_total_process_count', 'kill_on_close_enabled', 'job_active_process_limit_one',
@@ -1032,6 +1267,8 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
         if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $case $caseFields) -or
             [string]$case.case_id -cne $expectedCases[$index] -or
             [string]$case.state -cnotin @('NATIVE_BOUNDARY_VERIFIED', 'EXPECTED_REFUSAL_VERIFIED', 'BLOCKED', 'BUDGET_STOPPED', 'UNRESOLVED', 'NOT_RUN') -or
+            (($null -ne $case.case_nonce) -and ($case.case_nonce -isnot [string] -or [string]$case.case_nonce -cnotmatch '^[0-9a-f]{32}$')) -or
+            (($null -ne $case.case_evidence_sha256) -and [string]$case.case_evidence_sha256 -cnotmatch '^[0-9a-f]{64}$') -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $case.create_attempt_count) -or [Int64]$case.create_attempt_count -gt 1 -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $case.planned_termination_count) -or [Int64]$case.planned_termination_count -gt 1 -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $case.fail_safe_termination_count) -or [Int64]$case.fail_safe_termination_count -gt 1 -or
@@ -1070,7 +1307,8 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
                 'create_attempt_ticks', 'process_id', 'creation_filetime_ticks', 'process_image_path', 'job_instance_id', 'resume_ticks',
                 'planned_termination_ticks', 'fail_safe_termination_ticks', 'exit_ticks', 'exit_code', 'job_active_process_count', 'job_total_process_count',
                 'cleanup_observed_ticks', 'case_completed_ticks')) { if ($null -ne $case.$name) { return $false } }
-            if ([Int64]$case.create_attempt_count -ne 0 -or [Int64]$case.planned_termination_count -ne 0 -or
+            if ($null -ne $case.case_nonce -or $null -ne $case.precreate_admission -or $null -ne $case.actual_invocation -or $null -ne $case.case_evidence_sha256 -or
+                [Int64]$case.create_attempt_count -ne 0 -or [Int64]$case.planned_termination_count -ne 0 -or
                 [Int64]$case.fail_safe_termination_count -ne 0 -or $case.process_image_binding_verified -or $case.job_assigned -or
                 $case.kill_on_close_enabled -or $case.job_active_process_limit_one -or $case.stdout_truncated -or $case.stderr_truncated -or
                 $case.stdout_token_verified -or $case.stderr_token_verified -or $case.capture_join_verified -or $case.job_closed -or
@@ -1082,8 +1320,28 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
         if ($caseSequenceClosed -or $null -eq $case.case_t0_ticks -or $null -eq $case.active_deadline_ticks -or
             $null -eq $case.cleanup_deadline_ticks -or $null -eq $case.audit_deadline_ticks -or
             $null -eq $case.admission_observed_ticks -or $null -eq $case.case_completed_ticks -or
+            $null -eq $case.case_nonce -or $null -eq $case.case_evidence_sha256 -or
             [Int64]$case.case_t0_ticks -lt $previousCaseCompletedTicks -or
             [Int64]$case.case_completed_ticks -lt [Int64]$case.admission_observed_ticks) { return $false }
+        if ($null -ne $case.precreate_admission -and -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1PrecreateAdmission -Admission $case.precreate_admission -Record $Record)) { return $false }
+        if ($null -ne $case.actual_invocation -and -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ActualInvocation -Invocation $case.actual_invocation -Record $Record -Case $case -Admission $case.precreate_admission)) { return $false }
+        if ([string]$case.case_evidence_sha256 -cne (Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseEvidenceSha256 -CaseNonce $case.case_nonce -PrecreateAdmission $case.precreate_admission -ActualInvocation $case.actual_invocation)) { return $false }
+        if ([Int64]$case.create_attempt_count -gt 0 -and ($null -eq $case.actual_invocation -or -not [bool]$case.actual_invocation.api_attempted)) { return $false }
+        if ($null -ne $case.precreate_admission -and ([Int64]$case.precreate_admission.observed_ticks -lt [Int64]$case.admission_observed_ticks -or
+            [Int64]$case.precreate_admission.observed_ticks -ge [Int64]$case.active_deadline_ticks)) { return $false }
+        if ($null -ne $case.actual_invocation) {
+            $actual = $case.actual_invocation
+            if ([bool]$actual.api_attempted -ne ([Int64]$case.create_attempt_count -eq 1) -or
+                (($null -eq $actual.api_attempt_ticks) -ne ($null -eq $case.create_attempt_ticks)) -or
+                ($null -ne $actual.api_attempt_ticks -and [Int64]$actual.api_attempt_ticks -ne [Int64]$case.create_attempt_ticks) -or
+                (($null -eq $actual.process_id) -ne ($null -eq $case.process_id)) -or
+                ($null -ne $actual.process_id -and [Int64]$actual.process_id -ne [Int64]$case.process_id) -or
+                (($null -eq $actual.creation_filetime_ticks) -ne ($null -eq $case.creation_filetime_ticks)) -or
+                ($null -ne $actual.creation_filetime_ticks -and [Int64]$actual.creation_filetime_ticks -ne [Int64]$case.creation_filetime_ticks) -or
+                (($null -eq $actual.process_image_path) -ne ($null -eq $case.process_image_path)) -or
+                ($null -ne $actual.process_image_path -and [string]$actual.process_image_path -cne [string]$case.process_image_path) -or
+                [bool]$actual.process_image_binding_verified -ne [bool]$case.process_image_binding_verified) { return $false }
+        }
         $previousCaseCompletedTicks = [Int64]$case.case_completed_ticks
         $createSum += [Int64]$case.create_attempt_count; $termSum += [Int64]$case.planned_termination_count
         $failSafeSum += [Int64]$case.fail_safe_termination_count
@@ -1102,6 +1360,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
             [string]$case.state -cnotin @('BUDGET_STOPPED', 'UNRESOLVED')) { return $false }
         if ([string]$case.state -ceq 'NATIVE_BOUNDARY_VERIFIED') {
             if ($index -gt 1 -or [Int64]$case.create_attempt_count -ne 1 -or $null -eq $case.process_id -or
+                $null -eq $case.actual_invocation -or -not [bool]$case.actual_invocation.api_attempted -or $case.actual_invocation.api_returned -ne $true -or
                 $null -eq $case.creation_filetime_ticks -or $null -eq $case.job_instance_id -or -not $case.job_assigned -or
                 $case.process_image_path -cne [string]$Record.powershell_runtime.path -or -not $case.process_image_binding_verified -or
                 $null -eq $case.resume_ticks -or $null -eq $case.exit_ticks -or $null -eq $case.exit_code -or
@@ -1122,6 +1381,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape {
                 [Int64]$case.fail_safe_termination_count -ne 0 -or $null -ne $case.fail_safe_termination_ticks)) { return $false }
         } elseif ([string]$case.state -ceq 'EXPECTED_REFUSAL_VERIFIED') {
             if ($index -ne 2 -or [Int64]$case.create_attempt_count -ne 0 -or $null -ne $case.create_attempt_ticks -or
+                $null -eq $case.precreate_admission -or [string]$case.precreate_admission.decision -cne 'ENTRY_PIN_BINDING_REFUSAL' -or $null -ne $case.actual_invocation -or
                 $null -ne $case.process_id -or $null -ne $case.creation_filetime_ticks -or $null -ne $case.job_instance_id -or
                 $null -ne $case.process_image_path -or $case.process_image_binding_verified -or
                 $case.job_assigned -or $null -ne $case.resume_ticks -or $null -ne $case.exit_ticks -or $null -ne $case.exit_code -or
@@ -1185,15 +1445,38 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings {
     foreach ($name in @('root_path', 'parent_path', 'root_volume_serial_hex', 'root_file_id_hex', 'parent_volume_serial_hex', 'parent_file_id_hex', 'result_path', 'journal_path')) { if ([string]$Record.output.$name -cne [string]$Authority.output.$name) { return $false } }
     if ([Int64]$Record.clock.frequency -ne [Int64][Diagnostics.Stopwatch]::Frequency) { return $false }
     for ($index = 0; $index -lt 3; $index++) {
-        if ([string]$Record.cases[$index].case_id -cne [string]$Authority.cases[$index].case_id) { return $false }
+        if ([string]$Record.cases[$index].case_id -cne [string]$Authority.cases[$index].case_id -or
+            ([string]$Record.cases[$index].state -cne 'NOT_RUN' -and [string]$Record.cases[$index].case_nonce -cne [string]$Authority.cases[$index].nonce)) { return $false }
         $expectedCount = [Int64]$Authority.cases[$index].expected_create_attempts
         if ([string]$Record.cases[$index].state -ceq 'NATIVE_BOUNDARY_VERIFIED' -and $expectedCount -ne 1) { return $false }
         if ([string]$Record.cases[$index].state -ceq 'EXPECTED_REFUSAL_VERIFIED' -and $expectedCount -ne 0) { return $false }
+        $admission = $Record.cases[$index].precreate_admission
+        if ($null -ne $admission) {
+            $entryPin = $Authority.source_pins[1]; $runtimePin = $Authority.powershell_runtime
+            foreach ($name in @('path', 'bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) {
+                if ([string]$admission.entry_reference.$name -cne [string]$entryPin.$name -or
+                    [string]$admission.runtime_reference.$name -cne [string]$runtimePin.$name) { return $false }
+            }
+            $expectedAdmissionPin = if ([string]$admission.decision -ceq 'ENTRY_PIN_BINDING_REFUSAL') {
+                Get-D32BoundedDiagnosticSourceProofNonSourceL1DerivedEntryMismatchSha256 -Sha256 ([string]$entryPin.sha256)
+            } else { [string]$entryPin.sha256 }
+            if ([string]$admission.entry_expected_sha256 -cne $expectedAdmissionPin -or
+                [string]$admission.entry_observed_sha256 -cne [string]$entryPin.sha256 -or
+                [string]$admission.runtime_expected_sha256 -cne [string]$runtimePin.sha256) { return $false }
+        }
+        $invocation = $Record.cases[$index].actual_invocation
+        if ($null -ne $invocation) {
+            $expectedEnvironment = Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentEntries -Environment $Authority.invocation.child_environment
+            if ($invocation.environment_entries.Count -ne $expectedEnvironment.Count) { return $false }
+            for ($environmentIndex = 0; $environmentIndex -lt $expectedEnvironment.Count; $environmentIndex++) {
+                if ([string]$invocation.environment_entries[$environmentIndex] -cne [string]$expectedEnvironment[$environmentIndex]) { return $false }
+            }
+        }
     }
     if ([string]$Record.status -ceq 'COMPLETE_NON_SOURCE_L1') {
         if ($null -eq $PersistedFact -or $null -eq $ResultReference -or
             -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $ResultReference) -or
-            -not (Test-D32BoundedCompilerDiagnosticExactProperties $PersistedFact @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'gate_authority')) -or
+            -not (Test-D32BoundedCompilerDiagnosticExactProperties $PersistedFact @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'case_evidence_sha256', 'gate_authority')) -or
             [string]$PersistedFact.event -cne 'L1_RESULT_PERSISTED' -or [string]$PersistedFact.result_path -cne [string]$Record.output.result_path -or
             [string]$PersistedFact.case_id -cne '' -or $null -ne $PersistedFact.scheduled_ticks -or $null -ne $PersistedFact.lateness_ticks -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $PersistedFact.result_bytes -Positive) -or
@@ -1206,7 +1489,8 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultBindings {
             [string]$PersistedFact.result_volume_serial_hex -cne [string]$ResultReference.volume_serial_hex -or
             [string]$PersistedFact.result_file_id_hex -cne [string]$ResultReference.file_id_hex -or
             -not (Test-D32BoundedCompilerDiagnosticInteger $PersistedFact.observed_ticks -Positive) -or
-            [Int64]$PersistedFact.observed_ticks -ge [Int64]$Record.clock.batch_deadline_ticks -or [string]$PersistedFact.gate_authority -cne 'NONE') { return $false }
+            [Int64]$PersistedFact.observed_ticks -ge [Int64]$Record.clock.batch_deadline_ticks -or $null -ne $PersistedFact.case_evidence_sha256 -or
+            [string]$PersistedFact.gate_authority -cne 'NONE') { return $false }
     }
     return $true
 }
@@ -1244,7 +1528,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
         [Parameter(Mandatory = $true)][long]$CallerObservedTicks)
     if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape $Record) -or $null -eq $PersistedFact -or
         [string]$Record.status -cnotin @('COMPLETE_NON_SOURCE_L1', 'BLOCKED', 'BUDGET_STOPPED', 'REFUSED', 'UNRESOLVED') -or
-        -not (Test-D32BoundedCompilerDiagnosticExactProperties $PersistedFact @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'gate_authority')) -or
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $PersistedFact @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'case_evidence_sha256', 'gate_authority')) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $ResultReference) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $JournalReference) -or
         [string]$ResultReference.path -cne [string]$Record.output.result_path -or
@@ -1258,7 +1542,8 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
         -not (Test-D32BoundedCompilerDiagnosticInteger $CallerObservedTicks -Positive) -or
         [Int64]$JournalReference.bytes -ne $JournalBytes.Length -or $JournalBytes.Length -le 0 -or $JournalBytes.Length -gt 65536 -or
         [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($JournalBytes)).ToLowerInvariant() -cne [string]$JournalReference.sha256 -or
-        $CallerObservedTicks -lt [Int64]$PersistedFact.observed_ticks -or $CallerObservedTicks -ge [Int64]$Record.clock.batch_deadline_ticks) { return $false }
+        $CallerObservedTicks -lt [Int64]$PersistedFact.observed_ticks -or $CallerObservedTicks -ge [Int64]$Record.clock.batch_deadline_ticks -or
+        $null -ne $PersistedFact.case_evidence_sha256) { return $false }
     try {
         $text = [Text.UTF8Encoding]::new($false, $true).GetString($JournalBytes)
         if (-not $text.EndsWith("`n", [StringComparison]::Ordinal) -or $text.Contains("`r")) { return $false }
@@ -1275,22 +1560,23 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
             } finally { $json.Dispose() }
         }
         $last = $rows[$rows.Count - 1]
-        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $last @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'gate_authority')) -or
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $last @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'case_evidence_sha256', 'gate_authority')) -or
             [string]$last.event -cne 'L1_RESULT_PERSISTED' -or [string]$last.result_path -cne [string]$PersistedFact.result_path -or
             [Int64]$last.result_bytes -ne [Int64]$PersistedFact.result_bytes -or [string]$last.result_sha256 -cne [string]$PersistedFact.result_sha256 -or
             [string]$last.result_volume_serial_hex -cne [string]$PersistedFact.result_volume_serial_hex -or
             [string]$last.result_file_id_hex -cne [string]$PersistedFact.result_file_id_hex -or
-            [Int64]$last.observed_ticks -ne [Int64]$PersistedFact.observed_ticks -or [string]$last.gate_authority -cne 'NONE' -or
+            [Int64]$last.observed_ticks -ne [Int64]$PersistedFact.observed_ticks -or $null -ne $last.case_evidence_sha256 -or [string]$last.gate_authority -cne 'NONE' -or
             [string]$last.case_id -cne '' -or $null -ne $last.scheduled_ticks -or $null -ne $last.lateness_ticks) { return $false }
         $first = $rows[0]
-        if ([string]$first.event -cne 'AUTHORITY_ADMISSION' -or [string]$first.case_id -cne '' -or
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $first @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'case_evidence_sha256', 'gate_authority')) -or
+            [string]$first.event -cne 'AUTHORITY_ADMISSION' -or [string]$first.case_id -cne '' -or
             [Int64]$first.scheduled_ticks -ne [Int64]$Record.clock.batch_t0_ticks -or
             $null -ne $first.result_path -or $null -ne $first.result_bytes -or $null -ne $first.result_sha256 -or
-            $null -ne $first.result_volume_serial_hex -or $null -ne $first.result_file_id_hex) { return $false }
+            $null -ne $first.result_volume_serial_hex -or $null -ne $first.result_file_id_hex -or $null -ne $first.case_evidence_sha256) { return $false }
         $previousObserved = [Int64]$Record.clock.batch_t0_ticks
         for ($index = 0; $index -lt $rows.Count; $index++) {
             $row = $rows[$index]
-            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $row @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'gate_authority')) -or
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $row @('event', 'case_id', 'scheduled_ticks', 'observed_ticks', 'lateness_ticks', 'result_path', 'result_bytes', 'result_sha256', 'result_volume_serial_hex', 'result_file_id_hex', 'case_evidence_sha256', 'gate_authority')) -or
                 [string]$row.event -cnotin @('AUTHORITY_ADMISSION', 'CASE_NATIVE_BOUNDARY_VERIFIED', 'CASE_EXPECTED_REFUSAL_VERIFIED', 'CASE_BLOCKED', 'CASE_BUDGET_STOPPED', 'CASE_UNRESOLVED', 'L1_RESULT_PERSISTED') -or
                 ($index -eq 0 -and [string]$row.event -cne 'AUTHORITY_ADMISSION') -or
                 ($index -gt 0 -and [string]$row.event -ceq 'AUTHORITY_ADMISSION') -or
@@ -1302,6 +1588,9 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
                     -not (Test-D32BoundedCompilerDiagnosticInteger $row.lateness_ticks) -or [Int64]$row.observed_ticks -lt [Int64]$row.scheduled_ticks -or
                     [Int64]$row.lateness_ticks -ne ([Int64]$row.observed_ticks - [Int64]$row.scheduled_ticks))) -or
                 ($index -lt ($rows.Count - 1) -and [string]$row.event -ceq 'L1_RESULT_PERSISTED')) { return $false }
+            if ([string]$row.event -like 'CASE_*') {
+                if ([string]$row.case_evidence_sha256 -cnotmatch '^[0-9a-f]{64}$') { return $false }
+            } elseif ($null -ne $row.case_evidence_sha256) { return $false }
             if ($index -eq 0 -and ($null -eq $row.scheduled_ticks -or
                 [Int64]$row.observed_ticks -lt [Int64]$Record.clock.batch_t0_ticks)) { return $false }
             $previousObserved = [Int64]$row.observed_ticks
@@ -1321,6 +1610,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
             $expectedEvent = 'CASE_' + [string]$case.state
             if ([string]$row.event -cne $expectedEvent -or [string]$row.case_id -cne [string]$case.case_id -or
                 $null -ne $row.scheduled_ticks -or $null -ne $row.lateness_ticks -or
+                [string]$row.case_evidence_sha256 -cne [string]$case.case_evidence_sha256 -or
                 [Int64]$row.observed_ticks -ne [Int64]$case.case_completed_ticks -or
                 [Int64]$row.observed_ticks -lt [Int64]$case.case_t0_ticks -or
                 ([Int64]$row.observed_ticks -ge [Int64]$case.audit_deadline_ticks -and
@@ -1339,7 +1629,7 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence {
 }
 
 function New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate {
-    param([Parameter(Mandatory = $true)][string]$CaseId, [string]$State = 'NOT_RUN',
+    param([Parameter(Mandatory = $true)][string]$CaseId, [string]$State = 'NOT_RUN', [AllowNull()][object]$CaseNonce = $null,
         [AllowNull()][object]$CaseT0Ticks = $null, [AllowNull()][object]$ActiveDeadlineTicks = $null,
         [AllowNull()][object]$CleanupDeadlineTicks = $null, [AllowNull()][object]$AuditDeadlineTicks = $null,
         [AllowNull()][object]$AdmissionObservedTicks = $null, [long]$CreateAttemptCount = 0L,
@@ -1358,10 +1648,14 @@ function New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate {
         [bool]$StderrTruncated = $false, [bool]$StdoutTokenVerified = $false, [bool]$StderrTokenVerified = $false,
         [bool]$CaptureJoinVerified = $false, [bool]$JobClosed = $false,
         [AllowNull()][object]$CleanupObservedTicks = $null, [AllowNull()][object]$CaseCompletedTicks = $null,
+        [AllowNull()][object]$PrecreateAdmission = $null, [AllowNull()][object]$ActualInvocation = $null,
+        [AllowNull()][object]$CaseEvidenceSha256 = $null,
         [AllowNull()][object]$PrimaryError = $null,
         [string[]]$SecondaryErrors = @())
     return [PSCustomObject][ordered]@{
-        case_id = $CaseId; state = $State; case_t0_ticks = $CaseT0Ticks; active_deadline_ticks = $ActiveDeadlineTicks
+        case_id = $CaseId; case_nonce = $CaseNonce; precreate_admission = $PrecreateAdmission
+        actual_invocation = $ActualInvocation; case_evidence_sha256 = $CaseEvidenceSha256
+        state = $State; case_t0_ticks = $CaseT0Ticks; active_deadline_ticks = $ActiveDeadlineTicks
         cleanup_deadline_ticks = $CleanupDeadlineTicks; audit_deadline_ticks = $AuditDeadlineTicks; admission_observed_ticks = $AdmissionObservedTicks
         create_attempt_count = [Int64]$CreateAttemptCount; create_attempt_ticks = $CreateAttemptTicks; process_id = $ProcessId
         creation_filetime_ticks = $CreationFiletimeTicks; process_image_path = $ProcessImagePath

@@ -75,6 +75,10 @@ $script:D32NonSourceL1BatchDeadline = [long]0
 # exercised without calling CreateProcessW, Job APIs, or reader processes.
 $script:D32NonSourceL1NativeAdapter = $null
 $script:D32NonSourceL1FileAdapter = $null
+# Private in-process synthetic test seam only. The operational entry never
+# accepts this as an argument and leaves it null, preserving each fixed
+# production metadata/file operation below.
+$script:D32NonSourceL1EnvironmentAdapter = $null
 
 # The caller captures T0 before invoking this entry. Parameter binding, this
 # script's admission, native type initialization, and child creation all spend
@@ -894,6 +898,95 @@ function Invoke-D32LifecycleCleanupAndAudit {
 
 function Get-D32NonSourceL1Now { return [Int64](& $script:D32NonSourceL1Now) }
 
+function Get-D32NonSourceL1QpcFrequency {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [Int64](& $script:D32NonSourceL1EnvironmentAdapter.QpcFrequency) }
+    return [Int64][Diagnostics.Stopwatch]::Frequency
+}
+
+function Get-D32NonSourceL1CurrentControllerPath {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [string](& $script:D32NonSourceL1EnvironmentAdapter.ControllerPath) }
+    return [IO.Path]::GetFullPath($PSCommandPath)
+}
+
+function Get-D32NonSourceL1CurrentRuntimePath {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [string](& $script:D32NonSourceL1EnvironmentAdapter.RuntimePath) }
+    return [string][Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+}
+
+function Get-D32NonSourceL1CurrentOwnerSid {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [string](& $script:D32NonSourceL1EnvironmentAdapter.OwnerSid) }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try { return [string]$identity.User.Value } finally { $identity.Dispose() }
+}
+
+function Test-D32NonSourceL1NoReparsePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [bool](& $script:D32NonSourceL1EnvironmentAdapter.NoReparse -Path $Path) }
+    return Test-D32LifecycleNoReparsePath -Path $Path
+}
+
+function Get-D32NonSourceL1InitialReferenceBytes {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][long]$MaximumBytes,
+        [Parameter(Mandatory = $true)][long]$DeadlineTicks)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+        return & $script:D32NonSourceL1EnvironmentAdapter.InitialReference -Path $Path -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    }
+    return Get-D32LifecycleReferenceBytes -Path $Path -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+}
+
+function Open-D32NonSourceL1AuthorityRecord {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [Parameter(Mandatory = $true)][long]$MaximumBytes, [Parameter(Mandatory = $true)][long]$DeadlineTicks)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+        return & $script:D32NonSourceL1EnvironmentAdapter.OpenAuthority -Path $Path -DirectoryFences $DirectoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    }
+    return Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $DirectoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+}
+
+function Get-D32NonSourceL1DirectoryIdentity {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return & $script:D32NonSourceL1EnvironmentAdapter.DirectoryIdentity -Path $Path }
+    return Get-D32LifecycleDirectoryIdentity -Path $Path
+}
+
+function Get-D32NonSourceL1RootSecurity {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return & $script:D32NonSourceL1EnvironmentAdapter.RootSecurity -Path $Path }
+    return [System.IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($Path))
+}
+
+function Test-D32NonSourceL1OutputPathExists {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [bool](& $script:D32NonSourceL1EnvironmentAdapter.OutputPathExists -Path $Path) }
+    return [IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)
+}
+
+function New-D32NonSourceL1JournalStream {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return & $script:D32NonSourceL1EnvironmentAdapter.CreateJournal -Path $Path }
+    return [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+}
+
+function New-D32NonSourceL1ResultStream {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return & $script:D32NonSourceL1EnvironmentAdapter.CreateResult -Path $Path }
+    return [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+}
+
+function Open-D32NonSourceL1PersistedOutput {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [Parameter(Mandatory = $true)][long]$MaximumBytes, [Parameter(Mandatory = $true)][long]$DeadlineTicks)
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+        return & $script:D32NonSourceL1EnvironmentAdapter.OpenOutput -Path $Path -DirectoryFences $DirectoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    }
+    return Open-D32PowerShellAuthorityFile -Path $Path -DirectoryFences $DirectoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+}
+
+function Get-D32NonSourceL1ControllerCreationFileTime {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) { return [Int64](& $script:D32NonSourceL1EnvironmentAdapter.ControllerCreationFileTime) }
+    return Get-D32LifecycleProcessCreationFileTime
+}
+
 function Get-D32NonSourceL1DeadlineTicks {
     param([long]$T0Ticks, [long]$Frequency, [long]$Milliseconds)
     if ($T0Ticks -le 0 -or $Frequency -le 0 -or $Milliseconds -le 0) { throw 'D32_NON_SOURCE_L1_REFUSED: invalid monotonic deadline input' }
@@ -1090,7 +1183,7 @@ function New-D32NonSourceL1PreCreatePlan {
         '-NonSourceL1', '-L1AuthorityPath', $L1AuthorityPath, '-ExpectedL1AuthoritySha256', $ExpectedL1AuthoritySha256,
         '-L1CandidateSha', $CandidateSha, '-L1BatchId', [string]$script:D32NonSourceL1Authority.batch_id,
         '-L1CaseId', $CaseId, '-L1Nonce', $Nonce, '-L1T0Ticks', [string]$L1T0Ticks,
-        '-L1CounterFrequency', [string][Diagnostics.Stopwatch]::Frequency, '-L1CaseT0Ticks', [string]$CaseT0Ticks,
+        '-L1CounterFrequency', [string](Get-D32NonSourceL1QpcFrequency), '-L1CaseT0Ticks', [string]$CaseT0Ticks,
         '-L1ActiveDeadlineTicks', [string]$ActiveDeadlineTicks)
     $env = $script:D32NonSourceL1Authority.invocation.child_environment
     $admission = [PSCustomObject][ordered]@{
@@ -1111,7 +1204,7 @@ function Get-D32NonSourceL1RemainingWaitMilliseconds {
     param([long]$DeadlineTicks)
     $now = Get-D32NonSourceL1Now
     if ($now -ge $DeadlineTicks) { return [uint32]0 }
-    $remaining = [decimal]($DeadlineTicks - $now) * [decimal]1000 / [decimal][Diagnostics.Stopwatch]::Frequency
+    $remaining = [decimal]($DeadlineTicks - $now) * [decimal]1000 / [decimal](Get-D32NonSourceL1QpcFrequency)
     return [uint32][Math]::Max(1, [Math]::Min(50, [Math]::Ceiling($remaining)))
 }
 
@@ -1214,7 +1307,7 @@ function New-D32NonSourceL1ActualInvocationRecord {
     if ($null -eq $evidence) { return $null }
     return [PSCustomObject][ordered]@{
         case_id = $CaseId; case_nonce = $CaseNonce; batch_t0_ticks = [Int64]$L1T0Ticks; case_t0_ticks = $CaseT0Ticks
-        counter_frequency = [Int64][Diagnostics.Stopwatch]::Frequency; active_deadline_ticks = $ActiveDeadlineTicks
+        counter_frequency = Get-D32NonSourceL1QpcFrequency; active_deadline_ticks = $ActiveDeadlineTicks
         entry_reference = $Plan.admission.entry_reference; executable_reference = $Plan.admission.runtime_reference
         admission_observed_ticks = [Int64]$Plan.admission.observed_ticks
         image_path = [string]$evidence.ImagePath; arguments = @($evidence.Arguments); raw_command_line = [string]$evidence.CommandLine
@@ -1242,7 +1335,7 @@ function Invoke-D32NonSourceL1Case {
     $caseId = [string]$caseAuthority.case_id
     $caseNonce = [string]$caseAuthority.nonce
     $caseT0 = Get-D32NonSourceL1Now
-    $caseDeadlines = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseDeadlines -CaseT0Ticks $caseT0 -Frequency ([Diagnostics.Stopwatch]::Frequency) -BatchDeadlineTicks $script:D32NonSourceL1BatchDeadline
+    $caseDeadlines = Get-D32BoundedDiagnosticSourceProofNonSourceL1CaseDeadlines -CaseT0Ticks $caseT0 -Frequency (Get-D32NonSourceL1QpcFrequency) -BatchDeadlineTicks $script:D32NonSourceL1BatchDeadline
     $active = [Int64]$caseDeadlines.active_deadline_ticks; $cleanup = [Int64]$caseDeadlines.cleanup_deadline_ticks; $audit = [Int64]$caseDeadlines.audit_deadline_ticks
     $row = New-D32BoundedDiagnosticSourceProofNonSourceL1CaseCandidate -CaseId $caseId -CaseNonce $caseNonce -CaseT0Ticks $caseT0 `
         -ActiveDeadlineTicks $active -CleanupDeadlineTicks $cleanup -AuditDeadlineTicks $audit -AdmissionObservedTicks (Get-D32NonSourceL1Now)
@@ -1259,7 +1352,7 @@ function Invoke-D32NonSourceL1Case {
         $native = Start-D32NonSourceL1NativeChild -Image ([string]$plan.image) -Arguments ([string[]]$plan.arguments) `
             -WorkingDirectory ([string]$plan.working_directory) -EnvironmentEntries ([string[]]$plan.environment_entries) `
             -CaseId ([string]$caseId) -CaseNonce ([string]$caseNonce) -BatchT0Ticks ([Int64]$L1T0Ticks) -CaseT0Ticks ([Int64]$caseT0) `
-            -CounterFrequency ([Int64][Diagnostics.Stopwatch]::Frequency) -ActiveDeadlineTicks ([Int64]$active) -WorkDeadlineTicks ([Int64]$active)
+            -CounterFrequency (Get-D32NonSourceL1QpcFrequency) -ActiveDeadlineTicks ([Int64]$active) -WorkDeadlineTicks ([Int64]$active)
         $row.actual_invocation = New-D32NonSourceL1ActualInvocationRecord -Native $native -Plan $plan -CaseId $caseId -CaseNonce $caseNonce -CaseT0Ticks $caseT0 -ActiveDeadlineTicks $active
         if ($native.CreateProcessAttempted) { $script:D32NonSourceL1CreateAttempts++; $row.create_attempt_count = 1L; $row.create_attempt_ticks = [Int64]$native.CreateProcessAttemptTicks }
         $row.job_instance_id = if ([string]$native.JobInstanceId -match '^[0-9a-f]{32}$') { [string]$native.JobInstanceId } else { $null }
@@ -1430,14 +1523,16 @@ function Invoke-D32NonSourceL1 {
     try {
         if ($PSVersionTable.PSVersion -lt [version]'7.5' -or -not [Environment]::Is64BitProcess -or
             $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $ExpectedL1AuthoritySha256 -cnotmatch '^[0-9a-f]{64}$' -or
-            $L1T0Ticks -le 0 -or [Diagnostics.Stopwatch]::Frequency -le 0 -or
+            $L1T0Ticks -le 0 -or (Get-D32NonSourceL1QpcFrequency) -le 0 -or
             $script:D32LifecycleControllerEntryTicks -lt $L1T0Ticks -or
             [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository) -or
-            [IO.Path]::GetFullPath($L1AuthorityPath) -cne $L1AuthorityPath -or -not (Test-D32LifecycleNoReparsePath -Path $L1AuthorityPath)) {
+            [IO.Path]::GetFullPath($L1AuthorityPath) -cne $L1AuthorityPath -or -not (Test-D32NonSourceL1NoReparsePath -Path $L1AuthorityPath)) {
             throw 'D32_NON_SOURCE_L1_REFUSED: fixed candidate/repository/runtime/caller clock input invalid'
         }
-        $script:D32NonSourceL1Now = { [Diagnostics.Stopwatch]::GetTimestamp() }
-        $frequency = [Int64][Diagnostics.Stopwatch]::Frequency
+        if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+            $script:D32NonSourceL1Now = { [Int64](& $script:D32NonSourceL1EnvironmentAdapter.Now) }
+        } else { $script:D32NonSourceL1Now = { [Diagnostics.Stopwatch]::GetTimestamp() } }
+        $frequency = Get-D32NonSourceL1QpcFrequency
         $script:D32NonSourceL1BatchDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $L1T0Ticks -Frequency $frequency -Milliseconds 60000L
         if ((Get-D32NonSourceL1Now) -lt $L1T0Ticks -or (Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: controller admission reached batch deadline' }
 
@@ -1449,7 +1544,7 @@ function Invoke-D32NonSourceL1 {
 
         # The initial L1 record read is caller-pinned and bounded. The path is
         # re-opened through the fixed module-free authority loader below.
-        $authorityRaw = Get-D32LifecycleReferenceBytes -Path $L1AuthorityPath -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $authorityRaw = Get-D32NonSourceL1InitialReferenceBytes -Path $L1AuthorityPath -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         $script:D32NonSourceL1OwnedBuffers += [Int64]$authorityRaw.Reference.bytes
         $authorityRawReference = $authorityRaw.Reference
         if ($authorityRaw.Reference.sha256 -cne $ExpectedL1AuthoritySha256 -or $script:D32NonSourceL1OwnedBuffers -gt 16777216) {
@@ -1467,14 +1562,14 @@ function Invoke-D32NonSourceL1 {
         $modulePath = [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-powershell-module-authority.ps1'))
         $modulePin = @($script:D32NonSourceL1Authority.source_pins | Where-Object { [string]$_.path -ceq $modulePath })
         if ($modulePin.Count -ne 1) { throw 'D32_NON_SOURCE_L1_REFUSED: exact fixed authority loader pin absent' }
-        $moduleRaw = Get-D32LifecycleReferenceBytes -Path $modulePath -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $moduleRaw = Get-D32NonSourceL1InitialReferenceBytes -Path $modulePath -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         $script:D32NonSourceL1OwnedBuffers += [Int64]$moduleRaw.Reference.bytes
         foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$moduleRaw.Reference.($name) -cne [string]$modulePin[0].($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: bootstrap loader pin mismatch' } }
         if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed bootstrap buffers exceed 16 MiB' }
         . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$moduleRaw.Bytes)))
         if ($null -ne $moduleRaw.Stream) { $moduleRaw.Stream.Dispose(); $moduleRaw = $null }
         $script:D32LifecycleFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
-        $authorityOpened = Open-D32PowerShellAuthorityFile -Path $L1AuthorityPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $authorityOpened = Open-D32NonSourceL1AuthorityRecord -Path $L1AuthorityPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 1048576 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         $script:D32NonSourceL1Opened.Add($authorityOpened)
         $script:D32NonSourceL1OwnedBuffers += [Int64]$authorityOpened.Record.bytes
         foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$authorityOpened.Record.($name) -cne [string]$authorityRawReference.($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: authority reopened identity differs from initial caller pin' } }
@@ -1489,14 +1584,14 @@ function Invoke-D32NonSourceL1 {
         $policyPath = [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
         $policyPin = @($script:D32NonSourceL1Authority.source_pins | Where-Object { [string]$_.path -ceq $policyPath })
         if ($policyPin.Count -ne 1) { throw 'D32_NON_SOURCE_L1_REFUSED: fixed policy pin absent' }
-        $policyOpened = Open-D32PowerShellAuthorityFile -Path $policyPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $policyOpened = Open-D32NonSourceL1AuthorityRecord -Path $policyPath -DirectoryFences $script:D32LifecycleFences -MaximumBytes 16777216 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         $script:D32NonSourceL1Opened.Add($policyOpened); $script:D32NonSourceL1OwnedBuffers += [Int64]$policyOpened.Record.bytes
         foreach ($name in @('bytes', 'sha256', 'volume_serial_hex', 'file_id_hex')) { if ([string]$policyOpened.Record.($name) -cne [string]$policyPin[0].($name)) { throw 'D32_NON_SOURCE_L1_REFUSED: pinned strict L1 policy drifted' } }
         if ($script:D32NonSourceL1OwnedBuffers -gt 16777216) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: verified code buffers exceed 16 MiB' }
         . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$policyOpened.Bytes)))
 
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $script:D32NonSourceL1Authority -ExpectedCandidateSha $CandidateSha -Repository $Repository) -or
-            [string]$script:D32NonSourceL1Authority.source_pins[0].path -cne [IO.Path]::GetFullPath($PSCommandPath) -or
+            [string]$script:D32NonSourceL1Authority.source_pins[0].path -cne (Get-D32NonSourceL1CurrentControllerPath) -or
             [string]$script:D32NonSourceL1Authority.invocation.entry_path -cne [IO.Path]::GetFullPath((Join-Path $Repository 'scripts/d32-bounded-diagnostic-sourceproof.ps1')) -or
             (Test-D32PowerShellAuthorityPathWithin -Child $L1AuthorityPath -Parent $Repository) -or
             (Test-D32PowerShellAuthorityPathWithin -Child $L1AuthorityPath -Parent 'E:\d32\inv7\r\c') -or
@@ -1504,32 +1599,30 @@ function Invoke-D32NonSourceL1 {
             throw 'D32_NON_SOURCE_L1_REFUSED: strict L1 authority or fixed external role bindings failed'
         }
         if ([string]$script:D32NonSourceL1Authority.source_repo -cne $Repository -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$script:D32NonSourceL1Authority.powershell_runtime.path), [IO.Path]::GetFullPath([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName))) {
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath([string]$script:D32NonSourceL1Authority.powershell_runtime.path), [IO.Path]::GetFullPath((Get-D32NonSourceL1CurrentRuntimePath)))) {
             throw 'D32_NON_SOURCE_L1_REFUSED: current repository/runtime role binding mismatch'
         }
-        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        try { if ([string]$currentIdentity.User.Value -cne [string]$script:D32NonSourceL1Authority.owner_id) { throw 'D32_NON_SOURCE_L1_REFUSED: current Windows owner differs from the authority owner binding' } }
-        finally { $currentIdentity.Dispose() }
-        $repoIdentity = Get-D32LifecycleDirectoryIdentity $Repository
+        if ((Get-D32NonSourceL1CurrentOwnerSid) -cne [string]$script:D32NonSourceL1Authority.owner_id) { throw 'D32_NON_SOURCE_L1_REFUSED: current Windows owner differs from the authority owner binding' }
+        $repoIdentity = Get-D32NonSourceL1DirectoryIdentity $Repository
         if ($repoIdentity.VolumeSerialHex -cne [string]$script:D32NonSourceL1Authority.repository_identity.volume_serial_hex -or $repoIdentity.FileIdHex -cne [string]$script:D32NonSourceL1Authority.repository_identity.file_id_hex) {
             throw 'D32_NON_SOURCE_L1_REFUSED: repository directory identity drift'
         }
-        $rootIdentity = Get-D32LifecycleDirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.root_path)
-        $parentIdentity = Get-D32LifecycleDirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.parent_path)
+        $rootIdentity = Get-D32NonSourceL1DirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.root_path)
+        $parentIdentity = Get-D32NonSourceL1DirectoryIdentity ([string]$script:D32NonSourceL1Authority.output.parent_path)
         foreach ($pair in @(@('root_volume_serial_hex', 'root_file_id_hex', $rootIdentity), @('parent_volume_serial_hex', 'parent_file_id_hex', $parentIdentity))) {
             if ([string]$script:D32NonSourceL1Authority.output.($pair[0]) -cne [string]$pair[2].VolumeSerialHex -or [string]$script:D32NonSourceL1Authority.output.($pair[1]) -cne [string]$pair[2].FileIdHex) { throw 'D32_NON_SOURCE_L1_REFUSED: external root/parent opened identity drift' }
         }
-        $rootSecurity = [System.IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new([string]$script:D32NonSourceL1Authority.output.root_path))
+        $rootSecurity = Get-D32NonSourceL1RootSecurity -Path ([string]$script:D32NonSourceL1Authority.output.root_path)
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RootSecurity -Security $rootSecurity -OwnerSid ([string]$script:D32NonSourceL1Authority.owner_id))) {
             throw 'D32_NON_SOURCE_L1_REFUSED: fresh external root owner-bound DACL is not protected by the fixed trusted-writer allowlist'
         }
         if ((Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent $Repository) -or
             (Test-D32PowerShellAuthorityPathWithin -Child ([string]$script:D32NonSourceL1Authority.output.root_path) -Parent 'E:\d32\inv7\r\c')) { throw 'D32_NON_SOURCE_L1_REFUSED: external L1 root violates fixed containment' }
         foreach ($path in @([string]$script:D32NonSourceL1Authority.output.result_path, [string]$script:D32NonSourceL1Authority.output.journal_path)) {
-            if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw 'D32_NON_SOURCE_L1_REFUSED: create-new result/journal path already exists' }
+            if (Test-D32NonSourceL1OutputPathExists -Path $path) { throw 'D32_NON_SOURCE_L1_REFUSED: create-new result/journal path already exists' }
         }
         $script:D32NonSourceL1AdmissionValidated = $true
-        $script:D32NonSourceL1JournalStream = [IO.File]::Open([string]$script:D32NonSourceL1Authority.output.journal_path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $script:D32NonSourceL1JournalStream = New-D32NonSourceL1JournalStream -Path ([string]$script:D32NonSourceL1Authority.output.journal_path)
         Add-D32NonSourceL1JournalFact -Event 'AUTHORITY_ADMISSION' -ScheduledTicks $L1T0Ticks -ObservedTicks (Get-D32NonSourceL1Now)
 
         # Open and hash only the six fixed script pins, plus the fixed runtime.
@@ -1585,17 +1678,17 @@ function Invoke-D32NonSourceL1 {
             -PowerShellRuntime ([PSCustomObject][ordered]@{ path = $script:D32NonSourceL1Authority.powershell_runtime.path; bytes = $script:D32NonSourceL1Authority.powershell_runtime.bytes; sha256 = $script:D32NonSourceL1Authority.powershell_runtime.sha256; volume_serial_hex = $script:D32NonSourceL1Authority.powershell_runtime.volume_serial_hex; file_id_hex = $script:D32NonSourceL1Authority.powershell_runtime.file_id_hex }) `
             -Output $script:D32NonSourceL1Authority.output `
             -Clock ([PSCustomObject][ordered]@{ counter_origin = 'QueryPerformanceCounter'; frequency = $frequency; batch_t0_ticks = $L1T0Ticks; batch_deadline_ticks = $script:D32NonSourceL1BatchDeadline; controller_entry_ticks = $script:D32LifecycleControllerEntryTicks }) `
-            -Controller ([PSCustomObject][ordered]@{ process_id = [Int64]$PID; creation_filetime_ticks = (Get-D32LifecycleProcessCreationFileTime) }) `
+            -Controller ([PSCustomObject][ordered]@{ process_id = [Int64]$PID; creation_filetime_ticks = (Get-D32NonSourceL1ControllerCreationFileTime) }) `
             -Cases @($script:D32NonSourceL1Cases.ToArray()) -CreateProcessAttemptCount $script:D32NonSourceL1CreateAttempts `
             -PlannedTerminationCount $script:D32NonSourceL1PlannedTerminations -FailSafeTerminationCount $script:D32NonSourceL1FailSafeTerminations `
             -Status $script:D32NonSourceL1Status -PrimaryError $script:D32NonSourceL1Primary -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) `
             -StartedAtUtc $script:D32NonSourceL1StartedAtUtc -CompletedAtUtc ([DateTimeOffset]::UtcNow.ToString('o'))
         $bytes = ConvertTo-D32NonSourceL1ResultBytes -Record $record
         if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: result size or batch persistence deadline exceeded' }
-        $resultStream = [IO.File]::Open([string]$script:D32NonSourceL1Authority.output.result_path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $resultStream = New-D32NonSourceL1ResultStream -Path ([string]$script:D32NonSourceL1Authority.output.result_path)
         try { $resultStream.Write($bytes, 0, $bytes.Length); $resultStream.Flush($true) } finally { $resultStream.Dispose() }
         if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: result flush returned after batch deadline' }
-        $resultOpened = Open-D32PowerShellAuthorityFile -Path ([string]$script:D32NonSourceL1Authority.output.result_path) -DirectoryFences ([System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)) -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $resultOpened = Open-D32NonSourceL1PersistedOutput -Path ([string]$script:D32NonSourceL1Authority.output.result_path) -DirectoryFences ([System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)) -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         $resultDocument = [System.Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$resultOpened.Bytes))
         try {
             if ($resultDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $resultDocument.RootElement)) { throw 'D32_NON_SOURCE_L1_UNRESOLVED: persisted L1 result JSON is duplicate or non-object' }
@@ -1615,7 +1708,7 @@ function Invoke-D32NonSourceL1 {
         }
         $resultWritten = $true
         $journalFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
-        $journalOpened = Open-D32PowerShellAuthorityFile -Path ([string]$script:D32NonSourceL1Authority.output.journal_path) -DirectoryFences $journalFences -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $journalOpened = Open-D32NonSourceL1PersistedOutput -Path ([string]$script:D32NonSourceL1Authority.output.journal_path) -DirectoryFences $journalFences -MaximumBytes 65536 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
         try {
             $journalCallerObserved = Get-D32NonSourceL1Now
             if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultPersistence -Record $readback -PersistedFact $persistedFact `
@@ -1641,7 +1734,8 @@ function Invoke-D32NonSourceL1 {
     return $returnCode
 }
 
-if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
+function Invoke-D32NonSourceL1ControllerBoundary {
+    param([Parameter(Mandatory = $true)][System.IO.TextWriter]$DiagnosticWriter)
     $l1ExitCode = 87
     try { $l1ExitCode = [int](Invoke-D32NonSourceL1) }
     catch {
@@ -1659,9 +1753,13 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
         }
         if ($diagnosticStatus -ceq 'COMPLETE_NON_SOURCE_L1') { $diagnosticStatus = 'UNRESOLVED' }
         $null = Write-D32NonSourceL1Diagnostic -Status $diagnosticStatus -PrimaryError $diagnosticPrimary `
-            -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) -Writer ([Console]::Error)
+            -SecondaryErrors @($script:D32NonSourceL1Secondary.ToArray()) -Writer $DiagnosticWriter
     }
-    exit $l1ExitCode
+    return [int]$l1ExitCode
+}
+
+if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
+    exit (Invoke-D32NonSourceL1ControllerBoundary -DiagnosticWriter ([Console]::Error))
 }
 
 try {

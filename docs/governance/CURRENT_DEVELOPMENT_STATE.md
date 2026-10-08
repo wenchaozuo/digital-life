@@ -2,6 +2,12 @@
 
 > 本文件是 Codex 每轮进入项目时读取的短状态页。它是缓存，不覆盖 Git、已批准决定或 exact-SHA evidence。
 
+## 暂停覆盖记录 — 2026-10-08
+
+用户要求暂停开发并备份到 GitHub。当前状态为 **PAUSED / NOT FROZEN / Gate NONE**；不继续测试或重启。
+暂停前最后完成批次为 `21ba1bc52683b056b28a600fbe4ce74fe1a39115`；中断修改另存未验证 WIP `0101e9761447242a0d8eb05e168cc930f5b61151`。
+详见 [D32 暂停交接](D32_PAUSE_HANDOFF_2026-10-08.md)。下方为历史缓存，不代表当前 WIP 已完成或正式 Phase0 已通过。
+
 ## 1. 当前阶段
 
 - **Milestone / Task:** D32 final-gate readiness（D32-A-R2）

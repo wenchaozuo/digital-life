@@ -4343,20 +4343,44 @@ $outerObserverBoundaryExact=$null -ne $outerCallerFunctionAst -and $null -ne $ob
 Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed outer route binds the existing observer, keeps child runtime admission separate, and exposes no arbitrary preparation/launch inputs' $outerObserverBoundaryExact
 $preparationSessionAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -ceq 'Invoke-D32PreparationObserverControlSession'},$true)
+$preparationEntryAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Invoke-D32PreparationObserverSessionEntry'},$true)
 $preparationReaderAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -ceq 'Read-D32PreparationControlLine'},$true)
 $preparationSessionText=if ($null -eq $preparationSessionAst) { '' } else { [string]$preparationSessionAst.Extent.Text }
+$preparationEntryText=if ($null -eq $preparationEntryAst) { '' } else { [string]$preparationEntryAst.Extent.Text }
 $preparationReaderText=if ($null -eq $preparationReaderAst) { '' } else { [string]$preparationReaderAst.Extent.Text }
 $preparationSessionParameters=@($controllerAst.ParamBlock.Parameters | Where-Object {
     @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.FullName -ceq 'Parameter' -and
         @($_.NamedArguments | Where-Object { $_.ArgumentName -ceq 'ParameterSetName' -and $_.Argument.Extent.Text -ceq "'PreparationSession'" }).Count -gt 0 }).Count -gt 0
 } | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
 $preparationNativeText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'),[Text.UTF8Encoding]::new($false,$true))
-$preparationSessionWired=$null -ne $preparationSessionAst -and $null -ne $preparationReaderAst -and
+$preparationAuthorityTokens=$null;$preparationAuthorityParseErrors=$null
+$preparationAuthorityAst=[System.Management.Automation.Language.Parser]::ParseInput($preparationNativeText,[ref]$preparationAuthorityTokens,[ref]$preparationAuthorityParseErrors)
+$preparationNativeInitializerAst=$preparationAuthorityAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Initialize-D32PowerShellAuthorityNativeApi'},$true)
+$preparationNativeInitializerText=if($null -eq $preparationNativeInitializerAst){''}else{[string]$preparationNativeInitializerAst.Extent.Text}
+$preparationObserverBootstrapAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'New-D32NonSourceL1ObserverBindingPreparation'},$true)
+$preparationObserverBootstrapText=if($null -eq $preparationObserverBootstrapAst){''}else{[string]$preparationObserverBootstrapAst.Extent.Text}
+$preparationNativeBootstrapExact=$null -ne $preparationNativeInitializerAst -and $null -ne $preparationObserverBootstrapAst -and
+    $preparationObserverBootstrapText.Contains('Get-D32NonSourceL1CurrentTokenFacts') -and
+    $preparationObserverBootstrapText.Contains('Open-D32NonSourceL1AuthorityRecord') -and
+    $preparationObserverBootstrapText.Contains('scripts/d32-powershell-module-authority.ps1') -and
+    $preparationObserverBootstrapText.Contains('scripts/d32-bounded-compiler-diagnostic-policy.ps1') -and
+    -not $preparationObserverBootstrapText.Contains('Import-Module') -and -not $preparationObserverBootstrapText.Contains('Add-Type') -and
+    $preparationNativeInitializerText.Contains('Reflection.Emit.AssemblyBuilder') -and
+    $preparationNativeInitializerText.Contains('DefinePInvokeMethod') -and
+    -not $preparationNativeInitializerText.Contains('Add-Type') -and -not $preparationNativeInitializerText.Contains('Import-Module') -and
+    -not $preparationNativeInitializerText.Contains('CreateProcess') -and -not $preparationNativeInitializerText.Contains('LoadLibrary')
+$preparationSessionWired=$null -ne $preparationSessionAst -and $null -ne $preparationEntryAst -and $null -ne $preparationReaderAst -and
     ($preparationSessionParameters -join '|') -ceq 'Repository|CandidateSha|PreparationSession' -and
-    $controllerText.Contains('exit (Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha') -and
+    $controllerText.Contains('exit (Invoke-D32PreparationObserverSessionEntry -ParameterSetName $PSCmdlet.ParameterSetName') -and
     $controllerText.Contains('-Reader ([Console]::In) -Writer ([Console]::Out)') -and
-    $controllerText.Contains('$PSModuleAutoLoadingPreference = ''None''') -and
+    $controllerText.Contains('-DiagnosticWriter ([Console]::Error)') -and
+    $preparationEntryText.IndexOf('$PSModuleAutoLoadingPreference = ''None''',[StringComparison]::Ordinal) -ge 0 -and
+    $preparationEntryText.IndexOf('Invoke-D32PreparationObserverControlSession',[StringComparison]::Ordinal) -gt
+        $preparationEntryText.IndexOf('$PSModuleAutoLoadingPreference = ''None''',[StringComparison]::Ordinal) -and
     $preparationSessionText.Contains('D32_PREP_OBSERVER_CONTROL_V1') -and $preparationSessionText.Contains('1800000L') -and
     $preparationSessionText.Contains('300000L') -and $preparationSessionText.Contains('15000L') -and
     $preparationSessionText.Contains('VERIFY_RETURNED_PINS') -and $preparationSessionText.Contains('CAPTURE_OLD_RUN_UPTIME_BASELINE') -and
@@ -4364,10 +4388,18 @@ $preparationSessionWired=$null -ne $preparationSessionAst -and $null -ne $prepar
     -not $preparationSessionText.Contains('Start-Process') -and -not $preparationSessionText.Contains('CreateProcessW') -and
     -not $preparationSessionText.Contains('ScriptBlock]::Create') -and -not $preparationSessionText.Contains('Invoke-Expression') -and
     -not $preparationReaderText.Contains('ScriptBlock]::Create') -and -not $preparationReaderText.Contains('Invoke-Expression') -and
+    $preparationSessionText.Contains('$primaryFailure = $_.Exception') -and
+    $preparationSessionText.Contains('Write-D32PreparationEntryDiagnostic') -and
+    $preparationEntryText.Contains('Write-D32PreparationEntryDiagnostic') -and
+    -not $preparationEntryText.Contains('Import-Module') -and -not $preparationEntryText.Contains('Add-Type') -and
+    -not $preparationEntryText.Contains('CreateProcessW') -and -not $preparationEntryText.Contains('Start-Process') -and
+    -not $preparationSessionText.Contains('Import-Module') -and -not $preparationSessionText.Contains('Add-Type') -and
+    $preparationNativeBootstrapExact -and
     $preparationNativeText.Contains('GetTickCount64') -and $preparationNativeText.Contains('VirtualQuery') -and
     $preparationNativeText.Contains('GetModuleFileNameW') -and $preparationNativeText.Contains('MEM_IMAGE') -and
     $preparationNativeText.Contains('D32PowerShellAuthorityPreparationDeadlineTicks')
-Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed direct-host preparation session has strict JSONL controls, monotonic lease/time budgets, no stdin code path, no child/authority route, and UInt64 MEM_IMAGE uptime origin' $preparationSessionWired
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed preparation parameter set dispatches through a module-autoload-disabled direct-host wrapper with separate JSONL and bounded stderr diagnostics, strict lease/time controls, no child route, and UInt64 MEM_IMAGE uptime origin' $preparationSessionWired
+Assert-D32BoundedCompilerDiagnosticSelfTest 'observer startup remains module-free and uses only the existing dynamic in-process OS API initializer, not the controller inline CreateProcess Add-Type surface' $preparationNativeBootstrapExact
 $legacySyntheticCallerAst = $controllerAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32NonSourceL1SyntheticCallerReconciliation'
 }, $true)
@@ -4592,7 +4624,8 @@ $l1PipelineFunctionNames = @(
     'ConvertFrom-D32PreparationControlFrame', 'Write-D32PreparationControlResponse', 'Read-D32PreparationControlLine',
     'Get-D32PreparationFixedSourcePins', 'New-D32PreparationObserverSnapshot', 'Assert-D32PreparationObserverSnapshotCurrent',
     'Write-D32PreparationCreateNewRecord', 'Invoke-D32PreparationRuntimeCandidateProducer', 'Test-D32PreparationReturnedPinPayload',
-    'Invoke-D32PreparationOldRunBaselineProducer', 'Invoke-D32PreparationObserverControlSession',
+    'Invoke-D32PreparationOldRunBaselineProducer', 'Get-D32PreparationFailureStatus', 'Write-D32PreparationEntryDiagnostic',
+    'Invoke-D32PreparationObserverSessionEntry', 'Invoke-D32PreparationObserverControlSession',
     'Get-D32NonSourceL1LoadedModuleNames', 'Initialize-D32NonSourceL1ControllerRuntime', 'ConvertTo-D32NonSourceL1UtilityJson',
     'Test-D32NonSourceL1NoReparsePath', 'Get-D32NonSourceL1InitialReferenceBytes', 'Open-D32NonSourceL1AuthorityRecord',
     'Get-D32NonSourceL1DirectoryIdentity', 'Get-D32NonSourceL1ModuleAuthorityDirectoryIdentity', 'Get-D32NonSourceL1RootSecurity', 'Test-D32NonSourceL1OutputPathExists',
@@ -5501,8 +5534,9 @@ $script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestClo
 $script:D32PreparationSelfTestReadDeadlines.Clear();$script:D32PreparationSelfTestVerifyAllowed=$true;$script:D32PreparationSelfTestCandidateLate=$false
 $prepSuccessAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine,$prepVerifyLine,$prepBaselineLine,$prepCloseLine)
 $prepSuccessOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
-$prepSuccessCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
-    -Reader ([IO.StringReader]::new('')) -Writer $prepSuccessOutput -TestAdapter $prepSuccessAdapter
+$prepSuccessDiagnosticOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepSuccessCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'PreparationSession' -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepSuccessOutput -DiagnosticWriter $prepSuccessDiagnosticOutput -TestAdapter $prepSuccessAdapter
 $prepSuccessLines=@($prepSuccessOutput.ToString().Split([Environment]::NewLine,[StringSplitOptions]::RemoveEmptyEntries))
 $prepSuccessFrames=@($prepSuccessLines | ForEach-Object { [System.Text.Json.JsonDocument]::Parse([string]$_) })
 $prepAllNonAuthority=$prepSuccessFrames.Count -eq 6 -and $prepSuccessCode -eq 0 -and
@@ -5510,12 +5544,13 @@ $prepAllNonAuthority=$prepSuccessFrames.Count -eq 6 -and $prepSuccessCode -eq 0 
     $script:D32PreparationSelfTestCandidateCalls -eq 1 -and $script:D32PreparationSelfTestWriteCalls -eq 1 -and $script:D32PreparationSelfTestVerifyCalls -eq 1 -and
     $script:D32PreparationSelfTestBaselineCalls -eq 1 -and $script:D32PreparationSelfTestCloseCalls -eq 1 -and
     $script:D32PreparationSelfTestReadDeadlines.Count -eq 5 -and
+    $prepSuccessDiagnosticOutput.ToString().Length -eq 0 -and
     (@($prepSuccessFrames | Where-Object { $_.RootElement.GetProperty('gate_authority').GetString() -cne 'NONE' -or
         $_.RootElement.GetProperty('launch_authority').GetString() -cne 'NONE' }).Count -eq 0) -and
     $prepSuccessFrames[0].RootElement.GetProperty('sequence').GetInt64() -eq 0 -and
     $prepSuccessFrames[1].RootElement.GetProperty('operation').GetString() -ceq 'READY' -and
     $prepSuccessFrames[5].RootElement.GetProperty('status').GetString() -ceq 'CLOSED_PREPARATION_ONLY'
-foreach($frame in $prepSuccessFrames){$frame.Dispose()};$prepSuccessOutput.Dispose()
+foreach($frame in $prepSuccessFrames){$frame.Dispose()};$prepSuccessOutput.Dispose();$prepSuccessDiagnosticOutput.Dispose()
 if(-not $prepAllNonAuthority) {
     Write-Output ('PREP_SUCCESS_DIAGNOSTIC: code='+$prepSuccessCode+' frames='+$prepSuccessLines.Count+' candidate_calls='+$script:D32PreparationSelfTestCandidateCalls+
         ' writes='+$script:D32PreparationSelfTestWriteCalls+' verify='+$script:D32PreparationSelfTestVerifyCalls+' baseline='+$script:D32PreparationSelfTestBaselineCalls+
@@ -5525,6 +5560,88 @@ if(-not $prepAllNonAuthority) {
     foreach($line in $prepSuccessLines){Write-Output ('PREP_REPLY: '+$line)}
 }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session actual control interface completes READY→candidate→returned-pin verification→old-run baseline→CLOSE with immutable pins and Gate/launch NONE' $prepAllNonAuthority
+
+# Exercise the actual production entry wrapper and its separate diagnostic
+# channel for parameter-set and pre-handshake failures. All providers remain
+# synthetic and the wrapper receives no process/native/output capability.
+$prepWrongSetOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWrongSetDiagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWrongSetAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L
+$prepWrongSetCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'OuterCaller' -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepWrongSetOutput -DiagnosticWriter $prepWrongSetDiagnostics -TestAdapter $prepWrongSetAdapter
+$prepWrongSetDocument=[System.Text.Json.JsonDocument]::Parse($prepWrongSetDiagnostics.ToString().Trim())
+$prepWrongSetRoot=$prepWrongSetDocument.RootElement
+$prepWrongSetRefused=$prepWrongSetCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and
+    $prepWrongSetOutput.ToString().Length -eq 0 -and $prepWrongSetAdapter -ne $null -and
+    $prepWrongSetRoot.GetProperty('record_type').GetString() -ceq 'D32_PREP_OBSERVER_ENTRY_DIAGNOSTIC_V1' -and
+    $prepWrongSetRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and
+    $prepWrongSetRoot.GetProperty('gate_authority').GetString() -ceq 'NONE' -and
+    $prepWrongSetRoot.GetProperty('launch_authority').GetString() -ceq 'NONE' -and
+    $prepWrongSetRoot.GetProperty('primary_error').GetString().Contains('fixed preparation entry received a different PowerShell parameter set')
+$prepWrongSetDocument.Dispose();$prepWrongSetOutput.Dispose();$prepWrongSetDiagnostics.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'production preparation entry refuses a non-preparation parameter set before callbacks, emits only bounded redacted stderr JSON, and closes the supplied control streams' $prepWrongSetRefused
+
+$prepEarlyFrequencyAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepEarlyFrequencyAdapter.QpcFrequency={0L}
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepEarlyFrequencyOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepEarlyFrequencyDiagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepEarlyFrequencyCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'PreparationSession' -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepEarlyFrequencyOutput -DiagnosticWriter $prepEarlyFrequencyDiagnostics -TestAdapter $prepEarlyFrequencyAdapter
+$prepEarlyFrequencyDocument=[System.Text.Json.JsonDocument]::Parse($prepEarlyFrequencyDiagnostics.ToString().Trim())
+$prepEarlyFrequencyRoot=$prepEarlyFrequencyDocument.RootElement
+$prepEarlyFrequencyReported=$prepEarlyFrequencyCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and
+    $script:D32PreparationSelfTestCloseCalls -eq 1 -and $prepEarlyFrequencyOutput.ToString().Length -eq 0 -and
+    $prepEarlyFrequencyRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and
+    $prepEarlyFrequencyRoot.GetProperty('primary_error').GetString().Contains('fixed session candidate/repository or monotonic clock inputs are invalid')
+$prepEarlyFrequencyDocument.Dispose();$prepEarlyFrequencyOutput.Dispose();$prepEarlyFrequencyDiagnostics.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'pre-handshake clock refusal is caught before challenge, leaves candidate/baseline untouched, closes via the owned adapter, and preserves primary error on stderr' $prepEarlyFrequencyReported
+
+$prepInvalidCandidateReader=[IO.StringReader]::new('')
+$prepInvalidCandidateOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepInvalidCandidateDiagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepInvalidCandidateAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepInvalidCandidateAdapter.Close=$null
+$prepInvalidCandidateAdapter.QpcFrequency={1000L}
+$prepInvalidCandidateAdapter.Now={1000L}
+$prepInvalidCandidateCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'PreparationSession' -Repository $prepRepository -CandidateSha 'invalid' `
+    -Reader $prepInvalidCandidateReader -Writer $prepInvalidCandidateOutput -DiagnosticWriter $prepInvalidCandidateDiagnostics -TestAdapter $prepInvalidCandidateAdapter
+$prepInvalidCandidateReaderClosed=$false
+try { $null=$prepInvalidCandidateReader.ReadLine() } catch { $prepInvalidCandidateReaderClosed=$true }
+$prepInvalidCandidateDocument=[System.Text.Json.JsonDocument]::Parse($prepInvalidCandidateDiagnostics.ToString().Trim())
+$prepInvalidCandidateRoot=$prepInvalidCandidateDocument.RootElement
+$prepInvalidCandidateReported=$prepInvalidCandidateCode -eq 87 -and $prepInvalidCandidateReaderClosed -and
+    $prepInvalidCandidateOutput.ToString().Length -eq 0 -and
+    $prepInvalidCandidateRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and
+    $prepInvalidCandidateRoot.GetProperty('gate_authority').GetString() -ceq 'NONE' -and
+    $prepInvalidCandidateRoot.GetProperty('launch_authority').GetString() -ceq 'NONE' -and
+    $prepInvalidCandidateDiagnostics.ToString().Length -le 8192
+$prepInvalidCandidateDocument.Dispose();$prepInvalidCandidateOutput.Dispose();$prepInvalidCandidateDiagnostics.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'actual preparation entry prevalidation rejects a malformed candidate with no adapter/native/file capability, emits bounded stderr, and closes its owned input stream' $prepInvalidCandidateReported
+
+$prepWriteFailureAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepWriteFailureAdapter.WriteLine={param($Writer,$Line)
+    $script:D32PreparationSelfTestWriteCalls++
+    if($script:D32PreparationSelfTestWriteCalls -eq 1){throw 'D32_PREP_TEST_PRIMARY: synthetic challenge writer failure'}
+    throw 'D32_PREP_TEST_SECONDARY: synthetic refusal response writer failure'
+}
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$script:D32PreparationSelfTestWriteCalls=0L
+$prepWriteFailureOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWriteFailureDiagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWriteFailureCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'PreparationSession' -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepWriteFailureOutput -DiagnosticWriter $prepWriteFailureDiagnostics -TestAdapter $prepWriteFailureAdapter
+$prepWriteFailureDocument=[System.Text.Json.JsonDocument]::Parse($prepWriteFailureDiagnostics.ToString().Trim())
+$prepWriteFailureRoot=$prepWriteFailureDocument.RootElement
+$prepWriteFailureSecondary=$prepWriteFailureRoot.GetProperty('secondary_errors')
+$prepWriteFailureReported=$prepWriteFailureCode -eq 87 -and $prepWriteFailureOutput.ToString().Length -eq 0 -and
+    $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1 -and
+    $prepWriteFailureRoot.GetProperty('status').GetString() -ceq 'UNRESOLVED' -and
+    $prepWriteFailureRoot.GetProperty('primary_error').GetString().Contains('D32_PREP_TEST_PRIMARY') -and
+    $prepWriteFailureSecondary.GetArrayLength() -eq 1 -and $prepWriteFailureSecondary[0].GetString().Contains('D32_PREP_TEST_SECONDARY')
+$prepWriteFailureDocument.Dispose();$prepWriteFailureOutput.Dispose();$prepWriteFailureDiagnostics.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'failed challenge and refusal writes retain the original primary error, capture the secondary response failure, and keep protocol stdout empty' $prepWriteFailureReported
 
 $prepBadSequenceLine=$prepReadyLine.Replace('"sequence":1','"sequence":"1"')
 $script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L

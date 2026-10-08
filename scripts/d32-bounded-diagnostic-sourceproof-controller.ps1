@@ -3521,23 +3521,97 @@ function Invoke-D32PreparationOldRunBaselineProducer {
     return [PSCustomObject]@{Reference=$reference;OldCallerReference=$oldCallerReference;NativeUptime=$uptime;Status='CANDIDATE_ONLY'}
 }
 
+function Get-D32PreparationFailureStatus {
+    param([AllowNull()][string]$ErrorText)
+    if ([string]$ErrorText -match 'D32_(?:PREP_OBSERVER|NON_SOURCE_L1)_BUDGET_STOPPED') { return 'BUDGET_STOPPED' }
+    if ([string]$ErrorText -match 'D32_(?:PREP_OBSERVER|NON_SOURCE_L1)_BLOCKED') { return 'BLOCKED' }
+    if ([string]$ErrorText -match 'D32_(?:PREP_OBSERVER|NON_SOURCE_L1)_(?:REFUSED|EOF)') { return 'REFUSED' }
+    return 'UNRESOLVED'
+}
+
+function Write-D32PreparationEntryDiagnostic {
+    param([Parameter(Mandatory = $true)][ValidateSet('BLOCKED','BUDGET_STOPPED','REFUSED','UNRESOLVED')][string]$Status,
+        [AllowNull()][System.Exception]$PrimaryException, [AllowNull()][string]$PrimaryText,
+        [AllowNull()][string[]]$SecondaryErrors = @(), [AllowNull()][System.IO.TextWriter]$Writer)
+    if ($null -eq $Writer) { return $false }
+    $primary = if ($null -ne $PrimaryException) { Get-D32NonSourceL1ErrorText -Exception $PrimaryException } else { [string]$PrimaryText }
+    if ([string]::IsNullOrWhiteSpace($primary)) { $primary = 'D32_PREP_OBSERVER_REFUSED: preparation entry failed without a primary detail' }
+    if ($primary.Length -gt 1024) { $primary = $primary.Substring(0,1024) }
+    $jsonPrimary = '"' + [System.Text.Json.JsonEncodedText]::Encode([string]$primary).ToString() + '"'
+    $jsonSecondary = [System.Collections.Generic.List[string]]::new()
+    for ($secondaryIndex = 0; $secondaryIndex -lt $SecondaryErrors.Length -and $secondaryIndex -lt 4; $secondaryIndex++) {
+        $secondary = $SecondaryErrors[$secondaryIndex]
+        if ([string]::IsNullOrWhiteSpace([string]$secondary)) { continue }
+        $safe = Get-D32NonSourceL1ErrorText -Exception ([InvalidOperationException]::new([string]$secondary))
+        if ($safe.Length -gt 512) { $safe = $safe.Substring(0,512) }
+        $jsonSecondary.Add(('"' + [System.Text.Json.JsonEncodedText]::Encode([string]$safe).ToString() + '"'))
+    }
+    $line = '{"record_type":"D32_PREP_OBSERVER_ENTRY_DIAGNOSTIC_V1","status":"' + $Status +
+        '","gate_authority":"NONE","launch_authority":"NONE","primary_error":' + $jsonPrimary +
+        ',"secondary_errors":[' + [string]::Join(',', $jsonSecondary.ToArray()) + ']}'
+    if ($line.Length -gt 8192) {
+        $line = '{"record_type":"D32_PREP_OBSERVER_ENTRY_DIAGNOSTIC_V1","status":"UNRESOLVED","gate_authority":"NONE","launch_authority":"NONE","primary_error":"bounded diagnostic serialization exceeded its fixed limit","secondary_errors":[]}'
+    }
+    try { $Writer.WriteLine($line); $Writer.Flush(); return $true }
+    catch { return $false }
+}
+
+function Invoke-D32PreparationObserverSessionEntry {
+    param([Parameter(Mandatory = $true)][string]$ParameterSetName,
+        [Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer,
+        [Parameter(Mandatory = $true)][System.IO.TextWriter]$DiagnosticWriter, [AllowNull()][object]$TestAdapter = $null)
+    $sessionEntered = $false
+    try {
+        if ($ParameterSetName -cne 'PreparationSession') {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed preparation entry received a different PowerShell parameter set'
+        }
+        # Keep the existing observer host form, but disable command-name module
+        # autoload for this dynamic call chain before any preparation function runs.
+        $PSModuleAutoLoadingPreference = 'None'
+        if ([string]$PSModuleAutoLoadingPreference -cne 'None') {
+            throw 'D32_PREP_OBSERVER_REFUSED: module autoload preference could not be disabled in the fixed session scope'
+        }
+        $sessionEntered = $true
+        return [int](Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha `
+            -Reader $Reader -Writer $Writer -DiagnosticWriter $DiagnosticWriter -TestAdapter $TestAdapter)
+    } catch {
+        $status = Get-D32PreparationFailureStatus -ErrorText ([string]$_.Exception.Message)
+        $secondary = [System.Collections.Generic.List[string]]::new()
+        if (-not $sessionEntered) {
+            foreach ($stream in @($Reader,$Writer)) {
+                try { $stream.Dispose() }
+                catch { if ($secondary.Count -lt 4) { $secondary.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) } }
+            }
+        }
+        $null = Write-D32PreparationEntryDiagnostic -Status $status -PrimaryException $_.Exception `
+            -SecondaryErrors @($secondary.ToArray()) -Writer $DiagnosticWriter
+        return 87
+    }
+}
+
 function Invoke-D32PreparationObserverControlSession {
     param([Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
         [Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer,
-        [AllowNull()][object]$TestAdapter = $null)
-    $frequency = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.QpcFrequency) { [Int64](& $TestAdapter.QpcFrequency) } else { [Int64][Diagnostics.Stopwatch]::Frequency }
-    $started = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
-    if ($frequency -le 0 -or $started -le 0 -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
-        [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository)) {
-        throw 'D32_PREP_OBSERVER_REFUSED: fixed session candidate/repository or monotonic clock inputs are invalid'
-    }
-    $identityDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
-    $leaseDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 1800000L
+        [AllowNull()][System.IO.TextWriter]$DiagnosticWriter = $null, [AllowNull()][object]$TestAdapter = $null)
+    $frequency = 0L; $started = 0L; $identityDeadline = 0L; $leaseDeadline = 0L
     $snapshot = $null; $nonce = $null; $lastSequence = 0L; $candidateSequence = $null; $pinVerificationSequence = $null
     $state = 'AWAIT_READY'; $candidateResult = $null; $pinsVerified = $false; $baselineResult = $null
     $lastOperation = 'CHALLENGE'; $exitCode = 87; $closed = $false
-    $nowProvider = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { $TestAdapter.Now } else { { Get-D32NonSourceL1Now } }
+    $primaryFailure = $null; $secondaryFailures = [System.Collections.Generic.List[string]]::new()
+    $failureStatus = 'UNRESOLVED'
+    $nowProvider = $null
     try {
+        $PSModuleAutoLoadingPreference = 'None'
+        $frequency = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.QpcFrequency) { [Int64](& $TestAdapter.QpcFrequency) } else { [Int64][Diagnostics.Stopwatch]::Frequency }
+        $started = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
+        $nowProvider = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { $TestAdapter.Now } else { { Get-D32NonSourceL1Now } }
+        if ($frequency -le 0 -or $started -le 0 -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+            [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository)) {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed session candidate/repository or monotonic clock inputs are invalid'
+        }
+        $identityDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
+        $leaseDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 1800000L
         if ($null -ne $TestAdapter -and $null -ne $TestAdapter.CreateNonce) { $nonce = [string](& $TestAdapter.CreateNonce) }
         else { $nonce = [Guid]::NewGuid().ToString('N').ToLowerInvariant() }
         if ($nonce -cnotmatch '^[0-9a-f]{32}$') { throw 'D32_PREP_OBSERVER_REFUSED: session nonce is not fresh lower-case 32-hex' }
@@ -3628,6 +3702,8 @@ function Invoke-D32PreparationObserverControlSession {
             Write-D32PreparationControlResponse -Writer $Writer -Frame $response -TestAdapter $TestAdapter
         }
     } catch {
+        $primaryFailure = $_.Exception
+        $failureStatus = Get-D32PreparationFailureStatus -ErrorText ([string]$_.Exception.Message)
         $exitCode = 87
         if (-not [string]::IsNullOrWhiteSpace([string]$nonce)) {
             try {
@@ -3636,18 +3712,55 @@ function Invoke-D32PreparationObserverControlSession {
                     sequence=$errorSequence;candidate_sha=$CandidateSha;operation=$lastOperation;status='REFUSED'
                     gate_authority='NONE';launch_authority='NONE';payload=[PSCustomObject][ordered]@{reason='D32_PREP_OBSERVER_REFUSED';detail=(Get-D32NonSourceL1ErrorText -Exception $_.Exception)}}
                 Write-D32PreparationControlResponse -Writer $Writer -Frame $errorResponse -TestAdapter $TestAdapter
-            } catch {}
+            } catch { if ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) } }
         }
     } finally {
-        if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Close) { try { $null=& $TestAdapter.Close -Reader $Reader -Writer $Writer -Snapshot $snapshot } catch { $exitCode=87 } }
-        else {
-            try { $Reader.Dispose() } catch { $exitCode=87 }
-            try { $Writer.Dispose() } catch { $exitCode=87 }
-            if ($null -ne $snapshot) {
-                foreach ($item in $snapshot.Opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch { $exitCode=87 } }
-                foreach ($fence in $snapshot.DirectoryFences.Values) { try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } catch { $exitCode=87 } }
+        if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Close) {
+            try {
+                $closeResult = & $TestAdapter.Close -Reader $Reader -Writer $Writer -Snapshot $snapshot
+                if ($closeResult -is [bool] -and -not $closeResult) { throw 'synthetic owned control-channel close was not confirmed' }
+            } catch {
+                if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control-channel close was not confirmed', $_.Exception) }
+                elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                $failureStatus = 'UNRESOLVED'; $exitCode = 87
             }
         }
+        else {
+            try { $Reader.Dispose() }
+            catch {
+                if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control reader close failed', $_.Exception) }
+                elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                $failureStatus = 'UNRESOLVED'; $exitCode=87
+            }
+            try { $Writer.Dispose() }
+            catch {
+                if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control writer close failed', $_.Exception) }
+                elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                $failureStatus = 'UNRESOLVED'; $exitCode=87
+            }
+            if ($null -ne $snapshot) {
+                foreach ($item in $snapshot.Opened) {
+                    try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } }
+                    catch {
+                        if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation file close failed', $_.Exception) }
+                        elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                        $failureStatus = 'UNRESOLVED'; $exitCode=87
+                    }
+                }
+                foreach ($fence in $snapshot.DirectoryFences.Values) {
+                    try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+                    catch {
+                        if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation directory fence close failed', $_.Exception) }
+                        elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                        $failureStatus = 'UNRESOLVED'; $exitCode=87
+                    }
+                }
+            }
+        }
+    }
+    if ($null -ne $primaryFailure) {
+        $null = Write-D32PreparationEntryDiagnostic -Status $failureStatus -PrimaryException $primaryFailure `
+            -SecondaryErrors @($secondaryFailures.ToArray()) -Writer $DiagnosticWriter
     }
     return [int]$exitCode
 }
@@ -4566,9 +4679,9 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'PreparationSession') {
-    $PSModuleAutoLoadingPreference = 'None'
-    exit (Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha `
-        -Reader ([Console]::In) -Writer ([Console]::Out))
+    exit (Invoke-D32PreparationObserverSessionEntry -ParameterSetName $PSCmdlet.ParameterSetName `
+        -Repository $Repository -CandidateSha $CandidateSha -Reader ([Console]::In) -Writer ([Console]::Out) `
+        -DiagnosticWriter ([Console]::Error))
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'ObserverBindingPreparation') {

@@ -80,6 +80,36 @@ function Test-D32PowerShellAuthorityPathWithin {
     catch { return $false }
 }
 
+function Get-D32PowerShellAuthorityDirectoryFenceKey {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: directory fence path has no rooted volume'
+    }
+    # Numeric code points avoid PowerShell treating a doubled backslash string
+    # as a one-character TrimEnd argument.
+    $key = $full.TrimEnd([char[]]@([char]92, [char]47))
+    if ($key.Length -eq 2 -and $key[1] -eq ':') {
+        $key += [IO.Path]::DirectorySeparatorChar
+    }
+    return $key
+}
+
+function Get-D32PowerShellAuthorityRuntimeContentErrorCategory {
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception)
+    $message = [string]$Exception.Message
+    if ($message -match '(?is)System\.Char.*String must be exactly one character long|Cannot convert value .* to type "System\.Char"') {
+        return 'PATH_SEPARATOR_CHARACTER_WIDTH'
+    }
+    if ($message -match '(?i)deadline|budget') { return 'BOUNDED_DEADLINE' }
+    if ($message -match '(?i)ACL|security descriptor|untrusted namespace writer|protected namespace') { return 'PROTECTED_NAMESPACE_EVIDENCE' }
+    if ($message -match '(?i)Defender|WinTrust|Authenticode|signature') { return 'DEFENDER_COMPONENT_EVIDENCE' }
+    if ($message -match '(?i)deps\.json|runtimeconfig|TPA|native-search|resolver') { return 'RUNTIME_RESOLVER_INPUT' }
+    if ($message -match '(?i)module|Utility|manifest|closure') { return 'UTILITY_CLOSURE_INPUT' }
+    return 'RUNTIME_CONTENT_INPUT_OR_SCHEMA_REJECTED'
+}
+
 function Initialize-D32PowerShellAuthorityNativeApi {
     if ('D32PowerShellModuleNativeV2' -as [type]) { return }
     $assemblyName = [Reflection.AssemblyName]::new('D32PowerShellModuleNativeV2')
@@ -1908,7 +1938,7 @@ function New-D32PowerShellAuthorityStaticWindowsComponent {
     $sourceProof = [ordered]@{proof_type='GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1';api_path=$windowsRoot;environment_system_root=$systemRootFull;os_version=[Environment]::OSVersion.VersionString}
     $componentDigestMaterial = [string]$distribution.inventory_sha256 + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProof) + "`n"
     $componentDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($componentDigestMaterial))).ToLowerInvariant()
-    $rootKey = $windowsRoot.TrimEnd([char[]]@('\\','/')); if ($rootKey.Length -eq 2 -and $rootKey[1] -eq ':') { $rootKey += [IO.Path]::DirectorySeparatorChar }
+    $rootKey = Get-D32PowerShellAuthorityDirectoryFenceKey -Path $windowsRoot
     $rootFence = $DirectoryFences[$rootKey]
     if ($null -eq $rootFence) { throw 'static Windows component root identity fence is missing' }
     return [ordered]@{component_type='MICROSOFT_WINDOWS_OS_INSTALLATION';version=[Environment]::OSVersion.VersionString;root_path=$windowsRoot
@@ -1947,7 +1977,7 @@ function New-D32PowerShellAuthorityStaticDefenderComponent {
     $sourceProof = [ordered]@{proof_type='WINTRUST_CACHE_ONLY_AUTHENTICODE_V1';status='VERIFIED';anchor_images=$anchors.ToArray()}
     $digestMaterial = [string]$distribution.inventory_sha256 + "`n" + (ConvertTo-D32PowerShellAuthorityJsonText -Value $anchors.ToArray()) + "`n"
     $componentDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($digestMaterial))).ToLowerInvariant()
-    $rootKey = $root.TrimEnd([char[]]@('\\','/')); if ($rootKey.Length -eq 2 -and $rootKey[1] -eq ':') { $rootKey += [IO.Path]::DirectorySeparatorChar }
+    $rootKey = Get-D32PowerShellAuthorityDirectoryFenceKey -Path $root
     $rootFence = $DirectoryFences[$rootKey]
     if ($null -eq $rootFence) { throw 'fixed Defender package root identity fence is missing' }
     return [ordered]@{component_type='MICROSOFT_WINDOWS_DEFENDER_PLATFORM';version=[IO.Path]::GetFileName($root);root_path=$root
@@ -1957,6 +1987,7 @@ function New-D32PowerShellAuthorityStaticDefenderComponent {
 
 function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
     param([Parameter(Mandatory = $true)][string]$CandidateSha, [long]$DeadlineTicks = 0)
+    $phase = 'fixed_root_resolution'
     $repository = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot,'..'))
     $runtimeHome = [IO.Path]::GetFullPath([IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),'PowerShell','7'))
     $runtimePath = [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeHome,'pwsh.exe'))
@@ -1977,20 +2008,24 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
             $gaps.Add('candidate SHA or fixed Program Files PowerShell 7 root is not canonical')
             return [PSCustomObject][ordered]@{gate_authority='NONE';status='BLOCKED_INPUT_GAPS';candidate=$null;candidate_json=$null;candidate_sha256=$null;gaps=@($gaps.ToArray())}
         }
+        $phase = 'windows_root_binding'
         if (-not [StringComparer]::OrdinalIgnoreCase.Equals($windowsApiRoot,$systemRoot)) { throw 'GetWindowsDirectoryW does not match the fixed process SystemRoot namespace' }
+        $phase = 'repository_directory_fence'
         Add-D32PowerShellAuthorityDirectoryChain -Directory $repository -Fences $fences
-        $repositoryKey = $repository.TrimEnd([char[]]@('\\','/'))
-        if ($repositoryKey.Length -eq 2 -and $repositoryKey[1] -eq ':') { $repositoryKey += [IO.Path]::DirectorySeparatorChar }
+        $repositoryKey = Get-D32PowerShellAuthorityDirectoryFenceKey -Path $repository
         $repositoryFence = $fences[$repositoryKey]
         if ($null -eq $repositoryFence) { throw 'fixed source repository V2 identity fence is missing' }
         $repositoryIdentity = [PSCustomObject][ordered]@{VolumeSerialHex=[string]$repositoryFence.VolumeSerialHex;FileIdHex=[string]$repositoryFence.FileIdHex}
+        $phase = 'program_files_distribution_inventory'
         $runtimeFiles = [System.Collections.Generic.List[object]]::new()
         $distribution = Get-D32PowerShellAuthorityRuntimeDistributionSnapshot -PowerShellRoot $runtimeHome -DirectoryFences $fences -OpenFiles $runtimeFiles `
             -MaximumFiles 4096 -MaximumDirectories 1024 -MaximumAggregateBytes 2147483648L -MaximumSingleFileBytes 268435456L
         foreach ($file in $runtimeFiles) { Assert-D32PowerShellAuthorityPreparationDeadline; $opened.Add($file) }
+        $phase = 'fixed_runtime_image_open'
         $runtimeOpened = Open-D32PowerShellAuthorityFile -Path $runtimePath -DirectoryFences $fences -MaximumBytes 268435456L
         $opened.Add($runtimeOpened)
 
+        $phase = 'utility_module_closure'
         $utilityRole = $null
         foreach ($role in (Get-D32PowerShellAuthorityFixedModuleRoles -PowerShellRoot $runtimeHome)) {
             Assert-D32PowerShellAuthorityPreparationDeadline
@@ -2010,6 +2045,7 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
                 $opened.Add($utilityFile); $utilityRecords.Add($utilityFile.Record)
             }
         }
+        $phase = 'startup_file_states'
         $startupBytesByRole = [System.Collections.Generic.Dictionary[string,byte[]]]::new([StringComparer]::Ordinal)
         $startup = [ordered]@{}
         foreach ($input in @(@('deps','pwsh.deps.json'),@('runtime_config','pwsh.runtimeconfig.json'),@('protected_startup_config','powershell.config.json'))) {
@@ -2042,6 +2078,7 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
         if (-not $startupBytesByRole.ContainsKey('deps') -or -not $startupBytesByRole.ContainsKey('runtime_config')) {
             throw 'fixed pwsh.deps.json and pwsh.runtimeconfig.json content are both required to resolve the target runtime without child execution'
         }
+        $phase = 'deps_and_runtimeconfig_resolver_inputs'
         $staticAssets = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes $startupBytesByRole['deps'] `
             -PowerShellRoot $runtimeHome -DistributionFiles @($distribution.files)
         [void](Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes $startupBytesByRole['runtime_config'] -RuntimeTarget ([string]$staticAssets.RuntimeTarget))
@@ -2051,11 +2088,13 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
         foreach ($file in $runtimeFiles) { if ($nativeAssetPathSet.Contains([string]$file.Record.path)) { $nativeAssetSnapshots.Add($file) } }
         Assert-D32PowerShellAuthorityPreparationDeadline
         if ($nativeAssetSnapshots.Count -ne $staticAssets.NativeAssetFiles.Count) { throw 'fixed pwsh.deps.json native assets do not all have their independently opened V2 file snapshots' }
+        $phase = 'windows_os_security_component'
         $windowsNativeFiles = Get-D32PowerShellAuthorityStaticWindowsNativeFiles -PowerShellRoot $runtimeHome -SystemRoot $systemRoot `
             -RuntimeFiles $runtimeFiles.ToArray() -NativeAssetFiles $nativeAssetSnapshots.ToArray() -DirectoryFences $fences -OpenFiles $opened
         $windowsComponent = New-D32PowerShellAuthorityStaticWindowsComponent -SystemRoot $systemRoot -NativeFiles $windowsNativeFiles `
             -TrustedPlatformAssemblyReferences $staticAssets.TrustedPlatformAssemblyReferences -DirectoryFences $fences -OpenFiles $opened
 
+        $phase = 'defender_security_component'
         $defenderParent = 'C:\ProgramData\Microsoft\Windows Defender\Platform'
         if (-not [IO.Directory]::Exists($defenderParent)) { throw 'fixed protected Defender Platform parent is unavailable' }
         Add-D32PowerShellAuthorityDirectoryChain -Directory $defenderParent -Fences $fences
@@ -2072,6 +2111,7 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
             -DirectoryFences $fences -OpenFiles $opened
         $osSecurityComponents = @($windowsComponent,$defenderComponent)
 
+        $phase = 'native_resolver_directories'
         $nativeDirectoryByPath = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
         $fixedNativePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         [void]$fixedNativePaths.Add($runtimeHome); [void]$fixedNativePaths.Add([IO.Path]::GetFullPath([IO.Path]::Combine($systemRoot,'System32')))
@@ -2092,6 +2132,7 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
         }
         if ($nativeDirectoryByPath.Count -lt 1 -or $nativeDirectoryByPath.Count -gt 1024) { throw 'fixed target native-search V2 directory list is empty or exceeds 1024 entries' }
         Assert-D32PowerShellAuthorityPreparationDeadline
+        $phase = 'strict_candidate_json_readback'
         return New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $CandidateSha -Repository $repository `
             -RepositoryIdentity $repositoryIdentity -RuntimeFileReference $runtimeReference -PowerShellHome $runtimeHome -SystemRoot $systemRoot `
             -Distribution $distribution -OsSecurityComponents $osSecurityComponents -UtilityManifestReference $expectedUtility.Manifest.Record `
@@ -2099,7 +2140,11 @@ function New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate {
             -TrustedPlatformAssemblyReferences $staticAssets.TrustedPlatformAssemblyReferences `
             -NativeSearchDirectoryRecords @($nativeDirectoryByPath.Values) -InputGaps $gaps.ToArray()
     } catch {
-        $gaps.Add([string]$_.Exception.Message)
+        $primaryException = $_.Exception
+        $category = Get-D32PowerShellAuthorityRuntimeContentErrorCategory -Exception $primaryException
+        $exceptionType = [string]$primaryException.GetType().Name
+        $gaps.Add(('D32_RUNTIME_CONTENT_PRODUCER_BLOCKED: source=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate; phase=' +
+            [string]$phase + '; category=' + [string]$category + '; exception_type=' + $exceptionType))
         return [PSCustomObject][ordered]@{gate_authority='NONE';status='BLOCKED_INPUT_GAPS';candidate=$null;candidate_json=$null;candidate_sha256=$null;gaps=@($gaps.ToArray())}
     } finally {
         foreach ($item in $opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch {} }

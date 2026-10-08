@@ -1755,6 +1755,229 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileState {
     } catch { return $false }
 }
 
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1ProtectedAbsenceWitnessSha256 {
+    param([Parameter(Mandatory = $true)][string]$RolePath, [Parameter(Mandatory = $true)][object]$ParentDirectoryRecord)
+    $parent = [ordered]@{
+        kind = [string]$ParentDirectoryRecord.kind; path = [string]$ParentDirectoryRecord.path
+        volume_serial_hex = [string]$ParentDirectoryRecord.volume_serial_hex; file_id_hex = [string]$ParentDirectoryRecord.file_id_hex
+        owner_sid = [string]$ParentDirectoryRecord.owner_sid; security_descriptor_sddl = [string]$ParentDirectoryRecord.security_descriptor_sddl
+        security_descriptor_sha256 = [string]$ParentDirectoryRecord.security_descriptor_sha256
+    }
+    $projection = [ordered]@{ policy_id = 'D32_NON_SOURCE_L1_PROTECTED_ABSENCE_V1'; role_path = [IO.Path]::GetFullPath($RolePath); parent_directory = $parent }
+    $text = ConvertTo-D32PowerShellAuthorityJsonText -Value $projection
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($text))).ToLowerInvariant()
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDirectoryRecord {
+    param([AllowNull()][object]$Record, [switch]$AllowAncestor)
+    try {
+        return ((Test-D32BoundedCompilerDiagnosticExactProperties $Record @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256')) -and
+            ([string]$Record.kind -ceq 'directory' -or ($AllowAncestor -and [string]$Record.kind -ceq 'ancestor')) -and
+            (Test-D32BoundedCompilerDiagnosticCanonicalPath $Record.path) -and
+            (Test-D32BoundedCompilerDiagnosticIdentityPair $Record) -and
+            [string]$Record.owner_sid -cmatch '^S-1-(?:[0-9]{1,10}-)*[0-9]{1,10}$' -and
+            -not [string]::IsNullOrWhiteSpace([string]$Record.security_descriptor_sddl) -and
+            [string]$Record.security_descriptor_sha256 -cmatch '^[0-9a-f]{64}$' -and
+            [string]$Record.security_descriptor_sha256 -ceq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.UTF8Encoding]::new($false).GetBytes([string]$Record.security_descriptor_sddl))).ToLowerInvariant())
+    } catch { return $false }
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileRecord {
+    param([AllowNull()][object]$Record)
+    try {
+        return ((Test-D32BoundedCompilerDiagnosticExactProperties $Record @('kind','path','bytes','sha256','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256')) -and
+            [string]$Record.kind -ceq 'file' -and (Test-D32BoundedCompilerDiagnosticCanonicalPath $Record.path) -and
+            (Test-D32BoundedCompilerDiagnosticInteger $Record.bytes -Positive) -and [Int64]$Record.bytes -le 268435456 -and
+            [string]$Record.sha256 -cmatch '^[0-9a-f]{64}$' -and (Test-D32BoundedCompilerDiagnosticIdentityPair $Record) -and
+            [string]$Record.owner_sid -cmatch '^S-1-(?:[0-9]{1,10}-)*[0-9]{1,10}$' -and
+            -not [string]::IsNullOrWhiteSpace([string]$Record.security_descriptor_sddl) -and
+            [string]$Record.security_descriptor_sha256 -cmatch '^[0-9a-f]{64}$' -and
+            [string]$Record.security_descriptor_sha256 -ceq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.UTF8Encoding]::new($false).GetBytes([string]$Record.security_descriptor_sddl))).ToLowerInvariant())
+    } catch { return $false }
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDistributionRecord {
+    param([AllowNull()][object]$Distribution, [Parameter(Mandatory = $true)][string]$ExpectedRoot,
+        [switch]$RequireNativeFileMirror)
+    try {
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Distribution @('root_path','inventory_sha256','directories','files','protected_ancestors','trusted_writer_sids')) -or
+            [string]$Distribution.root_path -cne $ExpectedRoot -or
+            [string]$Distribution.inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $Distribution.directories -isnot [Array] -or $Distribution.directories.Count -lt 1 -or $Distribution.directories.Count -gt 1024 -or
+            $Distribution.files -isnot [Array] -or $Distribution.files.Count -lt 1 -or $Distribution.files.Count -gt 4096 -or
+            $Distribution.protected_ancestors -isnot [Array] -or $Distribution.protected_ancestors.Count -lt 1 -or $Distribution.protected_ancestors.Count -gt 1024 -or
+            $Distribution.trusted_writer_sids -isnot [Array] -or $Distribution.trusted_writer_sids.Count -ne 3) { return $false }
+        $expectedWriters = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
+        for ($index = 0; $index -lt $expectedWriters.Count; $index++) { if ([string]$Distribution.trusted_writer_sids[$index] -cne $expectedWriters[$index]) { return $false } }
+
+        $directories = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $files = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $identities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($directory in @($Distribution.directories)) {
+            if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDirectoryRecord $directory) -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$directory.path,[string]$ExpectedRoot) -and
+                -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$directory.path) $ExpectedRoot) -or
+                -not $directories.TryAdd([string]$directory.path,$directory) -or
+                -not $identities.Add(([string]$directory.volume_serial_hex + ':' + [string]$directory.file_id_hex))) { return $false }
+        }
+        if (-not $directories.ContainsKey($ExpectedRoot)) { return $false }
+        foreach ($directory in @($Distribution.directories)) {
+            if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$directory.path,$ExpectedRoot)) { continue }
+            if (-not $directories.ContainsKey([IO.Path]::GetDirectoryName([string]$directory.path))) { return $false }
+        }
+        foreach ($file in @($Distribution.files)) {
+            if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileRecord $file) -or
+                -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$file.path) $ExpectedRoot) -or
+                -not $directories.ContainsKey([IO.Path]::GetDirectoryName([string]$file.path)) -or
+                -not $files.TryAdd([string]$file.path,$file) -or
+                -not $identities.Add(([string]$file.volume_serial_hex + ':' + [string]$file.file_id_hex))) { return $false }
+        }
+        $expectedAncestors = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $ancestorPath = [IO.Path]::GetDirectoryName($ExpectedRoot)
+        while (-not [string]::IsNullOrWhiteSpace($ancestorPath)) {
+            $fullAncestor = [IO.Path]::GetFullPath($ancestorPath)
+            [void]$expectedAncestors.Add($fullAncestor)
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($fullAncestor,[IO.Path]::GetPathRoot($fullAncestor))) { break }
+            $ancestorPath = [IO.Path]::GetDirectoryName($fullAncestor)
+        }
+        $seenAncestors = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($ancestor in @($Distribution.protected_ancestors)) {
+            if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDirectoryRecord $ancestor -AllowAncestor) -or
+                [string]$ancestor.kind -cne 'ancestor' -or -not $expectedAncestors.Contains([string]$ancestor.path) -or
+                -not $seenAncestors.Add([string]$ancestor.path) -or
+                -not $identities.Add(([string]$ancestor.volume_serial_hex + ':' + [string]$ancestor.file_id_hex))) { return $false }
+        }
+        if ($seenAncestors.Count -ne $expectedAncestors.Count) { return $false }
+        if ((Get-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeInventoryDigest -Directories @($Distribution.directories) `
+                -Files @($Distribution.files) -Ancestors @($Distribution.protected_ancestors)) -cne [string]$Distribution.inventory_sha256) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeInventoryDigest {
+    param([AllowEmptyCollection()][object[]]$Directories = @(), [AllowEmptyCollection()][object[]]$Files = @(),
+        [AllowEmptyCollection()][object[]]$Ancestors = @())
+    $builder = [Text.StringBuilder]::new()
+    foreach ($group in @(
+            [PSCustomObject]@{ kind='ancestor'; items=$Ancestors },
+            [PSCustomObject]@{ kind='directory'; items=$Directories },
+            [PSCustomObject]@{ kind='file'; items=$Files })) {
+        $ordered = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($item in $group.items) {
+            $path = [string]$item.path
+            if ([string]::IsNullOrWhiteSpace($path) -or $ordered.ContainsKey($path)) { throw 'D32_NON_SOURCE_L1_REFUSED: V2 runtime inventory has a duplicate or empty path' }
+            $ordered.Add($path, $item)
+        }
+        foreach ($item in $ordered.Values) {
+            $kind = [string]$item.kind
+            if ([string]::IsNullOrWhiteSpace($kind)) { $kind = [string]$group.kind }
+            [void]$builder.Append($kind).Append('|').Append(([string]$item.path).Length).Append(':').Append([string]$item.path).Append('|')
+            if ($kind -ceq 'file') { [void]$builder.Append([Int64]$item.bytes).Append('|').Append([string]$item.sha256).Append('|') }
+            [void]$builder.Append([string]$item.volume_serial_hex).Append('|').Append([string]$item.file_id_hex).Append('|').Append([string]$item.owner_sid).Append('|').Append([string]$item.security_descriptor_sha256).Append("`n")
+        }
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($builder.ToString())
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1FileInventoryDigest {
+    param([Parameter(Mandatory = $true)][string]$Role, [AllowEmptyCollection()][object[]]$Files = @())
+    $ordered = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $Files) {
+        $path = [string]$file.path
+        if ([string]::IsNullOrWhiteSpace($path) -or $ordered.ContainsKey($path)) { throw 'D32_NON_SOURCE_L1_REFUSED: file inventory has a duplicate or empty path' }
+        $ordered.Add($path, $file)
+    }
+    $builder = [Text.StringBuilder]::new()
+    foreach ($file in $ordered.Values) {
+        [void]$builder.Append(([string]$file.path).Length).Append(':').Append([string]$file.path).Append('|').Append([Int64]$file.bytes).Append('|').Append([string]$file.sha256).Append('|')
+        [void]$builder.Append([string]$file.volume_serial_hex).Append('|').Append([string]$file.file_id_hex).Append("`n")
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Role + "`n" + $builder.ToString())
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-D32BoundedDiagnosticSourceProofNonSourceL1TpaInventoryDigest {
+    param([AllowEmptyCollection()][object[]]$Files = @())
+    return Get-D32BoundedDiagnosticSourceProofNonSourceL1FileInventoryDigest -Role 'D32_NON_SOURCE_L1_TRUSTED_PLATFORM_ASSEMBLIES_V1' -Files $Files
+}
+
+function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeComponent {
+    param([AllowNull()][object]$Component, [Parameter(Mandatory = $true)][string]$ExpectedType,
+        [Parameter(Mandatory = $true)][string]$ExpectedRoot, [Parameter(Mandatory = $true)][string]$ExpectedSystemRoot)
+    try {
+        if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $Component @('component_type','version','root_path','root_volume_serial_hex','root_file_id_hex','inventory_sha256','source_proof','distribution','native_files')) -or
+            [string]$Component.component_type -cne $ExpectedType -or [string]$Component.root_path -cne $ExpectedRoot -or
+            [string]::IsNullOrWhiteSpace([string]$Component.version) -or
+            ($ExpectedType -ceq 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM' -and [string]$Component.version -cne [IO.Path]::GetFileName($ExpectedRoot)) -or
+            [string]$Component.root_volume_serial_hex -cnotmatch '^[0-9a-f]{16}$' -or [string]$Component.root_file_id_hex -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$Component.inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            -not (Test-D32BoundedCompilerDiagnosticIdentityPair $Component -VolumeName 'root_volume_serial_hex' -FileIdName 'root_file_id_hex') -or
+            -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDistributionRecord -Distribution $Component.distribution -ExpectedRoot $ExpectedRoot) -or
+            $Component.native_files -isnot [Array] -or $Component.native_files.Count -lt 1 -or $Component.native_files.Count -gt 4096) { return $false }
+        $rootDirectory = $null
+        foreach ($directory in @($Component.distribution.directories)) {
+            if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$directory.path,$ExpectedRoot)) { $rootDirectory = $directory; break }
+        }
+        if ($null -eq $rootDirectory -or [string]$rootDirectory.volume_serial_hex -cne [string]$Component.root_volume_serial_hex -or
+            [string]$rootDirectory.file_id_hex -cne [string]$Component.root_file_id_hex) { return $false }
+        $distributionFiles = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in @($Component.distribution.files)) { $distributionFiles.Add([string]$file.path,$file) }
+        $nativePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($native in @($Component.native_files)) {
+            if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileRecord $native) -or
+                -not $nativePaths.Add([string]$native.path) -or -not $distributionFiles.ContainsKey([string]$native.path)) { return $false }
+            $expected = $distributionFiles[[string]$native.path]
+            foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256')) {
+                if ([string]$native.$name -cne [string]$expected.$name) { return $false }
+            }
+        }
+
+        if ($ExpectedType -ceq 'MICROSOFT_WINDOWS_OS_INSTALLATION') {
+            $sourceProof = $Component.source_proof
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $sourceProof @('proof_type','api_path','environment_system_root','os_version')) -or
+                [string]$sourceProof.proof_type -cne 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1' -or
+                [string]$sourceProof.api_path -cne $ExpectedRoot -or [string]$sourceProof.environment_system_root -cne $ExpectedSystemRoot -or
+                [string]$sourceProof.os_version -cne [string]$Component.version -or $Component.native_files.Count -ne $Component.distribution.files.Count) { return $false }
+        } else {
+            $sourceProof = $Component.source_proof
+            $rootLeaf = [IO.Path]::GetFileName($ExpectedRoot)
+            $lastDash = $rootLeaf.LastIndexOf('-')
+            if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $sourceProof @('proof_type','status','anchor_images')) -or
+                [string]$sourceProof.proof_type -cne 'WINTRUST_CACHE_ONLY_AUTHENTICODE_V1' -or [string]$sourceProof.status -cne 'VERIFIED' -or
+                $sourceProof.anchor_images -isnot [Array] -or $sourceProof.anchor_images.Count -ne 2 -or $lastDash -le 0) { return $false }
+            $anchors = @('MpOav.dll','MPCLIENT.DLL')
+            $anchorPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            for ($index = 0; $index -lt $anchors.Count; $index++) {
+                $anchor = $sourceProof.anchor_images[$index]
+                if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $anchor @('file','source_proof')) -or
+                    -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $anchor.file) -or
+                    -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFileName([string]$anchor.file.path),[string]$anchors[$index]) -or
+                    -not $anchorPaths.Add([string]$anchor.file.path) -or -not $nativePaths.Contains([string]$anchor.file.path)) { return $false }
+                $distributionFile = $distributionFiles[[string]$anchor.file.path]
+                foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+                    if ([string]$anchor.file.$name -cne [string]$distributionFile.$name) { return $false }
+                }
+                $signature = $anchor.source_proof
+                if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $signature @('proof_type','signature_status','signer_simple_name','issuer_name','signer_thumbprint','company_name','product_name','product_version','file_version')) -or
+                    [string]$signature.proof_type -cne 'WINTRUST_CACHE_ONLY_AUTHENTICODE_V1' -or
+                    [string]$signature.signature_status -cne 'VALID' -or [string]$signature.signer_simple_name -cne 'Microsoft Windows' -or
+                    [string]$signature.issuer_name -cnotlike 'CN=Windows Production PCA 2023,*' -or
+                    [string]$signature.signer_thumbprint -cnotmatch '^[0-9a-f]{40}$' -or
+                    [string]$signature.company_name -cne 'Microsoft Corporation' -or
+                    [string]$signature.product_version -cne $rootLeaf.Substring(0,$lastDash) -or
+                    [string]::IsNullOrWhiteSpace([string]$signature.product_name) -or [string]::IsNullOrWhiteSpace([string]$signature.file_version)) { return $false }
+            }
+        }
+        $digestMaterial = [string]$Component.distribution.inventory_sha256 + "`n" +
+            (ConvertTo-D32PowerShellAuthorityJsonText -Value $sourceProof) + "`n"
+        $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($digestMaterial))).ToLowerInvariant()
+        return $digest -ceq [string]$Component.inventory_sha256
+    } catch { return $false }
+}
+
 function Assert-D32BoundedDiagnosticSourceProofCanonicalUnicode {
     param([Parameter(Mandatory = $true)][string]$Value)
     for ($index = 0; $index -lt $Value.Length; $index++) {
@@ -2001,6 +2224,17 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityS
             }
         }
     }
+    if ((Get-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeInventoryDigest -Directories @($distribution.directories) `
+            -Files @($distribution.files) -Ancestors @($distribution.protected_ancestors)) -cne [string]$distribution.inventory_sha256) { return $false }
+    if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDistributionRecord -Distribution $distribution -ExpectedRoot ([string]$runtime.powershell_home))) { return $false }
+    $runtimeFileRecord = $null
+    foreach ($file in @($distribution.files)) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$file.path,[string]$runtime.path)) { $runtimeFileRecord = $file; break }
+    }
+    if ($null -eq $runtimeFileRecord) { return $false }
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$runtime.$name -cne [string]$runtimeFileRecord.$name) { return $false }
+    }
     $expectedWriters = @('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')
     if ($distribution.trusted_writer_sids -isnot [Array] -or $distribution.trusted_writer_sids.Count -ne 3) { return $false }
     for ($index=0; $index -lt 3; $index++) { if ([string]$distribution.trusted_writer_sids[$index] -cne $expectedWriters[$index]) { return $false } }
@@ -2029,6 +2263,13 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityS
         [string]$resolver.os_security_components[0].source_proof.proof_type -cne 'GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1' -or
         [string]$resolver.os_security_components[1].source_proof.proof_type -cne 'WINTRUST_CACHE_ONLY_AUTHENTICODE_V1' -or
         [string]$resolver.os_security_components[1].source_proof.status -cne 'VERIFIED') { return $false }
+    foreach ($component in @($resolver.os_security_components)) {
+        $expectedComponentRoot = [string]$component.root_path
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeComponent -Component $component `
+                -ExpectedType ([string]$component.component_type) -ExpectedRoot $expectedComponentRoot -ExpectedSystemRoot ([string]$runtime.system_root))) { return $false }
+        if ([string]$component.component_type -ceq 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM' -and
+            -not (Test-D32BoundedCompilerDiagnosticWithin $expectedComponentRoot 'C:\ProgramData\Microsoft\Windows Defender\Platform')) { return $false }
+    }
 
     $modulePolicy = $Document.module_policy
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $modulePolicy @('policy_id','controller_utility_manifest','controller_utility_inventory_sha256','controller_import_count','reader_import_count','controller_allowed_commands','reader_wait_policy')) -or
@@ -2041,6 +2282,23 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityS
         $modulePolicy.controller_allowed_commands -isnot [Array] -or $modulePolicy.controller_allowed_commands.Count -ne 2 -or
         [string]$modulePolicy.controller_allowed_commands[0] -cne 'Add-Type' -or [string]$modulePolicy.controller_allowed_commands[1] -cne 'ConvertTo-Json' -or
         [string]$modulePolicy.reader_wait_policy -cne 'MANAGED_FINITE_WAIT_V1') { return $false }
+    $utilityManifestPath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$runtime.powershell_home,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1'))
+    $utilityDirectory = [IO.Path]::GetDirectoryName($utilityManifestPath)
+    $utilityClosure = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @($distribution.files)) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$file.path,$utilityManifestPath) -or
+            (Test-D32BoundedCompilerDiagnosticWithin ([string]$file.path) $utilityDirectory) -or
+            [StringComparer]::OrdinalIgnoreCase.Equals([string]$file.path,[IO.Path]::GetFullPath([IO.Path]::Combine([string]$runtime.powershell_home,'Microsoft.PowerShell.Commands.Utility.dll')))) {
+            $utilityClosure.Add([string]$file.path,$file)
+        }
+    }
+    if (-not $utilityClosure.ContainsKey($utilityManifestPath) -or
+        -not $utilityClosure.ContainsKey([IO.Path]::GetFullPath([IO.Path]::Combine([string]$runtime.powershell_home,'Microsoft.PowerShell.Commands.Utility.dll'))) -or
+        (Get-D32BoundedDiagnosticSourceProofNonSourceL1FileInventoryDigest -Role 'Utility' -Files @($utilityClosure.Values)) -cne [string]$modulePolicy.controller_utility_inventory_sha256) { return $false }
+    $utilityManifestRecord = $utilityClosure[$utilityManifestPath]
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$modulePolicy.controller_utility_manifest.$name -cne [string]$utilityManifestRecord.$name) { return $false }
+    }
 
     $startup = $Document.startup_inputs
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $startup @('policy_id','deps','runtime_config','protected_startup_config','trusted_platform_assemblies','native_search','startup_hooks','profiling')) -or
@@ -2048,28 +2306,77 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityS
         -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileState $startup.deps) -or
         -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileState $startup.runtime_config) -or
         -not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeFileState $startup.protected_startup_config)) { return $false }
-    foreach ($input in @($startup.deps,$startup.runtime_config,$startup.protected_startup_config)) {
-        if ([string]$input.state -ceq 'PRESENT' -and
-            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$input.reference.path),[string]$runtime.powershell_home) -and
-            -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$input.reference.path) ([string]$runtime.powershell_home))) { return $false }
+    foreach ($inputRole in @(
+            [PSCustomObject]@{ name='deps'; file='pwsh.deps.json' },
+            [PSCustomObject]@{ name='runtime_config'; file='pwsh.runtimeconfig.json' },
+            [PSCustomObject]@{ name='protected_startup_config'; file='powershell.config.json' })) {
+        $input = $startup.([string]$inputRole.name)
+        $roleName = [string]$inputRole.file
+        $expectedInputPath = [IO.Path]::GetFullPath([IO.Path]::Combine([string]$runtime.powershell_home,$roleName))
+        if ([string]$input.state -ceq 'PRESENT') {
+            if ([string]$input.reference.path -cne $expectedInputPath) { return $false }
+            $inputFile = $null
+            foreach ($file in @($distribution.files)) { if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$file.path,$expectedInputPath)) { $inputFile = $file; break } }
+            if ($null -eq $inputFile) { return $false }
+            foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+                if ([string]$input.reference.$name -cne [string]$inputFile.$name) { return $false }
+            }
+        } else {
+            $parentPath = [IO.Path]::GetDirectoryName($expectedInputPath); $parentRecord = $null
+            foreach ($directory in @($distribution.directories)) { if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$directory.path,$parentPath)) { $parentRecord = $directory; break } }
+            $absentFilePresent = $false
+            foreach ($file in @($distribution.files)) { if ([StringComparer]::OrdinalIgnoreCase.Equals([string]$file.path,$expectedInputPath)) { $absentFilePresent = $true; break } }
+            if ($absentFilePresent -or $null -eq $parentRecord -or [string]$input.absence_witness_sha256 -cne
+                (Get-D32BoundedDiagnosticSourceProofNonSourceL1ProtectedAbsenceWitnessSha256 -RolePath $expectedInputPath -ParentDirectoryRecord $parentRecord)) { return $false }
+        }
     }
     if (-not (Test-D32BoundedCompilerDiagnosticExactProperties $startup.trusted_platform_assemblies @('count','inventory_sha256','paths')) -or
-        -not (Test-D32BoundedCompilerDiagnosticInteger $startup.trusted_platform_assemblies.count) -or [Int64]$startup.trusted_platform_assemblies.count -gt 1024 -or
+        -not (Test-D32BoundedCompilerDiagnosticInteger $startup.trusted_platform_assemblies.count -Positive) -or [Int64]$startup.trusted_platform_assemblies.count -gt 1024 -or
         [string]$startup.trusted_platform_assemblies.inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $startup.trusted_platform_assemblies.paths -isnot [Array] -or $startup.trusted_platform_assemblies.paths.Count -ne [Int64]$startup.trusted_platform_assemblies.count -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $startup.native_search @('inventory_sha256','paths')) -or
         [string]$startup.native_search.inventory_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $startup.native_search.paths -isnot [Array] -or
-        $startup.native_search.paths.Count -gt 1024 -or
+        $startup.native_search.paths.Count -lt 1 -or $startup.native_search.paths.Count -gt 1024 -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $startup.startup_hooks @('state','paths')) -or
         [string]$startup.startup_hooks.state -cne 'ABSENT' -or $startup.startup_hooks.paths -isnot [Array] -or $startup.startup_hooks.paths.Count -ne 0 -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $startup.profiling @('enabled','variables')) -or
         $startup.profiling.enabled -isnot [bool] -or [bool]$startup.profiling.enabled -or
         $startup.profiling.variables -isnot [Array] -or $startup.profiling.variables.Count -ne 0) { return $false }
-    foreach ($reference in @($startup.trusted_platform_assemblies.paths) + @($startup.native_search.paths)) {
+    if ((Get-D32BoundedDiagnosticSourceProofNonSourceL1TpaInventoryDigest -Files @($startup.trusted_platform_assemblies.paths)) -cne [string]$startup.trusted_platform_assemblies.inventory_sha256 -or
+        (Get-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeInventoryDigest -Directories @($startup.native_search.paths) -Files @() -Ancestors @()) -cne [string]$startup.native_search.inventory_sha256) { return $false }
+    $availableRuntimeFiles = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $availableNativeDirectories = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @($distribution.files)) { $availableRuntimeFiles.Add([string]$file.path,$file) }
+    foreach ($directory in @($distribution.directories)) { $availableNativeDirectories.Add([string]$directory.path,$directory) }
+    foreach ($component in @($resolver.os_security_components)) {
+        foreach ($file in @($component.distribution.files)) { if (-not $availableRuntimeFiles.ContainsKey([string]$file.path)) { $availableRuntimeFiles.Add([string]$file.path,$file) } }
+        if ([string]$component.component_type -ceq 'MICROSOFT_WINDOWS_OS_INSTALLATION') {
+            foreach ($directory in @($component.distribution.directories)) { if (-not $availableNativeDirectories.ContainsKey([string]$directory.path)) { $availableNativeDirectories.Add([string]$directory.path,$directory) } }
+        }
+    }
+    $previousTpaPath = $null
+    foreach ($reference in @($startup.trusted_platform_assemblies.paths)) {
         if (-not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $reference) -or
             (-not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) ([string]$runtime.powershell_home)) -and
-             -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) ([string]$runtime.system_root)) -and
-             -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) 'C:\ProgramData\Microsoft\Windows Defender\Platform'))) { return $false }
+             -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) ([string]$runtime.system_root))) -or
+            ($null -ne $previousTpaPath -and [StringComparer]::OrdinalIgnoreCase.Compare([string]$previousTpaPath,[string]$reference.path) -ge 0) -or
+            -not $availableRuntimeFiles.ContainsKey([string]$reference.path)) { return $false }
+        $fileRecord = $availableRuntimeFiles[[string]$reference.path]
+        foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) { if ([string]$reference.$name -cne [string]$fileRecord.$name) { return $false } }
+        $previousTpaPath = [string]$reference.path
+    }
+    $previousNativePath = $null
+    foreach ($reference in @($startup.native_search.paths)) {
+        if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeDirectoryRecord $reference) -or
+            (-not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) ([string]$runtime.powershell_home)) -and
+             -not (Test-D32BoundedCompilerDiagnosticWithin ([string]$reference.path) ([string]$runtime.system_root))) -or
+            ($null -ne $previousNativePath -and [StringComparer]::OrdinalIgnoreCase.Compare([string]$previousNativePath,[string]$reference.path) -ge 0) -or
+            -not $availableNativeDirectories.ContainsKey([string]$reference.path)) { return $false }
+        $directoryRecord = $availableNativeDirectories[[string]$reference.path]
+        foreach ($name in @('kind','path','volume_serial_hex','file_id_hex','owner_sid','security_descriptor_sddl','security_descriptor_sha256')) {
+            if ([string]$reference.$name -cne [string]$directoryRecord.$name) { return $false }
+        }
+        $previousNativePath = [string]$reference.path
     }
     $limits = $Document.limits
     $expectedLimits = [ordered]@{ runtime_bytes=4194304L; file_count=4096L; directory_count=1024L; aggregate_bytes=2147483648L; single_file_bytes=268435456L; resolver_list_entries=1024L }
@@ -2258,13 +2565,13 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1OuterCallerShape {
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $OuterCaller.entry_reference) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $OuterCaller.observer_host_reference) -or
         [string]$OuterCaller.entry_reference.path -cne [string]$Authority.source_pins[0].path -or
-        [string]$OuterCaller.observer_host_reference.path -cne [string]$Authority.powershell_runtime.path -or
+        [StringComparer]::OrdinalIgnoreCase.Equals([string]$OuterCaller.observer_host_reference.path,[string]$Authority.powershell_runtime.path) -or
         [string]$OuterCaller.observer_process_policy -cne 'EXISTING_TRUSTED_OBSERVER_CURRENT_PROCESS_V1' -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $OuterCaller.observer_process @('process_id','creation_filetime_ticks','image_reference','ordinary_token')) -or
         -not (Test-D32BoundedCompilerDiagnosticInteger $OuterCaller.observer_process.process_id -Positive) -or
         -not (Test-D32BoundedCompilerDiagnosticInteger $OuterCaller.observer_process.creation_filetime_ticks -Positive) -or
         -not (Test-D32BoundedCompilerDiagnosticFileReferenceShape $OuterCaller.observer_process.image_reference) -or
-        [string]$OuterCaller.observer_process.image_reference.path -cne [string]$Authority.powershell_runtime.path -or
+        [string]$OuterCaller.observer_process.image_reference.path -cne [string]$OuterCaller.observer_host_reference.path -or
         -not (Test-D32BoundedCompilerDiagnosticExactProperties $OuterCaller.observer_process.ordinary_token @('elevated','high_integrity','system_token','thread_impersonation')) -or
         $OuterCaller.observer_process.ordinary_token.elevated -isnot [bool] -or $OuterCaller.observer_process.ordinary_token.high_integrity -isnot [bool] -or
         $OuterCaller.observer_process.ordinary_token.system_token -isnot [bool] -or $OuterCaller.observer_process.ordinary_token.thread_impersonation -isnot [bool] -or
@@ -2286,6 +2593,9 @@ function Test-D32BoundedDiagnosticSourceProofNonSourceL1OuterCallerShape {
         $OuterCaller.ownership_policy.kill_on_close -isnot [bool] -or -not $OuterCaller.ownership_policy.kill_on_close -or
         $OuterCaller.ownership_policy.non_breakaway -isnot [bool] -or -not $OuterCaller.ownership_policy.non_breakaway -or
         [string]$OuterCaller.ownership_policy.controller_creation_policy -cne 'SUSPENDED_ASSIGN_RESUME_ONCE_V1') { return $false }
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$OuterCaller.observer_process.image_reference.$name -cne [string]$OuterCaller.observer_host_reference.$name) { return $false }
+    }
     return $true
     } catch { return $false }
 }

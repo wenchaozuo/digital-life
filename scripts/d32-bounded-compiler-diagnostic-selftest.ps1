@@ -3264,10 +3264,15 @@ for ($runtimeByteIndex = 0; $runtimeByteIndex -lt $l1SyntheticRuntimeImageBytes.
 }
 $l1SyntheticRuntimeImageSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($l1SyntheticRuntimeImageBytes)).ToLowerInvariant()
 $l1Runtime = [PSCustomObject][ordered]@{ path = $l1RuntimePath; bytes = [Int64]$l1SyntheticRuntimeImageBytes.Length; sha256 = $l1SyntheticRuntimeImageSha256
-    volume_serial_hex = '2222222222222222'; file_id_hex = '22222222222222222222222222222222'
+    volume_serial_hex = '2222222222222222'; file_id_hex = '00000000000000000000000000000001'
     powershell_home = $l1RuntimeHome; system_root = $l1SystemRoot }
 $l1RuntimeRef = [PSCustomObject][ordered]@{ path = $l1Runtime.path; bytes = $l1Runtime.bytes; sha256 = $l1Runtime.sha256
     volume_serial_hex = $l1Runtime.volume_serial_hex; file_id_hex = $l1Runtime.file_id_hex }
+$l1ObserverPath='C:\Codex\Codex.exe'
+$l1ObserverBytes=[Text.UTF8Encoding]::new($false).GetBytes('synthetic existing trusted observer image; distinct from Program Files child runtime')
+$l1ObserverRef=[PSCustomObject][ordered]@{path=$l1ObserverPath;bytes=[Int64]$l1ObserverBytes.Length
+    sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$l1ObserverBytes)).ToLowerInvariant()
+    volume_serial_hex='7777777777777777';file_id_hex='77777777777777777777777777777777'}
 $outerBindingPlaceholder = '0' * 64
 $outerBindingArgs = [PSCustomObject][ordered]@{ vector = @('-NoLogo','-NoProfile','-NonInteractive','-File',[IO.Path]::GetFullPath([IO.Path]::Combine($l1Repository,'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1')),
     '-Repository',[string]$l1Repository,'-CandidateSha',('a'*40),'-NonSourceL1','-L1AuthorityPath','C:\d32-l1-selftest\authority\L1.json',
@@ -3305,68 +3310,360 @@ try { $null = Get-D32BoundedDiagnosticSourceProofOuterPrelaunchCommandLine -Imag
 $outerBindingFloatRejected = $false
 try { $null = ConvertTo-D32BoundedDiagnosticSourceProofCanonicalJsonBytes -Value ([PSCustomObject]@{value=1.5}) } catch { $outerBindingFloatRejected = $true }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'outer-prelaunch canonical writer rejects NUL argv and non-integer JSON numbers' ($outerBindingNulRejected -and $outerBindingFloatRejected)
-$l1RuntimeDescriptorSha = '8' * 64
-$l1RuntimeFile = [PSCustomObject][ordered]@{ kind='file'; path=$l1RuntimePath; bytes=$l1Runtime.bytes; sha256=$l1Runtime.sha256
-    volume_serial_hex=$l1Runtime.volume_serial_hex; file_id_hex=$l1Runtime.file_id_hex; owner_sid='S-1-5-18'
-    security_descriptor_sddl='O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'; security_descriptor_sha256=$l1RuntimeDescriptorSha }
-$l1RuntimeDirectory = [PSCustomObject][ordered]@{ kind='directory'; path=$l1RuntimeHome; volume_serial_hex='2222222222222222'
-    file_id_hex='23232323232323232323232323232323'; owner_sid='S-1-5-18'; security_descriptor_sddl='O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
-    security_descriptor_sha256=$l1RuntimeDescriptorSha }
-$l1RuntimeAncestor = [PSCustomObject][ordered]@{ kind='ancestor'; path='C:\Program Files\PowerShell'; volume_serial_hex='2222222222222222'
-    file_id_hex='24242424242424242424242424242424'; owner_sid='S-1-5-18'; security_descriptor_sddl='O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
-    security_descriptor_sha256=$l1RuntimeDescriptorSha }
-$l1RuntimeDistribution = [PSCustomObject][ordered]@{ root_path=$l1RuntimeHome; inventory_sha256=('9'*64); directories=@($l1RuntimeDirectory)
-    files=@($l1RuntimeFile); protected_ancestors=@($l1RuntimeAncestor); trusted_writer_sids=@('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') }
-$l1OsDistribution = [PSCustomObject][ordered]@{ root_path=$l1SystemRoot; inventory_sha256=('1'*64); directories=@(); files=@(); protected_ancestors=@();
-    trusted_writer_sids=@('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') }
-$l1DefenderRoot = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.0.0-0'
-$l1DefenderDistribution = [PSCustomObject][ordered]@{ root_path=$l1DefenderRoot; inventory_sha256=('2'*64); directories=@(); files=@(); protected_ancestors=@();
-    trusted_writer_sids=@('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544') }
-$l1RuntimeAuthorityCandidate = [PSCustomObject][ordered]@{
-    schema_version=1; record_type='D32_NON_SOURCE_L1_RUNTIME_CONTENT_AUTHORITY_V1'; purpose='NON_SOURCE_L1_RUNTIME_ONLY'; gate_authority='NONE'
-    status='CANDIDATE_FOR_COORDINATOR_PIN'; candidate_sha=$l1CandidateSha; source_repo=$l1Repository
-    repository_identity=[PSCustomObject][ordered]@{volume_serial_hex='5555555555555555';file_id_hex='55555555555555555555555555555555'}
-    powershell_runtime=$l1Runtime; distribution=$l1RuntimeDistribution
-    resolver_policy=[PSCustomObject][ordered]@{
-        policy_id='D32_POWERSHELL_RESOLVER_DOMAIN_V2'; managed_distribution_root=$l1RuntimeHome; managed_os_root=$l1SystemRoot
-        native_application_root=$l1RuntimeHome; native_system_root=$l1SystemRoot
-        native_search_flags=@('LOAD_LIBRARY_SEARCH_APPLICATION_DIR','LOAD_LIBRARY_SEARCH_SYSTEM32')
-        forbidden_sources=@('CWD','PATH','USER_PSMODULEPATH','STARTUP_HOOKS','EXTERNAL_ASSEMBLIES','UNPINNED_DLL_DIRECTORIES')
-        os_security_components=@(
-            [PSCustomObject][ordered]@{component_type='MICROSOFT_WINDOWS_OS_INSTALLATION';version='Windows';root_path=$l1SystemRoot;root_volume_serial_hex='3333333333333333';root_file_id_hex=('3'*32);inventory_sha256=('4'*64)
-                source_proof=[PSCustomObject][ordered]@{proof_type='GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1';api_path=$l1SystemRoot;environment_system_root=$l1SystemRoot;os_version='Windows'}
-                distribution=$l1OsDistribution;native_files=@() },
-            [PSCustomObject][ordered]@{component_type='MICROSOFT_WINDOWS_DEFENDER_PLATFORM';version='4.18.0.0-0';root_path=$l1DefenderRoot;root_volume_serial_hex='3333333333333333';root_file_id_hex=('5'*32);inventory_sha256=('6'*64)
-                source_proof=[PSCustomObject][ordered]@{proof_type='WINTRUST_CACHE_ONLY_AUTHENTICODE_V1';status='VERIFIED';anchor_images=@()}
-                distribution=$l1DefenderDistribution;native_files=@() })
-    }
-    module_policy=[PSCustomObject][ordered]@{
-        policy_id='NON_SOURCE_L1_UTILITY_ONLY_V1'; controller_utility_manifest=[PSCustomObject][ordered]@{
-            path=[IO.Path]::Combine($l1RuntimeHome,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1');bytes=4096L;sha256=('7'*64)
-            volume_serial_hex='2222222222222222';file_id_hex=('7'*32) }
-        controller_utility_inventory_sha256=('7'*64);controller_import_count=1L;reader_import_count=0L
-        controller_allowed_commands=@('Add-Type','ConvertTo-Json');reader_wait_policy='MANAGED_FINITE_WAIT_V1'
-    }
-    startup_inputs=[PSCustomObject][ordered]@{
-        policy_id='D32_NON_SOURCE_L1_STARTUP_INPUTS_V1'
-        deps=[PSCustomObject][ordered]@{state='PROTECTED_ABSENT';reference=$null;absence_witness_sha256=('a'*64)}
-        runtime_config=[PSCustomObject][ordered]@{state='PROTECTED_ABSENT';reference=$null;absence_witness_sha256=('b'*64)}
-        protected_startup_config=[PSCustomObject][ordered]@{state='PROTECTED_ABSENT';reference=$null;absence_witness_sha256=('c'*64)}
-        trusted_platform_assemblies=[PSCustomObject][ordered]@{count=0L;inventory_sha256=('d'*64);paths=@()}
-        native_search=[PSCustomObject][ordered]@{inventory_sha256=('e'*64);paths=@()}
-        startup_hooks=[PSCustomObject][ordered]@{state='ABSENT';paths=@()}
-        profiling=[PSCustomObject][ordered]@{enabled=$false;variables=@()}
-    }
-    limits=[PSCustomObject][ordered]@{runtime_bytes=4194304L;file_count=4096L;directory_count=1024L;aggregate_bytes=2147483648L;single_file_bytes=268435456L;resolver_list_entries=1024L}
+$l1RuntimeProducerFunctionNames = @('Get-D32PowerShellAuthorityInventoryDigest','Get-D32PowerShellAuthorityRuntimeInventoryDigest',
+    'Get-D32PowerShellAuthorityProtectedAbsenceWitnessSha256','New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs',
+    'Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets','Assert-D32PowerShellAuthorityStaticRuntimeConfig',
+    'Get-D32PowerShellAuthorityPeImportNames')
+$l1RuntimeProducerFunctionsLoaded = $true
+$l1RuntimeProducerMissingFunctions = [System.Collections.Generic.List[string]]::new()
+$l1RuntimeProducerFunctionAsts = @($moduleAuthorityAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst]
+},$true))
+$l1RuntimeLoadedFunctionNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($functionAst in $l1RuntimeProducerFunctionAsts) {
+    . ([ScriptBlock]::Create([string]$functionAst.Extent.Text))
+    [void]$l1RuntimeLoadedFunctionNames.Add([string]$functionAst.Name)
 }
-$l1RuntimeAuthorityJson = ConvertTo-Json -InputObject $l1RuntimeAuthorityCandidate -Depth 40 -Compress -ErrorAction Stop
-$l1RuntimeAuthorityBytes = [Text.UTF8Encoding]::new($false).GetBytes($l1RuntimeAuthorityJson)
+foreach ($functionName in $l1RuntimeProducerFunctionNames) {
+    if (-not $l1RuntimeLoadedFunctionNames.Contains([string]$functionName)) {
+        $l1RuntimeProducerFunctionsLoaded = $false
+        $l1RuntimeProducerMissingFunctions.Add([string]$functionName)
+    }
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest ('runtime-content producer helpers are loaded from the current module-authority AST without dot-sourcing its native bootstrap; missing=' + [string]::Join('|',$l1RuntimeProducerMissingFunctions.ToArray())) $l1RuntimeProducerFunctionsLoaded
+
+$l1SyntheticDescriptor = 'O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+$l1SyntheticDescriptorSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($l1SyntheticDescriptor))).ToLowerInvariant()
+$l1SyntheticRecordIndex = 0
+function New-D32L1SelfTestV2Directory {
+    param([string]$Path,[string]$Volume)
+    $script:l1SyntheticRecordIndex++
+    return [PSCustomObject][ordered]@{kind='directory';path=[IO.Path]::GetFullPath($Path);volume_serial_hex=$Volume
+        file_id_hex=([Convert]::ToString($script:l1SyntheticRecordIndex,16).PadLeft(32,'0'));owner_sid='S-1-5-18'
+        security_descriptor_sddl=$l1SyntheticDescriptor;security_descriptor_sha256=$l1SyntheticDescriptorSha}
+}
+function New-D32L1SelfTestV2Ancestor {
+    param([string]$Path,[string]$Volume)
+    $record=New-D32L1SelfTestV2Directory -Path $Path -Volume $Volume
+    $record.kind='ancestor'
+    return $record
+}
+function New-D32L1SelfTestV2File {
+    param([string]$Path,[string]$Volume,[AllowNull()][byte[]]$Content)
+    $script:l1SyntheticRecordIndex++
+    if ($null -eq $Content) { $Content=[Text.UTF8Encoding]::new($false).GetBytes('synthetic L1 V2 content: '+[IO.Path]::GetFullPath($Path)) }
+    return [PSCustomObject][ordered]@{kind='file';path=[IO.Path]::GetFullPath($Path);bytes=[Int64]$Content.Length
+        sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$Content)).ToLowerInvariant()
+        volume_serial_hex=$Volume;file_id_hex=([Convert]::ToString($script:l1SyntheticRecordIndex,16).PadLeft(32,'0'))
+        owner_sid='S-1-5-18';security_descriptor_sddl=$l1SyntheticDescriptor;security_descriptor_sha256=$l1SyntheticDescriptorSha}
+}
+function New-D32L1SelfTestV2Distribution {
+    param([string]$Root,[string]$Volume,[string[]]$ChildDirectories,[object[]]$Files)
+    $directories=[System.Collections.Generic.List[object]]::new()
+    $directories.Add((New-D32L1SelfTestV2Directory -Path $Root -Volume $Volume))
+    foreach ($path in $ChildDirectories) { $directories.Add((New-D32L1SelfTestV2Directory -Path $path -Volume $Volume)) }
+    $ancestors=[System.Collections.Generic.List[object]]::new();$path=[IO.Path]::GetDirectoryName($Root)
+    while (-not [string]::IsNullOrWhiteSpace($path)) {
+        $full=[IO.Path]::GetFullPath($path);$ancestors.Add((New-D32L1SelfTestV2Ancestor -Path $full -Volume $Volume))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($full,[IO.Path]::GetPathRoot($full))) { break }
+        $path=[IO.Path]::GetDirectoryName($full)
+    }
+    $record=[ordered]@{root_path=[IO.Path]::GetFullPath($Root);inventory_sha256='';directories=$directories.ToArray();files=@($Files)
+        protected_ancestors=$ancestors.ToArray();trusted_writer_sids=@('S-1-5-18','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464','S-1-5-32-544')}
+    $record.inventory_sha256=Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories $record.directories -Files $record.files -Ancestors $record.protected_ancestors
+    return [PSCustomObject]$record
+}
+function New-D32L1SelfTestV2FileReference {
+    param([object]$File)
+    return [PSCustomObject][ordered]@{path=[string]$File.path;bytes=[Int64]$File.bytes;sha256=[string]$File.sha256
+        volume_serial_hex=[string]$File.volume_serial_hex;file_id_hex=[string]$File.file_id_hex}
+}
+function New-D32L1SelfTestV2Component {
+    param([string]$Type,[string]$Version,[string]$Root,[string]$Volume,[object]$Distribution,[object[]]$NativeFiles,[object]$SourceProof)
+    $rootDirectory=@($Distribution.directories | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path,$Root) })[0]
+    $material=[string]$Distribution.inventory_sha256+"`n"+(ConvertTo-D32PowerShellAuthorityJsonText -Value $SourceProof)+"`n"
+    $digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($material))).ToLowerInvariant()
+    return [PSCustomObject][ordered]@{component_type=$Type;version=$Version;root_path=[IO.Path]::GetFullPath($Root)
+        root_volume_serial_hex=[string]$rootDirectory.volume_serial_hex;root_file_id_hex=[string]$rootDirectory.file_id_hex
+        inventory_sha256=$digest;source_proof=$SourceProof;distribution=$Distribution;native_files=@($NativeFiles)}
+}
+
+$l1RuntimeExtraFile = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'System.Management.Automation.dll'))
+$l1RuntimeCoreLibraryPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'System.Private.CoreLib.dll'))
+$l1RuntimeEntryAssemblyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'pwsh.dll'))
+$l1RuntimeNativeAssetPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'native_probe.dll'))
+$l1RuntimeDepsPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'pwsh.deps.json'))
+$l1RuntimeConfigPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'pwsh.runtimeconfig.json'))
+$l1StartupConfigPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'powershell.config.json'))
+$l1UtilityDirectory = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'Modules','Microsoft.PowerShell.Utility'))
+$l1UtilityManifestPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1UtilityDirectory,'Microsoft.PowerShell.Utility.psd1'))
+$l1UtilityAssemblyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'Microsoft.PowerShell.Commands.Utility.dll'))
+$l1RuntimeVolume = '2222222222222222';$l1WindowsVolume='3333333333333333';$l1DefenderVolume='4444444444444444'
+$l1StaticDepsJson = '{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"},"targets":{".NETCoreApp,Version=v8.0/win-x64":{"Microsoft.PowerShell/7.0.0":{"runtime":{"pwsh.dll":{},"System.Management.Automation.dll":{}},"native":{"native_probe.dll":{}}}}},"libraries":{"Microsoft.PowerShell/7.0.0":{"type":"project","path":"Microsoft.PowerShell/7.0.0"}}}'
+$l1StaticDepsBytes = [Text.UTF8Encoding]::new($false).GetBytes($l1StaticDepsJson)
+$l1StaticRuntimeConfigJson = '{"runtimeOptions":{"tfm":"net8.0","configProperties":{"System.Reflection.Metadata.MetadataUpdater.IsSupported":false}}}'
+$l1StaticRuntimeConfigBytes = [Text.UTF8Encoding]::new($false).GetBytes($l1StaticRuntimeConfigJson)
+$l1RuntimeFile = New-D32L1SelfTestV2File -Path $l1RuntimePath -Volume $l1RuntimeVolume -Content $l1SyntheticRuntimeImageBytes
+$l1RuntimeDepsFile = New-D32L1SelfTestV2File -Path $l1RuntimeDepsPath -Volume $l1RuntimeVolume -Content $l1StaticDepsBytes
+$l1RuntimeConfigFile = New-D32L1SelfTestV2File -Path $l1RuntimeConfigPath -Volume $l1RuntimeVolume -Content $l1StaticRuntimeConfigBytes
+$l1StartupConfigFile = New-D32L1SelfTestV2File -Path $l1StartupConfigPath -Volume $l1RuntimeVolume
+$l1RuntimeExtraFile = New-D32L1SelfTestV2File -Path $l1RuntimeExtraFile -Volume $l1RuntimeVolume
+$l1RuntimeCoreLibraryFile = New-D32L1SelfTestV2File -Path $l1RuntimeCoreLibraryPath -Volume $l1RuntimeVolume
+$l1RuntimeEntryAssemblyFile = New-D32L1SelfTestV2File -Path $l1RuntimeEntryAssemblyPath -Volume $l1RuntimeVolume
+$l1RuntimeNativeAssetFile = New-D32L1SelfTestV2File -Path $l1RuntimeNativeAssetPath -Volume $l1RuntimeVolume
+$l1UtilityManifestFile = New-D32L1SelfTestV2File -Path $l1UtilityManifestPath -Volume $l1RuntimeVolume
+$l1UtilityAssemblyFile = New-D32L1SelfTestV2File -Path $l1UtilityAssemblyPath -Volume $l1RuntimeVolume
+$l1RuntimeFiles=@($l1RuntimeFile,$l1RuntimeDepsFile,$l1RuntimeConfigFile,$l1StartupConfigFile,$l1RuntimeExtraFile,$l1RuntimeCoreLibraryFile,$l1RuntimeEntryAssemblyFile,
+    $l1RuntimeNativeAssetFile,$l1UtilityManifestFile,$l1UtilityAssemblyFile)
+$l1RuntimeDistribution=New-D32L1SelfTestV2Distribution -Root $l1RuntimeHome -Volume $l1RuntimeVolume `
+    -ChildDirectories @([IO.Path]::GetFullPath([IO.Path]::Combine($l1RuntimeHome,'Modules')),$l1UtilityDirectory) -Files $l1RuntimeFiles
+$l1StaticAssets = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes $l1StaticDepsBytes -PowerShellRoot $l1RuntimeHome `
+    -DistributionFiles $l1RuntimeDistribution.files
+$l1StaticAssetPaths = [string[]]@($l1StaticAssets.TrustedPlatformAssemblyReferences | ForEach-Object { [string]$_.path })
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed target-runtime resolver inputs derive from bounded deps/runtimeconfig content and exact V2 file records' `
+    ($l1StaticAssets.RuntimeTarget -ceq '.NETCoreApp,Version=v8.0/win-x64' -and $l1StaticAssets.TrustedPlatformAssemblyReferences.Count -eq 3 -and
+        $l1StaticAssetPaths[0] -ceq [string]$l1RuntimeEntryAssemblyPath -and $l1StaticAssetPaths[1] -ceq [string]$l1RuntimeExtraFile.path -and
+        $l1StaticAssetPaths[2] -ceq [string]$l1RuntimeCoreLibraryPath -and
+        $l1StaticAssets.NativeAssetFiles.Count -eq 1 -and [string]$l1StaticAssets.NativeAssetFiles[0].path -ceq [string]$l1RuntimeNativeAssetPath -and
+        (Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes $l1StaticRuntimeConfigBytes -RuntimeTarget $l1StaticAssets.RuntimeTarget))
+$l1MissingDepsAssetJson = $l1StaticDepsJson.Replace('System.Management.Automation.dll','missing-managed.dll')
+$l1MissingDepsAssetRejected = $false
+try { $null = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1MissingDepsAssetJson)) `
+        -PowerShellRoot $l1RuntimeHome -DistributionFiles $l1RuntimeDistribution.files } catch { $l1MissingDepsAssetRejected = $true }
+$l1ExternalDepsAssetJson = $l1StaticDepsJson.Replace('native_probe.dll','..\\outside.dll')
+$l1ExternalDepsAssetRejected = $false
+try { $null = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1ExternalDepsAssetJson)) `
+        -PowerShellRoot $l1RuntimeHome -DistributionFiles $l1RuntimeDistribution.files } catch { $l1ExternalDepsAssetRejected = $true }
+$l1ExternalPackageFolderJson = $l1StaticDepsJson.Replace(',"libraries":',',"packageFolders":{"C:\\outside\\nuget\\":{}},"libraries":')
+$l1ExternalPackageFolderRejected = $false
+try { $null = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1ExternalPackageFolderJson)) `
+        -PowerShellRoot $l1RuntimeHome -DistributionFiles $l1RuntimeDistribution.files } catch { $l1ExternalPackageFolderRejected = $true }
+$l1DuplicateDepsJson = '{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"},"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"}}'
+$l1DuplicateDepsRejected = $false
+try { $null = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1DuplicateDepsJson)) `
+        -PowerShellRoot $l1RuntimeHome -DistributionFiles $l1RuntimeDistribution.files } catch { $l1DuplicateDepsRejected = $true }
+$l1WrongRuntimeConfigJson = '{"runtimeOptions":{"tfm":"net7.0"}}'
+$l1WrongRuntimeConfigRejected = $false
+try { $null = Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1WrongRuntimeConfigJson)) `
+        -RuntimeTarget $l1StaticAssets.RuntimeTarget } catch { $l1WrongRuntimeConfigRejected = $true }
+$l1ExternalFrameworkConfigJson = '{"runtimeOptions":{"tfm":"net8.0","framework":{"name":"Microsoft.NETCore.App","version":"8.0.0"}}}'
+$l1ExternalFrameworkRejected = $false
+try { $null = Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1ExternalFrameworkConfigJson)) `
+        -RuntimeTarget $l1StaticAssets.RuntimeTarget } catch { $l1ExternalFrameworkRejected = $true }
+$l1UnknownRuntimeConfigJson = '{"runtimeOptions":{"tfm":"net8.0","runtimeStoreManifestPaths":["C:\\outside\\manifest.json"]}}'
+$l1UnknownRuntimeConfigRejected = $false
+try { $null = Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1UnknownRuntimeConfigJson)) `
+        -RuntimeTarget $l1StaticAssets.RuntimeTarget } catch { $l1UnknownRuntimeConfigRejected = $true }
+$l1PathConfigPropertyJson = '{"runtimeOptions":{"tfm":"net8.0","configProperties":{"externalRoot":"C:\\outside"}}}'
+$l1PathConfigPropertyRejected = $false
+try { $null = Assert-D32PowerShellAuthorityStaticRuntimeConfig -RuntimeConfigBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1PathConfigPropertyJson)) `
+        -RuntimeTarget $l1StaticAssets.RuntimeTarget } catch { $l1PathConfigPropertyRejected = $true }
+$l1StaticAssetLimit = [System.Text.StringBuilder]::new()
+[void]$l1StaticAssetLimit.Append('{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"},"targets":{".NETCoreApp,Version=v8.0/win-x64":{"x/1.0":{"runtime":{')
+for ($l1StaticAssetIndex=0; $l1StaticAssetIndex -lt 4097; $l1StaticAssetIndex++) {
+    if ($l1StaticAssetIndex -gt 0) { [void]$l1StaticAssetLimit.Append(',') }
+    [void]$l1StaticAssetLimit.Append('"f').Append($l1StaticAssetIndex.ToString('D4')).Append('.dll":{}')
+}
+[void]$l1StaticAssetLimit.Append('}}}},"libraries":{"x/1.0":{"type":"project"}}}')
+$l1StaticAssetLimitRejected = $false
+try { $null = Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets -DepsBytes ([Text.UTF8Encoding]::new($false).GetBytes($l1StaticAssetLimit.ToString())) `
+        -PowerShellRoot $l1RuntimeHome -DistributionFiles $l1RuntimeDistribution.files } catch { $l1StaticAssetLimitRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'static target resolver rejects missing/external/duplicate/over-limit deps assets and runtimeconfig root, TFM, or unknown-input drift' `
+    ($l1MissingDepsAssetRejected -and $l1ExternalDepsAssetRejected -and $l1ExternalPackageFolderRejected -and $l1DuplicateDepsRejected -and $l1WrongRuntimeConfigRejected -and
+        $l1ExternalFrameworkRejected -and $l1UnknownRuntimeConfigRejected -and $l1PathConfigPropertyRejected -and $l1StaticAssetLimitRejected)
+function New-D32L1SelfTestPeImportImage {
+    param([string]$ImportName)
+    $bytes = [byte[]]::new(1024); $bytes[0]=0x4d; $bytes[1]=0x5a
+    [Array]::Copy([BitConverter]::GetBytes([Int32]0x80),0,$bytes,0x3c,4)
+    $bytes[0x80]=0x50; $bytes[0x81]=0x45
+    [Array]::Copy([BitConverter]::GetBytes([UInt16]1),0,$bytes,0x86,2)
+    [Array]::Copy([BitConverter]::GetBytes([UInt16]224),0,$bytes,0x94,2)
+    $optional=0x98
+    [Array]::Copy([BitConverter]::GetBytes([UInt16]0x10b),0,$bytes,$optional,2)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x200),0,$bytes,$optional+60,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]16),0,$bytes,$optional+92,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x1000),0,$bytes,$optional+104,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]40),0,$bytes,$optional+108,4)
+    $section=$optional+224
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x100),0,$bytes,$section+8,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x1000),0,$bytes,$section+12,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x100),0,$bytes,$section+16,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x200),0,$bytes,$section+20,4)
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]0x1028),0,$bytes,0x20c,4)
+    $nameBytes=[Text.Encoding]::ASCII.GetBytes($ImportName+[char]0)
+    [Array]::Copy($nameBytes,0,$bytes,0x228,$nameBytes.Length)
+    return ,$bytes
+}
+$l1PeImports = Get-D32PowerShellAuthorityPeImportNames -Bytes (New-D32L1SelfTestPeImportImage -ImportName 'kernel32.dll')
+$l1PeInvalidImportRejected = $false
+try { $null = Get-D32PowerShellAuthorityPeImportNames -Bytes (New-D32L1SelfTestPeImportImage -ImportName 'C:\\outside.dll') } catch { $l1PeInvalidImportRejected = $true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'bounded PE import reader extracts only literal basenames and rejects path-bearing imports' `
+    ($l1PeImports.Count -eq 1 -and $l1PeImports[0] -ceq 'kernel32.dll' -and $l1PeInvalidImportRejected)
+$l1Runtime = [PSCustomObject][ordered]@{ path=$l1RuntimeRef.path; bytes=$l1RuntimeRef.bytes; sha256=$l1RuntimeRef.sha256
+    volume_serial_hex=$l1RuntimeRef.volume_serial_hex; file_id_hex=$l1RuntimeRef.file_id_hex
+    powershell_home=$l1RuntimeHome; system_root=$l1SystemRoot }
+$l1WindowsRoot=$l1SystemRoot;$l1WindowsSystem32=[IO.Path]::Combine($l1WindowsRoot,'System32')
+$l1WindowsPrivateCore=New-D32L1SelfTestV2File -Path ([IO.Path]::Combine($l1WindowsSystem32,'System.Private.CoreLib.dll')) -Volume $l1WindowsVolume
+$l1WindowsKernel=New-D32L1SelfTestV2File -Path ([IO.Path]::Combine($l1WindowsSystem32,'kernelbase.dll')) -Volume $l1WindowsVolume
+$l1WindowsFiles=@($l1WindowsPrivateCore,$l1WindowsKernel)
+$l1OsDistribution=New-D32L1SelfTestV2Distribution -Root $l1WindowsRoot -Volume $l1WindowsVolume -ChildDirectories @($l1WindowsSystem32) -Files $l1WindowsFiles
+$l1WindowsSourceProof=[PSCustomObject][ordered]@{proof_type='GET_WINDOWSDIRECTORYW_OPENED_NAMESPACE_V1';api_path=$l1WindowsRoot
+    environment_system_root=$l1SystemRoot;os_version='Synthetic Windows build 1'}
+$l1WindowsComponent=New-D32L1SelfTestV2Component -Type 'MICROSOFT_WINDOWS_OS_INSTALLATION' -Version $l1WindowsSourceProof.os_version `
+    -Root $l1WindowsRoot -Volume $l1WindowsVolume -Distribution $l1OsDistribution -NativeFiles $l1WindowsFiles -SourceProof $l1WindowsSourceProof
+$l1DefenderRoot='C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.0.0-0'
+$l1DefenderAnchors=@('MpOav.dll','MPCLIENT.DLL');$l1DefenderFiles=[System.Collections.Generic.List[object]]::new()
+$l1DefenderNativeFiles=[System.Collections.Generic.List[object]]::new();$l1AnchorProofs=[System.Collections.Generic.List[object]]::new()
+foreach ($anchorName in $l1DefenderAnchors) {
+    $file=New-D32L1SelfTestV2File -Path ([IO.Path]::Combine($l1DefenderRoot,$anchorName)) -Volume $l1DefenderVolume
+    $l1DefenderFiles.Add($file);$l1DefenderNativeFiles.Add($file)
+    $l1AnchorProofs.Add([PSCustomObject][ordered]@{file=(New-D32L1SelfTestV2FileReference $file);source_proof=[PSCustomObject][ordered]@{
+        proof_type='WINTRUST_CACHE_ONLY_AUTHENTICODE_V1';signature_status='VALID';signer_simple_name='Microsoft Windows'
+        issuer_name='CN=Windows Production PCA 2023, O=Microsoft Corporation';signer_thumbprint=('a'*40);company_name='Microsoft Corporation'
+        product_name='Synthetic Defender';product_version='4.18.0.0';file_version='4.18.0.0'}})
+}
+$l1DefenderDistribution=New-D32L1SelfTestV2Distribution -Root $l1DefenderRoot -Volume $l1DefenderVolume -ChildDirectories @() -Files $l1DefenderFiles.ToArray()
+$l1DefenderSourceProof=[PSCustomObject][ordered]@{proof_type='WINTRUST_CACHE_ONLY_AUTHENTICODE_V1';status='VERIFIED';anchor_images=$l1AnchorProofs.ToArray()}
+$l1DefenderVersion=[IO.Path]::GetFileName($l1DefenderRoot)
+$l1DefenderComponent=New-D32L1SelfTestV2Component -Type 'MICROSOFT_WINDOWS_DEFENDER_PLATFORM' -Version $l1DefenderVersion `
+    -Root $l1DefenderRoot -Volume $l1DefenderVolume -Distribution $l1DefenderDistribution -NativeFiles $l1DefenderNativeFiles.ToArray() -SourceProof $l1DefenderSourceProof
+$l1RuntimeComponents=@($l1WindowsComponent,$l1DefenderComponent)
+$l1RuntimeUtilityFiles=@($l1UtilityManifestFile,$l1UtilityAssemblyFile)
+$l1RuntimeRootDirectory=@($l1RuntimeDistribution.directories | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path,$l1RuntimeHome) })[0]
+$l1RuntimeStartupFiles=[PSCustomObject][ordered]@{
+    deps=[PSCustomObject][ordered]@{state='PRESENT';reference=(New-D32L1SelfTestV2FileReference $l1RuntimeDepsFile);absence_witness_sha256=$null}
+    runtime_config=[PSCustomObject][ordered]@{state='PRESENT';reference=(New-D32L1SelfTestV2FileReference $l1RuntimeConfigFile);absence_witness_sha256=$null}
+    protected_startup_config=[PSCustomObject][ordered]@{state='PRESENT';reference=(New-D32L1SelfTestV2FileReference $l1StartupConfigFile);absence_witness_sha256=$null}}
+$l1SyntheticTpa=@((New-D32L1SelfTestV2FileReference $l1RuntimeExtraFile),(New-D32L1SelfTestV2FileReference $l1WindowsPrivateCore))
+$l1SyntheticNativeDirectories=@(
+    $l1RuntimeDistribution.directories[0],
+    $l1OsDistribution.directories[1])
+$l1RuntimeProducerResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha -Repository $l1Repository `
+    -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents `
+    -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) -UtilityFiles $l1RuntimeUtilityFiles `
+    -StartupFileStates $l1RuntimeStartupFiles -TrustedPlatformAssemblyReferences $l1SyntheticTpa `
+    -NativeSearchDirectoryRecords $l1SyntheticNativeDirectories
+if ([string]$l1RuntimeProducerResult.status -cne 'CANDIDATE_FOR_COORDINATOR_PIN') {
+    throw ('D32_NON_SOURCE_L1_SYNTHETIC_BLOCKER: V2 runtime-content candidate producer rejected the complete synthetic facts: ' +
+        [string]::Join('; ',[string[]]$l1RuntimeProducerResult.gaps))
+}
+$l1RuntimeAuthorityCandidate=$l1RuntimeProducerResult.candidate
+$l1RuntimeAuthorityJson=[string]$l1RuntimeProducerResult.candidate_json
+$l1RuntimeAuthorityBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes($l1RuntimeAuthorityJson)
+$l1RuntimeAuthorityReadback=ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json $l1RuntimeAuthorityJson
+$l1RuntimeAuthorityCandidate=$l1RuntimeAuthorityReadback
 $l1RuntimeAuthorityRef = [PSCustomObject][ordered]@{ path = 'C:\d32-l1-selftest\authority\runtime-content.json'; bytes = [Int64]$l1RuntimeAuthorityBytes.Length
     sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($l1RuntimeAuthorityBytes)).ToLowerInvariant()
     volume_serial_hex = 'aaaaaaaaaaaaaaaa'; file_id_hex = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime content candidate has the exact bounded V1 schema and typed distribution/resolver/startup policy' `
-    (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $l1RuntimeAuthorityCandidate `
+    ($l1RuntimeProducerResult.status -ceq 'CANDIDATE_FOR_COORDINATOR_PIN' -and $l1RuntimeProducerResult.gate_authority -ceq 'NONE' -and
+        [string]$l1RuntimeProducerResult.candidate_sha256 -ceq [string]$l1RuntimeAuthorityRef.sha256 -and
+        (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $l1RuntimeAuthorityCandidate `
         -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository)
+    )
+$l1RuntimeCandidateNegativeCases = @(
+    [PSCustomObject]@{name='unknown runtime-content field'; mutate={param($r) $r | Add-Member -NotePropertyName unexpected -NotePropertyValue $true}},
+    [PSCustomObject]@{name='gate authority elevation'; mutate={param($r) $r.gate_authority='APPROVED'}},
+    [PSCustomObject]@{name='runtime file reference does not bind to V2 distribution'; mutate={param($r) $r.powershell_runtime.sha256='0'*64}},
+    [PSCustomObject]@{name='V2 inventory digest drift'; mutate={param($r) $r.distribution.inventory_sha256='0'*64}},
+    [PSCustomObject]@{name='directory SDDL digest drift'; mutate={param($r) $r.distribution.directories[0].security_descriptor_sha256='0'*64}},
+    [PSCustomObject]@{name='TPA empty list'; mutate={param($r) $r.startup_inputs.trusted_platform_assemblies.paths=@();$r.startup_inputs.trusted_platform_assemblies.count=0L}},
+    [PSCustomObject]@{name='TPA content reference drift'; mutate={param($r) $r.startup_inputs.trusted_platform_assemblies.paths[0].bytes++}},
+    [PSCustomObject]@{name='TPA path outside fixed domains'; mutate={param($r) $r.startup_inputs.trusted_platform_assemblies.paths[0].path='C:\outside\untrusted.dll'}},
+    [PSCustomObject]@{name='TPA digest drift'; mutate={param($r) $r.startup_inputs.trusted_platform_assemblies.inventory_sha256='0'*64}},
+    [PSCustomObject]@{name='native directory list empty'; mutate={param($r) $r.startup_inputs.native_search.paths=@()}},
+    [PSCustomObject]@{name='native directory file-ref type substitution'; mutate={param($r) $r.startup_inputs.native_search.paths=@($l1SyntheticTpa[0])}},
+    [PSCustomObject]@{name='native directory identity cross-binding'; mutate={param($r) $r.startup_inputs.native_search.paths[0].file_id_hex='f'*32}},
+    [PSCustomObject]@{name='native resolver digest drift'; mutate={param($r) $r.startup_inputs.native_search.inventory_sha256='0'*64}},
+    [PSCustomObject]@{name='Utility closure digest drift'; mutate={param($r) $r.module_policy.controller_utility_inventory_sha256='0'*64}},
+    [PSCustomObject]@{name='startup absence witness drift'; mutate={param($r) $r.startup_inputs.protected_startup_config.absence_witness_sha256='0'*64}},
+    [PSCustomObject]@{name='startup hook injection'; mutate={param($r) $r.startup_inputs.startup_hooks.state='PRESENT';$r.startup_inputs.startup_hooks.paths=@('C:\outside\hook.dll')}},
+    [PSCustomObject]@{name='runtime file-count limit expansion'; mutate={param($r) $r.limits.file_count=4097L}},
+    [PSCustomObject]@{name='Defender signature source proof substitution'; mutate={param($r) $r.resolver_policy.os_security_components[1].source_proof.status='UNVERIFIED'}}
+)
+foreach ($negativeCase in $l1RuntimeCandidateNegativeCases) {
+    $badRuntimeCandidate=Copy-D32BoundedCompilerDiagnosticTestJson $l1RuntimeAuthorityCandidate
+    $mutation=[scriptblock]$negativeCase.mutate
+    & $mutation $badRuntimeCandidate
+    Assert-D32BoundedCompilerDiagnosticSelfTest ('runtime-content strict consumer rejects '+[string]$negativeCase.name) `
+        (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $badRuntimeCandidate `
+            -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository))
+}
+$l1RuntimeGapResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha `
+    -Repository $l1Repository -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) `
+    -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeStartupFiles -TrustedPlatformAssemblyReferences @() `
+    -NativeSearchDirectoryRecords @() -InputGaps @('independent target resolver input is not available')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content producer fails closed with complete gaps and no candidate when target inputs are missing' `
+    ($l1RuntimeGapResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $l1RuntimeGapResult.gate_authority -ceq 'NONE' -and
+        $null -eq $l1RuntimeGapResult.candidate -and $null -eq $l1RuntimeGapResult.candidate_json -and
+        @($l1RuntimeGapResult.gaps | Where-Object { $_ -ceq 'independent target resolver input is not available' }).Count -eq 1)
+$l1RuntimeResolverGapResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha `
+    -Repository $l1Repository -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) `
+    -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeStartupFiles -TrustedPlatformAssemblyReferences @() -NativeSearchDirectoryRecords @()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content producer independently reports missing TPA and native-search inputs without predicting or probing child admissions' `
+    ($l1RuntimeResolverGapResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $l1RuntimeResolverGapResult.candidate -and
+        @($l1RuntimeResolverGapResult.gaps | Where-Object { $_ -match 'trusted-platform-assembly list is unavailable' }).Count -eq 1 -and
+        @($l1RuntimeResolverGapResult.gaps | Where-Object { $_ -match 'native-search directory list is unavailable' }).Count -eq 1)
+$l1RuntimeWrongNativeTypeResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha `
+    -Repository $l1Repository -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) `
+    -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeStartupFiles -TrustedPlatformAssemblyReferences $l1SyntheticTpa `
+    -NativeSearchDirectoryRecords @($l1SyntheticTpa[0])
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content producer rejects a file reference passed into the native directory input slot' `
+    ($l1RuntimeWrongNativeTypeResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $l1RuntimeWrongNativeTypeResult.candidate -and
+        @($l1RuntimeWrongNativeTypeResult.gaps | Where-Object { $_ -match 'complete V2 directory record' }).Count -eq 1)
+$l1RuntimeAbsentDistribution=Copy-D32BoundedCompilerDiagnosticTestJson $l1RuntimeDistribution
+$l1RuntimeAbsentDistribution.files=@($l1RuntimeAbsentDistribution.files | Where-Object { -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path,$l1StartupConfigPath) })
+$l1RuntimeAbsentDistribution.inventory_sha256=Get-D32PowerShellAuthorityRuntimeInventoryDigest -Directories @($l1RuntimeAbsentDistribution.directories) `
+    -Files @($l1RuntimeAbsentDistribution.files) -Ancestors @($l1RuntimeAbsentDistribution.protected_ancestors)
+$l1RuntimeAbsentStartup=Copy-D32BoundedCompilerDiagnosticTestJson $l1RuntimeStartupFiles
+$l1RuntimeAbsentStartup.protected_startup_config=[PSCustomObject][ordered]@{state='PROTECTED_ABSENT';reference=$null
+    absence_witness_sha256=(Get-D32PowerShellAuthorityProtectedAbsenceWitnessSha256 -RolePath $l1StartupConfigPath -ParentDirectoryRecord $l1RuntimeRootDirectory)}
+$l1RuntimeAbsentProducerResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha -Repository $l1Repository `
+    -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeAbsentDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) `
+    -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeAbsentStartup -TrustedPlatformAssemblyReferences $l1SyntheticTpa `
+    -NativeSearchDirectoryRecords $l1SyntheticNativeDirectories
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content producer binds protected absence to the exact V2 parent identity and strict readback' `
+    ($l1RuntimeAbsentProducerResult.status -ceq 'CANDIDATE_FOR_COORDINATOR_PIN' -and
+        [string]$l1RuntimeAbsentProducerResult.candidate.startup_inputs.protected_startup_config.state -ceq 'PROTECTED_ABSENT' -and
+        (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $l1RuntimeAbsentProducerResult.candidate `
+            -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository))
+$l1RuntimeAbsentTamper=Copy-D32BoundedCompilerDiagnosticTestJson $l1RuntimeAbsentProducerResult.candidate
+$l1RuntimeAbsentTamper.startup_inputs.protected_startup_config.absence_witness_sha256='0'*64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content strict consumer rejects protected-absence parent identity/hash drift' `
+    (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $l1RuntimeAbsentTamper `
+        -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository))
+$l1RuntimeBadAbsenceStartup=Copy-D32BoundedCompilerDiagnosticTestJson $l1RuntimeStartupFiles
+$l1RuntimeBadAbsenceStartup.protected_startup_config=[PSCustomObject][ordered]@{state='PROTECTED_ABSENT';reference=$null;absence_witness_sha256=('0'*64)}
+$l1RuntimeBadAbsenceResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $l1CandidateSha -Repository $l1Repository `
+    -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) `
+    -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot `
+    -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) `
+    -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeBadAbsenceStartup -TrustedPlatformAssemblyReferences $l1SyntheticTpa `
+    -NativeSearchDirectoryRecords $l1SyntheticNativeDirectories
+Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime-content producer rejects protected-absence claims that contradict a present V2 file' `
+    ($l1RuntimeBadAbsenceResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $l1RuntimeBadAbsenceResult.candidate)
+$runtimeProducerEntryAst=$moduleAuthorityAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate'},$true)
+$runtimeProducerEntryText=if ($null -eq $runtimeProducerEntryAst) { '' } else { [string]$runtimeProducerEntryAst.Extent.Text }
+$runtimeProducerEntryParameters=[System.Collections.Generic.List[string]]::new()
+if ($null -ne $runtimeProducerEntryAst) {
+    foreach ($runtimeProducerEntryParameter in $runtimeProducerEntryAst.Body.ParamBlock.Parameters) {
+        $runtimeProducerEntryParameters.Add([string]$runtimeProducerEntryParameter.Name.VariablePath.UserPath)
+    }
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed runtime-content preparation exposes only the candidate pin and never borrows observer-loaded/AppContext target origins' `
+    ($null -ne $runtimeProducerEntryAst -and $runtimeProducerEntryParameters.Count -eq 1 -and $runtimeProducerEntryParameters[0] -ceq 'CandidateSha' -and
+        $runtimeProducerEntryText -notmatch 'GetCurrentProcess|\.Modules|AppContext|ProcessStartup|Start-D32|CreateProcess|Import-Module')
 $l1Drive = [IO.Path]::GetPathRoot($l1Root).TrimEnd('\'); $l1HomePath = $l1Root.Substring($l1Drive.Length)
 $l1ChildEnvironment = [PSCustomObject][ordered]@{
     SystemRoot = $l1SystemRoot; WINDIR = $l1SystemRoot; PATH = ($l1SystemRoot.TrimEnd('\') + '\System32;' + $l1RuntimeHome)
@@ -3390,9 +3687,9 @@ $l1DerivedOutput = Get-D32BoundedDiagnosticSourceProofNonSourceL1OutputPaths -Ro
 $l1OuterCaller = [PSCustomObject][ordered]@{
     role = 'D32_NON_SOURCE_L1_FIXED_OUTER_CALLER_V1'
     entry_reference = $l1SourcePins[0]
-    observer_host_reference = $l1RuntimeRef
+    observer_host_reference = $l1ObserverRef
     observer_process = [PSCustomObject][ordered]@{
-        process_id = 999L; creation_filetime_ticks = 134000000000000099L; image_reference = $l1RuntimeRef
+        process_id = 999L; creation_filetime_ticks = 134000000000000099L; image_reference = $l1ObserverRef
         ordinary_token = [PSCustomObject][ordered]@{ elevated = $false; high_integrity = $false; system_token = $false; thread_impersonation = $false }
     }
     observer_process_policy = 'EXISTING_TRUSTED_OBSERVER_CURRENT_PROCESS_V1'
@@ -3410,6 +3707,15 @@ $l1Authority = New-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityCandidate 
     -Cases $l1CasesAuthority -Output $l1Output -IssuedAtUtc '2026-10-06T00:00:00.0000000+00:00'
 Assert-D32BoundedCompilerDiagnosticSelfTest 'L1 strict authority producer emits the exact independent authority domain' `
     (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $l1Authority -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository)
+$l1ObserverRuntimeAlias=Copy-D32BoundedCompilerDiagnosticTestJson $l1Authority
+$l1ObserverRuntimeAlias.outer_caller.observer_host_reference=$l1ObserverRuntimeAlias.powershell_runtime
+$l1ObserverRuntimeAlias.outer_caller.observer_process.image_reference=$l1ObserverRuntimeAlias.powershell_runtime
+Assert-D32BoundedCompilerDiagnosticSelfTest 'outer observer identity cannot alias the fixed Program Files child runtime image' `
+    (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $l1ObserverRuntimeAlias -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository))
+$l1ObserverCrossBinding=Copy-D32BoundedCompilerDiagnosticTestJson $l1Authority
+$l1ObserverCrossBinding.outer_caller.observer_process.image_reference.sha256='0'*64
+Assert-D32BoundedCompilerDiagnosticSelfTest 'outer observer host and process image references must be the same full file pin' `
+    (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $l1ObserverCrossBinding -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository))
 Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime content candidate independently binds the exact authority reference, repository identity, candidate, and runtime' `
     (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityBinding -Document $l1RuntimeAuthorityCandidate -Authority $l1Authority -OpenedReference $l1RuntimeAuthorityRef)
 $l1AuthorityJson = ConvertTo-Json -InputObject $l1Authority -Depth 40 -Compress -ErrorAction Stop
@@ -3471,6 +3777,24 @@ try {
         -RuntimePath $l1RuntimePath -OwnerId $l1OwnerId -SystemRoot $l1SystemRoot
 } finally { $l1ReaderDocument.Dispose() }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed module-free child authority consumer accepts the actual producer JSON without SourceProof authority/profile reads' $l1ReaderAuthorityAccepted
+$l1ReaderObserverNegativeCases = @(
+    [PSCustomObject]@{name='observer image aliases the fixed child runtime'; mutate={param($r) $runtimeRef=[PSCustomObject][ordered]@{path=$r.powershell_runtime.path;bytes=$r.powershell_runtime.bytes;sha256=$r.powershell_runtime.sha256;volume_serial_hex=$r.powershell_runtime.volume_serial_hex;file_id_hex=$r.powershell_runtime.file_id_hex};$r.outer_caller.observer_host_reference=$runtimeRef;$r.outer_caller.observer_process.image_reference=$runtimeRef}},
+    [PSCustomObject]@{name='observer PID is not positive'; mutate={param($r) $r.outer_caller.observer_process.process_id=0L}},
+    [PSCustomObject]@{name='observer ordinary token is elevated'; mutate={param($r) $r.outer_caller.observer_process.ordinary_token.elevated=$true}},
+    [PSCustomObject]@{name='observer process image identity differs from host reference'; mutate={param($r) $r.outer_caller.observer_process.image_reference.file_id_hex='f'*32}}
+)
+foreach ($negativeCase in $l1ReaderObserverNegativeCases) {
+    $badObserverAuthority=Copy-D32BoundedCompilerDiagnosticTestJson $l1Authority
+    $mutation=[scriptblock]$negativeCase.mutate; & $mutation $badObserverAuthority
+    $badObserverJson=ConvertTo-Json -InputObject $badObserverAuthority -Depth 100 -Compress -ErrorAction Stop
+    $badObserverDocument=[System.Text.Json.JsonDocument]::Parse($badObserverJson)
+    try {
+        $badObserverRejected=-not (Test-D32NonSourceL1ReaderAuthority -Authority $badObserverDocument.RootElement -CaseId 'NORMAL_EXIT' `
+            -Nonce $l1CasesAuthority[0].nonce -CandidateSha $l1CandidateSha -BatchId $l1BatchId -AuthorityPath $l1EntryPath `
+            -RuntimePath $l1RuntimePath -OwnerId $l1OwnerId -SystemRoot $l1SystemRoot)
+    } finally { $badObserverDocument.Dispose() }
+    Assert-D32BoundedCompilerDiagnosticSelfTest ('L1 child reader rejects '+[string]$negativeCase.name) $badObserverRejected
+}
 $l1ReaderRefusalDetail = Get-D32NonSourceL1ReaderRefusalText -Exception ([InvalidOperationException]::new('reader token=private nonce=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee at "C:\private user\source\authority.json"'))
 Assert-D32BoundedCompilerDiagnosticSelfTest 'reader admission failures emit a bounded sanitized refusal detail without paths, nonce values, or long IDs' `
     ($l1ReaderRefusalDetail.StartsWith('InvalidOperationException:', [StringComparison]::Ordinal) -and
@@ -3959,6 +4283,7 @@ $controllerPath = Join-Path $PSScriptRoot 'd32-bounded-diagnostic-sourceproof-co
 $controllerTokens = $null; $controllerParseErrors = $null
 $controllerAst = [System.Management.Automation.Language.Parser]::ParseFile($controllerPath, [ref]$controllerTokens, [ref]$controllerParseErrors)
 $controllerText = [string]$controllerAst.Extent.Text
+$controllerTextSingleLine = [regex]::Replace($controllerText, '[`][ \t]*\r?\n', ' ')
 $controllerForbiddenCommands = @($controllerAst.FindAll({ param($node)
     $node -is [System.Management.Automation.Language.CommandAst] -and
     ([string]$node.GetCommandName() -match '^(?i:Start-Process|Start-Job|Invoke-Expression|Get-CimInstance|Get-Process|Stop-Process|cargo|git|rustc)$')
@@ -3968,8 +4293,8 @@ $controllerUtilityImports = @($controllerAst.FindAll({ param($node)
 }, $true))
 $controllerUtilityImportWired = $controllerUtilityImports.Count -eq 2 -and
     @($controllerUtilityImports | Where-Object { $_.Extent.Text -cnotin @('Import-Module -Name $utilityPath -ErrorAction Stop','Import-Module -Name $utilityManifestPath -ErrorAction Stop') }).Count -eq 0 -and
-    $controllerText.Contains('Get-D32NonSourceL1RuntimeContext -Authority $authority -DeadlineTicks $script:D32NonSourceL1BatchDeadline -PreImportOnly') -and
-    $controllerText.Contains('Get-D32NonSourceL1RuntimeContext -Authority $script:D32NonSourceL1Authority')
+    $controllerTextSingleLine -match 'Get-D32NonSourceL1RuntimeContext\s+-Authority\s+\$script:D32NonSourceL1Authority\s+-DeadlineTicks\s+\$script:D32NonSourceL1BatchDeadline\s+-PreImportOnly' -and
+    $controllerTextSingleLine -match 'Get-D32NonSourceL1RuntimeContext\s+-Authority\s+\$script:D32NonSourceL1Authority\s+-DeadlineTicks\s+\$script:D32NonSourceL1BatchDeadline'
 $controllerNativeCreationOrder = $controllerText.IndexOf('CreateProcessW(image,') -ge 0 -and
     $controllerText.IndexOf('CreateProcessW(image,') -lt $controllerText.IndexOf('AssignProcessToJobObject(owned.Job, owned.Process)', $controllerText.IndexOf('CreateProcessW(image,') , [StringComparison]::Ordinal) -and
     $controllerText.IndexOf('AssignProcessToJobObject(owned.Job, owned.Process)', $controllerText.IndexOf('CreateProcessW(image,') , [StringComparison]::Ordinal) -lt
@@ -3987,6 +4312,34 @@ $controllerSafetyAst = $controllerParseErrors.Count -eq 0 -and $controllerForbid
     -not $controllerText.Contains('Process.GetProcesses') -and -not $controllerText.Contains('.Kill()') -and
     $controllerText.Contains('cleanup_deadline_ticks') -and $controllerText.Contains('terminal_audit_deadline_ticks')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'durable controller AST has one fixed suspended CreateProcess→Job assignment→resume order and no free-form helper/commands' $controllerSafetyAst
+$outerCallerFunctionAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Invoke-D32NonSourceL1ProductionOuterCaller'},$true)
+$observerPrepFunctionAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'New-D32NonSourceL1ObserverBindingPreparation'},$true)
+$outerCallerFunctionText=if ($null -eq $outerCallerFunctionAst) { '' } else { [string]$outerCallerFunctionAst.Extent.Text }
+$observerPrepFunctionText=if ($null -eq $observerPrepFunctionAst) { '' } else { [string]$observerPrepFunctionAst.Extent.Text }
+$observerPrepParameterNames=@($controllerAst.ParamBlock.Parameters | Where-Object {
+    @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.FullName -ceq 'Parameter' -and
+        @($_.NamedArguments | Where-Object { $_.ArgumentName -ceq 'ParameterSetName' -and $_.Argument.Extent.Text -ceq "'ObserverBindingPreparation'" }).Count -gt 0 }).Count -gt 0
+} | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
+$fixedOuterCallerParameters=@($controllerAst.ParamBlock.Parameters | Where-Object {
+    @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.FullName -ceq 'Parameter' -and
+        @($_.NamedArguments | Where-Object { $_.ArgumentName -ceq 'ParameterSetName' -and $_.Argument.Extent.Text -ceq "'OuterCaller'" }).Count -gt 0 }).Count -gt 0
+} | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
+$outerObserverBoundaryExact=$null -ne $outerCallerFunctionAst -and $null -ne $observerPrepFunctionAst -and
+    ($observerPrepParameterNames -join '|') -ceq 'Repository|CandidateSha|PrepareObserverBinding' -and
+    ($fixedOuterCallerParameters -join '|') -ceq 'Repository|CandidateSha|L1AuthorityPath|ExpectedL1AuthoritySha256|FixedOuterCaller' -and
+    $observerPrepFunctionText.Contains('Get-D32NonSourceL1CurrentProcessFacts') -and
+    $observerPrepFunctionText.Contains('Get-D32NonSourceL1CurrentTokenFacts') -and
+    $observerPrepFunctionText.Contains('Get-D32NonSourceL1ObserverStartupDigest') -and
+    $observerPrepFunctionText.Contains('authority_created=$false') -and $observerPrepFunctionText.Contains('artifact_written=$false') -and
+    $observerPrepFunctionText.Contains('child_created=$false') -and $observerPrepFunctionText.Contains('job_created=$false') -and
+    $outerCallerFunctionText.Contains('Assert-D32NonSourceL1ObserverBindingCurrent') -and
+    $outerCallerFunctionText.Contains('Get-D32NonSourceL1ObserverStartupDigest') -and
+    -not $outerCallerFunctionText.Contains('Get-D32NonSourceL1RuntimeContext') -and
+    -not $outerCallerFunctionText.Contains('Get-D32NonSourceL1LoadedModuleNames') -and
+    -not $outerCallerFunctionText.Contains('Initialize-D32NonSourceL1ControllerRuntime')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed outer route binds the existing observer, keeps child runtime admission separate, and exposes no arbitrary preparation/launch inputs' $outerObserverBoundaryExact
 $legacySyntheticCallerAst = $controllerAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32NonSourceL1SyntheticCallerReconciliation'
 }, $true)
@@ -4188,15 +4541,24 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed native supervisor surface is 
 # file providers below are synthetic in-process objects; no P/Invoke operation,
 # process creation, filesystem output, or child is invoked.
 Add-Type -TypeDefinition @'
+using System;
 using System.IO;
+using Microsoft.Win32.SafeHandles;
 public sealed class D32NonSourceL1SelfTestStreamV1 : MemoryStream {
+    private readonly SafeFileHandle syntheticSafeFileHandle = new SafeFileHandle(new IntPtr(1), false);
+    public SafeFileHandle SafeFileHandle { get { return syntheticSafeFileHandle; } }
     public void Flush(bool flushToDisk) { base.Flush(); }
+    protected override void Dispose(bool disposing) {
+        if (disposing) syntheticSafeFileHandle.Dispose();
+        base.Dispose(disposing);
+    }
 }
 '@ -Language CSharp -ErrorAction Stop
 $l1PipelineFunctionNames = @(
     'Get-D32NonSourceL1Now', 'Get-D32NonSourceL1CaptureT0', 'Get-D32NonSourceL1DeadlineTicks', 'Get-D32NonSourceL1QpcFrequency',
     'Get-D32NonSourceL1CurrentControllerPath', 'Get-D32NonSourceL1CurrentRuntimePath', 'Get-D32NonSourceL1CurrentOwnerSid', 'Get-D32NonSourceL1UniquePinnedPath',
     'Get-D32NonSourceL1CurrentProcessFacts', 'Get-D32NonSourceL1CurrentTokenFacts', 'Get-D32NonSourceL1CurrentStartupFacts',
+    'Get-D32NonSourceL1ObserverStartupDigest', 'Assert-D32NonSourceL1ObserverBindingCurrent', 'New-D32NonSourceL1ObserverBindingPreparation',
     'Get-D32NonSourceL1LoadedModuleNames', 'Initialize-D32NonSourceL1ControllerRuntime', 'ConvertTo-D32NonSourceL1UtilityJson',
     'Test-D32NonSourceL1NoReparsePath', 'Get-D32NonSourceL1InitialReferenceBytes', 'Open-D32NonSourceL1AuthorityRecord',
     'Get-D32NonSourceL1DirectoryIdentity', 'Get-D32NonSourceL1ModuleAuthorityDirectoryIdentity', 'Get-D32NonSourceL1RootSecurity', 'Test-D32NonSourceL1OutputPathExists',
@@ -4315,7 +4677,8 @@ try {
     $script:D32NonSourceL1Secondary = [System.Collections.Generic.List[string]]::new(); $script:D32NonSourceL1Status = 'REFUSED'
     $script:D32SelfTestL1Ticks = [Int64]($l1T0 + 100L); $script:D32SelfTestL1ForceClockDeadline = [long]0
     $script:D32NonSourceL1Now = { $script:D32SelfTestL1Ticks += 1L; return [Int64]$script:D32SelfTestL1Ticks }
-    $script:D32SelfTestL1OpenCount = 0; $script:D32SelfTestL1StartInputs = [System.Collections.Generic.List[object]]::new()
+    $script:D32SelfTestL1OpenCount = 0; $script:D32SelfTestL1ObserverImageOpenCount = 0L
+    $script:D32SelfTestL1StartInputs = [System.Collections.Generic.List[object]]::new()
     $script:D32SelfTestL1NativeStates = @{}; $script:D32SelfTestL1JobMap = @{}
     $script:D32NonSourceL1FileAdapter = {
         param([string]$Path, [object]$Pin)
@@ -4333,7 +4696,8 @@ try {
         ModuleBytes = [byte[]]$l1FullModuleBytes; ModuleReference = $l1FullModulePin
         PolicyBytes = [byte[]]$l1FullPolicyBytes; PolicyReference = $l1FullPolicyPin
         RuntimeAuthorityBytes = [byte[]]$l1RuntimeAuthorityBytes; RuntimeAuthorityReference = $l1RuntimeAuthorityRef
-        RuntimeImageBytes = [byte[]]$l1SyntheticRuntimeImageBytes; RuntimeInitialized = $false; RuntimePreImportCallCount = 0L
+        RuntimeImageBytes = [byte[]]$l1SyntheticRuntimeImageBytes; ObserverImageBytes=[byte[]]$l1ObserverBytes; ObserverImageReference=$l1ObserverRef
+        RuntimeInitialized = $false; RuntimePreImportCallCount = 0L
         OuterControllerLaunched = $false; OuterControllerProcessId = 0L; OuterControllerCreationFileTime = 0L
         JournalStream = $null; ResultStream = $null; Artifacts = @{}; InitialAuthorityTamper = $false; InitialAuthorityFailureMessage = $null
     }
@@ -4348,6 +4712,7 @@ try {
             return [PSCustomObject][ordered]@{ process_id=[Int64]$observer.process_id
                 creation_filetime_ticks=[Int64]$observer.creation_filetime_ticks; image_path=[string]$observer.image_reference.path }
         }
+        ObserverStartupDigest = { return ('f' * 64) }
         CurrentToken = {
             return [PSCustomObject][ordered]@{ is_elevated=$false; integrity_rid=0x2000L; is_system=$false; thread_impersonating=$false }
         }
@@ -4382,6 +4747,9 @@ try {
             if ($Path -ceq [string]$script:D32SelfTestL1EnvironmentState.ModuleReference.path) {
                 return [PSCustomObject]@{ Reference = $script:D32SelfTestL1EnvironmentState.ModuleReference; Bytes = [byte[]]$script:D32SelfTestL1EnvironmentState.ModuleBytes; Stream = $null }
             }
+            if ($Path -ceq [string]$script:D32SelfTestL1EnvironmentState.PolicyReference.path) {
+                return [PSCustomObject]@{ Reference = $script:D32SelfTestL1EnvironmentState.PolicyReference; Bytes = [byte[]]$script:D32SelfTestL1EnvironmentState.PolicyBytes; Stream = $null }
+            }
             throw 'synthetic initial read reached an unexpected path'
         }
         OpenAuthority = {
@@ -4397,6 +4765,12 @@ try {
             if ($Path -ceq [string]$script:D32SelfTestL1EnvironmentState.PolicyReference.path) {
                 return [PSCustomObject]@{ Record = $script:D32SelfTestL1EnvironmentState.PolicyReference
                     Bytes = [byte[]]$script:D32SelfTestL1EnvironmentState.PolicyBytes; Stream = $null }
+            }
+            if ($Path -ceq [string]$script:D32SelfTestL1EnvironmentState.ObserverImageReference.path) {
+                $script:D32SelfTestL1OpenCount++
+                $script:D32SelfTestL1ObserverImageOpenCount++
+                return [PSCustomObject]@{ Record = $script:D32SelfTestL1EnvironmentState.ObserverImageReference
+                    Bytes = [byte[]]$script:D32SelfTestL1EnvironmentState.ObserverImageBytes; Stream = [D32NonSourceL1SelfTestStreamV1]::new() }
             }
             if ($Path -ceq [string]$l1FullAuthority.powershell_runtime.path) {
                 return [PSCustomObject]@{ Record = $l1FullAuthority.powershell_runtime
@@ -4698,6 +5072,20 @@ try {
             return $true
         }
     }
+    $l1PrepPriorArtifactCount=$script:D32SelfTestL1EnvironmentState.Artifacts.Count
+    $l1PrepPriorStartCount=$script:D32SelfTestL1StartInputs.Count
+    $l1ObserverPreparation=New-D32NonSourceL1ObserverBindingPreparation
+    $l1ObserverPreparationOnly=$l1ObserverPreparation.status -ceq 'CANDIDATE_ONLY' -and
+        $l1ObserverPreparation.gate_authority -ceq 'NONE' -and $l1ObserverPreparation.launch_authority -ceq 'NONE' -and
+        [string]$l1ObserverPreparation.outer_caller.observer_host_reference.path -ceq [string]$l1ObserverRef.path -and
+        [string]$l1ObserverPreparation.outer_caller.observer_process.image_reference.path -cne [string]$l1FullAuthority.powershell_runtime.path -and
+        [string]$l1ObserverPreparation.observer_startup_sha256 -ceq ('f'*64) -and
+        -not [bool]$l1ObserverPreparation.authority_created -and -not [bool]$l1ObserverPreparation.artifact_written -and
+        -not [bool]$l1ObserverPreparation.child_created -and -not [bool]$l1ObserverPreparation.job_created -and
+        $script:D32SelfTestL1EnvironmentState.Artifacts.Count -eq $l1PrepPriorArtifactCount -and
+        $script:D32SelfTestL1StartInputs.Count -eq $l1PrepPriorStartCount -and
+        $script:D32SelfTestL1OuterPrepareCount -eq 0L -and $script:D32SelfTestL1OuterLaunchCount -eq 0L
+    Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed observer preparation emits only a current-image candidate and neither creates authority/output/Job nor invokes the outer caller' $l1ObserverPreparationOnly
     $script:D32LifecycleFences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
     $l1NoCreateRefusalReference = Write-D32NonSourceL1ProductionNoCreateRefusal -Authority $l1FullAuthorityReadback `
         -AuthorityReference $l1FullAuthorityRef -T0Ticks ([Int64]$l1T0) -Frequency ([Int64][Diagnostics.Stopwatch]::Frequency) `
@@ -4915,7 +5303,7 @@ try {
         @($l1ActualResultReadback.runtime_admissions | Where-Object { [string]$_.status -ceq 'ADMITTED' }).Count -eq 3 -and
         [string]$l1ActualRows[0].state -ceq 'NATIVE_BOUNDARY_VERIFIED' -and [string]$l1ActualRows[1].state -ceq 'NATIVE_BOUNDARY_VERIFIED' -and
         [string]$l1ActualRows[2].state -ceq 'EXPECTED_REFUSAL_VERIFIED' -and $l1ActualRows[2].create_attempt_count -eq 0L -and
-        $script:D32SelfTestL1OpenCount -eq 13 -and $l1OuterZeroCreateCovered -and
+        $script:D32SelfTestL1OpenCount -eq 16 -and $script:D32SelfTestL1ObserverImageOpenCount -eq 3L -and $l1OuterZeroCreateCovered -and
         $script:D32SelfTestL1StartInputs[0].arguments.Count -eq 30 -and $script:D32SelfTestL1StartInputs[0].environment_entries.Count -eq 15 -and
         $script:D32SelfTestL1StartInputs[0].handle_roles.Count -eq 3 -and $script:D32SelfTestL1StartInputs[0].raw_command_line.Length -lt 32767 -and
         (Test-D32BoundedDiagnosticSourceProofNonSourceL1ResultShape -Record $l1ActualResultReadback) -and
@@ -4993,5 +5381,5 @@ foreach ($consumer in $formalConsumerSchemas) {
 }
 
 Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_EXTENSION: the fixed outer-caller function creates and reopens a canonical H-bound prelaunch record, then dispatches the actual controller boundary in-process through a synthetic-only route; the controller constructs and persists all three runtime admissions, executes the fixed case state machine through synthetic native/file/clock providers, writes the strict result and journal, and caller-reopens/reconciles the captures, three admission refs, inner result/journal refs, outcome, and one-line submitted caller journal. A strict zero-create caller refusal persists REFUSED/NOT_REQUIRED with null prelaunch/process/capture/inner-result facts and no predicted admissions. A separate early refusal preserves sanitized primary text through a connected bounded stderr-style pipe. The adapter explicitly refuses the native route. No P/Invoke, child process, runtime scan/import, or real output write occurs. Strict reader argv, cleared environment, raw command line, handle roles, case nonce/clock/evidence digest, nullable refusal/result JSON, bounded schemas, owner-bound root ACL, and untrusted-writer negative are covered.'
-Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, source-proof execution authority/result V1 producer-validator-JSON-consumer closure and strict scalar/schema mutations, isolated NON_SOURCE_L1 authority/result V2 producer→reader→JSON→consumer closure, outer-caller H projection and raw-command-line binding positives/negatives, create-new prelaunch/admission reference SHA+identity readback, controller/reader runtime-admission V1 process/argv/environment/import-order/cross-parent bindings, synthetic real-route refusal, exact six-code pin reader terminal branch and mode-disjoint fixed argv/environment roles, 2-create/1-termination/0-create refusal lifecycle evidence, one-reader Job active-process limit and retained-identity AST checks, 60-second shared T0 and 5/10/15-second case deadlines, ordered execution/NOT_RUN suffix and at-audit BUDGET_STOPPED result/journal reconciliation, no fabricated PID/capture on refusal, formal/SourceProof-domain cross-rejection, shared synthetic QPC phase boundaries at 269999/270000/299999/300000/345000/360000, clock rollback/overflow and reset rejection, exit/deadline race and late-zero/partial-result refusal, fake-clock controller read boundaries, retained-handle/job AST ordering and PID-creation identity requirements, bounded capture/journal/candidate limits, exact result-persisted journal bytes/hash/timing ordering, primary-error preservation and formal-consumer refusal. Pure synthetic fixtures only: no Cargo, native child/PInvoke call, runtime scan/import, network, registry cache, or archive content access.'
+Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, source-proof execution authority/result V1 producer-validator-JSON-consumer closure and strict scalar/schema mutations, NON_SOURCE_L1 runtime-content V2 producer→canonical-JSON→strict-consumer closure with V2 distribution/Utility/startup/resolver fixtures, bounded deps/runtimeconfig target parsing, exact V2 TPA/native-directory resolution, PE import dependency parsing and candidate-input rejection, protected-absence projection, candidate-gap behavior and exact schema/type/reference/digest/limit/unknown-field negatives, observer-image/process/token separation positives and reader/policy alias/cross-binding negatives, isolated NON_SOURCE_L1 authority/result V2 producer→reader→JSON→consumer closure, outer-caller H projection and raw-command-line binding positives/negatives, create-new prelaunch/admission reference SHA+identity readback, controller/reader runtime-admission V1 process/argv/environment/import-order/cross-parent bindings, synthetic real-route refusal, exact six-code pin reader terminal branch and mode-disjoint fixed argv/environment roles, 2-create/1-termination/0-create refusal lifecycle evidence, one-reader Job active-process limit and retained-identity AST checks, 60-second shared T0 and 5/10/15-second case deadlines, ordered execution/NOT_RUN suffix and at-audit BUDGET_STOPPED result/journal reconciliation, no fabricated PID/capture on refusal, formal/SourceProof-domain cross-rejection, shared synthetic QPC phase boundaries at 269999/270000/299999/300000/345000/360000, clock rollback/overflow and reset rejection, exit/deadline race and late-zero/partial-result refusal, fake-clock controller read boundaries, retained-handle/job AST ordering and PID-creation identity requirements, bounded capture/journal/candidate limits, exact result-persisted journal bytes/hash/timing ordering, primary-error preservation and formal-consumer refusal. Pure synthetic fixtures only: no Cargo, native child/PInvoke call, runtime scan/import, network, registry cache, or archive content access.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)

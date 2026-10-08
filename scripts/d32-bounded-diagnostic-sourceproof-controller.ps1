@@ -2,8 +2,8 @@
 # No shell, helper executable, retry, or free-form child argv is accepted.
 [CmdletBinding(DefaultParameterSetName = 'SourceProofOnly')]
 param(
-    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][string]$Repository,
-    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][string]$CandidateSha,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][string]$Repository,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][string]$CandidateSha,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExecutionAuthorityPath,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExpectedExecutionAuthoritySha256,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][long]$LifecycleT0Ticks,
@@ -12,7 +12,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][string]$ExpectedL1AuthoritySha256,
     [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$ExpectedOuterPrelaunchBindingSha256,
     [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][long]$L1T0Ticks,
-    [Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][switch]$FixedOuterCaller
+    [Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][switch]$FixedOuterCaller,
+    [Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][switch]$PrepareObserverBinding
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1256,6 +1257,73 @@ function Get-D32NonSourceL1CurrentStartupFacts {
     return Get-D32PowerShellAuthorityProcessStartup -EntryScriptPath $EntryScriptPath
 }
 
+function Get-D32NonSourceL1ObserverStartupDigest {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+        if ($null -eq $script:D32NonSourceL1EnvironmentAdapter.ObserverStartupDigest) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: synthetic trusted-observer startup digest provider is unavailable'
+        }
+        $digest = [string](& $script:D32NonSourceL1EnvironmentAdapter.ObserverStartupDigest)
+        if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw 'D32_NON_SOURCE_L1_REFUSED: synthetic trusted-observer startup digest is malformed' }
+        return $digest
+    }
+    $arguments = [string[]][Environment]::GetCommandLineArgs()
+    $commandLine = [string][Environment]::CommandLine
+    if ($arguments.Length -lt 1 -or $arguments.Length -gt 128 -or $commandLine.Length -gt 32766) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: actual trusted-observer startup exceeds its fixed observation bound'
+    }
+    $argumentBytes = 0L
+    foreach ($argument in $arguments) {
+        if ($null -eq $argument -or $argument.Length -gt 4096 -or $argument.IndexOf([char]0) -ge 0) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: actual trusted-observer startup argument is malformed or over-bound'
+        }
+        $argumentBytes += [Int64]([Text.Encoding]::Unicode.GetByteCount($argument) + 2)
+    }
+    if ($argumentBytes -gt 65536) { throw 'D32_NON_SOURCE_L1_REFUSED: actual trusted-observer argv exceeds its fixed digest input bound' }
+    $environment = [ordered]@{}
+    foreach ($name in @('SystemRoot','WINDIR','PATH','PSHOME','PSModulePath','PSModuleAutoLoadingPreference','DOTNET_STARTUP_HOOKS',
+            'DOTNET_ADDITIONAL_DEPS','CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH')) {
+        $value = [Environment]::GetEnvironmentVariable($name,[EnvironmentVariableTarget]::Process)
+        if ($null -ne $value -and ([string]$value).Length -gt 32767) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: actual trusted-observer fixed startup environment value exceeds its digest bound'
+        }
+        $environment[$name] = $value
+    }
+    $projection = [ordered]@{ command_line=$commandLine; arguments=@($arguments); environment=$environment }
+    $bytes = ConvertTo-D32BoundedDiagnosticSourceProofCanonicalJsonBytes -Value $projection
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$bytes)).ToLowerInvariant()
+}
+
+function Assert-D32NonSourceL1ObserverBindingCurrent {
+    param([Parameter(Mandatory = $true)][object]$Authority, [Parameter(Mandatory = $true)][object]$OpenedImage,
+        [Parameter(Mandatory = $true)][string]$ExpectedStartupDigest)
+    if ($ExpectedStartupDigest -cnotmatch '^[0-9a-f]{64}$' -or $null -eq $OpenedImage.Stream -or
+        $OpenedImage.Stream.SafeFileHandle.IsClosed -or $OpenedImage.Stream.SafeFileHandle.IsInvalid) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: retained observer image or finite startup witness is unavailable'
+    }
+    $observer = $Authority.outer_caller.observer_process
+    $process = Get-D32NonSourceL1CurrentProcessFacts
+    $token = Get-D32NonSourceL1CurrentTokenFacts
+    $imagePath = [IO.Path]::GetFullPath([string]$process.image_path)
+    $highIntegrity = [Int64]$token.integrity_rid -ge 0x3000
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$OpenedImage.Record.$name -cne [string]$observer.image_reference.$name -or
+            [string]$OpenedImage.Record.$name -cne [string]$Authority.outer_caller.observer_host_reference.$name) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: retained trusted-observer image reference drifted'
+        }
+    }
+    if ([Int64]$process.process_id -ne [Int64]$observer.process_id -or
+        [Int64]$process.creation_filetime_ticks -ne [Int64]$observer.creation_filetime_ticks -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($imagePath,[string]$observer.image_reference.path) -or
+        [bool]$token.is_elevated -or $highIntegrity -or [bool]$token.is_system -or [bool]$token.thread_impersonating -or
+        [bool]$observer.ordinary_token.elevated -ne [bool]$token.is_elevated -or
+        [bool]$observer.ordinary_token.high_integrity -ne $highIntegrity -or
+        [bool]$observer.ordinary_token.system_token -ne [bool]$token.is_system -or
+        [bool]$observer.ordinary_token.thread_impersonation -ne [bool]$token.thread_impersonating -or
+        (Get-D32NonSourceL1ObserverStartupDigest) -cne $ExpectedStartupDigest) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: live trusted-observer process/token/startup binding changed after external pinning'
+    }
+}
+
 function Get-D32NonSourceL1LoadedModuleNames {
     if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
         if ($null -eq $script:D32NonSourceL1EnvironmentAdapter.LoadedModuleNames) {
@@ -1834,8 +1902,24 @@ function New-D32NonSourceL1OuterPrelaunchRecord {
         [string]$Observation.outer_job.policy -cne 'CALLER_OWNED_NESTED_JOB_V1' -or [Int64]$Observation.outer_job.active_process_limit -ne 2 -or
         $Observation.outer_job.kill_on_close -isnot [bool] -or -not $Observation.outer_job.kill_on_close -or
         $Observation.outer_job.non_breakaway -isnot [bool] -or -not $Observation.outer_job.non_breakaway -or
-        $Observation.namespace_witness -isnot [System.Collections.IDictionary] -and $Observation.namespace_witness -isnot [PSCustomObject]) {
+        -not (Test-D32BoundedCompilerDiagnosticExactProperties $Observation.namespace_witness @('policy_id','observer_process_id','observer_creation_filetime_ticks',
+            'observer_image_reference','observer_startup_sha256','entry_reference','fixed_source_pin_count','live_fences_verified','caller_owned')) -or
+        [string]$Observation.namespace_witness.policy_id -cne 'D32_NON_SOURCE_L1_OBSERVER_NAMESPACE_WITNESS_V1' -or
+        [Int64]$Observation.namespace_witness.observer_process_id -ne [Int64]$Observation.caller_process.process_id -or
+        [Int64]$Observation.namespace_witness.observer_creation_filetime_ticks -ne [Int64]$Observation.caller_process.creation_filetime_ticks -or
+        [string]$Observation.namespace_witness.observer_image_reference.sha256 -cne [string]$Observation.caller_process.image_reference.sha256 -or
+        [string]$Observation.namespace_witness.observer_startup_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Observation.namespace_witness.entry_reference.path -cne [string]$controllerPin.path -or
+        [Int64]$Observation.namespace_witness.fixed_source_pin_count -ne 6 -or
+        $Observation.namespace_witness.live_fences_verified -isnot [bool] -or -not $Observation.namespace_witness.live_fences_verified -or
+        $Observation.namespace_witness.caller_owned -isnot [bool] -or -not $Observation.namespace_witness.caller_owned) {
         throw 'D32_NON_SOURCE_L1_REFUSED: outer-caller raw prelaunch observation is incomplete or violates fixed ownership/handle policy'
+    }
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$Observation.namespace_witness.observer_image_reference.$name -cne [string]$Observation.caller_process.image_reference.$name -or
+            [string]$Observation.namespace_witness.entry_reference.$name -cne [string]$controllerPin.$name) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: outer namespace witness does not bind the live observer and fixed controller entry'
+        }
     }
     for ($index = 0; $index -lt 15; $index++) {
         if ([string]$Observation.environment_entries[$index] -cne [string]$environmentEntries[$index]) { throw 'D32_NON_SOURCE_L1_REFUSED: outer controller environment differs from the fixed cleared block' }
@@ -2598,15 +2682,13 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
         if (-not (Test-D32BoundedDiagnosticSourceProofNonSourceL1AuthorityShape -Document $authority -ExpectedCandidateSha $CandidateSha -Repository $Repository) -or
             [string]$authority.source_repo -cne $Repository -or [string]$authority.source_pins[0].path -cne (Get-D32NonSourceL1CurrentControllerPath) -or
             [string]$authority.outer_caller.entry_reference.path -cne [string]$authority.source_pins[0].path -or
-            [string]$authority.outer_caller.observer_host_reference.path -cne [string]$authority.powershell_runtime.path -or
-            [string]$authority.outer_caller.observer_process.image_reference.path -cne [string]$authority.powershell_runtime.path -or
+            [string]$authority.outer_caller.observer_process.image_reference.path -cne [string]$authority.outer_caller.observer_host_reference.path -or
             [string]$authorityRef.path -cne $L1AuthorityPath -or [string]$authorityRef.sha256 -cne $ExpectedL1AuthoritySha256) {
             throw 'D32_NON_SOURCE_L1_REFUSED: strict authority/candidate/source/outer-caller binding failed'
         }
         foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
-            if ([string]$authority.outer_caller.observer_host_reference.$name -cne [string]$authority.powershell_runtime.$name -or
-                [string]$authority.outer_caller.observer_process.image_reference.$name -cne [string]$authority.powershell_runtime.$name) {
-                throw 'D32_NON_SOURCE_L1_REFUSED: observer host/process image refs differ from the pinned PowerShell runtime image'
+            if ([string]$authority.outer_caller.observer_host_reference.$name -cne [string]$authority.outer_caller.observer_process.image_reference.$name) {
+                throw 'D32_NON_SOURCE_L1_REFUSED: observer host/process image refs differ from the actual trusted observer pin'
             }
         }
         $runtimeRaw = Open-D32NonSourceL1AuthorityRecord -Path ([string]$authority.runtime_authority.path) -DirectoryFences $script:D32LifecycleFences -MaximumBytes 4194304 -DeadlineTicks $script:D32NonSourceL1BatchDeadline
@@ -2670,13 +2752,7 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
             [bool]$observer.ordinary_token.thread_impersonation -ne [bool]$token.thread_impersonating) {
             throw 'D32_NON_SOURCE_L1_REFUSED: trusted observer token differs from the pin or is elevated, high-integrity, system, or impersonating'
         }
-        $startup = Get-D32NonSourceL1CurrentStartupFacts -EntryScriptPath ([string]$authority.source_pins[0].path)
-        if ($startup.FileOperand -cne [string]$authority.source_pins[0].path) { throw 'D32_NON_SOURCE_L1_REFUSED: trusted observer startup is not direct pinned -File execution' }
-        $preImportContext = Get-D32NonSourceL1RuntimeContext -Authority $authority -DeadlineTicks $script:D32NonSourceL1BatchDeadline -PreImportOnly
-        $loadedModules = [string[]](Get-D32NonSourceL1LoadedModuleNames)
-        if ($loadedModules.Count -ne 0) { throw 'D32_NON_SOURCE_L1_REFUSED: trusted observer loaded a module before prelaunch admission' }
-        Initialize-D32NonSourceL1ControllerRuntime -PreImportContext $preImportContext
-        $script:D32NonSourceL1RuntimeContext = Get-D32NonSourceL1RuntimeContext -Authority $authority -DeadlineTicks $script:D32NonSourceL1BatchDeadline
+        $observerStartupDigest = Get-D32NonSourceL1ObserverStartupDigest
         $environmentEntries = [string[]](Get-D32BoundedDiagnosticSourceProofNonSourceL1EnvironmentEntries -Environment $authority.invocation.child_environment)
         $vector = [string[]](Get-D32NonSourceL1OuterControllerVector -Authority $authority -AuthorityReference $authorityRef -T0Ticks $t0)
         $outerPreparationAttempted = $true
@@ -2687,6 +2763,11 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
         $processRecord = [PSCustomObject][ordered]@{process_id=$callerPid;creation_filetime_ticks=$callerCreation;image_reference=$imageReference
             ordinary_token=[PSCustomObject][ordered]@{elevated=[bool]$token.is_elevated;high_integrity=([Int64]$token.integrity_rid -ge 0x3000)
                 system_token=[bool]$token.is_system;thread_impersonation=[bool]$token.thread_impersonating}}
+        $observerNamespaceWitness = [PSCustomObject][ordered]@{
+            policy_id='D32_NON_SOURCE_L1_OBSERVER_NAMESPACE_WITNESS_V1';observer_process_id=$callerPid;observer_creation_filetime_ticks=$callerCreation
+            observer_image_reference=$imageReference;observer_startup_sha256=$observerStartupDigest;entry_reference=$authority.outer_caller.entry_reference
+            fixed_source_pin_count=6L;live_fences_verified=$true;caller_owned=$true
+        }
         $invocation = $prepared.Owned.Invocation
         $observation = [PSCustomObject][ordered]@{
             caller_process=$processRecord;environment_entries=@($invocation.EnvironmentEntries)
@@ -2701,7 +2782,7 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
             startup_info=[PSCustomObject][ordered]@{extended_startupinfo=([bool]($invocation.CreationFlags -band 0x00080000));handle_list_applied=[bool]$invocation.HandleListApplied;handle_roles=@($invocation.HandleRoles)}
             outer_job=[PSCustomObject][ordered]@{policy='CALLER_OWNED_NESTED_JOB_V1';active_process_limit=2L
                 kill_on_close=[bool]$prepared.Owned.JobKillOnClose;non_breakaway=[bool]$prepared.Owned.JobActiveProcessLimitTwo}
-            namespace_witness=$script:D32NonSourceL1RuntimeContext.namespace_witness}
+            namespace_witness=$observerNamespaceWitness}
         $prelaunch = New-D32NonSourceL1OuterPrelaunchRecord -Authority $authority -AuthorityReference $authorityRef -Observation $observation -T0Ticks $t0 -CounterFrequency $frequency
         $bound = Set-D32BoundedDiagnosticSourceProofOuterPrelaunchBinding -Record $prelaunch
         $outerBindingSha256 = [string]$bound.binding_sha256
@@ -2719,6 +2800,7 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
         Bind-D32NonSourceL1OuterControllerCommandLine -Prepared $prepared -Vector ([string[]]$reopened.record.controller.arguments.vector) `
             -CommandLine ([string]$reopened.record.controller.arguments.command_line) -BindingSha256 ([string]$bound.binding_sha256)
         if ((Get-D32NonSourceL1Now) -ge $script:D32NonSourceL1BatchDeadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: outer controller creation cutoff reached before its sole attempt' }
+        Assert-D32NonSourceL1ObserverBindingCurrent -Authority $authority -OpenedImage $observerImageOpened -ExpectedStartupDigest $observerStartupDigest
         $attempted = $true
         $owned = Start-D32NonSourceL1OuterController -Prepared $prepared -CommandLine ([string]$reopened.record.controller.arguments.command_line) `
             -T0Ticks $t0 -Frequency $frequency -DeadlineTicks $script:D32NonSourceL1BatchDeadline
@@ -2868,6 +2950,71 @@ function Invoke-D32NonSourceL1ProductionOuterCaller {
 function Invoke-D32NonSourceL1FixedOuterCaller {
     param([Parameter(Mandatory = $true)][System.IO.TextWriter]$DiagnosticWriter)
     return Invoke-D32NonSourceL1ProductionOuterCaller -DiagnosticWriter $DiagnosticWriter
+}
+
+function New-D32NonSourceL1ObserverBindingPreparation {
+    if ($PSVersionTable.PSVersion -lt [version]'7.5' -or -not [Environment]::Is64BitProcess -or
+        $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or [IO.Path]::GetFullPath($Repository) -cne $Repository -or
+        -not [IO.Path]::IsPathRooted($Repository)) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: observer-binding preparation requires the fixed x64 PowerShell entry and canonical candidate/repository inputs'
+    }
+    $controllerPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1'))
+    if ([string]$controllerPath -cne [string](Get-D32NonSourceL1CurrentControllerPath) -or
+        -not (Test-D32NonSourceL1NoReparsePath -Path $controllerPath)) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: observer-binding preparation was not invoked through the exact fixed controller entry'
+    }
+    $frequency = [Int64](Get-D32NonSourceL1QpcFrequency)
+    $started = [Int64](Get-D32NonSourceL1CaptureT0 -Frequency $frequency)
+    $deadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
+    $modulePath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-powershell-module-authority.ps1'))
+    $policyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
+    $opened = [System.Collections.Generic.List[object]]::new()
+    $fences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($path in @($modulePath,$policyPath)) {
+            $raw = Get-D32NonSourceL1InitialReferenceBytes -Path $path -MaximumBytes 16777216 -DeadlineTicks $deadline
+            if ($raw.Reference.bytes -le 0 -or $raw.Reference.bytes -gt 16777216 -or (Get-D32NonSourceL1Now) -ge $deadline) {
+                throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed observer-preparation source input is empty, over-bound, or late'
+            }
+            . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$raw.Bytes)))
+        }
+        $entryOpened = Open-D32NonSourceL1AuthorityRecord -Path $controllerPath -DirectoryFences $fences -MaximumBytes 16777216 -DeadlineTicks $deadline
+        $opened.Add($entryOpened)
+        $processFacts = Get-D32NonSourceL1CurrentProcessFacts
+        $token = Get-D32NonSourceL1CurrentTokenFacts
+        $hostPath = [IO.Path]::GetFullPath([string]$processFacts.image_path)
+        $targetRuntime = [IO.Path]::GetFullPath([IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
+            'PowerShell','7','pwsh.exe'))
+        if ([Int64]$processFacts.process_id -le 0 -or [Int64]$processFacts.creation_filetime_ticks -le 0 -or
+            [StringComparer]::OrdinalIgnoreCase.Equals($hostPath,$targetRuntime) -or
+            [bool]$token.is_elevated -or [Int64]$token.integrity_rid -ge 0x3000 -or [bool]$token.is_system -or [bool]$token.thread_impersonating) {
+            throw 'D32_NON_SOURCE_L1_REFUSED: current observer is not the bounded ordinary host distinct from the fixed Program Files child runtime'
+        }
+        $hostOpened = Open-D32NonSourceL1AuthorityRecord -Path $hostPath -DirectoryFences $fences -MaximumBytes 16777216 -DeadlineTicks $deadline
+        $opened.Add($hostOpened)
+        $entryReference = Get-D32NonSourceL1ReferenceFromOpened -Opened $entryOpened
+        $hostReference = Get-D32NonSourceL1ReferenceFromOpened -Opened $hostOpened
+        $processRecord = [PSCustomObject][ordered]@{
+            process_id=[Int64]$processFacts.process_id;creation_filetime_ticks=[Int64]$processFacts.creation_filetime_ticks
+            image_reference=$hostReference
+            ordinary_token=[PSCustomObject][ordered]@{elevated=[bool]$token.is_elevated;high_integrity=([Int64]$token.integrity_rid -ge 0x3000)
+                system_token=[bool]$token.is_system;thread_impersonation=[bool]$token.thread_impersonating}
+        }
+        $outerCallerFragment = [PSCustomObject][ordered]@{
+            role='D32_NON_SOURCE_L1_FIXED_OUTER_CALLER_V1';entry_reference=$entryReference;observer_host_reference=$hostReference
+            observer_process=$processRecord;observer_process_policy='EXISTING_TRUSTED_OBSERVER_CURRENT_PROCESS_V1'
+        }
+        $startupDigest = Get-D32NonSourceL1ObserverStartupDigest
+        if ((Get-D32NonSourceL1Now) -ge $deadline) { throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: observer-binding preparation reached its fixed 15-second ceiling' }
+        return [PSCustomObject][ordered]@{
+            gate_authority='NONE';status='CANDIDATE_ONLY';candidate_sha=$CandidateSha;source_repo=$Repository
+            outer_caller=$outerCallerFragment;observer_startup_sha256=$startupDigest;child_runtime_path=$targetRuntime
+            launch_authority='NONE';authority_created=$false;artifact_written=$false;child_created=$false;job_created=$false
+        }
+    } finally {
+        foreach ($item in $opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch {} }
+        foreach ($fence in $fences.Values) { try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } catch {} }
+    }
 }
 
 function Open-D32NonSourceL1PersistedOutput {
@@ -3781,6 +3928,10 @@ function Invoke-D32NonSourceL1ControllerBoundary {
 
 if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
     exit (Invoke-D32NonSourceL1ControllerBoundary -DiagnosticWriter ([Console]::Error))
+}
+
+if ($PSCmdlet.ParameterSetName -ceq 'ObserverBindingPreparation') {
+    return (New-D32NonSourceL1ObserverBindingPreparation)
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'OuterCaller') {

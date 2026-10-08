@@ -197,7 +197,22 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
             -not (Test-D32NonSourceL1ReaderFileReference $outerCaller.GetProperty('entry_reference')) -or
             $outerCaller.GetProperty('entry_reference').GetProperty('path').GetString() -cne $expectedPins[0] -or
             -not (Test-D32NonSourceL1ReaderFileReference $outerCaller.GetProperty('observer_host_reference')) -or
-            $outerCaller.GetProperty('observer_host_reference').GetProperty('path').GetString() -cne $runtime.GetProperty('path').GetString()) { return $false }
+            [StringComparer]::OrdinalIgnoreCase.Equals($outerCaller.GetProperty('observer_host_reference').GetProperty('path').GetString(),$runtime.GetProperty('path').GetString())) { return $false }
+        $observerReference = $outerCaller.GetProperty('observer_host_reference')
+        $observerProcess = $outerCaller.GetProperty('observer_process')
+        if (-not (Test-D32NonSourceL1ReaderExactProperties $observerProcess @('process_id','creation_filetime_ticks','image_reference','ordinary_token')) -or
+            -not (Test-D32NonSourceL1ReaderPositiveInteger $observerProcess 'process_id') -or
+            -not (Test-D32NonSourceL1ReaderPositiveInteger $observerProcess 'creation_filetime_ticks') -or
+            -not (Test-D32NonSourceL1ReaderFileReference $observerProcess.GetProperty('image_reference')) -or
+            $observerProcess.GetProperty('image_reference').GetProperty('path').GetString() -cne $observerReference.GetProperty('path').GetString() -or
+            -not (Test-D32NonSourceL1ReaderExactProperties $observerProcess.GetProperty('ordinary_token') @('elevated','high_integrity','system_token','thread_impersonation'))) { return $false }
+        foreach ($name in @('elevated','high_integrity','system_token','thread_impersonation')) {
+            $tokenFact = $observerProcess.GetProperty('ordinary_token').GetProperty($name)
+            if ($tokenFact.ValueKind -ne [System.Text.Json.JsonValueKind]::False) { return $false }
+        }
+        foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+            if ($observerProcess.GetProperty('image_reference').GetProperty($name).ToString() -cne $observerReference.GetProperty($name).ToString()) { return $false }
+        }
         $environment = $invocation.GetProperty('child_environment')
         $environmentNames = @('SystemRoot', 'WINDIR', 'PATH', 'PSHOME', 'PSModulePath', 'PSModuleAutoLoadingPreference', 'POWERSHELL_TELEMETRY_OPTOUT',
             'DOTNET_CLI_TELEMETRY_OPTOUT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH')

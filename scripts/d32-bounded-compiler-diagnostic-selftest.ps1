@@ -4309,6 +4309,9 @@ $controllerSafetyAst = $controllerParseErrors.Count -eq 0 -and $controllerForbid
     $controllerText.Contains('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE') -and $controllerText.Contains('StartSuspendedAssignedAndResume') -and
     $controllerText.Contains('return (Invoke-D32NonSourceL1FixedOuterCaller -DiagnosticWriter ([Console]::Error))') -and
     $controllerText.Contains('return Invoke-D32NonSourceL1ProductionOuterCaller -DiagnosticWriter $DiagnosticWriter') -and
+    $controllerText.Contains("PSVariable.Get('D32PreparationObserverSessionTestAdapter')") -and
+    $controllerText.Contains("PSVariable.Remove('D32PreparationObserverSessionTestAdapter')") -and
+    $controllerText.Contains('-DiagnosticWriter ([Console]::Error) -TestAdapter $preparationSessionTestAdapter -RequireColdEntryMarker:$requireColdEntryMarker') -and
     $controllerText.Contains("'-NoLogo', '-NoProfile', '-NonInteractive', '-File'") -and
     -not $controllerText.Contains('Process.GetProcesses') -and -not $controllerText.Contains('.Kill()') -and
     $controllerText.Contains('cleanup_deadline_ticks') -and $controllerText.Contains('terminal_audit_deadline_ticks')
@@ -4363,12 +4366,44 @@ $preparationNativeInitializerText=if($null -eq $preparationNativeInitializerAst)
 $preparationObserverBootstrapAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -ceq 'New-D32NonSourceL1ObserverBindingPreparation'},$true)
 $preparationObserverBootstrapText=if($null -eq $preparationObserverBootstrapAst){''}else{[string]$preparationObserverBootstrapAst.Extent.Text}
+$preparationEntryDiagnosticAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Write-D32PreparationEntryDiagnostic'},$true)
+$preparationEntryDiagnosticText=if($null -eq $preparationEntryDiagnosticAst){''}else{[string]$preparationEntryDiagnosticAst.Extent.Text}
+$preparationSourceBootstrapAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Invoke-D32PreparationObserverBindingEntry'},$true)
+$preparationSourceBootstrapText=if($null -eq $preparationSourceBootstrapAst){''}else{[string]$preparationSourceBootstrapAst.Extent.Text}
+$preparationAuthorityRootAst=$preparationAuthorityAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Get-D32PowerShellAuthorityFixedProgramFilesRuntimeRoot'},$true)
+$preparationAuthorityEffectiveRootAst=$preparationAuthorityAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Get-D32PowerShellAuthorityTrustedRuntimeRoot'},$true)
+$preparationAuthorityTopLevel=$preparationNativeText.Contains('$script:D32PowerShellAuthorityTrustedRuntimeRoot = [IO.Path]::GetFullPath') -and
+    $preparationNativeText.Contains('$script:D32PowerShellAdmissionDirectoryFences = $null') -and
+    $preparationNativeText.Contains('$script:D32PowerShellAuthorityTestProvider = $null') -and
+    $preparationNativeText.Contains('$script:D32PowerShellModuleAdmissionValidationContext = ''record.not-started''') -and
+    $preparationNativeText.Contains('$script:D32PowerShellModuleAdmissionValidationDetail = $null') -and
+    -not $preparationNativeText.Contains('else { [string]$PSHOME }')
 $preparationNativeBootstrapExact=$null -ne $preparationNativeInitializerAst -and $null -ne $preparationObserverBootstrapAst -and
+    $null -ne $preparationSourceBootstrapAst -and $null -ne $preparationAuthorityRootAst -and $null -ne $preparationAuthorityEffectiveRootAst -and
     $preparationObserverBootstrapText.Contains('Get-D32NonSourceL1CurrentTokenFacts') -and
     $preparationObserverBootstrapText.Contains('Open-D32NonSourceL1AuthorityRecord') -and
-    $preparationObserverBootstrapText.Contains('scripts/d32-powershell-module-authority.ps1') -and
-    $preparationObserverBootstrapText.Contains('scripts/d32-bounded-compiler-diagnostic-policy.ps1') -and
+    $preparationSourceBootstrapText.IndexOf('scripts/d32-powershell-module-authority.ps1',[StringComparison]::Ordinal) -lt
+        $preparationSourceBootstrapText.IndexOf('scripts/d32-bounded-compiler-diagnostic-policy.ps1',[StringComparison]::Ordinal) -and
+    $preparationSourceBootstrapText.IndexOf('scripts/d32-powershell-module-authority.ps1',[StringComparison]::Ordinal) -lt
+        $preparationSourceBootstrapText.IndexOf('scripts/d32-bounded-compiler-diagnostic-policy.ps1',[StringComparison]::Ordinal) -and
+    $preparationSourceBootstrapText.Contains('New-D32NonSourceL1ObserverBindingPreparation') -and
+    $preparationEntryText.IndexOf('scripts/d32-powershell-module-authority.ps1',[StringComparison]::Ordinal) -lt
+        $preparationEntryText.IndexOf('scripts/d32-bounded-compiler-diagnostic-policy.ps1',[StringComparison]::Ordinal) -and
+    $preparationEntryText.IndexOf('ScriptBlock]::Create',[StringComparison]::Ordinal) -lt
+        $preparationEntryText.IndexOf('Invoke-D32PreparationObserverControlSession',[StringComparison]::Ordinal) -and
+    $preparationEntryText.Contains('BootstrapSourceReferences') -and
+    $preparationEntryText.Contains('Get-D32PowerShellAuthorityTrustedRuntimeRoot') -and
+    $preparationEntryText.Contains('ConvertTo-D32PowerShellAuthorityJsonText') -and
+    $preparationAuthorityRootAst.Extent.Text.Contains('ProgramFiles') -and
+    $preparationAuthorityEffectiveRootAst.Extent.Text.Contains('D32PowerShellAuthorityTrustedRuntimeRoot') -and
+    $preparationAuthorityEffectiveRootAst.Extent.Text.Contains('ProgramFiles') -and $preparationAuthorityTopLevel -and
     -not $preparationObserverBootstrapText.Contains('Import-Module') -and -not $preparationObserverBootstrapText.Contains('Add-Type') -and
+    -not $preparationEntryDiagnosticText.Contains('ConvertTo-D32PowerShellAuthorityJsonText') -and
+    $preparationEntryDiagnosticText.Contains('JsonEncodedText') -and
     $preparationNativeInitializerText.Contains('Reflection.Emit.AssemblyBuilder') -and
     $preparationNativeInitializerText.Contains('DefinePInvokeMethod') -and
     -not $preparationNativeInitializerText.Contains('Add-Type') -and -not $preparationNativeInitializerText.Contains('Import-Module') -and
@@ -4391,6 +4426,12 @@ $preparationSessionWired=$null -ne $preparationSessionAst -and $null -ne $prepar
     $preparationSessionText.Contains('$primaryFailure = $_.Exception') -and
     $preparationSessionText.Contains('Write-D32PreparationEntryDiagnostic') -and
     $preparationEntryText.Contains('Write-D32PreparationEntryDiagnostic') -and
+    $preparationSessionText.IndexOf('if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Close)',[StringComparison]::Ordinal) -lt
+        $preparationSessionText.IndexOf('$Reader.Dispose()',[StringComparison]::Ordinal) -and
+    $preparationSessionText.IndexOf('$Reader.Dispose()',[StringComparison]::Ordinal) -lt
+        $preparationSessionText.IndexOf('$Writer.Dispose()',[StringComparison]::Ordinal) -and
+    $preparationSessionText.IndexOf('$Writer.Dispose()',[StringComparison]::Ordinal) -lt
+        $preparationSessionText.IndexOf('foreach ($item in $snapshot.Opened)',[StringComparison]::Ordinal) -and
     -not $preparationEntryText.Contains('Import-Module') -and -not $preparationEntryText.Contains('Add-Type') -and
     -not $preparationEntryText.Contains('CreateProcessW') -and -not $preparationEntryText.Contains('Start-Process') -and
     -not $preparationSessionText.Contains('Import-Module') -and -not $preparationSessionText.Contains('Add-Type') -and
@@ -5450,9 +5491,14 @@ $prepSourcePins=[System.Collections.Generic.List[object]]::new()
 $prepSourceRelativePaths=@('scripts/d32-bounded-diagnostic-sourceproof-controller.ps1','scripts/d32-bounded-diagnostic-sourceproof.ps1',
     'scripts/d32-bounded-compiler-diagnostic.ps1','scripts/d32-bounded-compiler-diagnostic-policy.ps1',
     'scripts/d32-build-toolchain-profile.ps1','scripts/d32-powershell-module-authority.ps1')
+$prepSourceBytesByPath=@{}
 for($prepIndex=0;$prepIndex -lt 6;$prepIndex++) {
-    $prepSourcePins.Add([PSCustomObject][ordered]@{path=[IO.Path]::GetFullPath([IO.Path]::Combine($prepRepository,$prepSourceRelativePaths[$prepIndex]));bytes=[Int64](100+$prepIndex)
-        sha256=([string][char](97+$prepIndex)*64);volume_serial_hex=('4'*16);file_id_hex=([string][char](97+$prepIndex)*32)})
+    $prepSourcePath=[IO.Path]::GetFullPath([IO.Path]::Combine($prepRepository,$prepSourceRelativePaths[$prepIndex]))
+    $prepSourceBytes=[IO.File]::ReadAllBytes($prepSourcePath)
+    $prepSourceBytesByPath[$prepSourcePath]=$prepSourceBytes
+    $prepSourcePins.Add([PSCustomObject][ordered]@{path=$prepSourcePath;bytes=[Int64]$prepSourceBytes.Length
+        sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([byte[]]$prepSourceBytes)).ToLowerInvariant()
+        volume_serial_hex=('4'*16);file_id_hex=([string][char](97+$prepIndex)*32)})
 }
 $prepIdentity=[PSCustomObject][ordered]@{process_id=4321L;creation_filetime_ticks=134000000000000000L;image_reference=$prepImageReference
     ordinary_token=[PSCustomObject][ordered]@{elevated=$false;high_integrity=$false;system_token=$false;thread_impersonation=$false}
@@ -5490,6 +5536,19 @@ function New-D32PreparationSelfTestAdapter {
     foreach($line in $Lines){$script:D32PreparationSelfTestQueue.Enqueue([string]$line)}
     return [PSCustomObject]@{
         QpcFrequency={1000L};Now={ [Int64]$script:D32PreparationSelfTestNow };CreateNonce={ $prepNonce }
+        EnvironmentAdapter=[PSCustomObject]@{
+            ControllerPath={ [string]$prepSourcePins[0].path }
+            InitialReference={ param($Path,$MaximumBytes,$DeadlineTicks)
+                $full=[IO.Path]::GetFullPath([string]$Path)
+                if (-not $prepSourceBytesByPath.ContainsKey($full)) { throw 'synthetic source bootstrap requested a path outside the fixed six code references' }
+                $bytes=[byte[]]$prepSourceBytesByPath[$full]
+                if ($bytes.Length -le 0 -or $bytes.Length -gt $MaximumBytes -or $DeadlineTicks -ne 16000L) { throw 'synthetic source bootstrap violated its bytes/deadline bound' }
+                $reference=[PSCustomObject][ordered]@{path=$full;bytes=[Int64]$bytes.Length
+                    sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+                    volume_serial_hex=$null;file_id_hex=$null}
+                return [PSCustomObject]@{Reference=$reference;Bytes=$bytes;Stream=$null}
+            }
+        }
         GetIdentity={ param($Repository,$CandidateSha,$DeadlineTicks) if($DeadlineTicks -ne 16000L){throw 'identity deadline drift'}; return $script:D32PreparationSelfTestSnapshot }
         AssertCurrent={ param($Snapshot,$DeadlineTicks) return $true }
         ReadLine={ param($Reader,$DeadlineTicks,$LeaseDeadlineTicks)
@@ -5523,12 +5582,283 @@ function New-D32PreparationSelfTestAdapter {
         Close={ param($Reader,$Writer,$Snapshot) $script:D32PreparationSelfTestCloseCalls++;return $true }
     }
 }
+function New-D32PreparationSelfTestOwnedHandle {
+    $handle=[PSCustomObject]@{IsClosed=$false;IsInvalid=$false}
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value { $this.IsClosed=$true } -Force
+    return $handle
+}
+function New-D32PreparationSelfTestStream {
+    param([Parameter(Mandatory=$true)][object]$Handle)
+    $stream=[PSCustomObject]@{SafeFileHandle=$Handle}
+    Add-Member -InputObject $stream -MemberType ScriptMethod -Name Dispose -Value { $this.SafeFileHandle.Dispose() } -Force
+    return $stream
+}
+function New-D32PreparationSelfTestOpenedRecord {
+    param([Parameter(Mandatory=$true)][object]$Reference,[Parameter(Mandatory=$true)][byte[]]$Bytes)
+    return [PSCustomObject]@{Record=$Reference;Bytes=$Bytes;Stream=(New-D32PreparationSelfTestStream -Handle (New-D32PreparationSelfTestOwnedHandle))}
+}
 $prepReadyLine=New-D32PreparationSelfTestControlLine -Sequence 1 -Operation READY -Payload ([PSCustomObject][ordered]@{})
 $prepCandidateLine=New-D32PreparationSelfTestControlLine -Sequence 2 -Operation PREPARE_RUNTIME_CANDIDATE -Payload ([PSCustomObject][ordered]@{})
 $prepVerifyPayload=[PSCustomObject][ordered]@{identity=$prepIdentity;source_pins=$prepSourcePins.ToArray();runtime_candidate_reference=$prepCandidateReference}
 $prepVerifyLine=New-D32PreparationSelfTestControlLine -Sequence 3 -Operation VERIFY_RETURNED_PINS -Payload $prepVerifyPayload
 $prepBaselineLine=New-D32PreparationSelfTestControlLine -Sequence 4 -Operation CAPTURE_OLD_RUN_UPTIME_BASELINE -Payload ([PSCustomObject][ordered]@{})
 $prepCloseLine=New-D32PreparationSelfTestControlLine -Sequence 5 -Operation CLOSE -Payload ([PSCustomObject][ordered]@{})
+
+function Invoke-D32PreparationColdEntrySelfTest {
+    param([Parameter(Mandatory=$true)][ValidateSet('READY_CLOSE','BAD_MODULE_SOURCE','BAD_ADAPTER_MARKER')][string]$Mode,
+        [Parameter(Mandatory=$true)][object]$State, [Parameter(Mandatory=$true)][string]$Repository,
+        [Parameter(Mandatory=$true)][string]$CandidateSha, [Parameter(Mandatory=$true)][string[]]$SourceRelativePaths,
+        [Parameter(Mandatory=$true)][string]$ControllerPath, [Parameter(Mandatory=$true)][string]$Nonce)
+    $coldEntryScript=@'
+param([string]$ControllerPath,[string]$Repository,[string]$CandidateSha,[string[]]$SourceRelativePaths,[string]$Mode,[string]$Nonce,[object]$State)
+$ErrorActionPreference='Stop'
+$PSModuleAutoLoadingPreference='None'
+$preloadedFunctions=[System.Collections.Generic.List[string]]::new()
+foreach($name in $ExecutionContext.SessionState.Functions.Keys){if([string]$name -like 'D32*'){$preloadedFunctions.Add([string]$name)}}
+$preloadedScriptVariables=[System.Collections.Generic.List[string]]::new()
+foreach($scope in @('Script','Global')){
+    foreach($variable in Get-Variable -Name 'D32*' -Scope $scope -ErrorAction SilentlyContinue){$preloadedScriptVariables.Add([string]$scope+':'+[string]$variable.Name)}
+}
+$State.PreloadedFunctions=@($preloadedFunctions.ToArray())
+$State.PreloadedScriptVariables=@($preloadedScriptVariables.ToArray())
+$State.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp();$State.OpenFileCalls=0L;$State.OpenDirectoryCalls=0L;$State.InitialReferenceCalls=0L
+$State.ObserverProcessCalls=0L;$State.TokenCalls=0L;$State.StartupDigestCalls=0L;$State.NativeTypeObserved=$false
+$State.ModulesAfter=$null;$State.TestAdapterClearedBeforeSourceRead=$false
+$State.OpenedHandles=[System.Collections.Generic.List[object]]::new()
+$State.SourceBytesByPath=[System.Collections.Generic.Dictionary[string,byte[]]]::new([StringComparer]::OrdinalIgnoreCase)
+$State.FileIds=[System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+$State.ObserverImagePath='C:\D32-L0\SyntheticObserverHost.exe'
+$State.ControllerPath=[IO.Path]::GetFullPath($ControllerPath)
+foreach($relative in $SourceRelativePaths){
+    $path=[IO.Path]::GetFullPath([IO.Path]::Combine($Repository,$relative))
+    if($State.SourceBytesByPath.ContainsKey($path)){throw 'duplicate fixed source path in the cold-entry fixture'}
+    $State.SourceBytesByPath.Add($path,[IO.File]::ReadAllBytes($path))
+}
+if(-not $State.SourceBytesByPath.ContainsKey($State.ControllerPath)){throw 'fixed controller source is absent from the six-file cold-entry fixture'}
+$State.SourceBytesByPath.Add($State.ObserverImagePath,[Text.UTF8Encoding]::new($false).GetBytes('D32 synthetic observer image bytes'))
+$global:D32PreparationColdSelfTestState=$State
+$moduleProvider=[PSCustomObject]@{
+    NoReparse={ param($Path)
+        $state=$global:D32PreparationColdSelfTestState
+        return $state.SourceBytesByPath.ContainsKey([IO.Path]::GetFullPath([string]$Path))
+    }
+    OpenDirectory={ param($Path)
+        $state=$global:D32PreparationColdSelfTestState;$state.OpenDirectoryCalls++
+        $handle=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]1,$false)
+        $state.OpenedHandles.Add($handle)
+        return [PSCustomObject]@{Path=[IO.Path]::GetFullPath([string]$Path);VolumeSerialHex=('1'*16);FileIdHex=('2'*32)
+            OwnerSid='S-1-5-18';Sddl='D:P(A;;FA;;;SY)';AclSha256=('3'*64);Security=$null;Handle=$handle}
+    }
+    OpenFile={
+    param($Path,$DirectoryFences,$MaximumBytes,$DeadlineTicks)
+    $state=$global:D32PreparationColdSelfTestState;$state.OpenFileCalls++
+    $state.NativeTypeObserved=$state.NativeTypeObserved -or ($null -ne ('D32PowerShellModuleNativeV2' -as [type]))
+    $full=[IO.Path]::GetFullPath([string]$Path)
+    if(-not $state.SourceBytesByPath.ContainsKey($full)){throw 'cold module provider refused a path outside six code pins and one synthetic observer image'}
+    $bytes=[byte[]]$state.SourceBytesByPath[$full]
+    $state.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp()
+    if($bytes.Length -le 0 -or $bytes.Length -gt $MaximumBytes -or $DeadlineTicks -le $state.Now){throw 'cold module provider observed an empty, over-bound, or late open'}
+    $sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if(-not $state.FileIds.ContainsKey($full)){
+        $pathDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($full))).ToLowerInvariant()
+        $state.FileIds.Add($full,$pathDigest.Substring(0,32))
+    }
+    $handle=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]1,$false)
+    $state.OpenedHandles.Add($handle)
+    $stream=[PSCustomObject]@{SafeFileHandle=$handle}
+    $stream.PSObject.Members.Add([System.Management.Automation.PSScriptMethod]::new('Dispose',{ $this.SafeFileHandle.Dispose() }))
+    $record=[PSCustomObject][ordered]@{path=$full;bytes=[Int64]$bytes.Length;sha256=$sha;volume_serial_hex=('1'*16);file_id_hex=[string]$state.FileIds[$full]}
+    if($null -eq $state.ModulesAfter){
+        $modules=[System.Collections.Generic.List[string]]::new()
+        foreach($module in Microsoft.PowerShell.Core\Get-Module){if($null -ne $module){$modules.Add([string]$module.Name)}}
+        $moduleNames=[string[]]$modules.ToArray()
+        [Array]::Sort($moduleNames,[StringComparer]::OrdinalIgnoreCase)
+        $state.ModulesAfter=$moduleNames
+    }
+    return [PSCustomObject]@{Record=$record;Bytes=$bytes;Stream=$stream}
+    }
+}
+$State.ModuleProvider=$moduleProvider
+$environment=[PSCustomObject]@{
+    Now={
+    $state=$global:D32PreparationColdSelfTestState;$state.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp();return [Int64]$state.Now
+    }
+    QpcFrequency={ return [Int64][Diagnostics.Stopwatch]::Frequency }
+    CaptureT0={ param($Frequency) return [Int64][Diagnostics.Stopwatch]::GetTimestamp() }
+    ControllerPath={ return [string]$global:D32PreparationColdSelfTestState.ControllerPath }
+    NoReparse={
+    param($Path)
+    $state=$global:D32PreparationColdSelfTestState
+    return $state.SourceBytesByPath.ContainsKey([IO.Path]::GetFullPath([string]$Path))
+    }
+    InitialReference={
+    param($Path,$MaximumBytes,$DeadlineTicks)
+    $state=$global:D32PreparationColdSelfTestState;$state.InitialReferenceCalls++
+    $state.TestAdapterClearedBeforeSourceRead=$null -eq $ExecutionContext.SessionState.PSVariable.Get('D32PreparationObserverSessionTestAdapter')
+    $state.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp()
+    $full=[IO.Path]::GetFullPath([string]$Path)
+    if(-not $state.SourceBytesByPath.ContainsKey($full)){throw 'cold initial reader refused a source outside the fixed code-pin map'}
+    $bytes=[byte[]]$state.SourceBytesByPath[$full]
+    if($bytes.Length -le 0 -or $bytes.Length -gt $MaximumBytes -or $DeadlineTicks -le $state.Now){throw 'cold initial reader observed an empty, over-bound, or late fixed source'}
+    $sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if($state.Mode -ceq 'BAD_MODULE_SOURCE' -and [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFileName($full),'d32-powershell-module-authority.ps1')){$sha='0'*64}
+    $reference=[PSCustomObject][ordered]@{path=$full;bytes=[Int64]$bytes.Length;sha256=$sha;volume_serial_hex=$null;file_id_hex=$null}
+    return [PSCustomObject]@{Reference=$reference;Bytes=$bytes;Stream=$null}
+    }
+    ObserverProcess={
+    $state=$global:D32PreparationColdSelfTestState;$state.ObserverProcessCalls++
+    return [PSCustomObject][ordered]@{process_id=4321L;creation_filetime_ticks=134000000000000000L;image_path=[string]$state.ObserverImagePath}
+    }
+    CurrentToken={
+    $global:D32PreparationColdSelfTestState.TokenCalls++
+    return [PSCustomObject][ordered]@{is_elevated=$false;integrity_rid=8192L;is_system=$false;thread_impersonating=$false}
+    }
+    ObserverStartupDigest={
+    $global:D32PreparationColdSelfTestState.StartupDigestCalls++
+    return ('5'*64)
+    }
+    OpenAuthority={
+    param($Path,$DirectoryFences,$MaximumBytes,$DeadlineTicks)
+    return & $global:D32PreparationColdSelfTestState.ModuleProvider.OpenFile -Path $Path -DirectoryFences $DirectoryFences `
+        -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    }
+}
+$State.EnvironmentAdapter=$environment
+$adapter=[PSCustomObject]@{Marker='D32_COLD_ENTRY_TEST_ADAPTER_V1';EnvironmentAdapter=$environment;ModuleProvider=$moduleProvider
+    QpcFrequency={ [Int64][Diagnostics.Stopwatch]::Frequency };Now={ [Int64](& $global:D32PreparationColdSelfTestState.EnvironmentAdapter.Now) }
+    CreateNonce={ [string]$global:D32PreparationColdSelfTestState.Nonce }
+    GetIdentity=$null;AssertCurrent=$null;ReadLine=$null;WriteLine=$null;PrepareRuntime=$null;WriteRecord=$null
+    VerifyPins=$null;CaptureBaseline=$null;Close=$null}
+if($Mode -ceq 'BAD_ADAPTER_MARKER'){$adapter.Marker='D32_COLD_ENTRY_BAD_MARKER'}
+$State.Mode=$Mode;$State.Nonce=$Nonce
+$State.Output=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$State.Diagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$State.Reader=[IO.StringReader]::new([string]$State.ControlText)
+$modulesBefore=[System.Collections.Generic.List[string]]::new()
+foreach($module in Microsoft.PowerShell.Core\Get-Module){if($null -ne $module){$modulesBefore.Add([string]$module.Name)}}
+$moduleNamesBefore=[string[]]$modulesBefore.ToArray()
+[Array]::Sort($moduleNamesBefore,[StringComparer]::OrdinalIgnoreCase)
+$State.ModulesBefore=$moduleNamesBefore
+$global:D32PreparationObserverSessionTestAdapter=$adapter
+$priorIn=[Console]::In;$priorOut=[Console]::Out;$priorError=[Console]::Error
+[Console]::SetIn($State.Reader);[Console]::SetOut($State.Output);[Console]::SetError($State.Diagnostics)
+try { & $ControllerPath -Repository $Repository -CandidateSha $CandidateSha -PreparationSession }
+finally {
+    $State.ErrorCollectionCount=[Int64]$Error.Count
+    $State.ErrorCollectionMessages=@($Error | ForEach-Object { [string]$_.Exception.Message })
+    [Console]::SetIn($priorIn);[Console]::SetOut($priorOut);[Console]::SetError($priorError)
+}
+'@
+    $iss=[System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $runspace=[System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+    $powerShell=[System.Management.Automation.PowerShell]::Create()
+    $powerShell.Runspace=$runspace
+    $null=$powerShell.AddScript($coldEntryScript).AddArgument($ControllerPath).AddArgument($Repository).AddArgument($CandidateSha).AddArgument($SourceRelativePaths).AddArgument($Mode).AddArgument($Nonce).AddArgument($State)
+    $previousIn=[Console]::In;$previousOut=[Console]::Out;$previousError=[Console]::Error
+    try {
+        $runspace.Open()
+        $null=$powerShell.Invoke()
+        $State.InvocationHadErrors=[bool]$powerShell.HadErrors
+        $State.InvocationErrorCount=[Int64]$powerShell.Streams.Error.Count
+        $State.InvocationState=[string]$powerShell.InvocationStateInfo.State
+        $State.InvocationErrors=@($powerShell.Streams.Error | ForEach-Object { [string]$_.Exception.Message })
+    } catch {
+        $State.InvocationHadErrors=$true
+        $State.InvocationErrors=@([string]$_.Exception.Message)
+    } finally {
+        [Console]::SetIn($previousIn);[Console]::SetOut($previousOut);[Console]::SetError($previousError)
+        try { $runspace.Close() } catch {}
+        $powerShell.Dispose();$runspace.Dispose()
+    }
+}
+
+$prepColdNonce='e'*32
+$prepColdReady='{"protocol":"D32_PREP_OBSERVER_CONTROL_V1","session_nonce":"'+$prepColdNonce+'","sequence":1,"candidate_sha":"'+$prepCandidateSha+'","operation":"READY","payload":{}}'
+$prepColdClose='{"protocol":"D32_PREP_OBSERVER_CONTROL_V1","session_nonce":"'+$prepColdNonce+'","sequence":2,"candidate_sha":"'+$prepCandidateSha+'","operation":"CLOSE","payload":{}}'
+$prepColdState=[hashtable]::new();$prepColdState.ControlText=$prepColdReady+[Environment]::NewLine+$prepColdClose+[Environment]::NewLine
+Invoke-D32PreparationColdEntrySelfTest -Mode 'READY_CLOSE' -State $prepColdState -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -SourceRelativePaths $prepSourceRelativePaths -ControllerPath (Join-Path $prepRepository 'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1') -Nonce $prepColdNonce
+$prepColdOutputText=if($null -ne $prepColdState.Output){$prepColdState.Output.ToString()}else{''}
+$prepColdLines=@($prepColdOutputText.Split([Environment]::NewLine,[StringSplitOptions]::RemoveEmptyEntries))
+$prepColdFrames=@($prepColdLines | ForEach-Object { [System.Text.Json.JsonDocument]::Parse([string]$_) })
+$prepColdFrameSummary=@($prepColdFrames | ForEach-Object {
+    $root=$_.RootElement
+    [string]$root.GetProperty('operation').GetString()+':'+[string]$root.GetProperty('status').GetString()
+})
+$prepColdModulesStable=($prepColdState.ModulesBefore -join '|') -ceq ($prepColdState.ModulesAfter -join '|')
+$prepColdOpenedClosed=$prepColdState.OpenedHandles.Count -eq $prepColdState.OpenFileCalls -and
+    @($prepColdState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0
+$prepColdEntryReady=$prepColdState.PreloadedFunctions.Count -eq 0 -and $prepColdState.PreloadedScriptVariables.Count -eq 0 -and
+    $prepColdState.InvocationErrorCount -eq 0 -and $prepColdState.InvocationState -ceq 'Completed' -and
+    $prepColdState.InitialReferenceCalls -eq 2 -and
+    $prepColdState.OpenFileCalls -ge 14 -and $prepColdState.OpenDirectoryCalls -eq 0 -and $prepColdState.TestAdapterClearedBeforeSourceRead -and
+    $prepColdState.ObserverProcessCalls -ge 2 -and $prepColdState.TokenCalls -ge 2 -and $prepColdState.StartupDigestCalls -ge 2 -and
+    -not $prepColdState.NativeTypeObserved -and $prepColdOpenedClosed -and $prepColdModulesStable -and
+    $prepColdLines.Count -eq 3 -and $prepColdState.Diagnostics.ToString().Length -eq 0 -and
+    $prepColdFrames[0].RootElement.GetProperty('operation').GetString() -ceq 'CHALLENGE' -and
+    $prepColdFrames[1].RootElement.GetProperty('operation').GetString() -ceq 'READY' -and
+    $prepColdFrames[2].RootElement.GetProperty('status').GetString() -ceq 'CLOSED_INCOMPLETE' -and
+    @($prepColdFrames | Where-Object { $_.RootElement.GetProperty('gate_authority').GetString() -cne 'NONE' -or
+        $_.RootElement.GetProperty('launch_authority').GetString() -cne 'NONE' }).Count -eq 0
+foreach($frame in $prepColdFrames){$frame.Dispose()}
+if(-not $prepColdEntryReady){
+    Write-Output ('PREP_COLD_ENTRY_DIAGNOSTIC: errors='+[string]::Join('|',$prepColdState.InvocationErrors)+' initial='+$prepColdState.InitialReferenceCalls+
+        ' opens='+$prepColdState.OpenFileCalls+' process='+$prepColdState.ObserverProcessCalls+' token='+$prepColdState.TokenCalls+
+        ' startup='+$prepColdState.StartupDigestCalls+' frames='+$prepColdLines.Count+' preFns='+$prepColdState.PreloadedFunctions.Count+
+        ' preVars='+$prepColdState.PreloadedScriptVariables.Count+' opened='+$prepColdState.OpenedHandles.Count+
+        ' allClosed='+(@($prepColdState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0)+
+        ' nativeType='+$prepColdState.NativeTypeObserved+' moduleStable='+$prepColdModulesStable+
+        ' adapterCleared='+$prepColdState.TestAdapterClearedBeforeSourceRead+' hadErrors='+$prepColdState.InvocationHadErrors+
+        ' errorCount='+$prepColdState.InvocationErrorCount+' errorCollection='+$prepColdState.ErrorCollectionCount+
+        ' errorMessages='+[string]::Join('|',$prepColdState.ErrorCollectionMessages)+' invocationState='+$prepColdState.InvocationState+
+        ' framesSummary='+($prepColdFrameSummary -join ',')+' output='+$prepColdOutputText+
+        ' stderr='+$(if($null -ne $prepColdState.Diagnostics){$prepColdState.Diagnostics.ToString()}else{''}))
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fresh PS Core runspace executes the full fixed PreparationSession script-body dispatch with no D32 helpers/state preloaded; same-scope source loading binds the fixed Program Files root and JSON serializer, actual observer identity/source opens use only private in-process providers, and bounded control/retained handles close with Gate/launch NONE' $prepColdEntryReady
+$prepColdBadState=[hashtable]::new();$prepColdBadState.ControlText=$prepColdReady+[Environment]::NewLine+$prepColdClose+[Environment]::NewLine
+Invoke-D32PreparationColdEntrySelfTest -Mode 'BAD_MODULE_SOURCE' -State $prepColdBadState -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -SourceRelativePaths $prepSourceRelativePaths -ControllerPath (Join-Path $prepRepository 'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1') -Nonce $prepColdNonce
+$prepColdBadOutputText=if($null -ne $prepColdBadState.Output){$prepColdBadState.Output.ToString()}else{''}
+$prepColdBadDiagnosticText=if($null -ne $prepColdBadState.Diagnostics){$prepColdBadState.Diagnostics.ToString().Trim()}else{''}
+$prepColdBadLines=@($prepColdBadOutputText.Split([Environment]::NewLine,[StringSplitOptions]::RemoveEmptyEntries))
+$prepColdBadDocument=$null
+try{$prepColdBadDocument=[System.Text.Json.JsonDocument]::Parse($prepColdBadDiagnosticText)}catch{}
+$prepColdBadRoot=if($null -ne $prepColdBadDocument){$prepColdBadDocument.RootElement}else{$null}
+$prepColdBadPrimary=if($null -ne $prepColdBadRoot){$prepColdBadRoot.GetProperty('primary_error').GetString()}else{''}
+$prepColdBadRefused=$null -ne $prepColdBadRoot -and $prepColdBadState.PreloadedFunctions.Count -eq 0 -and $prepColdBadState.PreloadedScriptVariables.Count -eq 0 -and
+    $prepColdBadState.InitialReferenceCalls -eq 2 -and $prepColdBadState.OpenFileCalls -eq 0 -and $prepColdBadState.OpenDirectoryCalls -eq 0 -and
+    $prepColdBadState.ObserverProcessCalls -eq 0 -and $prepColdBadState.TokenCalls -eq 0 -and $prepColdBadState.StartupDigestCalls -eq 0 -and
+    $prepColdBadState.TestAdapterClearedBeforeSourceRead -and
+    $prepColdBadLines.Count -eq 0 -and $prepColdBadRoot.GetProperty('record_type').GetString() -ceq 'D32_PREP_OBSERVER_ENTRY_DIAGNOSTIC_V1' -and
+    $prepColdBadRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and $prepColdBadRoot.GetProperty('gate_authority').GetString() -ceq 'NONE' -and
+    $prepColdBadRoot.GetProperty('launch_authority').GetString() -ceq 'NONE' -and $prepColdBadPrimary.Contains('fixed candidate support source') -and
+    -not $prepColdBadPrimary.Contains('ConvertTo-D32PowerShellAuthorityJsonText') -and
+    $prepColdBadRoot.GetProperty('secondary_errors').GetArrayLength() -eq 0 -and
+    @($prepColdBadState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0
+if($null -ne $prepColdBadDocument){$prepColdBadDocument.Dispose()};if($null -ne $prepColdBadState.Output){$prepColdBadState.Output.Dispose()};if($null -ne $prepColdBadState.Diagnostics){$prepColdBadState.Diagnostics.Dispose()}
+if(-not $prepColdBadRefused){Write-Output ('PREP_COLD_BAD_SOURCE_DIAGNOSTIC: errors='+[string]::Join('|',$prepColdBadState.InvocationErrors)+' stderr='+$prepColdBadDiagnosticText)}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'cold malformed fixed module bytes fail before observer/native preparation and the direct bounded diagnostic writer preserves the primary source-pin error without serializer secondary failure' $prepColdBadRefused
+$prepColdMarkerState=[hashtable]::new();$prepColdMarkerState.ControlText=$prepColdReady+[Environment]::NewLine+$prepColdClose+[Environment]::NewLine
+Invoke-D32PreparationColdEntrySelfTest -Mode 'BAD_ADAPTER_MARKER' -State $prepColdMarkerState -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -SourceRelativePaths $prepSourceRelativePaths -ControllerPath (Join-Path $prepRepository 'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1') -Nonce $prepColdNonce
+$prepColdMarkerDiagnosticText=if($null -ne $prepColdMarkerState.Diagnostics){$prepColdMarkerState.Diagnostics.ToString().Trim()}else{''}
+$prepColdMarkerDocument=$null
+try{$prepColdMarkerDocument=[System.Text.Json.JsonDocument]::Parse($prepColdMarkerDiagnosticText)}catch{}
+$prepColdMarkerRoot=if($null -ne $prepColdMarkerDocument){$prepColdMarkerDocument.RootElement}else{$null}
+$prepColdMarkerRefused=$null -ne $prepColdMarkerRoot -and $prepColdMarkerState.PreloadedFunctions.Count -eq 0 -and $prepColdMarkerState.PreloadedScriptVariables.Count -eq 0 -and
+    $prepColdMarkerState.InitialReferenceCalls -eq 0 -and $prepColdMarkerState.OpenFileCalls -eq 0 -and $prepColdMarkerState.OpenDirectoryCalls -eq 0 -and
+    $prepColdMarkerState.ObserverProcessCalls -eq 0 -and $prepColdMarkerState.TokenCalls -eq 0 -and $prepColdMarkerState.StartupDigestCalls -eq 0 -and
+    $prepColdMarkerState.Output.ToString().Length -eq 0 -and $prepColdMarkerState.InvocationErrorCount -eq 0 -and
+    $prepColdMarkerRoot.GetProperty('record_type').GetString() -ceq 'D32_PREP_OBSERVER_ENTRY_DIAGNOSTIC_V1' -and
+    $prepColdMarkerRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and $prepColdMarkerRoot.GetProperty('gate_authority').GetString() -ceq 'NONE' -and
+    $prepColdMarkerRoot.GetProperty('launch_authority').GetString() -ceq 'NONE' -and
+    $prepColdMarkerRoot.GetProperty('primary_error').GetString().Contains('internal cold-entry provider marker is invalid') -and
+    $prepColdMarkerRoot.GetProperty('secondary_errors').GetArrayLength() -eq 0
+if($null -ne $prepColdMarkerDocument){$prepColdMarkerDocument.Dispose()};$prepColdMarkerState.Output.Dispose();$prepColdMarkerState.Diagnostics.Dispose()
+if(-not $prepColdMarkerRefused){Write-Output ('PREP_COLD_MARKER_DIAGNOSTIC: errorCount='+$prepColdMarkerState.InvocationErrorCount+' diagnostic='+$prepColdMarkerDiagnosticText)}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'actual fixed parameter-set dispatch rejects an invalid private test-provider marker through the bounded diagnostic before source or identity providers run' $prepColdMarkerRefused
+$prepColdState.Output.Dispose();$prepColdState.Diagnostics.Dispose()
+
 $script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestVerifyCalls=0L
 $script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
 $script:D32PreparationSelfTestReadDeadlines.Clear();$script:D32PreparationSelfTestVerifyAllowed=$true;$script:D32PreparationSelfTestCandidateLate=$false
@@ -5556,7 +5886,8 @@ if(-not $prepAllNonAuthority) {
         ' writes='+$script:D32PreparationSelfTestWriteCalls+' verify='+$script:D32PreparationSelfTestVerifyCalls+' baseline='+$script:D32PreparationSelfTestBaselineCalls+
         ' close='+$script:D32PreparationSelfTestCloseCalls+' candidate_status='+[string]$script:D32PreparationSelfTestCandidateResult.status+
         ' strict='+[string]$prepRuntimeCandidateStrict+' read_deadlines='+$script:D32PreparationSelfTestReadDeadlines.Count+
-        ' candidate_bytes='+[string]$script:D32PreparationSelfTestCandidateReference.bytes+' candidate_sha='+[string]$script:D32PreparationSelfTestCandidateReference.sha256)
+        ' candidate_bytes='+[string]$script:D32PreparationSelfTestCandidateReference.bytes+' candidate_sha='+[string]$script:D32PreparationSelfTestCandidateReference.sha256+
+        ' stderr='+$prepSuccessDiagnosticOutput.ToString())
     foreach($line in $prepSuccessLines){Write-Output ('PREP_REPLY: '+$line)}
 }
 Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session actual control interface completes READY→candidate→returned-pin verification→old-run baseline→CLOSE with immutable pins and Gate/launch NONE' $prepAllNonAuthority
@@ -5587,16 +5918,19 @@ $prepEarlyFrequencyAdapter.QpcFrequency={0L}
 $script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
 $prepEarlyFrequencyOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
 $prepEarlyFrequencyDiagnostics=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepEarlyFrequencyReader=[IO.StringReader]::new('')
 $prepEarlyFrequencyCode=Invoke-D32PreparationObserverSessionEntry -ParameterSetName 'PreparationSession' -Repository $prepRepository -CandidateSha $prepCandidateSha `
-    -Reader ([IO.StringReader]::new('')) -Writer $prepEarlyFrequencyOutput -DiagnosticWriter $prepEarlyFrequencyDiagnostics -TestAdapter $prepEarlyFrequencyAdapter
+    -Reader $prepEarlyFrequencyReader -Writer $prepEarlyFrequencyOutput -DiagnosticWriter $prepEarlyFrequencyDiagnostics -TestAdapter $prepEarlyFrequencyAdapter
+$prepEarlyFrequencyReaderClosed=$false
+try { $null=$prepEarlyFrequencyReader.ReadLine() } catch { $prepEarlyFrequencyReaderClosed=$true }
 $prepEarlyFrequencyDocument=[System.Text.Json.JsonDocument]::Parse($prepEarlyFrequencyDiagnostics.ToString().Trim())
 $prepEarlyFrequencyRoot=$prepEarlyFrequencyDocument.RootElement
 $prepEarlyFrequencyReported=$prepEarlyFrequencyCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and
-    $script:D32PreparationSelfTestCloseCalls -eq 1 -and $prepEarlyFrequencyOutput.ToString().Length -eq 0 -and
+    $script:D32PreparationSelfTestCloseCalls -eq 0 -and $prepEarlyFrequencyReaderClosed -and $prepEarlyFrequencyOutput.ToString().Length -eq 0 -and
     $prepEarlyFrequencyRoot.GetProperty('status').GetString() -ceq 'REFUSED' -and
     $prepEarlyFrequencyRoot.GetProperty('primary_error').GetString().Contains('fixed session candidate/repository or monotonic clock inputs are invalid')
-$prepEarlyFrequencyDocument.Dispose();$prepEarlyFrequencyOutput.Dispose();$prepEarlyFrequencyDiagnostics.Dispose()
-Assert-D32BoundedCompilerDiagnosticSelfTest 'pre-handshake clock refusal is caught before challenge, leaves candidate/baseline untouched, closes via the owned adapter, and preserves primary error on stderr' $prepEarlyFrequencyReported
+$prepEarlyFrequencyDocument.Dispose();$prepEarlyFrequencyReader.Dispose();$prepEarlyFrequencyOutput.Dispose();$prepEarlyFrequencyDiagnostics.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'pre-handshake clock refusal is caught before challenge, leaves candidate/baseline untouched, closes the owned reader directly, and preserves primary error on stderr' $prepEarlyFrequencyReported
 
 $prepInvalidCandidateReader=[IO.StringReader]::new('')
 $prepInvalidCandidateOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)

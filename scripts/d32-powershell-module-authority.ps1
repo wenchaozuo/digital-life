@@ -2,9 +2,36 @@
 # This file intentionally uses only PowerShell Core/.NET APIs until every pin and
 # content fence has passed. It does not trust ambient module search paths.
 $script:D32PowerShellAuthorityPreparationDeadlineTicks = 0L
+$script:D32PowerShellAuthorityTrustedRuntimeRoot = [IO.Path]::GetFullPath([IO.Path]::Combine(
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles), 'PowerShell', '7'))
+$script:D32PowerShellAdmissionDirectoryFences = $null
+$script:D32PowerShellAuthorityTestProvider = $null
+$script:D32PowerShellModuleAdmissionValidationContext = 'record.not-started'
+$script:D32PowerShellModuleAdmissionValidationDetail = $null
+
+function Get-D32PowerShellAuthorityFixedProgramFilesRuntimeRoot {
+    $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+    if ([string]::IsNullOrWhiteSpace([string]$programFiles)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: fixed Program Files runtime root is unavailable'
+    }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine([string]$programFiles, 'PowerShell', '7'))
+}
+
+function Get-D32PowerShellAuthorityTrustedRuntimeRoot {
+    $fixedRoot = Get-D32PowerShellAuthorityFixedProgramFilesRuntimeRoot
+    $configuredRoot = [string]$script:D32PowerShellAuthorityTrustedRuntimeRoot
+    if ([string]::IsNullOrWhiteSpace($configuredRoot) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($configuredRoot),$fixedRoot)) {
+        throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: trusted runtime root is not the fixed Program Files PowerShell 7 root'
+    }
+    return $fixedRoot
+}
 
 function Test-D32PowerShellAuthorityPathNoReparse {
     param([Parameter(Mandatory = $true)][string]$Path)
+    if ($null -ne $script:D32PowerShellAuthorityTestProvider -and $null -ne $script:D32PowerShellAuthorityTestProvider.NoReparse) {
+        return [bool](& $script:D32PowerShellAuthorityTestProvider.NoReparse -Path $Path)
+    }
     try {
         $full = [IO.Path]::GetFullPath($Path)
         $root = [IO.Path]::GetPathRoot($full)
@@ -482,8 +509,7 @@ function Test-D32PowerShellAuthorityProtectedSecurity {
     $powerShellRoot = ''
     try {
         $securityRoot = if (-not [string]::IsNullOrWhiteSpace($PowerShellRoot)) { $PowerShellRoot }
-            elseif (-not [string]::IsNullOrWhiteSpace([string]$script:D32PowerShellAuthorityTrustedRuntimeRoot)) { [string]$script:D32PowerShellAuthorityTrustedRuntimeRoot }
-            else { [string]$PSHOME }
+            else { Get-D32PowerShellAuthorityTrustedRuntimeRoot }
         $powerShellRoot = [IO.Path]::GetFullPath([string]$securityRoot)
         $volumeRoot = [IO.Path]::GetPathRoot($powerShellRoot)
     }
@@ -554,6 +580,9 @@ function Get-D32PowerShellAuthoritySecurityRecord {
 function Open-D32PowerShellAuthorityDirectoryFence {
     param([Parameter(Mandatory = $true)][string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
+    if ($null -ne $script:D32PowerShellAuthorityTestProvider -and $null -ne $script:D32PowerShellAuthorityTestProvider.OpenDirectory) {
+        return & $script:D32PowerShellAuthorityTestProvider.OpenDirectory -Path $full
+    }
     Initialize-D32PowerShellAuthorityNativeApi
     # V2 handles witness object identity only. Protected namespace policy, not a
     # directory share-mode lock, proves that untrusted writers cannot redirect it.
@@ -568,7 +597,7 @@ function Open-D32PowerShellAuthorityDirectoryFence {
             throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: directory is not a regular non-reparse object: $full"
         }
         $security = Get-D32PowerShellAuthorityObjectSecurity -Path $full -IsDirectory:$true -Handle $handle
-        $securityRoot = if (-not [string]::IsNullOrWhiteSpace([string]$script:D32PowerShellAuthorityTrustedRuntimeRoot)) { [string]$script:D32PowerShellAuthorityTrustedRuntimeRoot } else { [string]$PSHOME }
+        $securityRoot = Get-D32PowerShellAuthorityTrustedRuntimeRoot
         $runtimeDirectory = Test-D32PowerShellAuthorityPathWithin -Child $full -Parent $securityRoot
         $runtimeAncestor = -not $runtimeDirectory -and (Test-D32PowerShellAuthorityPathWithin -Child $securityRoot -Parent $full)
         if (($runtimeDirectory -or $runtimeAncestor) -and -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$true -IsProtectedAncestor:$runtimeAncestor -PowerShellRoot $securityRoot)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: untrusted namespace writer on PowerShell runtime directory/ancestor: $full" }
@@ -612,6 +641,10 @@ function Open-D32PowerShellAuthorityFile {
         [ValidateRange(1, 2147483647)][Int64]$MaximumBytes = [Int32]::MaxValue,
         [long]$DeadlineTicks = 0
     )
+    if ($null -ne $script:D32PowerShellAuthorityTestProvider -and $null -ne $script:D32PowerShellAuthorityTestProvider.OpenFile) {
+        return & $script:D32PowerShellAuthorityTestProvider.OpenFile -Path $Path -DirectoryFences $DirectoryFences `
+            -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    }
     if ($DeadlineTicks -le 0 -and [long]$script:D32PowerShellAuthorityPreparationDeadlineTicks -gt 0) { $DeadlineTicks = [long]$script:D32PowerShellAuthorityPreparationDeadlineTicks }
     if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: shared source-proof work deadline reached before bounded file open' }
     $full = [IO.Path]::GetFullPath($Path)
@@ -643,7 +676,7 @@ function Open-D32PowerShellAuthorityFile {
         if ($DeadlineTicks -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) { throw 'POWERSHELL_MODULE_AUTHORITY_BLOCKED: late bounded file-read bytes discarded before source-proof hashing' }
         $after = Get-D32PowerShellAuthorityHandleIdentity -Handle $stream.SafeFileHandle
         $security = Get-D32PowerShellAuthorityObjectSecurity -Path $full -IsDirectory:$false -Handle $stream.SafeFileHandle -Stream $stream
-        $securityRoot = if (-not [string]::IsNullOrWhiteSpace([string]$script:D32PowerShellAuthorityTrustedRuntimeRoot)) { [string]$script:D32PowerShellAuthorityTrustedRuntimeRoot } else { [string]$PSHOME }
+        $securityRoot = Get-D32PowerShellAuthorityTrustedRuntimeRoot
         if ((Test-D32PowerShellAuthorityPathWithin -Child $full -Parent $securityRoot) -and
             -not (Test-D32PowerShellAuthorityProtectedSecurity -Security $security -IsDirectory:$false -PowerShellRoot $securityRoot)) { throw "POWERSHELL_MODULE_AUTHORITY_BLOCKED: untrusted namespace writer on PowerShell runtime file: $full" }
         if ($stream.Length -ne $before.Bytes -or $after.Bytes -ne $before.Bytes -or

@@ -1179,7 +1179,19 @@ function Invoke-D32LifecycleCleanupAndAudit {
     }
 }
 
-function Get-D32NonSourceL1Now { return [Int64](& $script:D32NonSourceL1Now) }
+function Get-D32NonSourceL1Now {
+    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
+        $provider = $null
+        if ($script:D32NonSourceL1EnvironmentAdapter -is [System.Collections.IDictionary]) {
+            if ($script:D32NonSourceL1EnvironmentAdapter.Contains('Now')) { $provider = $script:D32NonSourceL1EnvironmentAdapter['Now'] }
+        } else {
+            $providerProperty = $script:D32NonSourceL1EnvironmentAdapter.PSObject.Properties['Now']
+            if ($null -ne $providerProperty) { $provider = $providerProperty.Value }
+        }
+        if ($null -ne $provider) { return [Int64](& $provider) }
+    }
+    return [Int64](& $script:D32NonSourceL1Now)
+}
 
 function Get-D32NonSourceL1CaptureT0 {
     param([Parameter(Mandatory = $true)][long]$Frequency)
@@ -1378,9 +1390,11 @@ function Test-D32NonSourceL1NoReparsePath {
 
 function Get-D32NonSourceL1InitialReferenceBytes {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][long]$MaximumBytes,
-        [Parameter(Mandatory = $true)][long]$DeadlineTicks)
-    if ($null -ne $script:D32NonSourceL1EnvironmentAdapter) {
-        return & $script:D32NonSourceL1EnvironmentAdapter.InitialReference -Path $Path -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+        [Parameter(Mandatory = $true)][long]$DeadlineTicks, [AllowNull()][object]$EnvironmentAdapter)
+    $environmentAdapter = if ($PSBoundParameters.ContainsKey('EnvironmentAdapter')) { $EnvironmentAdapter } else { $script:D32NonSourceL1EnvironmentAdapter }
+    if ($null -ne $environmentAdapter) {
+        if ($null -eq $environmentAdapter.InitialReference) { throw 'D32_NON_SOURCE_L1_REFUSED: bounded initial source reader is unavailable' }
+        return & $environmentAdapter.InitialReference -Path $Path -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
     }
     if ((Get-D32NonSourceL1Now) -ge $DeadlineTicks -or -not (Test-D32LifecycleNoReparsePath -Path $Path)) {
         throw 'D32_NON_SOURCE_L1_REFUSED: bounded initial bootstrap path is late, noncanonical, or reparse-backed'
@@ -2967,18 +2981,13 @@ function New-D32NonSourceL1ObserverBindingPreparation {
     $frequency = [Int64](Get-D32NonSourceL1QpcFrequency)
     $started = [Int64](Get-D32NonSourceL1CaptureT0 -Frequency $frequency)
     $deadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
-    $modulePath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-powershell-module-authority.ps1'))
-    $policyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
     $opened = [System.Collections.Generic.List[object]]::new()
     $fences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $fixedRuntimeRoot = [IO.Path]::GetFullPath([IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
+        'PowerShell','7'))
+    $previousTrustedRuntimeRoot = [string]$script:D32PowerShellAuthorityTrustedRuntimeRoot
+    $script:D32PowerShellAuthorityTrustedRuntimeRoot = $fixedRuntimeRoot
     try {
-        foreach ($path in @($modulePath,$policyPath)) {
-            $raw = Get-D32NonSourceL1InitialReferenceBytes -Path $path -MaximumBytes 16777216 -DeadlineTicks $deadline
-            if ($raw.Reference.bytes -le 0 -or $raw.Reference.bytes -gt 16777216 -or (Get-D32NonSourceL1Now) -ge $deadline) {
-                throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed observer-preparation source input is empty, over-bound, or late'
-            }
-            . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$raw.Bytes)))
-        }
         $entryOpened = Open-D32NonSourceL1AuthorityRecord -Path $controllerPath -DirectoryFences $fences -MaximumBytes 16777216 -DeadlineTicks $deadline
         $opened.Add($entryOpened)
         $processFacts = Get-D32NonSourceL1CurrentProcessFacts
@@ -3015,7 +3024,37 @@ function New-D32NonSourceL1ObserverBindingPreparation {
     } finally {
         foreach ($item in $opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch {} }
         foreach ($fence in $fences.Values) { try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } catch {} }
+        $script:D32PowerShellAuthorityTrustedRuntimeRoot = $previousTrustedRuntimeRoot
     }
+}
+
+function Invoke-D32PreparationObserverBindingEntry {
+    $PSModuleAutoLoadingPreference = 'None'
+    if ([string]$PSModuleAutoLoadingPreference -cne 'None') {
+        throw 'D32_NON_SOURCE_L1_REFUSED: observer-binding bootstrap could not disable module autoload'
+    }
+    $frequency = [Int64][Diagnostics.Stopwatch]::Frequency
+    $started = [Int64][Diagnostics.Stopwatch]::GetTimestamp()
+    $deadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
+    $modulePath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-powershell-module-authority.ps1'))
+    $policyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
+    $moduleRaw = Get-D32NonSourceL1InitialReferenceBytes -Path $modulePath -MaximumBytes 16777216L -DeadlineTicks $deadline
+    if ($moduleRaw.Reference.bytes -le 0 -or $moduleRaw.Reference.bytes -gt 16777216L -or
+        (Get-D32NonSourceL1Now) -ge $deadline) {
+        throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed observer-binding module input is empty, over-bound, or late'
+    }
+    . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$moduleRaw.Bytes)))
+    $policyRaw = Get-D32NonSourceL1InitialReferenceBytes -Path $policyPath -MaximumBytes 16777216L -DeadlineTicks $deadline
+    if ($policyRaw.Reference.bytes -le 0 -or $policyRaw.Reference.bytes -gt 16777216L -or
+        (Get-D32NonSourceL1Now) -ge $deadline) {
+        throw 'D32_NON_SOURCE_L1_BUDGET_STOPPED: fixed observer-binding policy input is empty, over-bound, or late'
+    }
+    . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$policyRaw.Bytes)))
+    $null = Get-D32PowerShellAuthorityTrustedRuntimeRoot
+    if ($null -eq (Get-Command -Name 'ConvertTo-D32PowerShellAuthorityJsonText' -CommandType Function -ErrorAction SilentlyContinue)) {
+        throw 'D32_NON_SOURCE_L1_REFUSED: fixed module bootstrap did not install the bounded JSON serializer'
+    }
+    return New-D32NonSourceL1ObserverBindingPreparation
 }
 
 function Test-D32PreparationExactProperties {
@@ -3560,40 +3599,129 @@ function Invoke-D32PreparationObserverSessionEntry {
     param([Parameter(Mandatory = $true)][string]$ParameterSetName,
         [Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
         [Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer,
-        [Parameter(Mandatory = $true)][System.IO.TextWriter]$DiagnosticWriter, [AllowNull()][object]$TestAdapter = $null)
+        [Parameter(Mandatory = $true)][System.IO.TextWriter]$DiagnosticWriter, [AllowNull()][object]$TestAdapter = $null,
+        [switch]$RequireColdEntryMarker = $false)
     $sessionEntered = $false
+    $primaryFailure = $null
+    $secondary = [System.Collections.Generic.List[string]]::new()
+    $environmentAdapterVariable = $ExecutionContext.SessionState.PSVariable.Get('D32NonSourceL1EnvironmentAdapter')
+    $previousEnvironmentAdapter = if ($null -ne $environmentAdapterVariable) { $environmentAdapterVariable.Value } else { $null }
+    $nativeProviderVariable = $ExecutionContext.SessionState.PSVariable.Get('D32PowerShellAuthorityTestProvider')
+    $previousNativeProvider = if ($null -ne $nativeProviderVariable) { $nativeProviderVariable.Value } else { $null }
     try {
         if ($ParameterSetName -cne 'PreparationSession') {
             throw 'D32_PREP_OBSERVER_REFUSED: fixed preparation entry received a different PowerShell parameter set'
         }
-        # Keep the existing observer host form, but disable command-name module
-        # autoload for this dynamic call chain before any preparation function runs.
-        $PSModuleAutoLoadingPreference = 'None'
-        if ([string]$PSModuleAutoLoadingPreference -cne 'None') {
-            throw 'D32_PREP_OBSERVER_REFUSED: module autoload preference could not be disabled in the fixed session scope'
+        if ($RequireColdEntryMarker) {
+            $markerProperty = if ($null -ne $TestAdapter) { $TestAdapter.PSObject.Properties['Marker'] } else { $null }
+            if ($null -eq $markerProperty -or [string]$markerProperty.Value -cne 'D32_COLD_ENTRY_TEST_ADAPTER_V1') {
+                throw 'D32_PREP_OBSERVER_REFUSED: internal cold-entry provider marker is invalid'
+            }
         }
+        Set-StrictMode -Version Latest
+        $PSModuleAutoLoadingPreference = 'None'
+        $environmentAdapter = $null; $qpcProvider = $null; $nowProvider = $null; $moduleProvider = $null
+        if ($null -ne $TestAdapter) {
+            $property = $TestAdapter.PSObject.Properties['EnvironmentAdapter']; if ($null -ne $property) { $environmentAdapter = $property.Value }
+            $property = $TestAdapter.PSObject.Properties['QpcFrequency']; if ($null -ne $property) { $qpcProvider = $property.Value }
+            $property = $TestAdapter.PSObject.Properties['Now']; if ($null -ne $property) { $nowProvider = $property.Value }
+            $property = $TestAdapter.PSObject.Properties['ModuleProvider']; if ($null -ne $property) { $moduleProvider = $property.Value }
+        }
+        $controllerPathProvider = $null
+        if ($null -ne $environmentAdapter) {
+            $controllerPathProperty = $environmentAdapter.PSObject.Properties['ControllerPath']
+            if ($null -ne $controllerPathProperty) { $controllerPathProvider = $controllerPathProperty.Value }
+        }
+        $controllerPath = if ($null -ne $controllerPathProvider) { [string](& $controllerPathProvider) }
+            else { Get-D32NonSourceL1CurrentControllerPath }
+        if ([string]$PSModuleAutoLoadingPreference -cne 'None' -or $PSVersionTable.PSEdition -cne 'Core' -or
+            $PSVersionTable.PSVersion -lt [version]'7.5' -or -not [Environment]::Is64BitProcess -or
+            $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or [IO.Path]::GetFullPath($Repository) -cne $Repository -or
+            -not [IO.Path]::IsPathRooted($Repository) -or
+            [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1')) -cne
+                [IO.Path]::GetFullPath($controllerPath)) {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed session candidate/repository, Core host, controller entry, or autoload startup input is invalid'
+        }
+        $frequency = if ($null -ne $qpcProvider) { [Int64](& $qpcProvider) } else { [Int64][Diagnostics.Stopwatch]::Frequency }
+        $started = if ($null -ne $nowProvider) { [Int64](& $nowProvider) } else { [Int64][Diagnostics.Stopwatch]::GetTimestamp() }
+        if ($frequency -le 0 -or $started -le 0) {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed session candidate/repository or monotonic clock inputs are invalid'
+        }
+        $identityDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
+        $modulePath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-powershell-module-authority.ps1'))
+        $policyPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))
+        $moduleRaw = if ($null -ne $environmentAdapter) {
+            Get-D32NonSourceL1InitialReferenceBytes -Path $modulePath -MaximumBytes 16777216L -DeadlineTicks $identityDeadline -EnvironmentAdapter $environmentAdapter
+        } else {
+            Get-D32NonSourceL1InitialReferenceBytes -Path $modulePath -MaximumBytes 16777216L -DeadlineTicks $identityDeadline
+        }
+        $policyRaw = if ($null -ne $environmentAdapter) {
+            Get-D32NonSourceL1InitialReferenceBytes -Path $policyPath -MaximumBytes 16777216L -DeadlineTicks $identityDeadline -EnvironmentAdapter $environmentAdapter
+        } else {
+            Get-D32NonSourceL1InitialReferenceBytes -Path $policyPath -MaximumBytes 16777216L -DeadlineTicks $identityDeadline
+        }
+        foreach ($sourceName in @('module','policy')) {
+            $raw = if ($sourceName -ceq 'module') { $moduleRaw } else { $policyRaw }
+            $expectedPath = if ($sourceName -ceq 'module') { $modulePath } else { $policyPath }
+            $bytes = [byte[]]$raw.Bytes
+            $sha = if ($bytes.Length -gt 0) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() } else { '' }
+            $observedTicks = if ($null -ne $nowProvider) { [Int64](& $nowProvider) } else { [Int64][Diagnostics.Stopwatch]::GetTimestamp() }
+            if ($null -eq $raw.Reference -or [string]$raw.Reference.path -cne $expectedPath -or $bytes.Length -le 0 -or
+                $bytes.Length -gt 16777216L -or [Int64]$raw.Reference.bytes -ne $bytes.Length -or
+                [string]$raw.Reference.sha256 -cne $sha -or $sha -cnotmatch '^[0-9a-f]{64}$' -or $observedTicks -ge $identityDeadline) {
+                throw 'D32_PREP_OBSERVER_REFUSED: fixed candidate support source is not a bounded, same-path content-hash binding or arrived after the identity deadline'
+            }
+        }
+        # These source scripts contain only the fixed module-free helper and policy
+        # definitions. Dot-source into this entry scope so every subsequent child
+        # function resolves the exact loaded serializer and its companion helpers.
+        . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$moduleRaw.Bytes)))
+        . ([ScriptBlock]::Create([Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$policyRaw.Bytes)))
+        $null = Get-D32PowerShellAuthorityTrustedRuntimeRoot
+        if ($null -eq (Get-Command -Name 'ConvertTo-D32PowerShellAuthorityJsonText' -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed module bootstrap did not install the bounded JSON serializer'
+        }
+        $script:D32PowerShellAuthorityTestProvider = $moduleProvider
+        if ($null -ne $TestAdapter) {
+            Set-Variable -Name D32NonSourceL1EnvironmentAdapter -Scope Script -Value $environmentAdapter
+        }
+        $bootstrapReferences = [PSCustomObject][ordered]@{module=$moduleRaw.Reference;policy=$policyRaw.Reference}
         $sessionEntered = $true
         return [int](Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha `
-            -Reader $Reader -Writer $Writer -DiagnosticWriter $DiagnosticWriter -TestAdapter $TestAdapter)
+            -Reader $Reader -Writer $Writer -DiagnosticWriter $DiagnosticWriter -TestAdapter $TestAdapter `
+            -SessionStartedTicks $started -SessionQpcFrequency $frequency -BootstrapSourceReferences $bootstrapReferences)
     } catch {
-        $status = Get-D32PreparationFailureStatus -ErrorText ([string]$_.Exception.Message)
-        $secondary = [System.Collections.Generic.List[string]]::new()
+        $primaryFailure = $_.Exception
+        $status = Get-D32PreparationFailureStatus -ErrorText ([string]$primaryFailure.Message)
         if (-not $sessionEntered) {
             foreach ($stream in @($Reader,$Writer)) {
                 try { $stream.Dispose() }
                 catch { if ($secondary.Count -lt 4) { $secondary.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) } }
             }
         }
-        $null = Write-D32PreparationEntryDiagnostic -Status $status -PrimaryException $_.Exception `
+        $null = Write-D32PreparationEntryDiagnostic -Status $status -PrimaryException $primaryFailure `
             -SecondaryErrors @($secondary.ToArray()) -Writer $DiagnosticWriter
         return 87
+    } finally {
+        if ($null -ne $environmentAdapterVariable) {
+            $environmentAdapterVariable.Value = $previousEnvironmentAdapter
+        } elseif ($null -ne $TestAdapter) {
+            $null = $ExecutionContext.SessionState.PSVariable.Remove('D32NonSourceL1EnvironmentAdapter')
+        }
+        if ($null -ne $nativeProviderVariable) {
+            $nativeProviderVariable.Value = $previousNativeProvider
+        } elseif ($null -ne $ExecutionContext.SessionState.PSVariable.Get('D32PowerShellAuthorityTestProvider')) {
+            $currentNativeProvider = $ExecutionContext.SessionState.PSVariable.Get('D32PowerShellAuthorityTestProvider')
+            if ($null -ne $currentNativeProvider) { $currentNativeProvider.Value = $null }
+        }
     }
 }
 
 function Invoke-D32PreparationObserverControlSession {
     param([Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
         [Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer,
-        [AllowNull()][System.IO.TextWriter]$DiagnosticWriter = $null, [AllowNull()][object]$TestAdapter = $null)
+        [AllowNull()][System.IO.TextWriter]$DiagnosticWriter = $null, [AllowNull()][object]$TestAdapter = $null,
+        [long]$SessionStartedTicks = 0L, [long]$SessionQpcFrequency = 0L, [AllowNull()][object]$BootstrapSourceReferences = $null)
     $frequency = 0L; $started = 0L; $identityDeadline = 0L; $leaseDeadline = 0L
     $snapshot = $null; $nonce = $null; $lastSequence = 0L; $candidateSequence = $null; $pinVerificationSequence = $null
     $state = 'AWAIT_READY'; $candidateResult = $null; $pinsVerified = $false; $baselineResult = $null
@@ -3603,8 +3731,12 @@ function Invoke-D32PreparationObserverControlSession {
     $nowProvider = $null
     try {
         $PSModuleAutoLoadingPreference = 'None'
-        $frequency = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.QpcFrequency) { [Int64](& $TestAdapter.QpcFrequency) } else { [Int64][Diagnostics.Stopwatch]::Frequency }
-        $started = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
+        $frequency = if ($SessionQpcFrequency -gt 0) { [Int64]$SessionQpcFrequency }
+            elseif ($null -ne $TestAdapter -and $null -ne $TestAdapter.QpcFrequency) { [Int64](& $TestAdapter.QpcFrequency) }
+            else { [Int64][Diagnostics.Stopwatch]::Frequency }
+        $started = if ($SessionStartedTicks -gt 0) { [Int64]$SessionStartedTicks }
+            elseif ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) }
+            else { [Int64](Get-D32NonSourceL1Now) }
         $nowProvider = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { $TestAdapter.Now } else { { Get-D32NonSourceL1Now } }
         if ($frequency -le 0 -or $started -le 0 -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
             [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository)) {
@@ -3617,6 +3749,24 @@ function Invoke-D32PreparationObserverControlSession {
         if ($nonce -cnotmatch '^[0-9a-f]{32}$') { throw 'D32_PREP_OBSERVER_REFUSED: session nonce is not fresh lower-case 32-hex' }
         $snapshot = New-D32PreparationObserverSnapshot -Repository $Repository -CandidateSha $CandidateSha -IdentityDeadlineTicks $identityDeadline -TestAdapter $TestAdapter
         if ([Int64](& $nowProvider) -ge $identityDeadline) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: identity admission exceeded 15 seconds from session start' }
+        if ($null -ne $BootstrapSourceReferences) {
+            if (-not (Test-D32PreparationExactProperties $BootstrapSourceReferences @('module','policy')) -or
+                $snapshot.SourcePins.Count -ne 6) {
+                throw 'D32_PREP_OBSERVER_REFUSED: cold-entry source bootstrap references are incomplete'
+            }
+            foreach ($binding in @(@('module',5,'scripts/d32-powershell-module-authority.ps1'),
+                    @('policy',3,'scripts/d32-bounded-compiler-diagnostic-policy.ps1'))) {
+                $loaded = $BootstrapSourceReferences.PSObject.Properties[[string]$binding[0]].Value
+                $pinned = $snapshot.SourcePins[[int]$binding[1]]
+                $expectedPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,[string]$binding[2]))
+                if ($null -eq $loaded -or [string]$loaded.path -cne $expectedPath -or
+                    [Int64]$loaded.bytes -le 0 -or [string]$loaded.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                    [string]$pinned.path -cne $expectedPath -or [Int64]$pinned.bytes -ne [Int64]$loaded.bytes -or
+                    [string]$pinned.sha256 -cne [string]$loaded.sha256) {
+                    throw 'D32_PREP_OBSERVER_REFUSED: loaded candidate module/policy bytes differ from the same-session six-file source pins'
+                }
+            }
+        }
         $challenge = [PSCustomObject][ordered]@{protocol='D32_PREP_OBSERVER_CONTROL_V1';session_nonce=$nonce;sequence=0L;candidate_sha=$CandidateSha
             operation='CHALLENGE';status='AWAITING_READY';gate_authority='NONE';launch_authority='NONE';payload=[PSCustomObject][ordered]@{}}
         Write-D32PreparationControlResponse -Writer $Writer -Frame $challenge -TestAdapter $TestAdapter
@@ -3725,35 +3875,33 @@ function Invoke-D32PreparationObserverControlSession {
                 $failureStatus = 'UNRESOLVED'; $exitCode = 87
             }
         }
-        else {
-            try { $Reader.Dispose() }
-            catch {
-                if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control reader close failed', $_.Exception) }
-                elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
-                $failureStatus = 'UNRESOLVED'; $exitCode=87
-            }
-            try { $Writer.Dispose() }
-            catch {
-                if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control writer close failed', $_.Exception) }
-                elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
-                $failureStatus = 'UNRESOLVED'; $exitCode=87
-            }
-            if ($null -ne $snapshot) {
-                foreach ($item in $snapshot.Opened) {
-                    try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } }
-                    catch {
-                        if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation file close failed', $_.Exception) }
-                        elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
-                        $failureStatus = 'UNRESOLVED'; $exitCode=87
-                    }
+        try { $Reader.Dispose() }
+        catch {
+            if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control reader close failed', $_.Exception) }
+            elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+            $failureStatus = 'UNRESOLVED'; $exitCode=87
+        }
+        try { $Writer.Dispose() }
+        catch {
+            if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: owned control writer close failed', $_.Exception) }
+            elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+            $failureStatus = 'UNRESOLVED'; $exitCode=87
+        }
+        if ($null -ne $snapshot) {
+            foreach ($item in $snapshot.Opened) {
+                try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } }
+                catch {
+                    if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation file close failed', $_.Exception) }
+                    elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                    $failureStatus = 'UNRESOLVED'; $exitCode=87
                 }
-                foreach ($fence in $snapshot.DirectoryFences.Values) {
-                    try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
-                    catch {
-                        if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation directory fence close failed', $_.Exception) }
-                        elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
-                        $failureStatus = 'UNRESOLVED'; $exitCode=87
-                    }
+            }
+            foreach ($fence in $snapshot.DirectoryFences.Values) {
+                try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } }
+                catch {
+                    if ($null -eq $primaryFailure) { $primaryFailure = [InvalidOperationException]::new('D32_PREP_OBSERVER_UNRESOLVED: retained preparation directory fence close failed', $_.Exception) }
+                    elseif ($secondaryFailures.Count -lt 8) { $secondaryFailures.Add((Get-D32NonSourceL1ErrorText -Exception $_.Exception)) }
+                    $failureStatus = 'UNRESOLVED'; $exitCode=87
                 }
             }
         }
@@ -4679,13 +4827,21 @@ if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'PreparationSession') {
+    $preparationSessionTestAdapter = $null
+    $requireColdEntryMarker = $false
+    $preparationSessionTestAdapterVariable = $ExecutionContext.SessionState.PSVariable.Get('D32PreparationObserverSessionTestAdapter')
+    if ($null -ne $preparationSessionTestAdapterVariable) {
+        $preparationSessionTestAdapter = $preparationSessionTestAdapterVariable.Value
+        $requireColdEntryMarker = $true
+        $null = $ExecutionContext.SessionState.PSVariable.Remove('D32PreparationObserverSessionTestAdapter')
+    }
     exit (Invoke-D32PreparationObserverSessionEntry -ParameterSetName $PSCmdlet.ParameterSetName `
         -Repository $Repository -CandidateSha $CandidateSha -Reader ([Console]::In) -Writer ([Console]::Out) `
-        -DiagnosticWriter ([Console]::Error))
+        -DiagnosticWriter ([Console]::Error) -TestAdapter $preparationSessionTestAdapter -RequireColdEntryMarker:$requireColdEntryMarker)
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'ObserverBindingPreparation') {
-    return (New-D32NonSourceL1ObserverBindingPreparation)
+    return (Invoke-D32PreparationObserverBindingEntry)
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'OuterCaller') {

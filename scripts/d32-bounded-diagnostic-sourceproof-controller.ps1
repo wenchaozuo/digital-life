@@ -3448,7 +3448,8 @@ function Invoke-D32PreparationRuntimeCandidateProducer {
     if ($null -ne $TestAdapter -and $null -ne $TestAdapter.PrepareRuntime) {
         $candidate = & $TestAdapter.PrepareRuntime -Snapshot $Snapshot -SessionNonce $SessionNonce -DeadlineTicks $DeadlineTicks
     } else {
-        $candidate = New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $Snapshot.CandidateSha -DeadlineTicks $DeadlineTicks
+        $candidate = New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $Snapshot.CandidateSha `
+            -Repository $Snapshot.Repository -DeadlineTicks $DeadlineTicks
     }
     $now = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
     if ($now -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: runtime-content producer crossed its 300-second deadline; candidate cannot succeed' }

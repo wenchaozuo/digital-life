@@ -3314,7 +3314,19 @@ $l1RuntimeProducerFunctionNames = @('Get-D32PowerShellAuthorityInventoryDigest',
     'Get-D32PowerShellAuthorityProtectedAbsenceWitnessSha256','New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs',
     'Get-D32PowerShellAuthorityNonSourceL1StaticRuntimeAssets','Assert-D32PowerShellAuthorityStaticRuntimeConfig',
     'Get-D32PowerShellAuthorityPeImportNames','Get-D32PowerShellAuthorityDirectoryFenceKey',
-    'Get-D32PowerShellAuthorityRuntimeContentErrorCategory')
+    'Get-D32PowerShellAuthorityRuntimeContentErrorCategory','New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate',
+    'Get-D32PowerShellAuthorityFixedProgramFilesRuntimeRoot','Get-D32PowerShellAuthoritySystemRootPath',
+    'Get-D32PowerShellAuthorityOsVersionString','Get-D32PowerShellAuthorityDirectoryEntries',
+    'Get-D32PowerShellAuthorityPathAttributes','Get-D32PowerShellAuthorityFileLength',
+    'Test-D32PowerShellAuthorityFileExists','Test-D32PowerShellAuthorityDirectoryExists',
+    'Get-D32PowerShellAuthorityWindowsRootPath','Get-D32PowerShellAuthorityHandleIdentity',
+    'Get-D32PowerShellAuthorityFinalHandlePath','Get-D32PowerShellAuthorityObjectSecurity',
+    'Get-D32PowerShellAuthorityAuthenticodeSourceProof','Open-D32PowerShellAuthorityDirectoryFence',
+    'Open-D32PowerShellAuthorityFile','Get-D32PowerShellAuthorityRuntimeDistributionSnapshot',
+    'Get-D32PowerShellAuthorityDefenderPlatformSnapshot','Get-D32PowerShellAuthorityStaticWindowsNativeFiles',
+    'New-D32PowerShellAuthorityStaticWindowsComponent','New-D32PowerShellAuthorityStaticDefenderComponent',
+    'Get-D32PowerShellAuthorityFixedModuleRoles','Get-D32PowerShellAuthorityExpectedModuleFiles',
+    'Get-D32PowerShellAuthorityModuleTreePaths')
 $l1RuntimeProducerFunctionsLoaded = $true
 $l1RuntimeProducerMissingFunctions = [System.Collections.Generic.List[string]]::new()
 $l1RuntimeProducerFunctionAsts = @($moduleAuthorityAst.FindAll({ param($node)
@@ -3597,6 +3609,255 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'runtime content candidate has the e
         (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $l1RuntimeAuthorityCandidate `
         -ExpectedCandidateSha $l1CandidateSha -Repository $l1Repository)
     )
+
+# Exercise the fixed installed-runtime collector without installed reads. The
+# provider below supplies only raw bytes and OS/filesystem query facts; the
+# collector itself walks the tree, binds opened identities and ACLs, parses PE
+# imports/deps/runtimeconfig, builds every V2 record, hashes the inventory, and
+# emits/strictly consumes the candidate JSON.
+$runtimeCollectorProgramFiles='C:\Program Files'
+$runtimeCollectorHome=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorProgramFiles,'PowerShell','7'))
+$runtimeCollectorSystemRoot='C:\Windows'
+$runtimeCollectorSystem32=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorSystemRoot,'System32'))
+$runtimeCollectorDefenderParent='C:\ProgramData\Microsoft\Windows Defender\Platform'
+$runtimeCollectorDefenderRoot=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorDefenderParent,'4.18.1.0-123'))
+$runtimeCollectorRepository=[IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot,'..'))
+$runtimeCollectorState=[PSCustomObject]@{
+    ProgramFiles=$runtimeCollectorProgramFiles;SystemRoot=$runtimeCollectorSystemRoot;WindowsDirectory=$runtimeCollectorSystemRoot
+    OsVersion='Synthetic Windows NT 10.0.0';Directories=[System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    Files=[System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    OpenedHandles=[System.Collections.Generic.List[object]]::new()
+    BadTrustPath=$null;FinalPathOverride=$null
+    Counters=@{DirectoryEntries=0;PathAttributes=0;FileLength=0;FileExists=0;DirectoryExists=0;OpenDirectory=0;OpenFile=0
+        ReadBytes=0;HandleIdentity=0;FinalHandlePath=0;ObjectSecurity=0;WindowsDirectory=0;AuthenticodeFacts=0}
+}
+$runtimeCollectorPreviousState=$script:runtimeCollectorState
+$script:runtimeCollectorState=$runtimeCollectorState
+$runtimeCollectorAddDirectory={
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath($Path)
+    if($state.Directories.ContainsKey($full)){return}
+    $root=[IO.Path]::GetPathRoot($full);$volume=if($root -ceq 'C:\'){'1111111111111111'}else{'2222222222222222'}
+    $owner=if($full -ceq 'C:\'){'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'}else{'S-1-5-18'}
+    $idMaterial=[Text.UTF8Encoding]::new($false).GetBytes('directory|'+$full)
+    $idHash=[Security.Cryptography.SHA256]::HashData($idMaterial);$fileId=[Convert]::ToHexString($idHash[0..15]).ToLowerInvariant()
+    $sddl='O:'+$owner+'G:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    $security=[Security.AccessControl.DirectorySecurity]::new()
+    $security.SetSecurityDescriptorSddlForm($sddl,[Security.AccessControl.AccessControlSections]::All)
+    $state.Directories.Add($full,[PSCustomObject]@{Path=$full;Attributes=[int][IO.FileAttributes]::Directory;VolumeSerialHex=$volume
+        FileIdHex=$fileId;Bytes=[Int64]0;Length=[Int64]0;Security=$security})
+}
+$runtimeCollectorAddFile={
+    param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][byte[]]$Bytes)
+    $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath($Path)
+    $root=[IO.Path]::GetPathRoot($full);$volume=if($root -ceq 'C:\'){'1111111111111111'}else{'2222222222222222'}
+    $idMaterial=[Text.UTF8Encoding]::new($false).GetBytes('file|'+$full)
+    $idHash=[Security.Cryptography.SHA256]::HashData($idMaterial);$fileId=[Convert]::ToHexString($idHash[0..15]).ToLowerInvariant()
+    $sddl='O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    $security=[Security.AccessControl.DirectorySecurity]::new()
+    $security.SetSecurityDescriptorSddlForm($sddl,[Security.AccessControl.AccessControlSections]::All)
+    $content=[byte[]]::new($Bytes.Length);[Array]::Copy($Bytes,$content,$Bytes.Length)
+    $state.Files.Add($full,[PSCustomObject]@{Path=$full;Attributes=[int][IO.FileAttributes]::Archive;VolumeSerialHex=$volume
+        FileIdHex=$fileId;Bytes=$content;Length=[Int64]$content.Length;Security=$security})
+}
+$runtimeCollectorTargets=@($runtimeCollectorHome,[IO.Path]::Combine($runtimeCollectorHome,'Modules'),
+    [IO.Path]::Combine($runtimeCollectorHome,'Modules','Microsoft.PowerShell.Utility'),$runtimeCollectorSystemRoot,$runtimeCollectorSystem32,
+    $runtimeCollectorDefenderParent,$runtimeCollectorDefenderRoot,$runtimeCollectorRepository)
+foreach($targetPath in $runtimeCollectorTargets){
+    $current=[IO.Path]::GetFullPath([string]$targetPath);$root=[IO.Path]::GetPathRoot($current)
+    while(-not [string]::IsNullOrWhiteSpace($current)){
+        & $runtimeCollectorAddDirectory -Path $current
+        if([StringComparer]::OrdinalIgnoreCase.Equals($current,$root)){break}
+        $current=[IO.Path]::GetDirectoryName($current)
+    }
+}
+$runtimeCollectorPeImports=New-D32L1SelfTestPeImportImage -ImportName 'kernel32.dll'
+$runtimeCollectorKernel32=New-D32L1SelfTestPeImportImage -ImportName 'kernelbase.dll'
+$runtimeCollectorKernelbase=New-D32L1SelfTestPeImportImage -ImportName 'api-ms-win-core-libraryloader-l1-2-0.dll'
+$runtimeCollectorManifestText="@{`n RootModule = ''`n NestedModules = @('Microsoft.PowerShell.Commands.Utility.dll')`n}`n"
+$runtimeCollectorManifestBytes=[Text.UTF8Encoding]::new($false).GetBytes($runtimeCollectorManifestText)
+$runtimeCollectorFileInputs=@(
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'pwsh.exe');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'pwsh.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'System.Management.Automation.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'System.Private.CoreLib.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'native_probe.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'Microsoft.PowerShell.Commands.Utility.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'pwsh.deps.json');Bytes=$l1StaticDepsBytes},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'pwsh.runtimeconfig.json');Bytes=$l1StaticRuntimeConfigBytes},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorHome,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1');Bytes=$runtimeCollectorManifestBytes},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorSystem32,'kernel32.dll');Bytes=$runtimeCollectorKernel32},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorSystem32,'kernelbase.dll');Bytes=$runtimeCollectorKernelbase},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorDefenderRoot,'MpOav.dll');Bytes=$runtimeCollectorPeImports},
+    [PSCustomObject]@{Path=[IO.Path]::Combine($runtimeCollectorDefenderRoot,'MPCLIENT.DLL');Bytes=$runtimeCollectorPeImports}
+)
+foreach($fileInput in $runtimeCollectorFileInputs){& $runtimeCollectorAddFile -Path $fileInput.Path -Bytes ([byte[]]$fileInput.Bytes)}
+$runtimeCollectorPreviousProvider=$script:D32PowerShellAuthorityTestProvider
+$runtimeCollectorProvider=[PSCustomObject]@{
+    GetProgramFilesDirectory={ [string]$script:runtimeCollectorState.ProgramFiles }
+    GetSystemRoot={ [string]$script:runtimeCollectorState.SystemRoot }
+    GetOsVersionString={ [string]$script:runtimeCollectorState.OsVersion }
+    GetWindowsDirectory={ $script:runtimeCollectorState.Counters.WindowsDirectory++;[string]$script:runtimeCollectorState.WindowsDirectory }
+    NoReparse={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path)
+        if($state.Directories.ContainsKey($full)){return (($state.Directories[$full].Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)}
+        if($state.Files.ContainsKey($full)){return (($state.Files[$full].Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)}
+        return $false}
+    GetDirectoryEntries={param($Path,$Kind) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$entries=[System.Collections.Generic.List[string]]::new()
+        $state.Counters.DirectoryEntries++
+        foreach($entryPath in $state.Directories.Keys){if([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$entryPath),$full)){
+            if($Kind -cne 'FILES'){$entries.Add([string]$entryPath)}}}
+        foreach($entryPath in $state.Files.Keys){if([StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName([string]$entryPath),$full)){
+            if($Kind -cne 'DIRECTORIES'){$entries.Add([string]$entryPath)}}}
+        $result=[string[]]$entries.ToArray();[Array]::Sort($result,[StringComparer]::OrdinalIgnoreCase);return ,$result}
+    GetPathAttributes={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.PathAttributes++
+        if($state.Directories.ContainsKey($full)){return [IO.FileAttributes]$state.Directories[$full].Attributes}
+        if($state.Files.ContainsKey($full)){return [IO.FileAttributes]$state.Files[$full].Attributes}
+        throw 'synthetic filesystem attribute query escaped the fixed in-memory tree'}
+    GetFileLength={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.FileLength++
+        if(-not $state.Files.ContainsKey($full)){throw 'synthetic file-length query escaped the fixed in-memory tree'}
+        return [Int64]$state.Files[$full].Length}
+    FileExists={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.FileExists++;return [bool]$state.Files.ContainsKey($full)}
+    DirectoryExists={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.DirectoryExists++;return [bool]$state.Directories.ContainsKey($full)}
+    OpenDirectory={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.OpenDirectory++
+        if(-not $state.Directories.ContainsKey($full)){throw 'synthetic directory-open query escaped the fixed in-memory tree'}
+        $handle=[PSCustomObject]@{Path=$full;Kind='directory';IsClosed=$false;IsInvalid=$false}
+        Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value { $this.IsClosed=$true } -Force
+        $state.OpenedHandles.Add($handle);return $handle}
+    OpenFile={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.OpenFile++
+        if(-not $state.Files.ContainsKey($full)){throw 'synthetic file-open query escaped the fixed in-memory tree'}
+        $handle=[PSCustomObject]@{Path=$full;Kind='file';IsClosed=$false;IsInvalid=$false}
+        Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value { $this.IsClosed=$true } -Force
+        $state.OpenedHandles.Add($handle);return $handle}
+    GetHandleIdentity={param($Handle) $state=$script:runtimeCollectorState;$path=[string]$Handle.Path;$state.Counters.HandleIdentity++
+        $fact=if($Handle.Kind -ceq 'directory'){$state.Directories[$path]}else{$state.Files[$path]}
+        if($null -eq $fact){throw 'synthetic opened-handle identity query escaped the fixed in-memory tree'}
+        return [PSCustomObject]@{Attributes=[int]$fact.Attributes;VolumeSerialHex=[string]$fact.VolumeSerialHex;FileIdHex=[string]$fact.FileIdHex;Bytes=[Int64]$fact.Length}}
+    GetFinalHandlePath={param($Handle) $state=$script:runtimeCollectorState;$path=[string]$Handle.Path;$state.Counters.FinalHandlePath++
+        if($null -ne $state.FinalPathOverride -and [StringComparer]::OrdinalIgnoreCase.Equals($path,[string]$state.FinalPathOverride.requested)){return [string]$state.FinalPathOverride.returned}
+        return $path}
+    GetObjectSecurity={param($Path,$IsDirectory) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.ObjectSecurity++
+        $fact=if($IsDirectory){$state.Directories[$full]}else{$state.Files[$full]}
+        if($null -eq $fact){throw 'synthetic opened-object ACL query escaped the fixed in-memory tree'}
+        return $fact.Security}
+    ReadFileBytes={param($Handle,$MaximumBytes,$DeadlineTicks) $state=$script:runtimeCollectorState;$path=[string]$Handle.Path;$state.Counters.ReadBytes++
+        if(-not $state.Files.ContainsKey($path)){throw 'synthetic opened-file byte query escaped the fixed in-memory tree'}
+        $bytes=[byte[]]$state.Files[$path].Bytes;if($bytes.Length -gt $MaximumBytes){throw 'synthetic opened-file byte query exceeded caller bound'}
+        $copy=[byte[]]::new($bytes.Length);[Array]::Copy($bytes,$copy,$bytes.Length);return ,$copy}
+    GetAuthenticodeFacts={param($Path) $state=$script:runtimeCollectorState;$full=[IO.Path]::GetFullPath([string]$Path);$state.Counters.AuthenticodeFacts++
+        return [PSCustomObject]@{WinTrustStatus=[int]$(if($null -ne $state.BadTrustPath -and [StringComparer]::OrdinalIgnoreCase.Equals($full,[string]$state.BadTrustPath)){1}else{0})
+            Subject='Microsoft Windows';Issuer='CN=Windows Production PCA 2023, O=Microsoft Corporation';Thumbprint=('a'*40)
+            CompanyName='Microsoft Corporation';ProductName='Synthetic Defender platform';ProductVersion='4.18.1.0';FileVersion='4.18.1.0'}}
+}
+$script:D32PowerShellAuthorityTestProvider=$runtimeCollectorProvider
+try {
+    $runtimeCollectorNativeTypeBefore=$null -ne ('D32PowerShellModuleNativeV2' -as [type])
+    $runtimeCollectorPositive=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $l1CandidateSha `
+        -Repository $runtimeCollectorRepository `
+        -DeadlineTicks ([Int64]([Diagnostics.Stopwatch]::GetTimestamp()+([Diagnostics.Stopwatch]::Frequency*300L)))
+    $runtimeCollectorCandidateJson=if($null -ne $runtimeCollectorPositive.candidate_json){[string]$runtimeCollectorPositive.candidate_json}else{''}
+    $runtimeCollectorReadback=if(-not [string]::IsNullOrWhiteSpace($runtimeCollectorCandidateJson)){
+        ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json $runtimeCollectorCandidateJson
+    }else{$null}
+    $runtimeCollectorRuntimeDistribution=if($null -ne $runtimeCollectorReadback){$runtimeCollectorReadback.distribution}else{$null}
+    $runtimeCollectorOsComponents=if($null -ne $runtimeCollectorReadback){@($runtimeCollectorReadback.resolver_policy.os_security_components)}else{@()}
+    $runtimeCollectorRequiredPaths=@(
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'pwsh.exe')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'pwsh.dll')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'System.Management.Automation.dll')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'System.Private.CoreLib.dll')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'native_probe.dll')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'Microsoft.PowerShell.Commands.Utility.dll')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'pwsh.deps.json')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'pwsh.runtimeconfig.json')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')))
+    $runtimeCollectorRequiredPathsPresent=$null -ne $runtimeCollectorRuntimeDistribution -and $runtimeCollectorRuntimeDistribution.files.Count -eq $runtimeCollectorRequiredPaths.Count
+    if($runtimeCollectorRequiredPathsPresent){foreach($requiredPath in $runtimeCollectorRequiredPaths){
+        $runtimeCollectorPathMatches=@($runtimeCollectorRuntimeDistribution.files | Where-Object { [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.path,[string]$requiredPath) })
+        if($runtimeCollectorPathMatches.Count -ne 1){
+            $runtimeCollectorRequiredPathsPresent=$false;break
+        }
+    }}
+    $runtimeCollectorContentDigestsBound=$null -ne $runtimeCollectorRuntimeDistribution -and $true
+    if($runtimeCollectorContentDigestsBound){foreach($record in $runtimeCollectorRuntimeDistribution.files){
+        $path=[string]$record.path
+        if(-not $runtimeCollectorState.Files.ContainsKey($path)){$runtimeCollectorContentDigestsBound=$false;break}
+        $bytes=[byte[]]$runtimeCollectorState.Files[$path].Bytes
+        $expectedSha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        if([Int64]$record.bytes -ne $bytes.Length -or [string]$record.sha256 -cne $expectedSha){$runtimeCollectorContentDigestsBound=$false;break}
+    }}
+    $runtimeCollectorPositiveComplete=$runtimeCollectorPositive.status -ceq 'CANDIDATE_FOR_COORDINATOR_PIN' -and
+        $runtimeCollectorPositive.gate_authority -ceq 'NONE' -and $runtimeCollectorPositive.gaps.Count -eq 0 -and
+        (Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $runtimeCollectorReadback `
+            -ExpectedCandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository) -and
+        [string]$runtimeCollectorPositive.candidate_sha256 -ceq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false,$true).GetBytes($runtimeCollectorCandidateJson))).ToLowerInvariant() -and
+        $runtimeCollectorRequiredPathsPresent -and $runtimeCollectorRuntimeDistribution.directories.Count -ge 3 -and
+        $runtimeCollectorOsComponents.Count -eq 2 -and $runtimeCollectorOsComponents[0].distribution.files.Count -ge 2 -and
+        $runtimeCollectorOsComponents[1].distribution.files.Count -eq 2 -and
+        $runtimeCollectorReadback.startup_inputs.trusted_platform_assemblies.paths.Count -ge 1 -and
+        $runtimeCollectorReadback.startup_inputs.native_search.paths.Count -eq 2 -and
+        $runtimeCollectorContentDigestsBound -and $runtimeCollectorState.Counters.AuthenticodeFacts -eq 2 -and
+        $runtimeCollectorState.Counters.OpenFile -eq $runtimeCollectorState.Counters.ReadBytes -and
+        $runtimeCollectorState.Counters.DirectoryEntries -ge 4 -and $runtimeCollectorState.Counters.ObjectSecurity -ge 10 -and
+        $runtimeCollectorState.OpenedHandles.Count -eq ($runtimeCollectorState.Counters.OpenDirectory+$runtimeCollectorState.Counters.OpenFile) -and
+        @($runtimeCollectorState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0 -and
+        -not $runtimeCollectorNativeTypeBefore -and $null -eq ('D32PowerShellModuleNativeV2' -as [type])
+    if(-not $runtimeCollectorPositiveComplete){
+        Write-Output ('D32_RUNTIME_COLLECTOR_L0_DIAGNOSTIC: status='+[string]$runtimeCollectorPositive.status+
+            '; gaps='+[string]::Join('|',[string[]]$runtimeCollectorPositive.gaps)+
+            '; runtimeFiles='+[string]$(if($null -ne $runtimeCollectorRuntimeDistribution){$runtimeCollectorRuntimeDistribution.files.Count}else{-1})+
+            '; runtimeDirs='+[string]$(if($null -ne $runtimeCollectorRuntimeDistribution){$runtimeCollectorRuntimeDistribution.directories.Count}else{-1})+
+            '; osComponents='+$runtimeCollectorOsComponents.Count+'; counters='+[string]($runtimeCollectorState.Counters|ConvertTo-Json -Compress)+
+            '; nativeTypeBefore='+$runtimeCollectorNativeTypeBefore+'; nativeTypeAfter='+($null -ne ('D32PowerShellModuleNativeV2' -as [type]))+
+            '; shape='+$(if($null -ne $runtimeCollectorReadback){Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $runtimeCollectorReadback -ExpectedCandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository}else{$false})+
+            '; returnedCandidateShape='+$(if($null -ne $runtimeCollectorPositive.candidate){Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $runtimeCollectorPositive.candidate -ExpectedCandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository}else{$false})+
+            '; repoMatches='+[StringComparer]::OrdinalIgnoreCase.Equals([string]$runtimeCollectorReadback.source_repo,$runtimeCollectorRepository)+
+            '; requiredRuntimePaths='+$runtimeCollectorRequiredPathsPresent+
+            '; contentHashes='+$runtimeCollectorContentDigestsBound)
+    }
+    Assert-D32BoundedCompilerDiagnosticSelfTest 'full fixed runtime collector walks a nonempty synthetic Program Files/Windows/Defender tree, derives file/ACL identities and hashes, parses deps/runtimeconfig and PE imports, builds V2 OS components/resolver lists, then emits and strictly consumes the exact candidate without native calls' $runtimeCollectorPositiveComplete
+
+    $runtimeCollectorLimitPath=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'System.Management.Automation.dll'))
+    $runtimeCollectorOriginalLength=[Int64]$runtimeCollectorState.Files[$runtimeCollectorLimitPath].Length
+    $runtimeCollectorState.Files[$runtimeCollectorLimitPath].Length=268435457L
+    $runtimeCollectorLimitResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository `
+        -DeadlineTicks ([Int64]([Diagnostics.Stopwatch]::GetTimestamp()+([Diagnostics.Stopwatch]::Frequency*300L)))
+    $runtimeCollectorState.Files[$runtimeCollectorLimitPath].Length=$runtimeCollectorOriginalLength
+    $runtimeCollectorLimitDiagnostic=[string]::Join('|',[string[]]$runtimeCollectorLimitResult.gaps)
+    Assert-D32BoundedCompilerDiagnosticSelfTest 'full runtime collector rejects a file-size query beyond the fixed 256 MiB single-file cap at the distribution phase, emits only the bounded limit category, and never returns a candidate' `
+        ($runtimeCollectorLimitResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $runtimeCollectorLimitResult.candidate -and
+            $runtimeCollectorLimitDiagnostic -match 'phase=program_files_distribution_inventory; category=RUNTIME_CONTENT_LIMIT' -and
+            $runtimeCollectorLimitDiagnostic -notmatch [regex]::Escape($runtimeCollectorLimitPath) -and
+            [string]::IsNullOrEmpty([string]$runtimeCollectorLimitResult.candidate_json))
+
+    $runtimeCollectorDepsPath=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorHome,'pwsh.deps.json'))
+    $runtimeCollectorDepsFact=$runtimeCollectorState.Files[$runtimeCollectorDepsPath]
+    [void]$runtimeCollectorState.Files.Remove($runtimeCollectorDepsPath)
+    $runtimeCollectorDepsResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository `
+        -DeadlineTicks ([Int64]([Diagnostics.Stopwatch]::GetTimestamp()+([Diagnostics.Stopwatch]::Frequency*300L)))
+    [void]$runtimeCollectorState.Files.Add($runtimeCollectorDepsPath,$runtimeCollectorDepsFact)
+    $runtimeCollectorDepsDiagnostic=[string]::Join('|',[string[]]$runtimeCollectorDepsResult.gaps)
+    Assert-D32BoundedCompilerDiagnosticSelfTest 'full runtime collector derives no deps resolver witness when the in-memory distribution omits pwsh.deps.json and reports the bounded resolver phase/category' `
+        ($runtimeCollectorDepsResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $runtimeCollectorDepsResult.candidate -and
+            $runtimeCollectorDepsDiagnostic -match 'phase=deps_and_runtimeconfig_resolver_inputs; category=RUNTIME_RESOLVER_INPUT' -and
+            $runtimeCollectorDepsDiagnostic -notmatch 'pwsh.deps.json|runtimeTarget|outside')
+
+    $runtimeCollectorBadTrustPath=[IO.Path]::GetFullPath([IO.Path]::Combine($runtimeCollectorDefenderRoot,'MpOav.dll'))
+    $runtimeCollectorState.BadTrustPath=$runtimeCollectorBadTrustPath
+    $runtimeCollectorTrustResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $l1CandidateSha -Repository $runtimeCollectorRepository `
+        -DeadlineTicks ([Int64]([Diagnostics.Stopwatch]::GetTimestamp()+([Diagnostics.Stopwatch]::Frequency*300L)))
+    $runtimeCollectorState.BadTrustPath=$null
+    $runtimeCollectorTrustDiagnostic=[string]::Join('|',[string[]]$runtimeCollectorTrustResult.gaps)
+    Assert-D32BoundedCompilerDiagnosticSelfTest 'full runtime collector fails closed on a nonzero synthetic cache-only trust-query result after the Defender inventory and reports only the bounded Defender phase/category' `
+        ($runtimeCollectorTrustResult.status -ceq 'BLOCKED_INPUT_GAPS' -and $null -eq $runtimeCollectorTrustResult.candidate -and
+            $runtimeCollectorTrustDiagnostic -match 'phase=defender_security_component; category=DEFENDER_COMPONENT_EVIDENCE' -and
+            $runtimeCollectorTrustDiagnostic -notmatch [regex]::Escape($runtimeCollectorBadTrustPath) -and
+            $runtimeCollectorState.Counters.AuthenticodeFacts -eq 3)
+} finally {
+    $script:D32PowerShellAuthorityTestProvider=$runtimeCollectorPreviousProvider
+    $script:runtimeCollectorState=$runtimeCollectorPreviousState
+}
+
 $l1RuntimeCandidateNegativeCases = @(
     [PSCustomObject]@{name='unknown runtime-content field'; mutate={param($r) $r | Add-Member -NotePropertyName unexpected -NotePropertyValue $true}},
     [PSCustomObject]@{name='gate authority elevation'; mutate={param($r) $r.gate_authority='APPROVED'}},
@@ -3695,9 +3956,9 @@ if ($null -ne $runtimeProducerEntryAst) {
         $runtimeProducerEntryParameters.Add([string]$runtimeProducerEntryParameter.Name.VariablePath.UserPath)
     }
 }
-Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed runtime-content preparation exposes only candidate pin and bounded deadline inputs and never borrows observer-loaded/AppContext target origins' `
-    ($null -ne $runtimeProducerEntryAst -and $runtimeProducerEntryParameters.Count -eq 2 -and
-        ($runtimeProducerEntryParameters -join '|') -ceq 'CandidateSha|DeadlineTicks' -and
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed runtime-content preparation accepts only candidate/repository pins and bounded deadline inputs and never borrows observer-loaded/AppContext target origins' `
+    ($null -ne $runtimeProducerEntryAst -and $runtimeProducerEntryParameters.Count -eq 3 -and
+        ($runtimeProducerEntryParameters -join '|') -ceq 'CandidateSha|Repository|DeadlineTicks' -and
         $runtimeProducerEntryText -notmatch 'GetCurrentProcess|\.Modules|AppContext|ProcessStartup|Start-D32|CreateProcess|Import-Module')
 $l1Drive = [IO.Path]::GetPathRoot($l1Root).TrimEnd('\'); $l1HomePath = $l1Root.Substring($l1Drive.Length)
 $l1ChildEnvironment = [PSCustomObject][ordered]@{
@@ -5671,38 +5932,113 @@ foreach($relative in $SourceRelativePaths){
 }
 if(-not $State.SourceBytesByPath.ContainsKey($State.ControllerPath)){throw 'fixed controller source is absent from the six-file cold-entry fixture'}
 $State.SourceBytesByPath.Add($State.ObserverImagePath,[Text.UTF8Encoding]::new($false).GetBytes('D32 synthetic observer image bytes'))
+$State.DirectoryFacts=[System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach($sourcePath in @($State.SourceBytesByPath.Keys)){
+    $directory=[IO.Path]::GetDirectoryName([string]$sourcePath)
+    while(-not [string]::IsNullOrWhiteSpace($directory)){
+        $fullDirectory=[IO.Path]::GetFullPath($directory)
+        if(-not $State.DirectoryFacts.ContainsKey($fullDirectory)){
+            $directoryDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('directory|'+$fullDirectory))).ToLowerInvariant()
+            $directorySecurity=[Security.AccessControl.DirectorySecurity]::new()
+            $directorySecurity.SetSecurityDescriptorSddlForm('O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)',[Security.AccessControl.AccessControlSections]::All)
+            $State.DirectoryFacts.Add($fullDirectory,[PSCustomObject]@{Path=$fullDirectory;Attributes=[int][IO.FileAttributes]::Directory
+                VolumeSerialHex=('1'*16);FileIdHex=$directoryDigest.Substring(0,32);Bytes=[Int64]0;Security=$directorySecurity})
+        }
+        $root=[IO.Path]::GetPathRoot($fullDirectory)
+        if([StringComparer]::OrdinalIgnoreCase.Equals($fullDirectory,$root)){break}
+        $directory=[IO.Path]::GetDirectoryName($fullDirectory)
+    }
+}
 $global:D32PreparationColdSelfTestState=$State
 $moduleProvider=[PSCustomObject]@{
+    GetProgramFilesDirectory={ [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles) }
+    GetSystemRoot={ [string]$env:SystemRoot }
+    GetOsVersionString={ [string][Environment]::OSVersion.Version.ToString() }
+    GetWindowsDirectory={ [string]$env:SystemRoot }
     NoReparse={ param($Path)
         $state=$global:D32PreparationColdSelfTestState
-        return $state.SourceBytesByPath.ContainsKey([IO.Path]::GetFullPath([string]$Path))
+        $full=[IO.Path]::GetFullPath([string]$Path)
+        return $state.SourceBytesByPath.ContainsKey($full) -or $state.DirectoryFacts.ContainsKey($full)
+    }
+    GetHandleIdentity={ param($Handle)
+        $state=$global:D32PreparationColdSelfTestState;$full=[string]$Handle.SyntheticPath
+        if([string]::IsNullOrWhiteSpace($full)){
+            throw 'cold module provider refused opened metadata outside the fixed source/image byte map'
+        }
+        if($state.DirectoryFacts.ContainsKey($full)){
+            $fact=$state.DirectoryFacts[$full]
+            return [PSCustomObject]@{Attributes=[int]$fact.Attributes;VolumeSerialHex=[string]$fact.VolumeSerialHex
+                FileIdHex=[string]$fact.FileIdHex;Bytes=[Int64]0}
+        }
+        if(-not $state.SourceBytesByPath.ContainsKey($full)){throw 'cold module provider refused opened metadata outside the fixed source/image byte map'}
+        if(-not $state.FileIds.ContainsKey($full)){
+            $pathDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($full))).ToLowerInvariant()
+            $state.FileIds.Add($full,$pathDigest.Substring(0,32))
+        }
+        return [PSCustomObject]@{Attributes=[int][IO.FileAttributes]::Archive;VolumeSerialHex=('1'*16)
+            FileIdHex=[string]$state.FileIds[$full];Bytes=[Int64]$state.SourceBytesByPath[$full].Length}
+    }
+    GetFinalHandlePath={ param($Handle)
+        $full=[string]$Handle.SyntheticPath
+        if([string]::IsNullOrWhiteSpace($full)){throw 'cold module provider refused an unidentified synthetic handle'}
+        return $full
+    }
+    GetObjectSecurity={ param($Path,$IsDirectory)
+        $state=$global:D32PreparationColdSelfTestState;$full=[IO.Path]::GetFullPath([string]$Path)
+        if($IsDirectory){
+            if(-not $state.DirectoryFacts.ContainsKey($full)){throw 'cold module provider refused directory ACL outside fixed source/image ancestors'}
+            return $state.DirectoryFacts[$full].Security
+        }
+        if(-not $state.SourceBytesByPath.ContainsKey($full)){
+            throw 'cold module provider refused ACL metadata outside the fixed source/image byte map'
+        }
+        $security=[Security.AccessControl.FileSecurity]::new()
+        $security.SetSecurityDescriptorSddlForm('O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)',[Security.AccessControl.AccessControlSections]::All)
+        return $security
+    }
+    ReadFileBytes={ param($Handle,$MaximumBytes,$DeadlineTicks)
+        $state=$global:D32PreparationColdSelfTestState;$full=[string]$Handle.SyntheticPath
+        if([Int64]$MaximumBytes -le 0){$MaximumBytes=16777216L}
+        if([string]::IsNullOrWhiteSpace($full) -or -not $state.SourceBytesByPath.ContainsKey($full)){
+            throw 'cold module provider refused file bytes outside the fixed source/image byte map'
+        }
+        $state.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp();$bytes=[byte[]]$state.SourceBytesByPath[$full]
+        if($bytes.Length -le 0 -or $bytes.Length -gt $MaximumBytes -or ($DeadlineTicks -gt 0 -and $DeadlineTicks -le $state.Now)){
+            throw 'cold module provider observed empty, over-bound, or late source bytes'
+        }
+        $copy=[byte[]]::new($bytes.Length);[Array]::Copy($bytes,$copy,$bytes.Length);return ,$copy
     }
     OpenDirectory={ param($Path)
         $state=$global:D32PreparationColdSelfTestState;$state.OpenDirectoryCalls++
-        $handle=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]1,$false)
+        $full=[IO.Path]::GetFullPath([string]$Path)
+        if(-not $state.DirectoryFacts.ContainsKey($full)){throw 'cold module provider refused a directory outside fixed source/image ancestors'}
+        $handle=[PSCustomObject]@{SyntheticPath=$full;Kind='directory';IsClosed=$false;IsInvalid=$false}
+        Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value { $this.IsClosed=$true } -Force
         $state.OpenedHandles.Add($handle)
-        return [PSCustomObject]@{Path=[IO.Path]::GetFullPath([string]$Path);VolumeSerialHex=('1'*16);FileIdHex=('2'*32)
-            OwnerSid='S-1-5-18';Sddl='D:P(A;;FA;;;SY)';AclSha256=('3'*64);Security=$null;Handle=$handle}
+        return $handle
     }
     OpenFile={
-    param($Path,$DirectoryFences,$MaximumBytes,$DeadlineTicks)
+    param($Path,$DirectoryFences,$MaximumBytes=16777216L,$DeadlineTicks=0L)
     $state=$global:D32PreparationColdSelfTestState;$state.OpenFileCalls++
     $state.NativeTypeObserved=$state.NativeTypeObserved -or ($null -ne ('D32PowerShellModuleNativeV2' -as [type]))
     $full=[IO.Path]::GetFullPath([string]$Path)
+    if([Int64]$MaximumBytes -le 0){$MaximumBytes=16777216L}
     if(-not $state.SourceBytesByPath.ContainsKey($full)){throw 'cold module provider refused a path outside six code pins and one synthetic observer image'}
-    $bytes=[byte[]]$state.SourceBytesByPath[$full]
     $state.Now=[Int64][Diagnostics.Stopwatch]::GetTimestamp()
-    if($bytes.Length -le 0 -or $bytes.Length -gt $MaximumBytes -or $DeadlineTicks -le $state.Now){throw 'cold module provider observed an empty, over-bound, or late open'}
-    $sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if($state.SourceBytesByPath[$full].Length -le 0 -or $state.SourceBytesByPath[$full].Length -gt $MaximumBytes -or
+        ($DeadlineTicks -gt 0 -and $DeadlineTicks -le $state.Now)){
+        throw ('cold module provider observed an invalid bounded open: empty=' + ($state.SourceBytesByPath[$full].Length -le 0) +
+            ';over=' + ($state.SourceBytesByPath[$full].Length -gt $MaximumBytes) +
+            ';late=' + ($DeadlineTicks -gt 0 -and $DeadlineTicks -le $state.Now) +
+            ';limit_positive=' + ($MaximumBytes -gt 0) + ';deadline_positive=' + ($DeadlineTicks -gt 0))
+    }
     if(-not $state.FileIds.ContainsKey($full)){
         $pathDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($full))).ToLowerInvariant()
         $state.FileIds.Add($full,$pathDigest.Substring(0,32))
     }
-    $handle=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]1,$false)
+    $handle=[PSCustomObject]@{SyntheticPath=$full;Kind='file';IsClosed=$false;IsInvalid=$false}
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name Dispose -Value { $this.IsClosed=$true } -Force
     $state.OpenedHandles.Add($handle)
-    $stream=[PSCustomObject]@{SafeFileHandle=$handle}
-    $stream.PSObject.Members.Add([System.Management.Automation.PSScriptMethod]::new('Dispose',{ $this.SafeFileHandle.Dispose() }))
-    $record=[PSCustomObject][ordered]@{path=$full;bytes=[Int64]$bytes.Length;sha256=$sha;volume_serial_hex=('1'*16);file_id_hex=[string]$state.FileIds[$full]}
     if($null -eq $state.ModulesAfter){
         $modules=[System.Collections.Generic.List[string]]::new()
         foreach($module in Microsoft.PowerShell.Core\Get-Module){if($null -ne $module){$modules.Add([string]$module.Name)}}
@@ -5710,7 +6046,7 @@ $moduleProvider=[PSCustomObject]@{
         [Array]::Sort($moduleNames,[StringComparer]::OrdinalIgnoreCase)
         $state.ModulesAfter=$moduleNames
     }
-    return [PSCustomObject]@{Record=$record;Bytes=$bytes;Stream=$stream}
+    return $handle
     }
 }
 $State.ModuleProvider=$moduleProvider
@@ -5754,8 +6090,29 @@ $environment=[PSCustomObject]@{
     }
     OpenAuthority={
     param($Path,$DirectoryFences,$MaximumBytes,$DeadlineTicks)
-    return & $global:D32PreparationColdSelfTestState.ModuleProvider.OpenFile -Path $Path -DirectoryFences $DirectoryFences `
-        -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    $state=$global:D32PreparationColdSelfTestState;$provider=$state.ModuleProvider;$full=[IO.Path]::GetFullPath([string]$Path)
+    $effectiveMaximum=[Int64]$MaximumBytes;if($effectiveMaximum -le 0){$effectiveMaximum=16777216L}
+    $handle=& $provider.OpenFile -Path $full -DirectoryFences $DirectoryFences -MaximumBytes $effectiveMaximum -DeadlineTicks $DeadlineTicks
+    $identity=& $provider.GetHandleIdentity -Handle $handle
+    $finalPath=[string](& $provider.GetFinalHandlePath -Handle $handle)
+    if(-not [StringComparer]::OrdinalIgnoreCase.Equals($finalPath,$full) -or $identity.Bytes -le 0 -or
+        $identity.Bytes -gt $effectiveMaximum -or ($identity.Attributes -band [int][IO.FileAttributes]::Directory) -ne 0 -or
+        ($identity.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0){
+        $handle.Dispose();throw 'cold authority provider observed incomplete or out-of-domain opened-file metadata'
+    }
+    $bytes=[byte[]](& $provider.ReadFileBytes -Handle $handle -MaximumBytes $effectiveMaximum -DeadlineTicks $DeadlineTicks)
+    if($bytes.Length -ne $identity.Bytes){$handle.Dispose();throw 'cold authority provider returned a byte count inconsistent with opened identity'}
+    $security=& $provider.GetObjectSecurity -Path $full -IsDirectory:$false
+    $ownerSid=[string]$security.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $sddl=[string]$security.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access)
+    $aclSha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($sddl))).ToLowerInvariant()
+    $sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    $record=[PSCustomObject][ordered]@{path=$full;bytes=[Int64]$bytes.Length;sha256=$sha
+        volume_serial_hex=[string]$identity.VolumeSerialHex;file_id_hex=[string]$identity.FileIdHex}
+    $stream=[PSCustomObject]@{SafeFileHandle=$handle;OwnerSid=$ownerSid;SecurityDescriptorSddl=$sddl;SecurityDescriptorSha256=$aclSha}
+    $stream.PSObject.Members.Add([System.Management.Automation.PSScriptMethod]::new('Dispose',{ $this.SafeFileHandle.Dispose() }))
+    return [PSCustomObject]@{Record=$record;Bytes=$bytes;Stream=$stream}
     }
 }
 $State.EnvironmentAdapter=$environment
@@ -5854,12 +6211,12 @@ $prepColdFrameSummary=@($prepColdFrames | ForEach-Object {
     [string]$root.GetProperty('operation').GetString()+':'+[string]$root.GetProperty('status').GetString()
 })
 $prepColdModulesStable=($prepColdState.ModulesBefore -join '|') -ceq ($prepColdState.ModulesAfter -join '|')
-$prepColdOpenedClosed=$prepColdState.OpenedHandles.Count -eq $prepColdState.OpenFileCalls -and
+$prepColdOpenedClosed=$prepColdState.OpenedHandles.Count -eq ($prepColdState.OpenFileCalls + $prepColdState.OpenDirectoryCalls) -and
     @($prepColdState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0
 $prepColdEntryReady=$prepColdState.PreloadedFunctions.Count -eq 0 -and $prepColdState.PreloadedScriptVariables.Count -eq 0 -and
     $prepColdState.InvocationErrorCount -eq 0 -and $prepColdState.InvocationState -ceq 'Completed' -and
     $prepColdState.InitialReferenceCalls -eq 2 -and
-    $prepColdState.OpenFileCalls -ge 14 -and $prepColdState.OpenDirectoryCalls -eq 0 -and $prepColdState.TestAdapterClearedBeforeSourceRead -and
+    $prepColdState.OpenFileCalls -ge 14 -and $prepColdState.OpenDirectoryCalls -ge 1 -and $prepColdState.OpenDirectoryCalls -le 16 -and $prepColdState.TestAdapterClearedBeforeSourceRead -and
     $prepColdState.ObserverProcessCalls -ge 2 -and $prepColdState.TokenCalls -ge 2 -and $prepColdState.StartupDigestCalls -ge 2 -and
     -not $prepColdState.NativeTypeObserved -and $prepColdOpenedClosed -and $prepColdModulesStable -and
     $prepColdLines.Count -eq 3 -and $prepColdState.Diagnostics.ToString().Length -eq 0 -and
@@ -5909,7 +6266,7 @@ $prepColdProducerEntryClosed=$prepColdProducerState.InvocationErrorCount -eq 0 -
     $prepColdProducerState.ObserverProcessCalls -ge 2 -and $prepColdProducerState.TokenCalls -ge 2 -and
     $prepColdProducerState.StartupDigestCalls -ge 2 -and $prepColdProducerState.TestAdapterClearedBeforeSourceRead -and
     $prepColdProducerState.ModulesBefore -join '|' -ceq ($prepColdProducerState.ModulesAfter -join '|') -and
-    $prepColdProducerState.OpenedHandles.Count -eq $prepColdProducerState.OpenFileCalls -and
+    $prepColdProducerState.OpenedHandles.Count -eq ($prepColdProducerState.OpenFileCalls + $prepColdProducerState.OpenDirectoryCalls) -and
     @($prepColdProducerState.OpenedHandles | Where-Object { -not $_.IsClosed }).Count -eq 0 -and
     $prepColdProducerLines.Count -eq 4 -and $prepColdProducerState.Diagnostics.ToString().Length -eq 0 -and
     $prepColdProducerFrames[0].RootElement.GetProperty('operation').GetString() -ceq 'CHALLENGE' -and

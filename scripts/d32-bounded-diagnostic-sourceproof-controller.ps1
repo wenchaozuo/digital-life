@@ -2,8 +2,8 @@
 # No shell, helper executable, retry, or free-form child argv is accepted.
 [CmdletBinding(DefaultParameterSetName = 'SourceProofOnly')]
 param(
-    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][string]$Repository,
-    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][string]$CandidateSha,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][Parameter(Mandatory = $true, ParameterSetName = 'PreparationSession')][string]$Repository,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][Parameter(Mandatory = $true, ParameterSetName = 'PreparationSession')][string]$CandidateSha,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExecutionAuthorityPath,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][string]$ExpectedExecutionAuthoritySha256,
     [Parameter(Mandatory = $true, ParameterSetName = 'SourceProofOnly')][long]$LifecycleT0Ticks,
@@ -13,7 +13,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][string]$ExpectedOuterPrelaunchBindingSha256,
     [Parameter(Mandatory = $true, ParameterSetName = 'NonSourceL1')][long]$L1T0Ticks,
     [Parameter(Mandatory = $true, ParameterSetName = 'OuterCaller')][switch]$FixedOuterCaller,
-    [Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][switch]$PrepareObserverBinding
+    [Parameter(Mandatory = $true, ParameterSetName = 'ObserverBindingPreparation')][switch]$PrepareObserverBinding,
+    [Parameter(Mandatory = $true, ParameterSetName = 'PreparationSession')][switch]$PreparationSession
 )
 
 $ErrorActionPreference = 'Stop'
@@ -3017,6 +3018,640 @@ function New-D32NonSourceL1ObserverBindingPreparation {
     }
 }
 
+function Test-D32PreparationExactProperties {
+    param([AllowNull()][object]$Value, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Names)
+    if ($null -eq $Value -or $null -eq $Value.PSObject) { return $false }
+    $actual = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $Value.PSObject.Properties) { if (-not $actual.Add([string]$property.Name)) { return $false } }
+    if ($actual.Count -ne $Names.Count) { return $false }
+    foreach ($name in $Names) { if (-not $actual.Contains($name)) { return $false } }
+    return $true
+}
+
+function Test-D32PreparationFileReferenceEqual {
+    param([AllowNull()][object]$Actual, [AllowNull()][object]$Expected)
+    if (-not (Test-D32PreparationFileReferenceShape $Actual) -or -not (Test-D32PreparationFileReferenceShape $Expected)) { return $false }
+    foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+        if ([string]$Actual.$name -cne [string]$Expected.$name) { return $false }
+    }
+    return $true
+}
+
+function Test-D32PreparationFileReferenceShape {
+    param([AllowNull()][object]$Value)
+    return ((Test-D32PreparationExactProperties $Value @('path','bytes','sha256','volume_serial_hex','file_id_hex')) -and
+        $Value.path -is [string] -and [IO.Path]::IsPathRooted([string]$Value.path) -and
+        $Value.bytes -is [long] -and [long]$Value.bytes -gt 0 -and
+        $Value.sha256 -is [string] -and [string]$Value.sha256 -cmatch '^[0-9a-f]{64}$' -and
+        $Value.volume_serial_hex -is [string] -and [string]$Value.volume_serial_hex -cmatch '^[0-9a-f]{16}$' -and
+        $Value.file_id_hex -is [string] -and [string]$Value.file_id_hex -cmatch '^[0-9a-f]{32}$')
+}
+
+function Test-D32PreparationJsonExactProperties {
+    param([System.Text.Json.JsonElement]$Element, [Parameter(Mandatory = $true)][string[]]$Names)
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+    $actual = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $Element.EnumerateObject()) { if (-not $actual.Add($property.Name)) { return $false } }
+    if ($actual.Count -ne $Names.Count) { return $false }
+    foreach ($name in $Names) { if (-not $actual.Contains($name)) { return $false } }
+    return $true
+}
+
+function Test-D32PreparationJsonFileReference {
+    param([System.Text.Json.JsonElement]$Element)
+    if (-not (Test-D32PreparationJsonExactProperties $Element @('path','bytes','sha256','volume_serial_hex','file_id_hex'))) { return $false }
+    $path=$Element.GetProperty('path'); $bytes=$Element.GetProperty('bytes'); $sha=$Element.GetProperty('sha256')
+    $volume=$Element.GetProperty('volume_serial_hex'); $fileId=$Element.GetProperty('file_id_hex'); [Int64]$byteCount=0
+    return ($path.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and [IO.Path]::IsPathRooted($path.GetString()) -and
+        $bytes.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and $bytes.TryGetInt64([ref]$byteCount) -and $byteCount -gt 0 -and
+        $sha.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and $sha.GetString() -cmatch '^[0-9a-f]{64}$' -and
+        $volume.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and $volume.GetString() -cmatch '^[0-9a-f]{16}$' -and
+        $fileId.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and $fileId.GetString() -cmatch '^[0-9a-f]{32}$')
+}
+
+function Test-D32PreparationBaselineJson {
+    param([Parameter(Mandatory = $true)][string]$Json, [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha,
+        [Parameter(Mandatory = $true)][string]$ExpectedRepository, [Parameter(Mandatory = $true)][string]$ExpectedSessionNonce)
+    $document=$null
+    try {
+        $document=[System.Text.Json.JsonDocument]::Parse($Json,[System.Text.Json.JsonDocumentOptions]@{
+            MaxDepth=24;CommentHandling=[System.Text.Json.JsonCommentHandling]::Disallow;AllowTrailingCommas=$false
+        })
+        $root=$document.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $root) -or
+            -not (Test-D32PreparationJsonExactProperties $root @('schema_version','record_type','purpose','gate_authority','launch_authority','status','candidate_sha',
+                'old_run_id','session_nonce','source_repo','observer','source_pins','runtime_candidate_reference','old_caller_reference','old_locked_references',
+                'native_uptime','monotonic_capture','control_order'))) { return $false }
+        $version=$root.GetProperty('schema_version'); [Int64]$versionValue=0
+        foreach ($pair in @(@('record_type','D32_NON_SOURCE_L1_RECOVERY_BOOT_BASELINE_V1'),@('purpose','NON_SOURCE_L1_PRE_RESET_BASELINE_ONLY'),
+                @('gate_authority','NONE'),@('launch_authority','NONE'),@('status','CANDIDATE_ONLY'),@('candidate_sha',$ExpectedCandidateSha),
+                @('old_run_id','5a260368a65644f28195842860c86dc1'),@('session_nonce',$ExpectedSessionNonce),@('source_repo',$ExpectedRepository))) {
+            $field=$root.GetProperty([string]$pair[0])
+            if ($field.ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $field.GetString() -cne [string]$pair[1]) { return $false }
+        }
+        if ($version.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or -not $version.TryGetInt64([ref]$versionValue) -or $versionValue -ne 1 -or
+            $ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or $ExpectedSessionNonce -cnotmatch '^[0-9a-f]{32}$') { return $false }
+        $observer=$root.GetProperty('observer')
+        if (-not (Test-D32PreparationJsonExactProperties $observer @('process_id','creation_filetime_ticks','image_reference','ordinary_token','observer_startup_sha256','entry_reference')) -or
+            -not (Test-D32PreparationJsonFileReference $observer.GetProperty('image_reference')) -or
+            -not (Test-D32PreparationJsonFileReference $observer.GetProperty('entry_reference'))) { return $false }
+        $process=$observer.GetProperty('process_id'); $creation=$observer.GetProperty('creation_filetime_ticks'); [Int64]$processValue=0; [Int64]$creationValue=0
+        if ($process.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or -not $process.TryGetInt64([ref]$processValue) -or $processValue -le 0 -or
+            $creation.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or -not $creation.TryGetInt64([ref]$creationValue) -or $creationValue -le 0 -or
+            $observer.GetProperty('observer_startup_sha256').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+            $observer.GetProperty('observer_startup_sha256').GetString() -cnotmatch '^[0-9a-f]{64}$') { return $false }
+        $token=$observer.GetProperty('ordinary_token')
+        if (-not (Test-D32PreparationJsonExactProperties $token @('elevated','high_integrity','system_token','thread_impersonation'))) { return $false }
+        foreach ($property in $token.EnumerateObject()) {
+            if ($property.Value.ValueKind -ne [System.Text.Json.JsonValueKind]::False) { return $false }
+        }
+        $pins=$root.GetProperty('source_pins')
+        if ($pins.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $pins.GetArrayLength() -ne 6) { return $false }
+        $fixedSourcePaths=@(
+            'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1',
+            'scripts/d32-bounded-diagnostic-sourceproof.ps1',
+            'scripts/d32-bounded-compiler-diagnostic.ps1',
+            'scripts/d32-bounded-compiler-diagnostic-policy.ps1',
+            'scripts/d32-build-toolchain-profile.ps1',
+            'scripts/d32-powershell-module-authority.ps1')
+        for ($pinIndex=0; $pinIndex -lt 6; $pinIndex++) {
+            $pin=$pins[$pinIndex]
+            $expectedPinPath=[IO.Path]::GetFullPath([IO.Path]::Combine($ExpectedRepository,$fixedSourcePaths[$pinIndex]))
+            if (-not (Test-D32PreparationJsonFileReference $pin) -or $pin.GetProperty('path').GetString() -cne $expectedPinPath) { return $false }
+        }
+        foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+            if ($observer.GetProperty('entry_reference').GetProperty($name).ToString() -cne $pins[0].GetProperty($name).ToString()) { return $false }
+        }
+        $programFiles=[IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles))
+        $fixedChildRuntime=[IO.Path]::GetFullPath([IO.Path]::Combine($programFiles,'PowerShell','7','pwsh.exe'))
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($observer.GetProperty('image_reference').GetProperty('path').GetString(),$fixedChildRuntime)) { return $false }
+        foreach ($name in @('runtime_candidate_reference','old_caller_reference')) {
+            if (-not (Test-D32PreparationJsonFileReference $root.GetProperty($name))) { return $false }
+        }
+        $expectedCandidatePath='E:\d32\D32-NON-SOURCE-L1-RUNTIME-CANDIDATE-' + $ExpectedCandidateSha.Substring(0,8) + '-' + $ExpectedSessionNonce + '.json'
+        $runtimeCandidate=$root.GetProperty('runtime_candidate_reference')
+        if ($runtimeCandidate.GetProperty('path').GetString() -cne $expectedCandidatePath -or
+            $runtimeCandidate.GetProperty('bytes').GetInt64() -gt 4194304L) { return $false }
+        $caller=$root.GetProperty('old_caller_reference')
+        if ($caller.GetProperty('path').GetString() -cne 'C:\Users\zuo\D32-NON-SOURCE-L1-CALLER-5a260368a65644f28195842860c86dc1.jsonl' -or
+            $caller.GetProperty('bytes').GetInt64() -ne 18157L -or
+            $caller.GetProperty('sha256').GetString() -cne '398a7c57055bc0a2c9e7f4af4a695451587f6a20c12579c5494c379952a82e04') { return $false }
+        $oldRefs=$root.GetProperty('old_locked_references')
+        if ($oldRefs.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or $oldRefs.GetArrayLength() -ne 1 -or
+            -not (Test-D32PreparationJsonFileReference $oldRefs[0])) { return $false }
+        foreach ($name in @('path','bytes','sha256','volume_serial_hex','file_id_hex')) {
+            if ($oldRefs[0].GetProperty($name).ToString() -cne $caller.GetProperty($name).ToString()) { return $false }
+        }
+        $native=$root.GetProperty('native_uptime')
+        if (-not (Test-D32PreparationJsonExactProperties $native @('api','return_type','value_milliseconds','kernel32_export_image','actual_target_image')) -or
+            $native.GetProperty('api').GetString() -cne 'kernel32!GetTickCount64' -or
+            $native.GetProperty('return_type').GetString() -cne 'System.UInt64') { return $false }
+        [UInt64]$uptimeValue=0; $uptime=$native.GetProperty('value_milliseconds')
+        if ($uptime.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or -not $uptime.TryGetUInt64([ref]$uptimeValue)) { return $false }
+        $kernel=$native.GetProperty('kernel32_export_image'); $target=$native.GetProperty('actual_target_image')
+        if (-not (Test-D32PreparationJsonExactProperties $kernel @('file','source_proof','module_base_hex')) -or
+            -not (Test-D32PreparationJsonExactProperties $target @('file','source_proof','allocation_base_hex','export_address_hex','memory_type')) -or
+            -not (Test-D32PreparationJsonFileReference $kernel.GetProperty('file')) -or
+            -not (Test-D32PreparationJsonFileReference $target.GetProperty('file')) -or
+            $kernel.GetProperty('module_base_hex').GetString() -cnotmatch '^0x[0-9a-f]{16}$' -or
+            $target.GetProperty('allocation_base_hex').GetString() -cnotmatch '^0x[0-9a-f]{16}$' -or
+            $target.GetProperty('export_address_hex').GetString() -cnotmatch '^0x[0-9a-f]{16}$' -or
+            $target.GetProperty('memory_type').GetString() -cne 'MEM_IMAGE') { return $false }
+        foreach ($sourceProof in @($kernel.GetProperty('source_proof'),$target.GetProperty('source_proof'))) {
+            if (-not (Test-D32PreparationJsonExactProperties $sourceProof @('proof_type','signature_status','signer_simple_name','issuer_name','signer_thumbprint',
+                    'company_name','product_name','product_version','file_version')) -or
+                $sourceProof.GetProperty('proof_type').GetString() -cne 'WINTRUST_CACHE_ONLY_AUTHENTICODE_V1' -or
+                $sourceProof.GetProperty('signature_status').GetString() -cne 'VALID' -or
+                $sourceProof.GetProperty('signer_simple_name').GetString() -cne 'Microsoft Windows' -or
+                $sourceProof.GetProperty('company_name').GetString() -cne 'Microsoft Corporation') { return $false }
+        }
+        $system32Path=[IO.Path]::Combine([string]$env:SystemRoot,'System32')
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFileName($kernel.GetProperty('file').GetProperty('path').GetString()),'kernel32.dll')) { return $false }
+        foreach ($file in @($kernel.GetProperty('file'),$target.GetProperty('file'))) {
+            $filePath=$file.GetProperty('path').GetString()
+            if (-not (Test-D32PowerShellAuthorityPathWithin -Child $filePath -Parent $system32Path)) { return $false }
+        }
+        $clock=$root.GetProperty('monotonic_capture')
+        if (-not (Test-D32PreparationJsonExactProperties $clock @('counter','frequency','qpc_before','qpc_after','captured_utc_before','captured_utc_after')) -or
+            $clock.GetProperty('counter').GetString() -cne 'QueryPerformanceCounter') { return $false }
+        [Int64]$frequency=0; [Int64]$before=0; [Int64]$after=0
+        [DateTimeOffset]$utcBefore=[DateTimeOffset]::MinValue; [DateTimeOffset]$utcAfter=[DateTimeOffset]::MinValue
+        if (-not $clock.GetProperty('frequency').TryGetInt64([ref]$frequency) -or $frequency -le 0 -or
+            -not $clock.GetProperty('qpc_before').TryGetInt64([ref]$before) -or $before -le 0 -or
+            -not $clock.GetProperty('qpc_after').TryGetInt64([ref]$after) -or $after -lt $before -or
+            $clock.GetProperty('captured_utc_before').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+            $clock.GetProperty('captured_utc_after').ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+            -not [DateTimeOffset]::TryParse([string]$clock.GetProperty('captured_utc_before').GetString(),[Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind,[ref]$utcBefore) -or
+            -not [DateTimeOffset]::TryParse([string]$clock.GetProperty('captured_utc_after').GetString(),[Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind,[ref]$utcAfter) -or
+            $utcBefore.Offset -ne [TimeSpan]::Zero -or $utcAfter.Offset -ne [TimeSpan]::Zero -or $utcAfter -lt $utcBefore) { return $false }
+        $order=$root.GetProperty('control_order'); [Int64]$candidateSequence=0; [Int64]$verifySequence=0; [Int64]$baselineSequence=0
+        if (-not (Test-D32PreparationJsonExactProperties $order @('candidate_sequence','pin_verification_sequence','baseline_sequence')) -or
+            -not $order.GetProperty('candidate_sequence').TryGetInt64([ref]$candidateSequence) -or $candidateSequence -le 0 -or
+            -not $order.GetProperty('pin_verification_sequence').TryGetInt64([ref]$verifySequence) -or $verifySequence -le $candidateSequence -or
+            -not $order.GetProperty('baseline_sequence').TryGetInt64([ref]$baselineSequence) -or $baselineSequence -le $verifySequence) { return $false }
+        return $true
+    } catch { return $false }
+    finally { if ($null -ne $document) { $document.Dispose() } }
+}
+
+function ConvertFrom-D32PreparationControlFrame {
+    param([Parameter(Mandatory = $true)][string]$Line, [Parameter(Mandatory = $true)][string]$SessionNonce,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateSha, [Parameter(Mandatory = $true)][long]$MinimumSequence)
+    if ($Line.Length -le 0 -or $Line.Length -gt 32768 -or $Line.IndexOf([char]0) -ge 0) {
+        throw 'D32_PREP_OBSERVER_REFUSED: control frame is empty, over-bound, or contains NUL'
+    }
+    $document = [System.Text.Json.JsonDocument]::Parse($Line,[System.Text.Json.JsonDocumentOptions]@{
+        MaxDepth=20;CommentHandling=[System.Text.Json.JsonCommentHandling]::Disallow;AllowTrailingCommas=$false
+    })
+    try {
+        $element = $document.RootElement
+        if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or (Test-D32PowerShellAuthorityJsonDuplicates -Element $element)) {
+            throw 'D32_PREP_OBSERVER_REFUSED: control frame must be a duplicate-free JSON object'
+        }
+        $frame = ConvertFrom-D32PowerShellAuthorityJsonElement -Element $element
+        if (-not (Test-D32PreparationExactProperties $frame @('protocol','session_nonce','sequence','candidate_sha','operation','payload')) -or
+            [string]$frame.protocol -cne 'D32_PREP_OBSERVER_CONTROL_V1' -or
+            [string]$frame.session_nonce -cne $SessionNonce -or $SessionNonce -cnotmatch '^[0-9a-f]{32}$' -or
+            [string]$frame.candidate_sha -cne $ExpectedCandidateSha -or $ExpectedCandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+            $frame.sequence -isnot [long] -or [Int64]$frame.sequence -le $MinimumSequence -or
+            [string]$frame.operation -cnotin @('READY','PREPARE_RUNTIME_CANDIDATE','VERIFY_RETURNED_PINS','CAPTURE_OLD_RUN_UPTIME_BASELINE','CLOSE')) {
+            throw 'D32_PREP_OBSERVER_REFUSED: protocol, session, candidate, sequence, operation, or exact frame shape is invalid'
+        }
+        if ([string]$frame.operation -ceq 'VERIFY_RETURNED_PINS') {
+            if (-not (Test-D32PreparationExactProperties $frame.payload @('identity','source_pins','runtime_candidate_reference'))) {
+                throw 'D32_PREP_OBSERVER_REFUSED: returned-pin payload has missing or extra fields'
+            }
+        } elseif (-not (Test-D32PreparationExactProperties $frame.payload @())) {
+            throw 'D32_PREP_OBSERVER_REFUSED: fixed operation payload must be empty'
+        }
+        return $frame
+    } finally { $document.Dispose() }
+}
+
+function Write-D32PreparationControlResponse {
+    param([Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer, [Parameter(Mandatory = $true)][object]$Frame,
+        [AllowNull()][object]$TestAdapter)
+    $text = ConvertTo-D32PowerShellAuthorityJsonText -Value $Frame
+    $bytes = [Text.UTF8Encoding]::new($false,$true).GetBytes($text)
+    if ($bytes.Length -le 0 -or $bytes.Length -gt 65536) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: response frame is empty or exceeds 64 KiB' }
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.WriteLine) { & $TestAdapter.WriteLine -Writer $Writer -Line $text }
+    else { $Writer.WriteLine($text); $Writer.Flush() }
+}
+
+function Read-D32PreparationControlLine {
+    param([Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][long]$DeadlineTicks,
+        [Parameter(Mandatory = $true)][long]$LeaseDeadlineTicks, [AllowNull()][object]$TestAdapter)
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.ReadLine) {
+        return [string](& $TestAdapter.ReadLine -Reader $Reader -DeadlineTicks $DeadlineTicks -LeaseDeadlineTicks $LeaseDeadlineTicks)
+    }
+    $now = [Diagnostics.Stopwatch]::GetTimestamp()
+    if ($now -ge $DeadlineTicks -or $now -ge $LeaseDeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: input wait deadline reached before reading a control frame' }
+    $remaining = [Math]::Min($DeadlineTicks,$LeaseDeadlineTicks) - $now
+    $waitMilliseconds = [int][Math]::Max(1,[Math]::Min(300000,[Math]::Floor(($remaining * 1000.0) / [Diagnostics.Stopwatch]::Frequency)))
+    $timeoutSource=[System.Threading.CancellationTokenSource]::new()
+    $delayTask=[System.Threading.Tasks.Task]::Delay($waitMilliseconds,$timeoutSource.Token)
+    $readBuffer=[char[]]::new(1); $lineBuilder=[Text.StringBuilder]::new(32768)
+    try {
+        while ($true) {
+            $readTask=$Reader.ReadAsync($readBuffer,0,1)
+            $completed=[System.Threading.Tasks.Task]::WhenAny([System.Threading.Tasks.Task[]]@($readTask,$delayTask)).GetAwaiter().GetResult()
+            if (-not [object]::ReferenceEquals($completed,$readTask)) {
+                try { $Reader.Dispose() } catch {}
+                try { $null = $readTask.Wait(1000) } catch {}
+                throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: fixed 300-second input wait or absolute session lease expired'
+            }
+            $charactersRead=[Int32]$readTask.GetAwaiter().GetResult()
+            if ($charactersRead -eq 0) {
+                if ($lineBuilder.Length -eq 0) { throw 'D32_PREP_OBSERVER_EOF: control channel closed before explicit CLOSE' }
+                return $lineBuilder.ToString()
+            }
+            if ([int]$readBuffer[0] -eq 10) {
+                if ($lineBuilder.Length -gt 0 -and [int]$lineBuilder[$lineBuilder.Length-1] -eq 13) { $lineBuilder.Length-- }
+                return $lineBuilder.ToString()
+            }
+            if ($lineBuilder.Length -ge 32768) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: input control frame exceeds the 32 Ki-character bound' }
+            [void]$lineBuilder.Append($readBuffer[0])
+        }
+    } finally { try { $timeoutSource.Cancel() } catch {}; $timeoutSource.Dispose() }
+}
+
+function Get-D32PreparationFixedSourcePins {
+    param([Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][long]$DeadlineTicks,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Opened)
+    $paths = @(
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-diagnostic-sourceproof-controller.ps1')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-diagnostic-sourceproof.ps1')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic.ps1')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-bounded-compiler-diagnostic-policy.ps1')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-build-toolchain-profile.ps1')),
+        [IO.Path]::GetFullPath([IO.Path]::Combine($Repository,'scripts/d32-powershell-module-authority.ps1')))
+    $pins = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $paths) {
+        if ((Get-D32NonSourceL1Now) -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: fixed six-file source-pin read crossed the identity deadline' }
+        $openedFile = Open-D32PowerShellAuthorityFile -Path $path -DirectoryFences $DirectoryFences -MaximumBytes 16777216L -DeadlineTicks $DeadlineTicks
+        $Opened.Add($openedFile)
+        $pins.Add([PSCustomObject][ordered]@{path=[string]$openedFile.Record.path;bytes=[Int64]$openedFile.Record.bytes;sha256=[string]$openedFile.Record.sha256
+            volume_serial_hex=[string]$openedFile.Record.volume_serial_hex;file_id_hex=[string]$openedFile.Record.file_id_hex})
+    }
+    return ,$pins.ToArray()
+}
+
+function New-D32PreparationObserverSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][long]$IdentityDeadlineTicks, [AllowNull()][object]$TestAdapter)
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.GetIdentity) {
+        return & $TestAdapter.GetIdentity -Repository $Repository -CandidateSha $CandidateSha -DeadlineTicks $IdentityDeadlineTicks
+    }
+    $preparation = New-D32NonSourceL1ObserverBindingPreparation
+    if ((Get-D32NonSourceL1Now) -ge $IdentityDeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: actual observer identity exceeded its 15-second startup ceiling' }
+    $fences = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    $opened = [System.Collections.Generic.List[object]]::new()
+    try {
+        $processFacts = Get-D32NonSourceL1CurrentProcessFacts
+        $token = Get-D32NonSourceL1CurrentTokenFacts
+        $imagePath = [IO.Path]::GetFullPath([string]$processFacts.image_path)
+        $image = Open-D32PowerShellAuthorityFile -Path $imagePath -DirectoryFences $fences -MaximumBytes 16777216L -DeadlineTicks $IdentityDeadlineTicks
+        $opened.Add($image)
+        $sourcePins = Get-D32PreparationFixedSourcePins -Repository $Repository -DeadlineTicks $IdentityDeadlineTicks -DirectoryFences $fences -Opened $opened
+        $imageReference = [PSCustomObject][ordered]@{path=[string]$image.Record.path;bytes=[Int64]$image.Record.bytes;sha256=[string]$image.Record.sha256
+            volume_serial_hex=[string]$image.Record.volume_serial_hex;file_id_hex=[string]$image.Record.file_id_hex}
+        if (-not (Test-D32PreparationFileReferenceEqual $imageReference $preparation.outer_caller.observer_host_reference) -or
+            -not (Test-D32PreparationFileReferenceEqual $sourcePins[0] $preparation.outer_caller.entry_reference) -or
+            [Int64]$processFacts.process_id -le 0 -or [Int64]$processFacts.creation_filetime_ticks -le 0) {
+            throw 'D32_PREP_OBSERVER_REFUSED: actual process image or fixed controller entry differs from the opened observer-binding bootstrap'
+        }
+        $identity = [PSCustomObject][ordered]@{
+            process_id=[Int64]$processFacts.process_id;creation_filetime_ticks=[Int64]$processFacts.creation_filetime_ticks
+            image_reference=$imageReference
+            ordinary_token=[PSCustomObject][ordered]@{elevated=[bool]$token.is_elevated;high_integrity=([Int64]$token.integrity_rid -ge 0x3000)
+                system_token=[bool]$token.is_system;thread_impersonation=[bool]$token.thread_impersonating}
+            observer_startup_sha256=[string]$preparation.observer_startup_sha256;entry_reference=$sourcePins[0]
+        }
+        if ((Get-D32NonSourceL1Now) -ge $IdentityDeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: actual observer identity exceeded its 15-second startup ceiling' }
+        return [PSCustomObject]@{Identity=$identity;SourcePins=$sourcePins;OuterCaller=$preparation.outer_caller;ObserverImageOpened=$image
+            Opened=$opened;DirectoryFences=$fences;Repository=$Repository;CandidateSha=$CandidateSha}
+    } catch {
+        foreach ($item in $opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch {} }
+        foreach ($fence in $fences.Values) { try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } catch {} }
+        throw
+    }
+}
+
+function Assert-D32PreparationObserverSnapshotCurrent {
+    param([Parameter(Mandatory = $true)][object]$Snapshot, [Parameter(Mandatory = $true)][long]$DeadlineTicks,
+        [AllowNull()][object]$TestAdapter)
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.AssertCurrent) {
+        if (-not [bool](& $TestAdapter.AssertCurrent -Snapshot $Snapshot -DeadlineTicks $DeadlineTicks)) { throw 'D32_PREP_OBSERVER_REFUSED: synthetic observer/code identity drift' }
+        return
+    }
+    if ((Get-D32NonSourceL1Now) -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: observer identity revalidation exceeded its fixed deadline' }
+    $authority = [PSCustomObject]@{outer_caller=$Snapshot.OuterCaller}
+    Assert-D32NonSourceL1ObserverBindingCurrent -Authority $authority -OpenedImage $Snapshot.ObserverImageOpened `
+        -ExpectedStartupDigest ([string]$Snapshot.Identity.observer_startup_sha256)
+    for ($index=0; $index -lt $Snapshot.SourcePins.Count; $index++) {
+        $pin = $Snapshot.SourcePins[$index]
+        $openedFile = Open-D32PowerShellAuthorityFile -Path ([string]$pin.path) -DirectoryFences $Snapshot.DirectoryFences -MaximumBytes 16777216L -DeadlineTicks $DeadlineTicks
+        try {
+            if (-not (Test-D32PreparationFileReferenceEqual ([PSCustomObject][ordered]@{path=$openedFile.Record.path;bytes=$openedFile.Record.bytes
+                    sha256=$openedFile.Record.sha256;volume_serial_hex=$openedFile.Record.volume_serial_hex;file_id_hex=$openedFile.Record.file_id_hex}) $pin)) {
+                throw 'D32_PREP_OBSERVER_REFUSED: one of the six fixed source pins changed after coordinator readback'
+            }
+        } finally { $openedFile.Stream.Dispose() }
+    }
+}
+
+function Write-D32PreparationCreateNewRecord {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][long]$MaximumBytes, [Parameter(Mandatory = $true)][long]$DeadlineTicks,
+        [Parameter(Mandatory = $true)][object]$Snapshot)
+    $fixedRoot = [IO.Path]::GetFullPath('E:\d32')
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName($full),$fixedRoot) -or
+        $Bytes.Length -le 0 -or $Bytes.Length -gt $MaximumBytes -or (Get-D32NonSourceL1Now) -ge $DeadlineTicks) {
+        throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: fixed create-new record path, bytes, or deadline is invalid'
+    }
+    Add-D32PowerShellAuthorityDirectoryChain -Directory $fixedRoot -Fences $Snapshot.DirectoryFences
+    $rootKey = $fixedRoot.TrimEnd([char[]]@('\','/'))
+    $rootFence = $Snapshot.DirectoryFences[$rootKey]
+    if ($null -eq $rootFence -or -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $rootFence.Handle),$fixedRoot)) {
+        throw 'D32_PREP_OBSERVER_REFUSED: fixed external output root has no stable opened V2 directory fence'
+    }
+    $beforeIdentity = Get-D32PowerShellAuthorityHandleIdentity -Handle $rootFence.Handle
+    $stream = $null
+    try {
+        $stream = [IO.FileStream]::new($full,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+        $stream.Write($Bytes,0,$Bytes.Length)
+        $stream.Flush($true)
+    } finally { if ($null -ne $stream) { $stream.Dispose() } }
+    if ((Get-D32NonSourceL1Now) -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: newly created preparation record finished after its deadline; output is preserved' }
+    $afterIdentity = Get-D32PowerShellAuthorityHandleIdentity -Handle $rootFence.Handle
+    if ($beforeIdentity.VolumeSerialHex -cne $afterIdentity.VolumeSerialHex -or $beforeIdentity.FileIdHex -cne $afterIdentity.FileIdHex -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-D32PowerShellAuthorityFinalHandlePath -Handle $rootFence.Handle),$fixedRoot)) {
+        throw 'D32_PREP_OBSERVER_REFUSED: fixed output directory identity drifted during create-new record write; output is preserved'
+    }
+    $opened = Open-D32PowerShellAuthorityFile -Path $full -DirectoryFences $Snapshot.DirectoryFences -MaximumBytes $MaximumBytes -DeadlineTicks $DeadlineTicks
+    $Snapshot.Opened.Add($opened)
+    $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes)).ToLowerInvariant()
+    if ([Int64]$opened.Record.bytes -ne $Bytes.Length -or [string]$opened.Record.sha256 -cne $sha -or
+        [Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTicks) {
+        throw 'D32_PREP_OBSERVER_REFUSED: create-new preparation record failed its independent V2 readback; output is preserved'
+    }
+    return [PSCustomObject][ordered]@{path=[string]$opened.Record.path;bytes=[Int64]$opened.Record.bytes;sha256=[string]$opened.Record.sha256
+        volume_serial_hex=[string]$opened.Record.volume_serial_hex;file_id_hex=[string]$opened.Record.file_id_hex}
+}
+
+function Invoke-D32PreparationRuntimeCandidateProducer {
+    param([Parameter(Mandatory = $true)][object]$Snapshot, [Parameter(Mandatory = $true)][string]$SessionNonce,
+        [Parameter(Mandatory = $true)][long]$DeadlineTicks, [AllowNull()][object]$TestAdapter)
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.PrepareRuntime) {
+        $candidate = & $TestAdapter.PrepareRuntime -Snapshot $Snapshot -SessionNonce $SessionNonce -DeadlineTicks $DeadlineTicks
+    } else {
+        $candidate = New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidate -CandidateSha $Snapshot.CandidateSha -DeadlineTicks $DeadlineTicks
+    }
+    $now = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
+    if ($now -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: runtime-content producer crossed its 300-second deadline; candidate cannot succeed' }
+    if ([string]$candidate.status -cne 'CANDIDATE_FOR_COORDINATOR_PIN' -or [string]$candidate.gate_authority -cne 'NONE' -or
+        $null -eq $candidate.candidate -or [string]$candidate.candidate.candidate_sha -cne [string]$Snapshot.CandidateSha -or
+        [string]$candidate.candidate_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace([string]$candidate.candidate_json)) {
+        return [PSCustomObject]@{Status='BLOCKED_INPUT_GAPS';Reference=$null;CandidateSha256=$null;Gaps=@($candidate.gaps)}
+    }
+    $bytes = [Text.UTF8Encoding]::new($false,$true).GetBytes([string]$candidate.candidate_json)
+    $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if ($sha -cne [string]$candidate.candidate_sha256 -or $bytes.Length -gt 4194304) {
+        throw 'D32_PREP_OBSERVER_REFUSED: runtime-content producer output hash or 4 MiB bound is inconsistent'
+    }
+    $path = 'E:\d32\D32-NON-SOURCE-L1-RUNTIME-CANDIDATE-' + $Snapshot.CandidateSha.Substring(0,8) + '-' + $SessionNonce + '.json'
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.WriteRecord) {
+        $reference = & $TestAdapter.WriteRecord -Path $path -Bytes $bytes -MaximumBytes 4194304L -DeadlineTicks $DeadlineTicks -Snapshot $Snapshot
+    } else {
+        $reference = Write-D32PreparationCreateNewRecord -Path $path -Bytes $bytes -MaximumBytes 4194304L -DeadlineTicks $DeadlineTicks -Snapshot $Snapshot
+    }
+    $now = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
+    if (-not (Test-D32PreparationFileReferenceShape $reference) -or [string]$reference.path -cne $path -or
+        [Int64]$reference.bytes -ne $bytes.Length -or [string]$reference.sha256 -cne $sha -or $now -ge $DeadlineTicks) {
+        throw 'D32_PREP_OBSERVER_REFUSED: reopened create-new runtime-content candidate differs from the fixed path, producer bytes, or SHA'
+    }
+    return [PSCustomObject]@{Status='CANDIDATE_FOR_COORDINATOR_PIN';Reference=$reference;CandidateSha256=$sha;Gaps=@()}
+}
+
+function Test-D32PreparationReturnedPinPayload {
+    param([Parameter(Mandatory = $true)][object]$Payload, [Parameter(Mandatory = $true)][object]$Snapshot,
+        [Parameter(Mandatory = $true)][object]$CandidateReference)
+    if (-not (Test-D32PreparationExactProperties $Payload @('identity','source_pins','runtime_candidate_reference')) -or
+        -not (Test-D32PreparationExactProperties $Payload.identity @('process_id','creation_filetime_ticks','image_reference','ordinary_token','observer_startup_sha256','entry_reference')) -or
+        -not (Test-D32PreparationExactProperties $Payload.identity.ordinary_token @('elevated','high_integrity','system_token','thread_impersonation')) -or
+        $Payload.identity.process_id -isnot [long] -or [long]$Payload.identity.process_id -le 0 -or
+        $Payload.identity.creation_filetime_ticks -isnot [long] -or [long]$Payload.identity.creation_filetime_ticks -le 0 -or
+        $Payload.identity.observer_startup_sha256 -isnot [string] -or [string]$Payload.identity.observer_startup_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        @($Payload.identity.ordinary_token.PSObject.Properties | Where-Object { $_.Value -isnot [bool] }).Count -ne 0 -or
+        $Payload.source_pins -isnot [Array] -or $Payload.source_pins.Count -ne 6) { return $false }
+    foreach ($field in @('process_id','creation_filetime_ticks','observer_startup_sha256')) {
+        if ([string]$Payload.identity.$field -cne [string]$Snapshot.Identity.$field) { return $false }
+    }
+    if (-not (Test-D32PreparationFileReferenceEqual $Payload.identity.image_reference $Snapshot.Identity.image_reference) -or
+        -not (Test-D32PreparationFileReferenceEqual $Payload.identity.entry_reference $Snapshot.Identity.entry_reference)) { return $false }
+    foreach ($field in @('elevated','high_integrity','system_token','thread_impersonation')) {
+        if ([bool]$Payload.identity.ordinary_token.$field -ne [bool]$Snapshot.Identity.ordinary_token.$field) { return $false }
+    }
+    for ($index=0; $index -lt 6; $index++) {
+        if (-not (Test-D32PreparationFileReferenceEqual $Payload.source_pins[$index] $Snapshot.SourcePins[$index])) { return $false }
+    }
+    return (Test-D32PreparationFileReferenceEqual $Payload.runtime_candidate_reference $CandidateReference)
+}
+
+function Invoke-D32PreparationOldRunBaselineProducer {
+    param([Parameter(Mandatory = $true)][object]$Snapshot, [Parameter(Mandatory = $true)][string]$SessionNonce,
+        [Parameter(Mandatory = $true)][object]$CandidateReference, [Parameter(Mandatory = $true)][long]$CandidateSequence,
+        [Parameter(Mandatory = $true)][long]$PinVerificationSequence, [Parameter(Mandatory = $true)][long]$Sequence,
+        [Parameter(Mandatory = $true)][long]$DeadlineTicks, [AllowNull()][object]$TestAdapter)
+    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.CaptureBaseline) {
+        return & $TestAdapter.CaptureBaseline -Snapshot $Snapshot -SessionNonce $SessionNonce -CandidateReference $CandidateReference `
+            -CandidateSequence $CandidateSequence -PinVerificationSequence $PinVerificationSequence -Sequence $Sequence -DeadlineTicks $DeadlineTicks
+    }
+    $oldCallerPath = 'C:\Users\zuo\D32-NON-SOURCE-L1-CALLER-5a260368a65644f28195842860c86dc1.jsonl'
+    $oldCallerExpectedSha = '398a7c57055bc0a2c9e7f4af4a695451587f6a20c12579c5494c379952a82e04'
+    $oldCallerExpectedBytes = 18157L
+    $oldCaller = Open-D32PowerShellAuthorityFile -Path $oldCallerPath -DirectoryFences $Snapshot.DirectoryFences `
+        -MaximumBytes $oldCallerExpectedBytes -DeadlineTicks $DeadlineTicks
+    $Snapshot.Opened.Add($oldCaller)
+    if ([Int64]$oldCaller.Record.bytes -ne $oldCallerExpectedBytes -or [string]$oldCaller.Record.sha256 -cne $oldCallerExpectedSha) {
+        throw 'D32_PREP_OBSERVER_REFUSED: the exact locked historical 5a260 caller record is unavailable or drifted'
+    }
+    $capturedUtcBefore = [DateTimeOffset]::UtcNow.ToString('o')
+    $qpcBefore = [Int64][Diagnostics.Stopwatch]::GetTimestamp()
+    $nativeFiles = [System.Collections.Generic.List[object]]::new()
+    $uptime = Get-D32PowerShellAuthorityNativeUptimeOriginEvidence -DirectoryFences $Snapshot.DirectoryFences -OpenFiles $nativeFiles -DeadlineTicks $DeadlineTicks
+    foreach ($item in $nativeFiles) { if (-not [object]::ReferenceEquals($item,$oldCaller)) { $Snapshot.Opened.Add($item) } }
+    $qpcAfter = [Int64][Diagnostics.Stopwatch]::GetTimestamp()
+    $capturedUtcAfter = [DateTimeOffset]::UtcNow.ToString('o')
+    Assert-D32PreparationObserverSnapshotCurrent -Snapshot $Snapshot -DeadlineTicks $DeadlineTicks -TestAdapter $null
+    if ($qpcBefore -le 0 -or $qpcAfter -lt $qpcBefore -or [Diagnostics.Stopwatch]::Frequency -le 0 -or
+        (Get-D32NonSourceL1Now) -ge $DeadlineTicks) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: baseline monotonic bounds or deadline failed' }
+    $oldCallerReference = [PSCustomObject][ordered]@{path=[string]$oldCaller.Record.path;bytes=[Int64]$oldCaller.Record.bytes;sha256=[string]$oldCaller.Record.sha256
+        volume_serial_hex=[string]$oldCaller.Record.volume_serial_hex;file_id_hex=[string]$oldCaller.Record.file_id_hex}
+    $baseline = [PSCustomObject][ordered]@{
+        schema_version=1;record_type='D32_NON_SOURCE_L1_RECOVERY_BOOT_BASELINE_V1';purpose='NON_SOURCE_L1_PRE_RESET_BASELINE_ONLY'
+        gate_authority='NONE';launch_authority='NONE';status='CANDIDATE_ONLY';candidate_sha=[string]$Snapshot.CandidateSha
+        old_run_id='5a260368a65644f28195842860c86dc1';session_nonce=$SessionNonce;source_repo=[string]$Snapshot.Repository
+        observer=$Snapshot.Identity;source_pins=@($Snapshot.SourcePins);runtime_candidate_reference=$CandidateReference
+        old_caller_reference=$oldCallerReference
+        old_locked_references=@($oldCallerReference)
+        native_uptime=$uptime
+        monotonic_capture=[PSCustomObject][ordered]@{counter='QueryPerformanceCounter';frequency=[Int64][Diagnostics.Stopwatch]::Frequency
+            qpc_before=$qpcBefore;qpc_after=$qpcAfter;captured_utc_before=$capturedUtcBefore;captured_utc_after=$capturedUtcAfter}
+        control_order=[PSCustomObject][ordered]@{candidate_sequence=$CandidateSequence;pin_verification_sequence=$PinVerificationSequence;baseline_sequence=$Sequence}
+    }
+    $json = ConvertTo-D32PowerShellAuthorityJsonText -Value $baseline
+    $bytes = [Text.UTF8Encoding]::new($false,$true).GetBytes($json)
+    if ($bytes.Length -le 0 -or $bytes.Length -gt 65536) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: old-run baseline exceeds the 64 KiB fixed record limit' }
+    if (-not (Test-D32PreparationBaselineJson -Json $json -ExpectedCandidateSha $Snapshot.CandidateSha -ExpectedRepository $Snapshot.Repository -ExpectedSessionNonce $SessionNonce)) {
+        throw 'D32_PREP_OBSERVER_REFUSED: typed old-run baseline failed strict UInt64/schema/reference/time readback before persistence'
+    }
+    $path = 'E:\d32\D32-NSL1-RECOVERY-BOOT-BASELINE-V1-5a260368a65644f28195842860c86dc1-' + $SessionNonce + '.json'
+    $reference = Write-D32PreparationCreateNewRecord -Path $path -Bytes $bytes -MaximumBytes 65536L -DeadlineTicks $DeadlineTicks -Snapshot $Snapshot
+    $persisted=$Snapshot.Opened[$Snapshot.Opened.Count-1]
+    $persistedJson=[Text.UTF8Encoding]::new($false,$true).GetString([byte[]]$persisted.Bytes)
+    if (-not (Test-D32PreparationBaselineJson -Json $persistedJson -ExpectedCandidateSha $Snapshot.CandidateSha -ExpectedRepository $Snapshot.Repository -ExpectedSessionNonce $SessionNonce) -or
+        [Int64]$persisted.Record.bytes -ne $bytes.Length -or [string]$persisted.Record.sha256 -cne [string]$reference.sha256) {
+        throw 'D32_PREP_OBSERVER_REFUSED: reopened old-run baseline failed strict persisted-byte/schema/pin readback; output is preserved'
+    }
+    return [PSCustomObject]@{Reference=$reference;OldCallerReference=$oldCallerReference;NativeUptime=$uptime;Status='CANDIDATE_ONLY'}
+}
+
+function Invoke-D32PreparationObserverControlSession {
+    param([Parameter(Mandatory = $true)][string]$Repository, [Parameter(Mandatory = $true)][string]$CandidateSha,
+        [Parameter(Mandatory = $true)][System.IO.TextReader]$Reader, [Parameter(Mandatory = $true)][System.IO.TextWriter]$Writer,
+        [AllowNull()][object]$TestAdapter = $null)
+    $frequency = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.QpcFrequency) { [Int64](& $TestAdapter.QpcFrequency) } else { [Int64][Diagnostics.Stopwatch]::Frequency }
+    $started = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { [Int64](& $TestAdapter.Now) } else { [Int64](Get-D32NonSourceL1Now) }
+    if ($frequency -le 0 -or $started -le 0 -or $CandidateSha -cnotmatch '^[0-9a-f]{40}$' -or
+        [IO.Path]::GetFullPath($Repository) -cne $Repository -or -not [IO.Path]::IsPathRooted($Repository)) {
+        throw 'D32_PREP_OBSERVER_REFUSED: fixed session candidate/repository or monotonic clock inputs are invalid'
+    }
+    $identityDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 15000L
+    $leaseDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $started -Frequency $frequency -Milliseconds 1800000L
+    $snapshot = $null; $nonce = $null; $lastSequence = 0L; $candidateSequence = $null; $pinVerificationSequence = $null
+    $state = 'AWAIT_READY'; $candidateResult = $null; $pinsVerified = $false; $baselineResult = $null
+    $lastOperation = 'CHALLENGE'; $exitCode = 87; $closed = $false
+    $nowProvider = if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Now) { $TestAdapter.Now } else { { Get-D32NonSourceL1Now } }
+    try {
+        if ($null -ne $TestAdapter -and $null -ne $TestAdapter.CreateNonce) { $nonce = [string](& $TestAdapter.CreateNonce) }
+        else { $nonce = [Guid]::NewGuid().ToString('N').ToLowerInvariant() }
+        if ($nonce -cnotmatch '^[0-9a-f]{32}$') { throw 'D32_PREP_OBSERVER_REFUSED: session nonce is not fresh lower-case 32-hex' }
+        $snapshot = New-D32PreparationObserverSnapshot -Repository $Repository -CandidateSha $CandidateSha -IdentityDeadlineTicks $identityDeadline -TestAdapter $TestAdapter
+        if ([Int64](& $nowProvider) -ge $identityDeadline) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: identity admission exceeded 15 seconds from session start' }
+        $challenge = [PSCustomObject][ordered]@{protocol='D32_PREP_OBSERVER_CONTROL_V1';session_nonce=$nonce;sequence=0L;candidate_sha=$CandidateSha
+            operation='CHALLENGE';status='AWAITING_READY';gate_authority='NONE';launch_authority='NONE';payload=[PSCustomObject][ordered]@{}}
+        Write-D32PreparationControlResponse -Writer $Writer -Frame $challenge -TestAdapter $TestAdapter
+        while (-not $closed) {
+            $now = [Int64](& $nowProvider)
+            if ($now -ge $leaseDeadline) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: absolute 1800-second session lease expired' }
+            $inputDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $now -Frequency $frequency -Milliseconds 300000L
+            if ($inputDeadline -gt $leaseDeadline) { $inputDeadline = $leaseDeadline }
+            $line = Read-D32PreparationControlLine -Reader $Reader -DeadlineTicks $inputDeadline -LeaseDeadlineTicks $leaseDeadline -TestAdapter $TestAdapter
+            if ([Int64](& $nowProvider) -ge $inputDeadline -or [Int64](& $nowProvider) -ge $leaseDeadline) {
+                throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: control frame arrived after the input/absolute deadline'
+            }
+            $frame = ConvertFrom-D32PreparationControlFrame -Line $line -SessionNonce $nonce -ExpectedCandidateSha $CandidateSha -MinimumSequence $lastSequence
+            $lastSequence = [Int64]$frame.sequence; $lastOperation = [string]$frame.operation
+            $payload = [PSCustomObject][ordered]@{}
+            $status = 'CANDIDATE_ONLY'
+            switch ([string]$frame.operation) {
+                'READY' {
+                    if ($state -cne 'AWAIT_READY') { throw 'D32_PREP_OBSERVER_REFUSED: READY is duplicate or out of order' }
+                    Assert-D32PreparationObserverSnapshotCurrent -Snapshot $snapshot -DeadlineTicks $leaseDeadline -TestAdapter $TestAdapter
+                    $payload = [PSCustomObject][ordered]@{identity=$snapshot.Identity;source_pins=@($snapshot.SourcePins)}
+                    $state = 'READY'
+                }
+                'PREPARE_RUNTIME_CANDIDATE' {
+                    if ($state -cne 'READY' -or $null -ne $candidateResult) { throw 'D32_PREP_OBSERVER_REFUSED: runtime candidate preparation is duplicate or out of order' }
+                    Assert-D32PreparationObserverSnapshotCurrent -Snapshot $snapshot -DeadlineTicks $leaseDeadline -TestAdapter $TestAdapter
+                    $operationStart = [Int64](& $nowProvider)
+                    $operationDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $operationStart -Frequency $frequency -Milliseconds 300000L
+                    if ($operationDeadline -gt $leaseDeadline) { $operationDeadline = $leaseDeadline }
+                    $candidateResult = Invoke-D32PreparationRuntimeCandidateProducer -Snapshot $snapshot -SessionNonce $nonce -DeadlineTicks $operationDeadline -TestAdapter $TestAdapter
+                    $candidateSequence = $lastSequence
+                    if ([Int64](& $nowProvider) -ge $operationDeadline) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: runtime candidate result crossed its fixed wall deadline' }
+                    if ([string]$candidateResult.Status -cne 'CANDIDATE_FOR_COORDINATOR_PIN' -or $null -eq $candidateResult.Reference) {
+                        $state = 'FAILED'; $status = 'BLOCKED_INPUT_GAPS'
+                        $payload = [PSCustomObject][ordered]@{gaps=@($candidateResult.Gaps);gate_authority='NONE';launch_authority='NONE'}
+                    } else {
+                        $state = 'CANDIDATE_READY'
+                        $payload = [PSCustomObject][ordered]@{runtime_candidate_reference=$candidateResult.Reference
+                            candidate_content_sha256=[string]$candidateResult.CandidateSha256}
+                    }
+                }
+                'VERIFY_RETURNED_PINS' {
+                    if ($state -cne 'CANDIDATE_READY' -or $pinsVerified) { throw 'D32_PREP_OBSERVER_REFUSED: returned-pin verification is duplicate or out of order' }
+                    $verificationStart = [Int64](& $nowProvider)
+                    $verificationDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $verificationStart -Frequency $frequency -Milliseconds 15000L
+                    if ($verificationDeadline -gt $leaseDeadline) { $verificationDeadline = $leaseDeadline }
+                    if (-not (Test-D32PreparationReturnedPinPayload -Payload $frame.payload -Snapshot $snapshot -CandidateReference $candidateResult.Reference)) {
+                        throw 'D32_PREP_OBSERVER_REFUSED: coordinator returned pins do not exactly bind this observer, six source files, and runtime candidate'
+                    }
+                    Assert-D32PreparationObserverSnapshotCurrent -Snapshot $snapshot -DeadlineTicks $verificationDeadline -TestAdapter $TestAdapter
+                    if ($null -ne $TestAdapter -and $null -ne $TestAdapter.VerifyPins -and
+                        -not [bool](& $TestAdapter.VerifyPins -Payload $frame.payload -Snapshot $snapshot -CandidateReference $candidateResult.Reference -DeadlineTicks $verificationDeadline)) {
+                        throw 'D32_PREP_OBSERVER_REFUSED: synthetic independent pin verification refused'
+                    }
+                    $pinsVerified = $true; $state = 'PINS_VERIFIED'
+                    $pinVerificationSequence = $lastSequence
+                    $payload = [PSCustomObject][ordered]@{verified=$true;runtime_candidate_reference=$candidateResult.Reference;gate_authority='NONE';launch_authority='NONE'}
+                }
+                'CAPTURE_OLD_RUN_UPTIME_BASELINE' {
+                    if ($state -cne 'PINS_VERIFIED' -or $null -ne $baselineResult) { throw 'D32_PREP_OBSERVER_REFUSED: old-run baseline capture is duplicate or out of order' }
+                    Assert-D32PreparationObserverSnapshotCurrent -Snapshot $snapshot -DeadlineTicks $leaseDeadline -TestAdapter $TestAdapter
+                    $operationStart = [Int64](& $nowProvider)
+                    $operationDeadline = Get-D32NonSourceL1DeadlineTicks -T0Ticks $operationStart -Frequency $frequency -Milliseconds 300000L
+                    if ($operationDeadline -gt $leaseDeadline) { $operationDeadline = $leaseDeadline }
+                    $baselineResult = Invoke-D32PreparationOldRunBaselineProducer -Snapshot $snapshot -SessionNonce $nonce `
+                        -CandidateReference $candidateResult.Reference -CandidateSequence $candidateSequence `
+                        -PinVerificationSequence $pinVerificationSequence -Sequence $lastSequence -DeadlineTicks $operationDeadline -TestAdapter $TestAdapter
+                    if ([Int64](& $nowProvider) -ge $operationDeadline) { throw 'D32_PREP_OBSERVER_BUDGET_STOPPED: old-run baseline crossed its fixed wall deadline' }
+                    $state = 'BASELINE_READY'
+                    $payload = [PSCustomObject][ordered]@{baseline_reference=$baselineResult.Reference;old_caller_reference=$baselineResult.OldCallerReference
+                        native_uptime_api='kernel32!GetTickCount64';gate_authority='NONE';launch_authority='NONE'}
+                }
+                'CLOSE' {
+                    $complete = $null -ne $baselineResult -and $pinsVerified
+                    $status = if ($complete) { 'CLOSED_PREPARATION_ONLY' } else { 'CLOSED_INCOMPLETE' }
+                    $payload = [PSCustomObject][ordered]@{runtime_candidate_reference=$(if ($null -ne $candidateResult) {$candidateResult.Reference} else {$null})
+                        baseline_reference=$(if ($null -ne $baselineResult) {$baselineResult.Reference} else {$null});gate_authority='NONE';launch_authority='NONE'}
+                    $closed = $true; $exitCode = if ($complete) {0} else {87}
+                }
+            }
+            $response = [PSCustomObject][ordered]@{protocol='D32_PREP_OBSERVER_CONTROL_V1';session_nonce=$nonce;sequence=[Int64]$frame.sequence
+                candidate_sha=$CandidateSha;operation=[string]$frame.operation;status=$status;gate_authority='NONE';launch_authority='NONE';payload=$payload}
+            Write-D32PreparationControlResponse -Writer $Writer -Frame $response -TestAdapter $TestAdapter
+        }
+    } catch {
+        $exitCode = 87
+        if (-not [string]::IsNullOrWhiteSpace([string]$nonce)) {
+            try {
+                $errorSequence = if ($lastSequence -lt [Int64]::MaxValue) { [Int64]($lastSequence + 1L) } else { [Int64]$lastSequence }
+                $errorResponse = [PSCustomObject][ordered]@{protocol='D32_PREP_OBSERVER_CONTROL_V1';session_nonce=$nonce
+                    sequence=$errorSequence;candidate_sha=$CandidateSha;operation=$lastOperation;status='REFUSED'
+                    gate_authority='NONE';launch_authority='NONE';payload=[PSCustomObject][ordered]@{reason='D32_PREP_OBSERVER_REFUSED';detail=(Get-D32NonSourceL1ErrorText -Exception $_.Exception)}}
+                Write-D32PreparationControlResponse -Writer $Writer -Frame $errorResponse -TestAdapter $TestAdapter
+            } catch {}
+        }
+    } finally {
+        if ($null -ne $TestAdapter -and $null -ne $TestAdapter.Close) { try { $null=& $TestAdapter.Close -Reader $Reader -Writer $Writer -Snapshot $snapshot } catch { $exitCode=87 } }
+        else {
+            try { $Reader.Dispose() } catch { $exitCode=87 }
+            try { $Writer.Dispose() } catch { $exitCode=87 }
+            if ($null -ne $snapshot) {
+                foreach ($item in $snapshot.Opened) { try { if ($null -ne $item.Stream -and -not $item.Stream.SafeFileHandle.IsClosed) { $item.Stream.Dispose() } } catch { $exitCode=87 } }
+                foreach ($fence in $snapshot.DirectoryFences.Values) { try { if ($null -ne $fence.Handle -and -not $fence.Handle.IsClosed) { $fence.Handle.Dispose() } } catch { $exitCode=87 } }
+            }
+        }
+    }
+    return [int]$exitCode
+}
+
 function Open-D32NonSourceL1PersistedOutput {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DirectoryFences,
         [Parameter(Mandatory = $true)][long]$MaximumBytes, [Parameter(Mandatory = $true)][long]$DeadlineTicks)
@@ -3928,6 +4563,12 @@ function Invoke-D32NonSourceL1ControllerBoundary {
 
 if ($PSCmdlet.ParameterSetName -ceq 'NonSourceL1') {
     exit (Invoke-D32NonSourceL1ControllerBoundary -DiagnosticWriter ([Console]::Error))
+}
+
+if ($PSCmdlet.ParameterSetName -ceq 'PreparationSession') {
+    $PSModuleAutoLoadingPreference = 'None'
+    exit (Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha `
+        -Reader ([Console]::In) -Writer ([Console]::Out))
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'ObserverBindingPreparation') {

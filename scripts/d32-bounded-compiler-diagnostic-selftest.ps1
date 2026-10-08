@@ -3661,8 +3661,9 @@ if ($null -ne $runtimeProducerEntryAst) {
         $runtimeProducerEntryParameters.Add([string]$runtimeProducerEntryParameter.Name.VariablePath.UserPath)
     }
 }
-Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed runtime-content preparation exposes only the candidate pin and never borrows observer-loaded/AppContext target origins' `
-    ($null -ne $runtimeProducerEntryAst -and $runtimeProducerEntryParameters.Count -eq 1 -and $runtimeProducerEntryParameters[0] -ceq 'CandidateSha' -and
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed runtime-content preparation exposes only candidate pin and bounded deadline inputs and never borrows observer-loaded/AppContext target origins' `
+    ($null -ne $runtimeProducerEntryAst -and $runtimeProducerEntryParameters.Count -eq 2 -and
+        ($runtimeProducerEntryParameters -join '|') -ceq 'CandidateSha|DeadlineTicks' -and
         $runtimeProducerEntryText -notmatch 'GetCurrentProcess|\.Modules|AppContext|ProcessStartup|Start-D32|CreateProcess|Import-Module')
 $l1Drive = [IO.Path]::GetPathRoot($l1Root).TrimEnd('\'); $l1HomePath = $l1Root.Substring($l1Drive.Length)
 $l1ChildEnvironment = [PSCustomObject][ordered]@{
@@ -4340,6 +4341,33 @@ $outerObserverBoundaryExact=$null -ne $outerCallerFunctionAst -and $null -ne $ob
     -not $outerCallerFunctionText.Contains('Get-D32NonSourceL1LoadedModuleNames') -and
     -not $outerCallerFunctionText.Contains('Initialize-D32NonSourceL1ControllerRuntime')
 Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed outer route binds the existing observer, keeps child runtime admission separate, and exposes no arbitrary preparation/launch inputs' $outerObserverBoundaryExact
+$preparationSessionAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Invoke-D32PreparationObserverControlSession'},$true)
+$preparationReaderAst=$controllerAst.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -ceq 'Read-D32PreparationControlLine'},$true)
+$preparationSessionText=if ($null -eq $preparationSessionAst) { '' } else { [string]$preparationSessionAst.Extent.Text }
+$preparationReaderText=if ($null -eq $preparationReaderAst) { '' } else { [string]$preparationReaderAst.Extent.Text }
+$preparationSessionParameters=@($controllerAst.ParamBlock.Parameters | Where-Object {
+    @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.FullName -ceq 'Parameter' -and
+        @($_.NamedArguments | Where-Object { $_.ArgumentName -ceq 'ParameterSetName' -and $_.Argument.Extent.Text -ceq "'PreparationSession'" }).Count -gt 0 }).Count -gt 0
+} | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
+$preparationNativeText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'd32-powershell-module-authority.ps1'),[Text.UTF8Encoding]::new($false,$true))
+$preparationSessionWired=$null -ne $preparationSessionAst -and $null -ne $preparationReaderAst -and
+    ($preparationSessionParameters -join '|') -ceq 'Repository|CandidateSha|PreparationSession' -and
+    $controllerText.Contains('exit (Invoke-D32PreparationObserverControlSession -Repository $Repository -CandidateSha $CandidateSha') -and
+    $controllerText.Contains('-Reader ([Console]::In) -Writer ([Console]::Out)') -and
+    $controllerText.Contains('$PSModuleAutoLoadingPreference = ''None''') -and
+    $preparationSessionText.Contains('D32_PREP_OBSERVER_CONTROL_V1') -and $preparationSessionText.Contains('1800000L') -and
+    $preparationSessionText.Contains('300000L') -and $preparationSessionText.Contains('15000L') -and
+    $preparationSessionText.Contains('VERIFY_RETURNED_PINS') -and $preparationSessionText.Contains('CAPTURE_OLD_RUN_UPTIME_BASELINE') -and
+    $preparationSessionText.Contains("gate_authority='NONE'") -and $preparationSessionText.Contains("launch_authority='NONE'") -and
+    -not $preparationSessionText.Contains('Start-Process') -and -not $preparationSessionText.Contains('CreateProcessW') -and
+    -not $preparationSessionText.Contains('ScriptBlock]::Create') -and -not $preparationSessionText.Contains('Invoke-Expression') -and
+    -not $preparationReaderText.Contains('ScriptBlock]::Create') -and -not $preparationReaderText.Contains('Invoke-Expression') -and
+    $preparationNativeText.Contains('GetTickCount64') -and $preparationNativeText.Contains('VirtualQuery') -and
+    $preparationNativeText.Contains('GetModuleFileNameW') -and $preparationNativeText.Contains('MEM_IMAGE') -and
+    $preparationNativeText.Contains('D32PowerShellAuthorityPreparationDeadlineTicks')
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed direct-host preparation session has strict JSONL controls, monotonic lease/time budgets, no stdin code path, no child/authority route, and UInt64 MEM_IMAGE uptime origin' $preparationSessionWired
 $legacySyntheticCallerAst = $controllerAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-D32NonSourceL1SyntheticCallerReconciliation'
 }, $true)
@@ -4559,6 +4587,12 @@ $l1PipelineFunctionNames = @(
     'Get-D32NonSourceL1CurrentControllerPath', 'Get-D32NonSourceL1CurrentRuntimePath', 'Get-D32NonSourceL1CurrentOwnerSid', 'Get-D32NonSourceL1UniquePinnedPath',
     'Get-D32NonSourceL1CurrentProcessFacts', 'Get-D32NonSourceL1CurrentTokenFacts', 'Get-D32NonSourceL1CurrentStartupFacts',
     'Get-D32NonSourceL1ObserverStartupDigest', 'Assert-D32NonSourceL1ObserverBindingCurrent', 'New-D32NonSourceL1ObserverBindingPreparation',
+    'Test-D32PreparationExactProperties', 'Test-D32PreparationFileReferenceEqual', 'Test-D32PreparationFileReferenceShape',
+    'Test-D32PreparationJsonExactProperties', 'Test-D32PreparationJsonFileReference', 'Test-D32PreparationBaselineJson',
+    'ConvertFrom-D32PreparationControlFrame', 'Write-D32PreparationControlResponse', 'Read-D32PreparationControlLine',
+    'Get-D32PreparationFixedSourcePins', 'New-D32PreparationObserverSnapshot', 'Assert-D32PreparationObserverSnapshotCurrent',
+    'Write-D32PreparationCreateNewRecord', 'Invoke-D32PreparationRuntimeCandidateProducer', 'Test-D32PreparationReturnedPinPayload',
+    'Invoke-D32PreparationOldRunBaselineProducer', 'Invoke-D32PreparationObserverControlSession',
     'Get-D32NonSourceL1LoadedModuleNames', 'Initialize-D32NonSourceL1ControllerRuntime', 'ConvertTo-D32NonSourceL1UtilityJson',
     'Test-D32NonSourceL1NoReparsePath', 'Get-D32NonSourceL1InitialReferenceBytes', 'Open-D32NonSourceL1AuthorityRecord',
     'Get-D32NonSourceL1DirectoryIdentity', 'Get-D32NonSourceL1ModuleAuthorityDirectoryIdentity', 'Get-D32NonSourceL1RootSecurity', 'Test-D32NonSourceL1OutputPathExists',
@@ -5373,6 +5407,337 @@ Assert-D32BoundedCompilerDiagnosticSelfTest 'actual controller Invoke admission�
 Assert-D32BoundedCompilerDiagnosticSelfTest 'caller strict re-open rejects a persisted outcome whose controller assignment fact is altered after create-new persistence' $l1CallerOutcomeTamperRejected
 Assert-D32BoundedCompilerDiagnosticSelfTest 'actual controller early REFUSED boundary captures sanitized primary text through a connected bounded stderr-style pipe with no output creation or additional native attempt' $l1ActualRefusalCaptured
 
+# Pure in-process L0 of the fixed prep-session wire protocol. The providers below
+# return synthetic pins and records; no runtime inventory, file read, native query,
+# child, Job, authority, output write, or process launch is reachable from them.
+$prepRepository=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$prepCandidateSha='a'*40; $prepNonce='b'*32
+$prepImageReference=[PSCustomObject][ordered]@{path='C:\Tools\TrustedObserver.exe';bytes=100L;sha256=('1'*64);volume_serial_hex=('2'*16);file_id_hex=('3'*32)}
+$prepSourcePins=[System.Collections.Generic.List[object]]::new()
+$prepSourceRelativePaths=@('scripts/d32-bounded-diagnostic-sourceproof-controller.ps1','scripts/d32-bounded-diagnostic-sourceproof.ps1',
+    'scripts/d32-bounded-compiler-diagnostic.ps1','scripts/d32-bounded-compiler-diagnostic-policy.ps1',
+    'scripts/d32-build-toolchain-profile.ps1','scripts/d32-powershell-module-authority.ps1')
+for($prepIndex=0;$prepIndex -lt 6;$prepIndex++) {
+    $prepSourcePins.Add([PSCustomObject][ordered]@{path=[IO.Path]::GetFullPath([IO.Path]::Combine($prepRepository,$prepSourceRelativePaths[$prepIndex]));bytes=[Int64](100+$prepIndex)
+        sha256=([string][char](97+$prepIndex)*64);volume_serial_hex=('4'*16);file_id_hex=([string][char](97+$prepIndex)*32)})
+}
+$prepIdentity=[PSCustomObject][ordered]@{process_id=4321L;creation_filetime_ticks=134000000000000000L;image_reference=$prepImageReference
+    ordinary_token=[PSCustomObject][ordered]@{elevated=$false;high_integrity=$false;system_token=$false;thread_impersonation=$false}
+    observer_startup_sha256=('5'*64);entry_reference=$prepSourcePins[0]}
+$script:D32PreparationSelfTestSnapshot=[PSCustomObject]@{Identity=$prepIdentity;SourcePins=$prepSourcePins.ToArray();OuterCaller=$null
+    ObserverImageOpened=$null;Opened=[System.Collections.Generic.List[object]]::new()
+    DirectoryFences=[System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    Repository=$prepRepository;CandidateSha=$prepCandidateSha}
+$prepRuntimeCandidateResult=New-D32PowerShellAuthorityNonSourceL1RuntimeContentCandidateFromV2Inputs -CandidateSha $prepCandidateSha -Repository $l1Repository -RepositoryIdentity ([PSCustomObject][ordered]@{VolumeSerialHex='5555555555555555';FileIdHex='55555555555555555555555555555555'}) -RuntimeFileReference (New-D32L1SelfTestV2FileReference $l1RuntimeFile) -PowerShellHome $l1RuntimeHome -SystemRoot $l1SystemRoot -Distribution $l1RuntimeDistribution -OsSecurityComponents $l1RuntimeComponents -UtilityManifestReference (New-D32L1SelfTestV2FileReference $l1UtilityManifestFile) -UtilityFiles $l1RuntimeUtilityFiles -StartupFileStates $l1RuntimeStartupFiles -TrustedPlatformAssemblyReferences $l1SyntheticTpa -NativeSearchDirectoryRecords $l1SyntheticNativeDirectories
+$prepRuntimeCandidateReadback=ConvertFrom-D32BoundedCompilerDiagnosticTestJson -Json ([string]$prepRuntimeCandidateResult.candidate_json)
+$prepRuntimeCandidateStrict=Test-D32BoundedDiagnosticSourceProofNonSourceL1RuntimeContentAuthorityShape -Document $prepRuntimeCandidateReadback -ExpectedCandidateSha $prepCandidateSha -Repository $prepRepository
+$prepCandidateBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes([string]$prepRuntimeCandidateResult.candidate_json)
+$prepCandidateReference=[PSCustomObject][ordered]@{path=('E:\d32\D32-NON-SOURCE-L1-RUNTIME-CANDIDATE-'+$prepCandidateSha.Substring(0,8)+'-'+$prepNonce+'.json')
+    bytes=[Int64]$prepCandidateBytes.Length;sha256=[string]$prepRuntimeCandidateResult.candidate_sha256;volume_serial_hex=('7'*16);file_id_hex=('8'*32)}
+$script:D32PreparationSelfTestCandidateReference=$prepCandidateReference
+$script:D32PreparationSelfTestNonce=$prepNonce
+$prepOldCallerReference=[PSCustomObject][ordered]@{path='C:\Users\zuo\D32-NON-SOURCE-L1-CALLER-5a260368a65644f28195842860c86dc1.jsonl'
+    bytes=18157L;sha256='398a7c57055bc0a2c9e7f4af4a695451587f6a20c12579c5494c379952a82e04';volume_serial_hex=('9'*16);file_id_hex=('a'*32)}
+$prepBaselineReference=[PSCustomObject][ordered]@{path=('E:\d32\D32-NSL1-RECOVERY-BOOT-BASELINE-V1-5a260368a65644f28195842860c86dc1-'+$prepNonce+'.json')
+    bytes=2048L;sha256=('b'*64);volume_serial_hex=('c'*16);file_id_hex=('d'*32)}
+$script:D32PreparationSelfTestCandidateResult=$prepRuntimeCandidateResult
+$script:D32PreparationSelfTestBaselineResult=[PSCustomObject]@{Reference=$prepBaselineReference;OldCallerReference=$prepOldCallerReference;NativeUptime=$null;Status='CANDIDATE_ONLY'}
+$script:D32PreparationSelfTestNow=1000L; $script:D32PreparationSelfTestCandidateCalls=0L; $script:D32PreparationSelfTestWriteCalls=0L; $script:D32PreparationSelfTestVerifyCalls=0L
+$script:D32PreparationSelfTestBaselineCalls=0L; $script:D32PreparationSelfTestCloseCalls=0L; $script:D32PreparationSelfTestReadDeadlines=[System.Collections.Generic.List[long]]::new()
+$script:D32PreparationSelfTestCandidateLate=$false;$script:D32PreparationSelfTestVerifyAllowed=$true
+function New-D32PreparationSelfTestControlLine {
+    param([long]$Sequence,[string]$Operation,[object]$Payload,[string]$Nonce=$prepNonce,[string]$Candidate=$prepCandidateSha)
+    $frame=[PSCustomObject][ordered]@{protocol='D32_PREP_OBSERVER_CONTROL_V1';session_nonce=$Nonce;sequence=$Sequence;candidate_sha=$Candidate
+        operation=$Operation;payload=$Payload}
+    return ConvertTo-D32PowerShellAuthorityJsonText -Value $frame
+}
+function New-D32PreparationSelfTestAdapter {
+    param([string[]]$Lines)
+    $script:D32PreparationSelfTestQueue=[System.Collections.Generic.Queue[string]]::new()
+    foreach($line in $Lines){$script:D32PreparationSelfTestQueue.Enqueue([string]$line)}
+    return [PSCustomObject]@{
+        QpcFrequency={1000L};Now={ [Int64]$script:D32PreparationSelfTestNow };CreateNonce={ $prepNonce }
+        GetIdentity={ param($Repository,$CandidateSha,$DeadlineTicks) if($DeadlineTicks -ne 16000L){throw 'identity deadline drift'}; return $script:D32PreparationSelfTestSnapshot }
+        AssertCurrent={ param($Snapshot,$DeadlineTicks) return $true }
+        ReadLine={ param($Reader,$DeadlineTicks,$LeaseDeadlineTicks)
+            $script:D32PreparationSelfTestReadDeadlines.Add([Int64]$DeadlineTicks)
+            if($script:D32PreparationSelfTestQueue.Count -eq 0){throw 'D32_PREP_TEST_INPUT_TIMEOUT'}
+            return $script:D32PreparationSelfTestQueue.Dequeue()
+        }
+        WriteLine={ param($Writer,$Line) $Writer.WriteLine([string]$Line);$Writer.Flush() }
+        PrepareRuntime={ param($Snapshot,$SessionNonce,$DeadlineTicks)
+            $script:D32PreparationSelfTestCandidateCalls++
+            if($script:D32PreparationSelfTestCandidateLate){$script:D32PreparationSelfTestNow=[Int64]$DeadlineTicks}
+            return $script:D32PreparationSelfTestCandidateResult
+        }
+        WriteRecord={ param($Path,$Bytes,$MaximumBytes,$DeadlineTicks,$Snapshot)
+            $script:D32PreparationSelfTestWriteCalls++
+            $expectedPath='E:\d32\D32-NON-SOURCE-L1-RUNTIME-CANDIDATE-'+$Snapshot.CandidateSha.Substring(0,8)+'-'+$script:D32PreparationSelfTestNonce+'.json'
+            if($Path -cne $expectedPath -or $Bytes.Length -ne $script:D32PreparationSelfTestCandidateReference.bytes -or
+                $Bytes.Length -gt $MaximumBytes -or $DeadlineTicks -ne 301000L -or $script:D32PreparationSelfTestWriteCalls -ne 1) {
+                throw 'synthetic create-new record path/bytes/deadline/count drift'
+            }
+            return $script:D32PreparationSelfTestCandidateReference
+        }
+        VerifyPins={ param($Payload,$Snapshot,$CandidateReference,$DeadlineTicks)
+            $script:D32PreparationSelfTestVerifyCalls++
+            return [bool]$script:D32PreparationSelfTestVerifyAllowed
+        }
+        CaptureBaseline={ param($Snapshot,$SessionNonce,$CandidateReference,$CandidateSequence,$PinVerificationSequence,$Sequence,$DeadlineTicks)
+            $script:D32PreparationSelfTestBaselineCalls++
+            return $script:D32PreparationSelfTestBaselineResult
+        }
+        Close={ param($Reader,$Writer,$Snapshot) $script:D32PreparationSelfTestCloseCalls++;return $true }
+    }
+}
+$prepReadyLine=New-D32PreparationSelfTestControlLine -Sequence 1 -Operation READY -Payload ([PSCustomObject][ordered]@{})
+$prepCandidateLine=New-D32PreparationSelfTestControlLine -Sequence 2 -Operation PREPARE_RUNTIME_CANDIDATE -Payload ([PSCustomObject][ordered]@{})
+$prepVerifyPayload=[PSCustomObject][ordered]@{identity=$prepIdentity;source_pins=$prepSourcePins.ToArray();runtime_candidate_reference=$prepCandidateReference}
+$prepVerifyLine=New-D32PreparationSelfTestControlLine -Sequence 3 -Operation VERIFY_RETURNED_PINS -Payload $prepVerifyPayload
+$prepBaselineLine=New-D32PreparationSelfTestControlLine -Sequence 4 -Operation CAPTURE_OLD_RUN_UPTIME_BASELINE -Payload ([PSCustomObject][ordered]@{})
+$prepCloseLine=New-D32PreparationSelfTestControlLine -Sequence 5 -Operation CLOSE -Payload ([PSCustomObject][ordered]@{})
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestVerifyCalls=0L
+$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$script:D32PreparationSelfTestReadDeadlines.Clear();$script:D32PreparationSelfTestVerifyAllowed=$true;$script:D32PreparationSelfTestCandidateLate=$false
+$prepSuccessAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine,$prepVerifyLine,$prepBaselineLine,$prepCloseLine)
+$prepSuccessOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepSuccessCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepSuccessOutput -TestAdapter $prepSuccessAdapter
+$prepSuccessLines=@($prepSuccessOutput.ToString().Split([Environment]::NewLine,[StringSplitOptions]::RemoveEmptyEntries))
+$prepSuccessFrames=@($prepSuccessLines | ForEach-Object { [System.Text.Json.JsonDocument]::Parse([string]$_) })
+$prepAllNonAuthority=$prepSuccessFrames.Count -eq 6 -and $prepSuccessCode -eq 0 -and
+    $prepRuntimeCandidateStrict -and
+    $script:D32PreparationSelfTestCandidateCalls -eq 1 -and $script:D32PreparationSelfTestWriteCalls -eq 1 -and $script:D32PreparationSelfTestVerifyCalls -eq 1 -and
+    $script:D32PreparationSelfTestBaselineCalls -eq 1 -and $script:D32PreparationSelfTestCloseCalls -eq 1 -and
+    $script:D32PreparationSelfTestReadDeadlines.Count -eq 5 -and
+    (@($prepSuccessFrames | Where-Object { $_.RootElement.GetProperty('gate_authority').GetString() -cne 'NONE' -or
+        $_.RootElement.GetProperty('launch_authority').GetString() -cne 'NONE' }).Count -eq 0) -and
+    $prepSuccessFrames[0].RootElement.GetProperty('sequence').GetInt64() -eq 0 -and
+    $prepSuccessFrames[1].RootElement.GetProperty('operation').GetString() -ceq 'READY' -and
+    $prepSuccessFrames[5].RootElement.GetProperty('status').GetString() -ceq 'CLOSED_PREPARATION_ONLY'
+foreach($frame in $prepSuccessFrames){$frame.Dispose()};$prepSuccessOutput.Dispose()
+if(-not $prepAllNonAuthority) {
+    Write-Output ('PREP_SUCCESS_DIAGNOSTIC: code='+$prepSuccessCode+' frames='+$prepSuccessLines.Count+' candidate_calls='+$script:D32PreparationSelfTestCandidateCalls+
+        ' writes='+$script:D32PreparationSelfTestWriteCalls+' verify='+$script:D32PreparationSelfTestVerifyCalls+' baseline='+$script:D32PreparationSelfTestBaselineCalls+
+        ' close='+$script:D32PreparationSelfTestCloseCalls+' candidate_status='+[string]$script:D32PreparationSelfTestCandidateResult.status+
+        ' strict='+[string]$prepRuntimeCandidateStrict+' read_deadlines='+$script:D32PreparationSelfTestReadDeadlines.Count+
+        ' candidate_bytes='+[string]$script:D32PreparationSelfTestCandidateReference.bytes+' candidate_sha='+[string]$script:D32PreparationSelfTestCandidateReference.sha256)
+    foreach($line in $prepSuccessLines){Write-Output ('PREP_REPLY: '+$line)}
+}
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session actual control interface completes READY→candidate→returned-pin verification→old-run baseline→CLOSE with immutable pins and Gate/launch NONE' $prepAllNonAuthority
+
+$prepBadSequenceLine=$prepReadyLine.Replace('"sequence":1','"sequence":"1"')
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepBadSequenceAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepBadSequenceLine)
+$prepBadSequenceOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepBadSequenceCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha -Reader ([IO.StringReader]::new('')) -Writer $prepBadSequenceOutput -TestAdapter $prepBadSequenceAdapter
+$prepBadSequenceRefused=$prepBadSequenceCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestWriteCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepBadSequenceOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session rejects a wrong-typed control sequence before candidate creation and closes the channel' $prepBadSequenceRefused
+
+$prepBadRuntimeHash=[PSCustomObject][ordered]@{gate_authority='NONE';status='CANDIDATE_FOR_COORDINATOR_PIN'
+    candidate=$prepRuntimeCandidateResult.candidate;candidate_json=$prepRuntimeCandidateResult.candidate_json;candidate_sha256=('0'*64);gaps=@()}
+$prepBadHashAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepBadHashAdapter.PrepareRuntime={param($Snapshot,$SessionNonce,$DeadlineTicks) return $prepBadRuntimeHash}
+$script:D32PreparationSelfTestWriteCalls=0L;$prepBadHashRejected=$false
+try { $null=Invoke-D32PreparationRuntimeCandidateProducer -Snapshot $script:D32PreparationSelfTestSnapshot -SessionNonce $prepNonce -DeadlineTicks 301000L -TestAdapter $prepBadHashAdapter } catch { $prepBadHashRejected=$true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed prep runtime producer rejects producer JSON SHA drift before any create-new write' ($prepBadHashRejected -and $script:D32PreparationSelfTestWriteCalls -eq 0)
+$prepOversizeJson='x'*(4194304+1)
+$prepOversizeSha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false,$true).GetBytes($prepOversizeJson))).ToLowerInvariant()
+$prepOversizeRuntime=[PSCustomObject][ordered]@{gate_authority='NONE';status='CANDIDATE_FOR_COORDINATOR_PIN'
+    candidate=$prepRuntimeCandidateResult.candidate;candidate_json=$prepOversizeJson;candidate_sha256=$prepOversizeSha;gaps=@()}
+$prepOversizeAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepOversizeAdapter.PrepareRuntime={param($Snapshot,$SessionNonce,$DeadlineTicks) return $prepOversizeRuntime}
+$script:D32PreparationSelfTestWriteCalls=0L;$prepOversizeRejected=$false
+try { $null=Invoke-D32PreparationRuntimeCandidateProducer -Snapshot $script:D32PreparationSelfTestSnapshot -SessionNonce $prepNonce -DeadlineTicks 301000L -TestAdapter $prepOversizeAdapter } catch { $prepOversizeRejected=$true }
+Assert-D32BoundedCompilerDiagnosticSelfTest 'fixed prep runtime producer refuses candidate JSON over the existing 4 MiB authority cap without a create-new write' ($prepOversizeRejected -and $script:D32PreparationSelfTestWriteCalls -eq 0)
+$script:D32PreparationSelfTestCandidateResult=$prepRuntimeCandidateResult
+
+$prepWrongNonce=New-D32PreparationSelfTestControlLine -Sequence 1 -Operation READY -Payload ([PSCustomObject][ordered]@{}) -Nonce ('c'*32)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestVerifyCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepWrongNonceAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepWrongNonce)
+$prepWrongNonceOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWrongNonceCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepWrongNonceOutput -TestAdapter $prepWrongNonceAdapter
+$prepWrongNonceRefused=$prepWrongNonceCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and
+    $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepWrongNonceOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session rejects cross-session nonce before candidate/baseline callbacks and closes its channel' $prepWrongNonceRefused
+
+$prepDuplicateLine='{"protocol":"D32_PREP_OBSERVER_CONTROL_V1","session_nonce":"'+$prepNonce+'","sequence":1,"candidate_sha":"'+$prepCandidateSha+'","operation":"READY","operation":"CLOSE","payload":{}}'
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepDuplicateAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepDuplicateLine)
+$prepDuplicateOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepDuplicateCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepDuplicateOutput -TestAdapter $prepDuplicateAdapter
+$prepDuplicateRefused=$prepDuplicateCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepDuplicateOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session rejects duplicate JSON keys without reaching any candidate or baseline producer' $prepDuplicateRefused
+
+$prepReplayAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine,(New-D32PreparationSelfTestControlLine -Sequence 2 -Operation VERIFY_RETURNED_PINS -Payload $prepVerifyPayload))
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestVerifyCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepReplayOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepReplayCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepReplayOutput -TestAdapter $prepReplayAdapter
+$prepReplayRefused=$prepReplayCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 1 -and $script:D32PreparationSelfTestWriteCalls -eq 1 -and
+    $script:D32PreparationSelfTestVerifyCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepReplayOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session rejects replayed/decreasing sequence before pin verification or baseline capture' $prepReplayRefused
+
+$prepWrongCandidate=New-D32PreparationSelfTestControlLine -Sequence 1 -Operation READY -Payload ([PSCustomObject][ordered]@{}) -Candidate ('f'*40)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepWrongCandidateAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepWrongCandidate)
+$prepWrongCandidateOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepWrongCandidateCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepWrongCandidateOutput -TestAdapter $prepWrongCandidateAdapter
+$prepWrongCandidateRefused=$prepWrongCandidateCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepWrongCandidateOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session refuses a control frame bound to a different candidate SHA before producer invocation' $prepWrongCandidateRefused
+
+$prepExtraPayloadLine=New-D32PreparationSelfTestControlLine -Sequence 1 -Operation READY -Payload ([PSCustomObject][ordered]@{unexpected=$true})
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepExtraPayloadAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepExtraPayloadLine)
+$prepExtraPayloadOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepExtraPayloadCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepExtraPayloadOutput -TestAdapter $prepExtraPayloadAdapter
+$prepExtraPayloadRefused=$prepExtraPayloadCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepExtraPayloadOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session refuses extra operation payload fields under its strict frame contract' $prepExtraPayloadRefused
+
+$prepDriftIdentity=[PSCustomObject][ordered]@{process_id=4322L;creation_filetime_ticks=$prepIdentity.creation_filetime_ticks
+    image_reference=$prepIdentity.image_reference;ordinary_token=$prepIdentity.ordinary_token
+    observer_startup_sha256=$prepIdentity.observer_startup_sha256;entry_reference=$prepIdentity.entry_reference}
+$prepDriftPayload=[PSCustomObject][ordered]@{identity=$prepDriftIdentity;source_pins=$prepSourcePins.ToArray();runtime_candidate_reference=$prepCandidateReference}
+$prepDriftLine=New-D32PreparationSelfTestControlLine -Sequence 3 -Operation VERIFY_RETURNED_PINS -Payload $prepDriftPayload
+$prepDriftAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine,$prepDriftLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestVerifyCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepDriftOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepDriftCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepDriftOutput -TestAdapter $prepDriftAdapter
+$prepDriftRefused=$prepDriftCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 1 -and $script:D32PreparationSelfTestWriteCalls -eq 1 -and
+    $script:D32PreparationSelfTestVerifyCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepDriftOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session refuses coordinator-returned observer PID drift before verifying pins or capturing baseline' $prepDriftRefused
+
+$prepOrderAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepBaselineLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepOrderOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepOrderCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepOrderOutput -TestAdapter $prepOrderAdapter
+$prepOrderRefused=$prepOrderCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepOrderOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session refuses baseline-before-runtime-candidate-and-independent-pin-verification ordering' $prepOrderRefused
+
+$script:D32PreparationSelfTestCandidateResult=[PSCustomObject]@{Status='BLOCKED_INPUT_GAPS';Reference=$null;CandidateSha256=$null;Gaps=@('synthetic fixed runtime input gap')}
+$prepBlockedAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine,$prepCloseLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepBlockedOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepBlockedCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepBlockedOutput -TestAdapter $prepBlockedAdapter
+$prepBlockedRefusesBaseline=$prepBlockedCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 1 -and
+    $script:D32PreparationSelfTestWriteCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepBlockedOutput.Dispose();$script:D32PreparationSelfTestCandidateResult=$prepRuntimeCandidateResult
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session preserves candidate producer gaps, skips baseline after A fails, and permits only explicit incomplete CLOSE' $prepBlockedRefusesBaseline
+
+$prepTimeoutAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestWriteCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$script:D32PreparationSelfTestReadDeadlines.Clear()
+$prepTimeoutOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepTimeoutCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepTimeoutOutput -TestAdapter $prepTimeoutAdapter
+$prepInputWaitBound=$script:D32PreparationSelfTestReadDeadlines.Count -eq 1 -and $script:D32PreparationSelfTestReadDeadlines[0] -eq 301000L
+$prepTimeoutClosed=$prepTimeoutCode -eq 87 -and $prepInputWaitBound -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepTimeoutOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session applies the bounded input wait, refuses timeout, and closes without retry or baseline' $prepTimeoutClosed
+
+$prepEofAdapter=New-D32PreparationSelfTestAdapter -Lines @()
+$prepEofAdapter.QpcFrequency={ [Int64][Diagnostics.Stopwatch]::Frequency }
+$prepEofAdapter.Now={ [Int64][Diagnostics.Stopwatch]::GetTimestamp() }
+$prepEofAdapter.GetIdentity={param($Repository,$CandidateSha,$DeadlineTicks) return $script:D32PreparationSelfTestSnapshot}
+$prepEofAdapter.ReadLine=$null
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L
+$prepEofOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepEofCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha -Reader ([IO.StringReader]::new('')) -Writer $prepEofOutput -TestAdapter $prepEofAdapter
+$prepEofClosed=$prepEofCode -eq 87 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepEofOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session observes actual managed TextReader EOF and closes without candidate, baseline, or retry' $prepEofClosed
+
+$prepLeaseAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepLeaseAdapter.ReadLine={ param($Reader,$DeadlineTicks,$LeaseDeadlineTicks) $script:D32PreparationSelfTestNow=1801001L;return $script:D32PreparationSelfTestQueue.Dequeue() }
+$prepLeaseOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepLeaseCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepLeaseOutput -TestAdapter $prepLeaseAdapter
+$prepLeaseRefused=$prepLeaseCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepLeaseOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session absolute 1800-second lease refuses a late control frame and performs deterministic close' $prepLeaseRefused
+
+$prepLateAdapter=New-D32PreparationSelfTestAdapter -Lines @($prepReadyLine,$prepCandidateLine)
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$script:D32PreparationSelfTestCandidateLate=$true
+$prepLateOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepLateCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepLateOutput -TestAdapter $prepLateAdapter
+$prepLateRefused=$prepLateCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 1 -and $script:D32PreparationSelfTestWriteCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepLateOutput.Dispose();$script:D32PreparationSelfTestCandidateLate=$false
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session rejects a runtime producer that returns at or after its 300-second deadline and never captures baseline' $prepLateRefused
+
+$prepCloseAdapter=New-D32PreparationSelfTestAdapter -Lines @((New-D32PreparationSelfTestControlLine -Sequence 1 -Operation CLOSE -Payload ([PSCustomObject][ordered]@{})))
+$script:D32PreparationSelfTestCandidateCalls=0L;$script:D32PreparationSelfTestBaselineCalls=0L;$script:D32PreparationSelfTestCloseCalls=0L;$script:D32PreparationSelfTestNow=1000L
+$prepCloseOutput=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+$prepCloseCode=Invoke-D32PreparationObserverControlSession -Repository $prepRepository -CandidateSha $prepCandidateSha `
+    -Reader ([IO.StringReader]::new('')) -Writer $prepCloseOutput -TestAdapter $prepCloseAdapter
+$prepEarlyClose=$prepCloseCode -eq 87 -and $script:D32PreparationSelfTestCandidateCalls -eq 0 -and $script:D32PreparationSelfTestBaselineCalls -eq 0 -and $script:D32PreparationSelfTestCloseCalls -eq 1
+$prepCloseOutput.Dispose()
+Assert-D32BoundedCompilerDiagnosticSelfTest 'prep session CLOSE before candidate/baseline remains incomplete, non-authorizing, and closes cleanly' $prepEarlyClose
+
+$prepBaselineRefForTest={ param([string]$Path,[long]$Bytes,[string]$Sha,[string]$Volume,[string]$FileId)
+    [ordered]@{path=$Path;bytes=$Bytes;sha256=$Sha;volume_serial_hex=$Volume;file_id_hex=$FileId} }
+$prepSys32=[IO.Path]::Combine([string]$env:SystemRoot,'System32')
+$prepSourceProof=[ordered]@{proof_type='WINTRUST_CACHE_ONLY_AUTHENTICODE_V1';signature_status='VALID';signer_simple_name='Microsoft Windows'
+    issuer_name='CN=Windows Production PCA 2023, O=Microsoft Corporation, C=US';signer_thumbprint=('f'*40);company_name='Microsoft Corporation'
+    product_name='Microsoft Windows';product_version='10.0';file_version='10.0'}
+$prepKernelRef=& $prepBaselineRefForTest ([IO.Path]::Combine($prepSys32,'kernel32.dll')) 4096L ('1'*64) ('1'*16) ('1'*32)
+$prepTargetRef=& $prepBaselineRefForTest ([IO.Path]::Combine($prepSys32,'kernelbase.dll')) 8192L ('2'*64) ('2'*16) ('2'*32)
+$prepTestCallerReference=[ordered]@{path='C:\Users\zuo\D32-NON-SOURCE-L1-CALLER-5a260368a65644f28195842860c86dc1.jsonl';bytes=18157L
+    sha256='398a7c57055bc0a2c9e7f4af4a695451587f6a20c12579c5494c379952a82e04';volume_serial_hex=('3'*16);file_id_hex=('3'*32)}
+$prepBaselineDocument=[ordered]@{schema_version=1;record_type='D32_NON_SOURCE_L1_RECOVERY_BOOT_BASELINE_V1';purpose='NON_SOURCE_L1_PRE_RESET_BASELINE_ONLY'
+    gate_authority='NONE';launch_authority='NONE';status='CANDIDATE_ONLY';candidate_sha=$prepCandidateSha;old_run_id='5a260368a65644f28195842860c86dc1'
+    session_nonce=$prepNonce;source_repo=$prepRepository;observer=$prepIdentity;source_pins=$prepSourcePins.ToArray()
+    runtime_candidate_reference=$prepCandidateReference;old_caller_reference=$prepTestCallerReference;old_locked_references=@($prepTestCallerReference)
+    native_uptime=[ordered]@{api='kernel32!GetTickCount64';return_type='System.UInt64';value_milliseconds=[UInt64]::MaxValue
+        kernel32_export_image=[ordered]@{file=$prepKernelRef;source_proof=$prepSourceProof;module_base_hex='0x00007ff800000000'}
+        actual_target_image=[ordered]@{file=$prepTargetRef;source_proof=$prepSourceProof;allocation_base_hex='0x00007ff800100000'
+            export_address_hex='0x00007ff800123456';memory_type='MEM_IMAGE'}}
+    monotonic_capture=[ordered]@{counter='QueryPerformanceCounter';frequency=10000000L;qpc_before=987654321L;qpc_after=987654322L
+        captured_utc_before='2026-10-08T00:00:00.0000000+00:00';captured_utc_after='2026-10-08T00:00:00.0000001+00:00'}
+    control_order=[ordered]@{candidate_sequence=2L;pin_verification_sequence=3L;baseline_sequence=4L}}
+$prepBaselineJson=ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineDocument
+$prepBaselinePositive=Test-D32PreparationBaselineJson -Json $prepBaselineJson -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce
+$prepBaselineWrongUptimeType=$prepBaselineJson.Replace('18446744073709551615','"18446744073709551615"')
+$prepBaselineBadUInt64=-not (Test-D32PreparationBaselineJson -Json $prepBaselineWrongUptimeType -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineBadCaller=$prepBaselineJson.Replace('18157','18156')
+$prepBaselineBadLock=-not (Test-D32PreparationBaselineJson -Json $prepBaselineBadCaller -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineDocument.native_uptime.value_milliseconds=123456789L
+$prepBaselineElevated=Copy-D32BoundedCompilerDiagnosticTestJson $prepBaselineDocument
+$prepBaselineElevated.observer.ordinary_token.elevated=$true
+$prepBaselineBadElevated=-not (Test-D32PreparationBaselineJson -Json (ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineElevated) -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineWrongImage=Copy-D32BoundedCompilerDiagnosticTestJson $prepBaselineDocument
+$prepBaselineWrongImage.observer.image_reference.path=[IO.Path]::GetFullPath([IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),'PowerShell','7','pwsh.exe'))
+$prepBaselineBadImage=-not (Test-D32PreparationBaselineJson -Json (ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineWrongImage) -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineWrongSourcePin=Copy-D32BoundedCompilerDiagnosticTestJson $prepBaselineDocument
+$prepBaselineWrongSourcePin.source_pins[5].path=[IO.Path]::Combine($prepRepository,'scripts/other.ps1')
+$prepBaselineBadSourcePin=-not (Test-D32PreparationBaselineJson -Json (ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineWrongSourcePin) -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineWrongUtcOrder=Copy-D32BoundedCompilerDiagnosticTestJson $prepBaselineDocument
+$prepBaselineWrongUtcOrder.monotonic_capture.captured_utc_after='2026-10-07T23:59:59.0000000+00:00'
+$prepBaselineBadUtcOrder=-not (Test-D32PreparationBaselineJson -Json (ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineWrongUtcOrder) -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+$prepBaselineWrongKernel=Copy-D32BoundedCompilerDiagnosticTestJson $prepBaselineDocument
+$prepBaselineWrongKernel.native_uptime.kernel32_export_image.file.path=[IO.Path]::Combine($prepSys32,'ntdll.dll')
+$prepBaselineBadKernel=-not (Test-D32PreparationBaselineJson -Json (ConvertTo-D32PowerShellAuthorityJsonText -Value $prepBaselineWrongKernel) -ExpectedCandidateSha $prepCandidateSha -ExpectedRepository $prepRepository -ExpectedSessionNonce $prepNonce)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'baseline strict consumer rejects elevated observer, aliased child image, source-pin path drift, UTC/QPC ordering drift, and non-kernel32 export origin' ($prepBaselineBadElevated -and $prepBaselineBadImage -and $prepBaselineBadSourcePin -and $prepBaselineBadUtcOrder -and $prepBaselineBadKernel)
+Assert-D32BoundedCompilerDiagnosticSelfTest 'typed pre-reset baseline strict consumer accepts actual UInt64 JSON and rejects string uptime or historical caller pin drift' `
+    ($prepBaselinePositive -and $prepBaselineBadUInt64 -and $prepBaselineBadLock)
+
 foreach ($consumer in $formalConsumerSchemas) {
     $consumerText = [IO.File]::ReadAllText($consumer.path, [Text.UTF8Encoding]::new($false, $true))
     Assert-D32BoundedCompilerDiagnosticSelfTest "formal consumer remains on its exact schema and rejects diagnostic V3/census V2: $([IO.Path]::GetFileName($consumer.path))" `
@@ -5382,4 +5747,5 @@ foreach ($consumer in $formalConsumerSchemas) {
 
 Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_EXTENSION: the fixed outer-caller function creates and reopens a canonical H-bound prelaunch record, then dispatches the actual controller boundary in-process through a synthetic-only route; the controller constructs and persists all three runtime admissions, executes the fixed case state machine through synthetic native/file/clock providers, writes the strict result and journal, and caller-reopens/reconciles the captures, three admission refs, inner result/journal refs, outcome, and one-line submitted caller journal. A strict zero-create caller refusal persists REFUSED/NOT_REQUIRED with null prelaunch/process/capture/inner-result facts and no predicted admissions. A separate early refusal preserves sanitized primary text through a connected bounded stderr-style pipe. The adapter explicitly refuses the native route. No P/Invoke, child process, runtime scan/import, or real output write occurs. Strict reader argv, cleared environment, raw command line, handle roles, case nonce/clock/evidence digest, nullable refusal/result JSON, bounded schemas, owner-bound root ACL, and untrusted-writer negative are covered.'
 Write-Output 'D32_BOUNDED_COMPILER_DIAGNOSTIC_POLICY_SELFTEST_COVERAGE: exact Git query and global writer bounds, argv/budget/environment, source-plan V1 rejection, locked-source graph V2 roots/hosts/targets, edge reconciliation, conservative feature/cfg evaluation, exhaustive inclusion/exclusion witnesses, in-memory Git pack/index SHA-1/CRC/REF_DELTA parsing, strict USTAR/GNU/mixed registry archive decoding, GNU L controls, exact fallback/pair/inventory digests and strict negative matrix, USTAR prefix/reserved-byte and numeric/checksum/text/type/path/NFC/collision negatives, optional unique package-root directory, inferred/explicit parent equivalence, same-member-inventory cross-layout fixtures, producer/census header digest/count equivalence, ordinary-payload-discard versus control-metadata-hash census behavior, gzip/tar framing/padding/truncation/time/member-budget outcomes, strict census-authority V2 and census-result V2 exact-schema/policy/root/identity/source-pin/archive-set/budget/output/coverage/header-count/format-count/status/primary-error roundtrips and mutation negatives, unsupported first-header and unexamined-remainder preservation, no-auto-launch/caller-pinned entry AST checks, strict source-proof V4/header-digest/count/policy crossbinding, canonical Cargo registry .cargo-ok bytes and distinct Git marker rules, auxiliary metadata routing, Cargo checksum and .git pointer malformed-input negatives, source-proof constructor/fallback/timeout branches and dual current/historical bindings, source-proof execution authority/result V1 producer-validator-JSON-consumer closure and strict scalar/schema mutations, NON_SOURCE_L1 runtime-content V2 producer→canonical-JSON→strict-consumer closure with V2 distribution/Utility/startup/resolver fixtures, bounded deps/runtimeconfig target parsing, exact V2 TPA/native-directory resolution, PE import dependency parsing and candidate-input rejection, protected-absence projection, candidate-gap behavior and exact schema/type/reference/digest/limit/unknown-field negatives, observer-image/process/token separation positives and reader/policy alias/cross-binding negatives, isolated NON_SOURCE_L1 authority/result V2 producer→reader→JSON→consumer closure, outer-caller H projection and raw-command-line binding positives/negatives, create-new prelaunch/admission reference SHA+identity readback, controller/reader runtime-admission V1 process/argv/environment/import-order/cross-parent bindings, synthetic real-route refusal, exact six-code pin reader terminal branch and mode-disjoint fixed argv/environment roles, 2-create/1-termination/0-create refusal lifecycle evidence, one-reader Job active-process limit and retained-identity AST checks, 60-second shared T0 and 5/10/15-second case deadlines, ordered execution/NOT_RUN suffix and at-audit BUDGET_STOPPED result/journal reconciliation, no fabricated PID/capture on refusal, formal/SourceProof-domain cross-rejection, shared synthetic QPC phase boundaries at 269999/270000/299999/300000/345000/360000, clock rollback/overflow and reset rejection, exit/deadline race and late-zero/partial-result refusal, fake-clock controller read boundaries, retained-handle/job AST ordering and PID-creation identity requirements, bounded capture/journal/candidate limits, exact result-persisted journal bytes/hash/timing ordering, primary-error preservation and formal-consumer refusal. Pure synthetic fixtures only: no Cargo, native child/PInvoke call, runtime scan/import, network, registry cache, or archive content access.'
+Write-Output 'D32_PREPARATION_SESSION_L0_COVERAGE: existing V2 runtime-content producer through strict canonical-JSON consumer and bounded synthetic create-new reference; exact JSONL operation/framing/nonce/candidate/Int64 sequence/payload checks; actual synthetic observer identity and six ordered source-pin return/revalidation; once-only state ordering and no-baseline after candidate gaps; 4 MiB output cap and SHA/path drift; 15-second identity, 300-second input/preparation and 1800-second absolute lease boundaries; managed bounded reader EOF and channel close; strict baseline UInt64, old caller/code pins, ordinary observer, non-child image, System32 kernel32/MEM_IMAGE origin, UTC/QPC order positives and negatives. Synthetic data only; no live observer, runtime inventory, old-run file read, native query, output write, restart, authority or attempt.'
 Write-Output ('D32_BOUNDED_COMPILER_DIAGNOSTIC_CONTAINMENT_REPARSE_FIXTURE: ' + $script:D32ContainmentReparseFixtureStatus)
